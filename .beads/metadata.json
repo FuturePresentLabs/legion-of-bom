@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "legion_of_bom",
+  "project_id": "31ed5aab-42be-4cd6-be9f-cc48d4e721a1"
+}
