@@ -8,6 +8,13 @@
 __pycache__/
 *.pyc
 
+# SKiDL working-directory artifacts (ERC reports, logs, auto-generated backup
+# libraries). The runner directs these into out/; ignore any that escape to root.
+*.erc
+*.log
+*_sklib.py
+skidl.cfg
+
 # Local pipeline outputs / scratch (generated netlists, boards, gerbers)
 /out/
 
