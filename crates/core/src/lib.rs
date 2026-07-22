@@ -14,12 +14,18 @@ pub mod model;
 pub mod netlist;
 pub mod skidl;
 pub mod source;
+pub mod spice;
 pub mod stage;
 pub mod tools;
+pub mod units;
+pub mod verify;
 
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
+pub use spice::{simulate_ac, AcPoint, AcResult, SimConfig};
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
 pub use tools::{find_on_path, phase0_tools, Tool, ToolStatus};
+pub use units::parse_eng_value;
+pub use verify::check_rc_cutoff;

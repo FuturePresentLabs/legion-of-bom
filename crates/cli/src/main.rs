@@ -12,7 +12,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use legion_of_bom_core::{parse_netlist_file, CircuitSource, SkidlRunner};
+use legion_of_bom_core::{
+    check_rc_cutoff, parse_netlist_file, simulate_ac, CircuitSource, Finding, PipelineReport,
+    Severity, SimConfig, SkidlRunner, StageOutcome,
+};
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
 #[derive(Debug, Parser)]
@@ -57,10 +60,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the pipeline against a circuit.
+/// Run the pipeline against a circuit and report per-stage pass/fail.
 ///
-/// Stage 1 (SKiDL runner) is wired; parse -> validate -> simulate -> verify ->
-/// bom are the remaining Phase 0 tasks and plug in below.
+/// Stages: SKiDL run → parse → simulate (ngspice AC) → verify (textbook cutoff).
+/// Validate (ERC as structured findings) and BOM are the remaining Phase 0 tasks
+/// and slot into the same report. Exits non-zero if any stage fails.
 fn run(circuit: PathBuf) -> Result<()> {
     let circuit = circuit
         .canonicalize()
@@ -73,38 +77,80 @@ fn run(circuit: PathBuf) -> Result<()> {
     let work_dir = PathBuf::from("out").join(stem);
 
     tracing::info!(circuit = %circuit.display(), "lob run");
-    println!("lob run: {}", circuit.display());
+    println!("lob run: {}\n", circuit.display());
 
-    // Stage 1: SKiDL — run the script, capture the netlist + ERC report.
+    let mut report = PipelineReport::new();
+
+    // Stage: SKiDL — run the script, capture the netlist + ERC report.
     let runner = SkidlRunner::discover(&work_dir);
     let skidl_run = runner
         .run(&circuit)
         .with_context(|| "SKiDL stage failed (try `lob doctor`)")?;
-
-    println!(
-        "  ✓ skidl     netlist: {}",
+    let mut skidl_outcome = StageOutcome::passed("skidl").with(Finding::info(format!(
+        "netlist: {}",
         skidl_run.netlist_path.display()
-    );
-    match &skidl_run.erc_report {
-        Some(report) => {
-            let summary = erc_summary(report);
-            println!("             ERC: {summary}");
-        }
-        None => println!("             ERC: (no report emitted)"),
+    )));
+    if let Some(erc) = &skidl_run.erc_report {
+        skidl_outcome = skidl_outcome.with(Finding::info(format!("ERC: {}", erc_summary(erc))));
     }
+    report.push(skidl_outcome);
 
-    // Stage 2: parse the netlist into the internal Circuit model.
-    let circuit =
+    // Stage: parse the netlist into the internal Circuit model.
+    let model =
         parse_netlist_file(&skidl_run.netlist_path).with_context(|| "parse stage failed")?;
-    println!(
-        "  ✓ parse     {} parts, {} nets",
-        circuit.parts().len(),
-        circuit.nets().len()
-    );
+    report.push(StageOutcome::passed("parse").with(Finding::info(format!(
+        "{} parts, {} nets",
+        model.parts().len(),
+        model.nets().len()
+    ))));
 
-    println!("  … validate -> simulate -> verify -> bom: not yet implemented");
-    println!("    (see the beads 'Phase 0' epic)");
-    Ok(())
+    // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep.
+    let ac = simulate_ac(&model, &SimConfig::default(), &work_dir)
+        .with_context(|| "simulate stage failed (try `lob doctor`)")?;
+    report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
+        "AC sweep: {} points, passband {:.2} dB",
+        ac.points.len(),
+        ac.passband_gain_db().unwrap_or(0.0)
+    ))));
+
+    // Stage: verify — assert the simulated cutoff against the textbook value.
+    report.push(check_rc_cutoff(&model, &ac, 0.02));
+
+    print_report(&report);
+    if report.passed() {
+        Ok(())
+    } else {
+        anyhow::bail!("pipeline reported stage failures")
+    }
+}
+
+/// Print each stage's pass/fail mark and findings, then an overall summary.
+fn print_report(report: &PipelineReport) {
+    for outcome in &report.outcomes {
+        println!(
+            "  {} {}",
+            if outcome.passed { "✓" } else { "✗" },
+            outcome.stage
+        );
+        for finding in &outcome.findings {
+            let prefix = match finding.severity {
+                Severity::Info => "",
+                Severity::Warning => "warning: ",
+                Severity::Error => "error: ",
+            };
+            println!("      {prefix}{}", finding.message);
+        }
+    }
+    println!();
+    if report.passed() {
+        println!("✓ pipeline passed ({} stages)", report.outcomes.len());
+    } else {
+        let failed = report.outcomes.iter().filter(|o| !o.passed).count();
+        println!(
+            "✗ pipeline failed ({failed} of {} stages)",
+            report.outcomes.len()
+        );
+    }
 }
 
 /// One-line summary from a SKiDL ERC report: the counts line if present, else
