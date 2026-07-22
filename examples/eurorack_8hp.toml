@@ -1,0 +1,21 @@
+# Example Eurorack panel spec: 8 HP with 2 jacks and 1 pot.
+# Generate DXF: lob panel dxf examples/eurorack_8hp.toml
+
+format = "eurorack"
+hp = 8
+thickness_mm = 2.0
+
+[[cutouts]]
+x_mm = 7.5
+y_mm = 100.0
+footprint = "Thonkiconn"
+
+[[cutouts]]
+x_mm = 25.0
+y_mm = 100.0
+footprint = "Thonkiconn"
+
+[[cutouts]]
+x_mm = 16.25
+y_mm = 50.0
+footprint = "Alpha9mm"

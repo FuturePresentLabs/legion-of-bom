@@ -17,6 +17,7 @@ pub mod jlcpcb;
 pub mod model;
 pub mod mouser;
 pub mod netlist;
+pub mod panel;
 pub mod parts;
 pub mod route;
 mod sexpr;
@@ -39,6 +40,10 @@ pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use model::{Circuit, Net, Part, PinRef, RefDes, SimModel};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
+pub use panel::{
+    default_panel_orders_dir, footprint_shape, panel_to_dxf, Cutout, CutoutShape, EurorackPanel,
+    MountingHole, PanelFile, PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
+};
 pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
