@@ -12,6 +12,7 @@
 
 pub mod bom;
 pub mod fetch;
+pub mod jlcpcb;
 pub mod model;
 pub mod mouser;
 pub mod netlist;
@@ -28,7 +29,8 @@ pub mod validate;
 pub mod verify;
 
 pub use bom::{generate_bom, Bom, BomLine};
-pub use fetch::fetch_from_kicad;
+pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
+pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};

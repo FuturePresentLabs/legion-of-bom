@@ -2,16 +2,18 @@
 //! citation for every fact. DESIGN.md 3.5; MCP.md 1. okm.3.
 //!
 //! Trust order (DESIGN.md 3.5): distributor-official CAD library → broader CAD
-//! library → PDF datasheet extraction. This module currently implements the
-//! **KiCad official symbol library** source — a high-trust CAD library
-//! (CC-BY-SA, already installed, LIBRARIES.md §1). It yields pins + the symbol's
-//! datasheet URL; ratings and PDF-page citations come from the
-//! distributor-API/PDF sources added next (JLCPCB, then Mouser for pricing in the
-//! BOM epic).
+//! library → PDF datasheet extraction. Two sources exist, and compose (the CLI
+//! merges non-empty fields across fetches):
+//!   - [`fetch_from_kicad`]: the installed KiCad official library (CC-BY-SA,
+//!     LIBRARIES.md §1) — yields pins + the symbol's datasheet URL.
+//!   - [`fetch_from_jlcpcb`]: JLCPCB's authoritative distributor data by LCSC
+//!     code — yields datasheet URL + structured parameters (ratings) + MPN.
+//! PDF-page citations (`cited_page`) come from a future PDF-extraction source.
 
 use std::path::Path;
 
-use crate::parts::{PartRecord, PinRecord};
+use crate::jlcpcb::{JlcpcbClient, JlcpcbError};
+use crate::parts::{PartRecord, PinRecord, RatingRecord};
 use crate::stage::StageError;
 use crate::symbols;
 
@@ -45,6 +47,44 @@ pub fn fetch_from_kicad(mpn: &str, symbol_dir: &Path) -> Result<PartRecord, Stag
         })
         .collect();
     Ok(part)
+}
+
+/// Fetch a part from JLCPCB by LCSC component code (`C1002`) — an authoritative
+/// distributor source yielding datasheet URL, structured parameters (as ratings),
+/// and the MPN (componentModel). Not pin names (that's CAD data — use the KiCad
+/// source for pins). The record is keyed by its MPN and left unverified.
+pub fn fetch_from_jlcpcb(lcsc_code: &str, client: &JlcpcbClient) -> Result<PartRecord, StageError> {
+    let component = client
+        .component_by_code(lcsc_code)
+        .map_err(jlcpcb_err)?
+        .ok_or_else(|| StageError::Other(format!("no JLCPCB component for code '{lcsc_code}'")))?;
+
+    if component.component_model.is_empty() {
+        return Err(StageError::Other(format!(
+            "JLCPCB component {lcsc_code} has no model/MPN"
+        )));
+    }
+
+    let mut part = PartRecord::new(&component.component_model);
+    part.datasheet_url = component.datasheet_url;
+    part.ratings = component
+        .parameters
+        .into_iter()
+        .map(|(name, value)| RatingRecord {
+            name,
+            value,
+            unit: None,
+            cited_page: None,
+        })
+        .collect();
+    Ok(part)
+}
+
+fn jlcpcb_err(e: JlcpcbError) -> StageError {
+    match e {
+        JlcpcbError::MissingKeys => StageError::ToolNotFound("JLCPCB API keys".into()),
+        other => StageError::Other(other.to_string()),
+    }
 }
 
 /// Best-effort manufacturer from a datasheet URL host (a heuristic for the

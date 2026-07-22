@@ -13,9 +13,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::kicad_symbol_dir;
 use legion_of_bom_core::{
-    analytic_check, default_parts_dir, fetch_from_kicad, generate_bom, parse_netlist_file,
-    simulate_ac, validate_erc, CircuitSource, Finding, MouserClient, PartRecord, PartResolution,
-    PartsLibrary, PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, default_parts_dir, fetch_from_jlcpcb, fetch_from_kicad, generate_bom,
+    parse_netlist_file, simulate_ac, validate_erc, CircuitSource, Finding, JlcpcbClient,
+    MouserClient, PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus,
+    Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -71,10 +72,14 @@ enum PartsCmd {
         #[arg(long)]
         datasheet: Option<String>,
     },
-    /// Fetch a part's pins + datasheet from a source into the library (unverified).
+    /// Fetch a part into the library (unverified) from a source.
+    ///
+    /// `--source kicad` (default): pins + datasheet from the installed KiCad
+    /// library, keyed by symbol/MPN. `--source jlcpcb`: authoritative datasheet +
+    /// parameters (ratings) from JLCPCB, keyed by LCSC code (`C1002`).
     Fetch {
-        mpn: String,
-        /// Source: `kicad` (installed KiCad library). Distributor APIs come next.
+        /// MPN (kicad source) or LCSC component code (jlcpcb source).
+        id: String,
         #[arg(long, default_value = "kicad")]
         source: String,
     },
@@ -312,17 +317,23 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             let model = parse_netlist_file(&run.netlist_path)?;
             print_resolutions(&lib.resolve_circuit(&model)?);
         }
-        PartsCmd::Fetch { mpn, source } => {
-            let part = match source.as_str() {
+        PartsCmd::Fetch { id, source } => {
+            let fetched = match source.as_str() {
                 "kicad" => {
                     let dir = kicad_symbol_dir()
                         .context("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")?;
-                    fetch_from_kicad(&mpn, dir.path())?
+                    fetch_from_kicad(&id, dir.path())?
                 }
-                other => anyhow::bail!(
-                    "unknown source '{other}' (only `kicad` so far; JLCPCB/Mouser next)"
-                ),
+                "jlcpcb" => {
+                    let client = JlcpcbClient::from_env().context(
+                        "JLCPCB fetch needs JLCPCB_APP_ID/ACCESS_KEY/SECRET_KEY in .env",
+                    )?;
+                    fetch_from_jlcpcb(&id, &client)?
+                }
+                other => anyhow::bail!("unknown source '{other}' (use `kicad` or `jlcpcb`)"),
             };
+            let part = merge_fetched(lib.get_part(&fetched.mpn)?, fetched);
+            let mpn = part.mpn.clone();
             lib.upsert_part(&part)?;
             lib.commit(&format!("parts: fetch {mpn} from {source}"))?;
             println!("fetched {mpn} from {source}:");
@@ -331,6 +342,28 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Merge a freshly-fetched part into any existing record: overlay non-empty
+/// fields so different sources compose (JLCPCB datasheet/ratings + KiCad pins)
+/// rather than overwrite. Verification status is preserved.
+fn merge_fetched(existing: Option<PartRecord>, fetched: PartRecord) -> PartRecord {
+    let Some(mut merged) = existing else {
+        return fetched;
+    };
+    if fetched.manufacturer.is_some() {
+        merged.manufacturer = fetched.manufacturer;
+    }
+    if fetched.datasheet_url.is_some() {
+        merged.datasheet_url = fetched.datasheet_url;
+    }
+    if !fetched.pins.is_empty() {
+        merged.pins = fetched.pins;
+    }
+    if !fetched.ratings.is_empty() {
+        merged.ratings = fetched.ratings;
+    }
+    merged
 }
 
 fn print_part(part: &PartRecord) {
