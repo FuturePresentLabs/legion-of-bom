@@ -22,7 +22,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    3.2 Path to a native Rust DSL (v2+)
    3.3 DSL-agnostic circuit IR — what it must capture to support multiple frontends
    3.4 Reusable component/subcircuit library (op-amp stages, OTA stages, RIAA networks, etc.)
-   3.5 Global parts library (pinout/rating verification — see also MCP.md)
+   3.5 Global parts library (pinout/rating/SPICE-model verification — see also MCP.md)
 
 4. **Validation Layer**
    4.1 ERC (first pass) — what it catches, what it doesn't
@@ -45,10 +45,11 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    6.8 Manual layout escape hatch — where the human loop stays in
 
 7. **Panel Design**
-   7.1 DXF output
+   7.1 DXF output (filled — see body)
    7.2 SVG output
    7.3 KiCad-native panel workflow
    7.4 Mechanical fit checks against PCB (jack/pot alignment)
+   7.5 Manual order tracking — no fab-vendor API available (filled — see body)
 
 8. **Manufacturing Outputs**
    8.1 Gerbers via KiCad (v1 path)
@@ -150,9 +151,9 @@ everything that consumes circuit data.
 
 ### 2.4 Repo & project structure
 - **FuturePresentLabs/legion-of-bom** — the tool itself (core lib + CLI + web
-  backend), AGPLv3
+  ba[118;1:3uckend), AGPLv3
 - **Board/circuit repos** — one per project (e.g. `puget-audio-2opfm`,
-  `puget-audio-slew-limit[118;1:3uer`), each can hold multiple related circuits, plain git.
+  `puget-audio-slew-limiter`), each can hold multiple related circuits, plain git.
   In v1, these are local clones on the machine running `lob` — the CLI/backend
   shells out to `git` directly, no remote-hosting integration yet. The
   Forestry.io-for-KiCad model (connecting to *someone else's* remote repo) is a v2+
@@ -209,7 +210,14 @@ module. Revisit after Phase 0 and the slew limiter (Phase 1) are both done — b
 there'll be enough real examples (RC filter, op-amp gain stage, OTA slew stage) to
 know what's actually common.
 
-### 3.5 Global parts library (pinout/rating verification)
+### 3.5 Global parts library (pinout/rating/SPICE-model verification)
+**Status: in progress — tracked as epic `okm`, 5 P1 tasks open (schema,
+distributor sourcing, `fetch_datasheet`, the `verified_by_human` gate,
+MPN-based `define_circuit`).** Unblocked by Phase 0's close; the first proven
+slice already exists — Phase 0 demonstrated components carrying their own
+SPICE models with a resolver seam this library plugs into, ahead of the full
+schema being built.
+
 `define_circuit` — whether invoked directly (writing SKiDL by hand), via the
 `lob` CLI, or via an MCP-driving agent (see MCP.md) — resolves parts by MPN
 against a **global, Dolt-backed parts library**, not model/training memory and
@@ -220,10 +228,20 @@ agent-only construct: the same trust rules apply regardless of entry point.
   KiCad library, JLCPCB/EasyEDA) → broader CAD library (SnapEDA/Ultra
   Librarian, checking verification status) → PDF datasheet extraction as
   fallback, sourced only from a distributor API's datasheet URL field, never a
-  general web search
+  general web search. See LIBRARIES.md for the full curated source list.
 - **Every extracted pin/rating carries a citation** (source, page/section) —
   see MCP.md Section 1 for the full schema (`parts`, `part_pins`,
   `part_ratings` tables)
+- **SPICE models are a distinct artifact from pinout/ratings, sourced
+  differently and verified differently.** They typically come from the
+  manufacturer directly (e.g. TI's own product page), not a distributor API
+  field, and multi-channel packages often need a wrapper subcircuit (the raw
+  manufacturer model is single-channel; a dual op-amp needs it instantiated
+  twice with matching pin order). Verification here isn't "read the pin
+  number correctly" — it's "run a known textbook case and confirm the
+  simulated result matches," the same evidentiary bar Phase 0 held its own
+  demo circuits to. See MCP.md and the `part_spice_models` table concept for
+  schema detail.
 - **`verified_by_human` gates real use**: a part can be fetched and extracted
   automatically, but `layout` and `generate_bom` (Section 6, Section 9) refuse
   to run against any part that hasn't been human-confirmed at least once.
@@ -232,6 +250,15 @@ agent-only construct: the same trust rules apply regardless of entry point.
 - This exists specifically to prevent a repeat of the LM13700-pinout-from-
   memory mistake made earlier in this project — the fix is structural
   (a gate the pipeline enforces) rather than a process reminder to double-check
+
+**Parts library ≠ BOM — related, not the same epic.** The parts library
+answers "is this part definition trustworthy" (pinout, ratings, SPICE model,
+keyed by MPN) — no pricing, no quantities, no vendor stock, that's not its
+job. BOM generation (Section 9.1) *reads* this library to know which MPNs are
+real and verified, then adds something the parts library was never meant to
+hold: live pricing/stock from a distributor API (Mouser, to start). Sequencing
+consequence: the parts-library epic unblocks BOM, but BOM is a separate
+epic layered on top, not a subtask inside this one.
 
 Full detail, tool schemas, and the agent-facing flow live in MCP.md — that
 document describes the agent surface of this same core mechanism, not a
@@ -386,10 +413,73 @@ this project.
 
 ---
 
+## 7. Panel Design
+
+*(7.2–7.4 remain TOC-only — filling in 7.1 and 7.5 now since they're the
+concrete near-term ask: get a real DXF out, and know whether it's been
+ordered, given no fab vendor offers API automation yet)*
+
+### 7.1 DXF output
+Panel outline and cutouts (jack holes, pot holes, mounting holes, any
+silkscreen-equivalent engraving) are exported to DXF from the same
+`kicad-ipc-rs` connection used for the board itself (Section 6.6) — the panel
+is its own KiCad PCB-editor-adjacent artifact (either a dedicated mechanical
+layer/outline within the project, or a separate panel-only board file
+depending on how the `PanelProfile`, Section 6.1, is implemented), with
+geometry driven by the per-module physical layout (jack/pot/LED positions,
+HP width) that DESIGN.md flagged as a real, currently-undesigned input.
+`kicad-cli`'s existing plot/export tooling handles the actual DXF write —
+same already-headless CLI path used for Gerber export in 6.6, not gated by
+the "KiCad GUI must be running" requirement that applies to interactive
+IPC operations.
+
+DXF is the priority format because it's what both SendCutSend and OSH Cut
+actually want as upload input (confirmed via their own tutorials/workflows) —
+SVG (7.2) is lower priority until there's a concrete reason to need it.
+
+### 7.5 Manual order tracking — no fab-vendor API available
+Neither SendCutSend nor OSH Cut expose a public order-submission API (confirmed
+— both are upload-a-file-to-a-web-app workflows only), unlike JLCPCB/Mouser/
+DigiKey. So panel ordering itself stays a manual step: `legion-of-bom`
+generates the correct DXF, a human uploads it and places the order on the
+vendor's site. What *is* automatable is tracking status of that manual step,
+so it doesn't get lost the way an untracked step easily does.
+
+**Storage: a `panel_orders` table in the same Dolt-backed store used for
+inventory (Section 2.6, Section 11)** — this is structured, queryable,
+cross-project data, the same category as parts verification and inventory,
+not project-specific circuit content that belongs in git.
+
+```sql
+CREATE TABLE panel_orders (
+  id INT PRIMARY KEY,
+  module VARCHAR(64) NOT NULL,       -- e.g. "crossfader-v1"
+  dxf_path TEXT NOT NULL,            -- path/commit ref to the generated DXF
+  vendor VARCHAR(32),                -- "sendcutsend" | "oshcut" | other
+  status VARCHAR(16) DEFAULT 'not_ordered',  -- not_ordered | ordered | shipped | received
+  ordered_at DATETIME,
+  tracking_ref TEXT,                 -- vendor order/tracking number, entered manually
+  notes TEXT
+);
+```
+
+`lob panel status <module>` reads current state; `lob panel mark-ordered
+<module> --vendor oshcut --tracking <ref>` updates it — simple manual CLI
+commands standing in for what an API webhook would otherwise do automatically.
+**Explicitly deferred, not designed away**: if either vendor adds a real API
+later, or if this becomes a big enough part of operations to justify it, the
+manual `mark-ordered` step gets replaced by an actual API call updating the
+same table — the schema doesn't need to change, just how `status` gets set.
+
+---
+
 ## 9. BOM & PCBA Pipeline
 
 *(9.1–9.3 and 9.5 remain TOC-only — filling in 9.4 out of order for the same
-reason as 4.3 above)*
+reason as 4.3 above. Note: 9.1 depends on the parts library (Section 3.5,
+epic `okm`) but is its own separate epic — BOM adds live distributor pricing
+on top of the parts library's verified-MPN data, it doesn't live inside the
+parts-library epic. Mouser-priced BOM CSV is the current priority for 9.1.)*
 
 ### 9.4 BOM accuracy/verification — this has to be airtight
 BOM generation reads part records (pricing, stock, footprint) from the same
