@@ -314,6 +314,18 @@ pub struct PartResolution {
     pub status: ResolutionStatus,
 }
 
+impl PartResolution {
+    /// Whether this part blocks verified-only operations — it declares an MPN
+    /// but that MPN isn't a human-verified library entry. This is the check the
+    /// gate (okm.4) enforces before `layout`/`generate_bom` ordering.
+    pub fn blocks_verified_use(&self) -> bool {
+        matches!(
+            self.status,
+            ResolutionStatus::Unknown | ResolutionStatus::Unverified
+        )
+    }
+}
+
 impl PartsLibrary {
     /// Resolve every part of a circuit against the library by MPN. This is the
     /// bridge circuits cross to reach verified part data — and what BOM pricing

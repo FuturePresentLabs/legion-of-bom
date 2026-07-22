@@ -91,6 +91,11 @@ enum PartsCmd {
     },
     /// Resolve a circuit's parts against the library by MPN.
     Resolve { circuit: PathBuf },
+    /// Verification gate: fail if any MPN-bearing part isn't human-verified.
+    ///
+    /// This is the check `layout` / real BOM ordering enforce (okm.4) — the
+    /// structural block against unverified part data.
+    Gate { circuit: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -303,19 +308,35 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             println!("verified {mpn} (by {by})");
         }
         PartsCmd::Resolve { circuit } => {
-            let circuit = circuit
-                .canonicalize()
-                .with_context(|| format!("circuit not found: {}", circuit.display()))?;
-            let stem = circuit
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("circuit");
-            let work_dir = PathBuf::from("out").join(stem);
-            let run = SkidlRunner::discover(&work_dir)
-                .run(&circuit)
-                .with_context(|| "SKiDL failed (try `lob doctor`)")?;
-            let model = parse_netlist_file(&run.netlist_path)?;
-            print_resolutions(&lib.resolve_circuit(&model)?);
+            print_resolutions(&resolve_circuit_file(&lib, circuit)?);
+        }
+        PartsCmd::Gate { circuit } => {
+            let resolutions = resolve_circuit_file(&lib, circuit)?;
+            let blockers: Vec<_> = resolutions
+                .iter()
+                .filter(|r| r.blocks_verified_use())
+                .collect();
+            if blockers.is_empty() {
+                let n = resolutions.iter().filter(|r| r.mpn.is_some()).count();
+                println!("✓ verification gate passed — {n} MPN-bearing part(s), all verified");
+            } else {
+                for b in &blockers {
+                    let why = match b.status {
+                        ResolutionStatus::Unknown => "not in library",
+                        ResolutionStatus::Unverified => "in library, unverified",
+                        _ => "",
+                    };
+                    println!(
+                        "  ✗ {:<6} {:<18} {why}",
+                        b.refdes,
+                        b.mpn.as_deref().unwrap_or("-")
+                    );
+                }
+                anyhow::bail!(
+                    "verification gate FAILED: {} part(s) not verified — layout / BOM ordering refuse to run",
+                    blockers.len()
+                );
+            }
         }
         PartsCmd::Fetch { id, source } => {
             let fetched = match source.as_str() {
@@ -342,6 +363,26 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run SKiDL + parse a circuit, then resolve its parts against the library.
+fn resolve_circuit_file(
+    lib: &PartsLibrary,
+    circuit: PathBuf,
+) -> Result<Vec<legion_of_bom_core::PartResolution>> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    Ok(lib.resolve_circuit(&model)?)
 }
 
 /// Merge a freshly-fetched part into any existing record: overlay non-empty
