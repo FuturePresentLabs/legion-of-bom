@@ -33,9 +33,14 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    5.3 What gets simulated pre-layout vs. what waits
 
 6. **Layout & DFM**
-   6.1 KiCad pcbnew integration (from IR/netlist to board file)
-   6.2 DFM checks (JLCDFM or equivalent) before ordering
-   6.3 Manual layout work still required — where the human loop stays in
+   6.1 Format profiles (Eurorack, Guitar Pedal, Rack Mount, Desktop) — anchored connectors
+   6.2 2-layer convention (ground pour default)
+   6.3 Mode: Analog vs. Digital — cost-function weighting
+   6.4 Critical-net tagging in SKiDL
+   6.5 Iterative layout loop (place → route → check → repair)
+   6.6 KiCad pcbnew integration (from IR/netlist to board file)
+   6.7 DFM checks (JLCDFM + mechanical/3D collision checks)
+   6.8 Manual layout escape hatch — where the human loop stays in
 
 7. **Panel Design**
    7.1 DXF output
@@ -115,7 +120,7 @@ tenant/business.
 - Full autorouting/autoplacement — manual layout stays human-driven initially
 - Replacing KiCad's schematic/layout editors outright — legion-of-bom orchestrates
   around them, doesn't replace them
-- Multi-tenancy, hosted auth, remote repo connections, billing — v1 is local-only,
+- Multi-tenancy, hos[118;1:3uted auth, remote repo connections, billing — v1 is local-only,
   single-user, no network-facing auth surface at all. SaaS-shaping is an
   architectural intent for later, not a v1 requirement
 
@@ -152,7 +157,7 @@ everything that consumes circuit data.
   concern once SaaS-ification happens
 - **Inventory data** — lives in Dolt, not in the circuit git repos (see 2.6)
 
-### 2.5 Multi-tenancy & auth ([118;1:3udeferred to a later phase)
+### 2.5 Multi-tenancy & auth (deferred to a later phase)
 v1 is local-first and single-user: the CLI runs git commands directly against
 locally-cloned repos, and the web dashboard runs on localhost with no auth layer at
 all. Multi-tenancy, hosted repo connections, and auth (WebAuthn passkeys vs GitHub
@@ -201,3 +206,96 @@ having 2+ circuits before anything gets extracted into a shared `circuits/lib`
 module. Revisit after Phase 0 and the slew limiter (Phase 1) are both done — by then
 there'll be enough real examples (RC filter, op-amp gain stage, OTA slew stage) to
 know what's actually common.
+
+---
+
+## 6. Layout & DFM
+
+*(Sections 4–5 remain TOC-only placeholders — filled out of order because this was
+the harder architectural problem to work through)*
+
+### 6.1 Format profiles (Eurorack, Guitar Pedal, Rack Mount, Desktop) — anchored connectors
+v1 scope is deliberately limited to four form factors rather than general PCB
+layout. Each format gets a `PanelProfile`: mounting hole pattern, panel
+dimension convention (Eurorack HP, pedal enclosure size classes, rack U-height,
+desktop footprint), and a library of standard connectors with fixed footprints
+and 3D models. Critically, connectors defined by a format's `PanelProfile`
+(jacks, pots, switches) are **placement-anchored** — their position is
+determined by the panel spec, not by the layout optimizer. This shrinks the
+free-placement problem to just the support components (passives, ICs) instead of
+the whole board, which is what makes an iterative loop tractable instead of a
+general NP-hard placement search.
+
+### 6.2 2-layer convention (ground pour default)
+Hard v1 constraint: 2 layers only, matching real fabrication experience and no
+near-term need for more. Default convention: bottom layer is a solid ground
+pour, top layer carries signal and power traces, with via stitching down to
+ground where needed. This substantially replaces manual star-ground topology
+work for most nets — a solid pour gives a low-impedance return path largely "for
+free," rather than requiring every ground connection to be individually routed
+to converge at one point. Reduces one of the most error-prone parts of analog
+layout (see the phono-preamp grounding discussion) to a default that mostly just
+works, with critical-net tagging (6.4) as the escape hatch for the nets where it
+doesn't.
+
+### 6.3 Mode: Analog vs. Digital — cost-function weighting
+Project-level mode selection (not auto-detected) picks which violation-scoring
+weights the iterative loop (6.5) uses:
+- **Analog mode:** weights ground-pour integrity, critical-net proximity
+  (feedback networks, decoupling caps within a short distance of IC power pins),
+  and channel symmetry (stereo matching)
+- **Digital mode:** weights trace length, via count, and (later) controlled
+  impedance / differential pair matching
+- **Mixed:** both weight sets active, with per-net critical tagging (6.4) doing
+  the heavy lifting to tell the loop which rules apply where
+
+### 6.4 Critical-net tagging in SKiDL
+Manual, not auto-detected (confirmed decision). The circuit author explicitly
+tags nets that need analog-careful treatment at definition time — e.g. a
+feedback network net, a high-impedance input stage net, a matched-pair net for
+stereo channels. Auto-detection from topology was considered and rejected:
+whether a net is "critical" often depends on domain judgment (audio-rate,
+high-impedance, sensitive to parasitic coupling) that isn't cleanly inferable
+from graph structure alone. Practical shape: something like a `critical()`
+wrapper or tag argument on the net when defined in SKiDL, carried through into
+the netlist/IR so the layout loop can read it without re-deriving it.
+
+### 6.5 Iterative layout loop (place → route → check → repair)
+Not general autorouting — guided iterative repair over the *free* (non-anchored)
+components and nets only:
+1. Auto-place free components, seeded near their anchored neighbors (e.g. a
+   decoupling cap seeded close to the IC it decouples)
+2. Auto-route non-critical nets against the current mode's cost weights
+3. Check violations: electrical DRC, mechanical/3D collision checks (6.7),
+   critical-net rules (e.g. "is this tagged critical net physically short and
+   direct, or did the router send it around the board")
+4. If violations exist, generate a targeted repair (not a full re-place) and
+   recheck
+5. Exit condition is **not** "zero violations" — critical nets that the loop
+   can't confidently resolve get surfaced explicitly for manual routing, not
+   silently left broken or silently "solved" by a heuristic that shouldn't be
+   trusted on that net
+
+Each attempt is a natural git commit (circuit repos are already git-native),
+which gives the loop's history for free — diffable, revertable, no separate
+state-tracking needed.
+
+### 6.6 KiCad pcbnew integration (from IR/netlist to board file)
+*(to be filled in — mechanics of driving pcbnew from `legion-of-bom-core`)*
+
+### 6.7 DFM checks (JLCDFM + mechanical/3D collision checks)
+Two kinds of check: standard electrical/manufacturing DFM (JLCDFM or
+equivalent — trace/space rules, hole sizes, etc.) and mechanical collision
+checks enabled by having 3D models of every component — catching a jack body
+colliding with a neighboring part, or a panel cutout misaligned with its PCB
+footprint, before it becomes a physical mistake instead of just an electrical
+one.
+
+### 6.8 Manual layout escape hatch — where the human loop stays in
+Any net the iterative loop can't resolve with confidence (per its exit
+condition in 6.5) gets flagged for manual routing rather than forced through a
+heuristic. Given the RIAA/phono-style circuits discussed earlier are exactly
+the case where layout mistakes are audible and hard to diagnose after the fact,
+this escape hatch is treated as a feature, not a shortfall — the loop's job is
+to auto-resolve what's mechanically resolvable and clearly surface what needs
+judgment.
