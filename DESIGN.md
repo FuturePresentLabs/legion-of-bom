@@ -120,7 +120,7 @@ tenant/business.
 - Full autorouting/autoplacement — manual layout stays human-driven initially
 - Replacing KiCad's schematic/layout editors outright — legion-of-bom orchestrates
   around them, doesn't replace them
-- Multi-tenancy, hos[118;1:3uted auth, remote repo connections, billing — v1 is local-only,
+- Multi-tenancy, hosted auth, remote repo connections, billing — v1 is local-only,
   single-user, no network-facing auth surface at all. SaaS-shaping is an
   architectural intent for later, not a v1 requirement
 
@@ -139,7 +139,7 @@ backend (axum — same stack as Understory) wraps the *same* library for the hos
 dashboard, so nothing is web-only — anything the dashboard can do, the CLI can do
 headless.
 
-### 2.3 Canonical circuit representation
+### 2.3 [118;1:3uCanonical circuit representation
 Deferred per decision: SKiDL-native for now, IR extracted once a second DSL is real.
 Flag for later sections: pipeline stages downstream of circuit definition
 (validation, sim, layout) should still be written against a thin internal interface
@@ -281,7 +281,41 @@ which gives the loop's history for free — diffable, revertable, no separate
 state-tracking needed.
 
 ### 6.6 KiCad pcbnew integration (from IR/netlist to board file)
-*(to be filled in — mechanics of driving pcbnew from `legion-of-bom-core`)*
+**Decision: `kicad-ipc-rs`, talking to KiCad's IPC API — not the SWIG-based
+Python `pcbnew` bindings.** SWIG is technically usable on the current stable
+release (KiCad 10) but is deprecated as of KiCad 9, in maintenance mode only,
+and scheduled for full removal in KiCad 11 — building `legion-of-bom-core`
+against it means a forced rewrite the moment KiCad is upgraded. The IPC API is
+KiCad's actively-developed, forward-looking programmatic interface and is
+where `kicad-python` (the official Python equivalent) already lives.
+
+**v1 connection mode: attach to a running KiCad GUI instance**, not a headless
+server. The IPC API in KiCad 9/10 only supports talking to an already-running
+KiCad session — there is no headless option yet on the current stable release.
+Rather than standing up Docker/xvfb to fake a headless environment (real
+overhead, especially unpleasant on macOS), v1 simply requires KiCad open
+locally and connects `kicad-ipc-rs` to it — a reasonable requirement given
+`legion-of-bom` is already local-first and single-user (Section 2.5), and this
+matches the actual working setup rather than solving a CI/server problem that
+doesn't exist yet.
+
+**Known upgrade path, not a maybe**: `kicad-cli api-server` (headless IPC
+server, no GUI) ships as of KiCad 11, and `kicad-python` already has a
+`headless=True` connection mode built specifically around it — same IPC
+protocol, just a different socket to connect to. When `legion-of-bom` needs
+true headless (CI, the eventual SaaS phase in 14.6), the change is which
+socket `kicad-ipc-rs` connects to, not a rewrite of how it talks to KiCad.
+Document this here so it isn't re-litigated later: **v1 requires KiCad running
+locally, on purpose, with a known and already-supported path off of that
+requirement when it's actually needed.**
+
+**Mechanics**: netlist (from SKiDL, Section 3) → `kicad-ipc-rs` client calls
+into the running KiCad instance to create/update the board, place footprints
+(anchored per Section 6.1, free-placed per the iterative loop in 6.5), and
+drive routing attempts → violations read back via the same IPC connection
+(Section 6.5 step 3) → once clean, Gerbers exported via `kicad-cli pcb export
+gerbers` (a separate, already-headless CLI command, not gated by the
+GUI-instance requirement above).
 
 ### 6.7 DFM checks (JLCDFM + mechanical/3D collision checks)
 Two kinds of check: standard electrical/manufacturing DFM (JLCDFM or
