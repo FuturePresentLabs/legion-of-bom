@@ -18,6 +18,11 @@ skidl.cfg
 # Local pipeline outputs / scratch (generated netlists, boards, gerbers)
 /out/
 
+# Secrets — API keys/tokens. NEVER commit. Commit .env.example (unignored) instead.
+.env
+.env.*
+!.env.example
+
 # OS / editor
 .DS_Store
 
