@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+use crate::sexpr::Sexpr;
 use crate::stage::StageError;
 
 /// Parse a KiCad netlist file into a [`Circuit`], naming it after the file stem.
@@ -92,146 +93,6 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
         parts,
         nets,
     })
-}
-
-// ---- minimal S-expression reader ----------------------------------------
-
-/// A parsed S-expression: either an atom (symbol, number, or quoted string) or
-/// a parenthesised list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Sexpr {
-    Atom(String),
-    List(Vec<Sexpr>),
-}
-
-impl Sexpr {
-    fn parse(input: &str) -> Result<Sexpr, String> {
-        let tokens = tokenize(input)?;
-        let mut pos = 0;
-        let expr = parse_expr(&tokens, &mut pos)?;
-        if pos != tokens.len() {
-            return Err("trailing tokens after the top-level expression".into());
-        }
-        Ok(expr)
-    }
-
-    fn as_atom(&self) -> Option<&str> {
-        match self {
-            Sexpr::Atom(s) => Some(s),
-            Sexpr::List(_) => None,
-        }
-    }
-
-    fn as_list(&self) -> Option<&[Sexpr]> {
-        match self {
-            Sexpr::List(items) => Some(items),
-            Sexpr::Atom(_) => None,
-        }
-    }
-
-    /// The head symbol of a list, e.g. `comp` for `(comp …)`.
-    fn head(&self) -> Option<&str> {
-        self.as_list()?.first()?.as_atom()
-    }
-
-    /// The first direct child list whose head symbol equals `key`.
-    fn get(&self, key: &str) -> Option<&Sexpr> {
-        self.as_list()?.iter().find(|c| c.head() == Some(key))
-    }
-
-    /// All direct child lists whose head symbol equals `key`.
-    fn get_all(&self, key: &str) -> Vec<&Sexpr> {
-        self.as_list()
-            .map(|items| items.iter().filter(|c| c.head() == Some(key)).collect())
-            .unwrap_or_default()
-    }
-
-    /// For a child `(key value)`, the `value` atom.
-    fn field(&self, key: &str) -> Option<&str> {
-        self.get(key)?.as_list()?.get(1)?.as_atom()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Token {
-    Open,
-    Close,
-    Atom(String),
-}
-
-fn tokenize(input: &str) -> Result<Vec<Token>, String> {
-    let mut tokens = Vec::new();
-    let mut chars = input.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        match c {
-            '(' => {
-                tokens.push(Token::Open);
-                chars.next();
-            }
-            ')' => {
-                tokens.push(Token::Close);
-                chars.next();
-            }
-            c if c.is_whitespace() => {
-                chars.next();
-            }
-            '"' => {
-                chars.next(); // opening quote
-                let mut s = String::new();
-                loop {
-                    match chars.next() {
-                        Some('\\') => match chars.next() {
-                            // Fields we care about (refdes, values, footprints,
-                            // net names) don't use escapes; keep the escaped char.
-                            Some(escaped) => s.push(escaped),
-                            None => return Err("unterminated escape in string".into()),
-                        },
-                        Some('"') => break,
-                        Some(ch) => s.push(ch),
-                        None => return Err("unterminated string literal".into()),
-                    }
-                }
-                tokens.push(Token::Atom(s));
-            }
-            _ => {
-                let mut s = String::new();
-                while let Some(&ch) = chars.peek() {
-                    if ch.is_whitespace() || ch == '(' || ch == ')' {
-                        break;
-                    }
-                    s.push(ch);
-                    chars.next();
-                }
-                tokens.push(Token::Atom(s));
-            }
-        }
-    }
-    Ok(tokens)
-}
-
-fn parse_expr(tokens: &[Token], pos: &mut usize) -> Result<Sexpr, String> {
-    match tokens.get(*pos) {
-        Some(Token::Open) => {
-            *pos += 1;
-            let mut items = Vec::new();
-            loop {
-                match tokens.get(*pos) {
-                    Some(Token::Close) => {
-                        *pos += 1;
-                        return Ok(Sexpr::List(items));
-                    }
-                    Some(_) => items.push(parse_expr(tokens, pos)?),
-                    None => return Err("unexpected end of input, expected `)`".into()),
-                }
-            }
-        }
-        Some(Token::Atom(s)) => {
-            *pos += 1;
-            Ok(Sexpr::Atom(s.clone()))
-        }
-        Some(Token::Close) => Err("unexpected `)`".into()),
-        None => Err("unexpected end of input".into()),
-    }
 }
 
 #[cfg(test)]
@@ -309,21 +170,5 @@ mod tests {
     fn rejects_non_netlist() {
         let err = parse_netlist_str("(something_else (foo))", "x").unwrap_err();
         assert!(matches!(err, StageError::Other(_)));
-    }
-
-    #[test]
-    fn tokenizer_handles_quotes_and_nesting() {
-        let s = Sexpr::parse(r#"(a "quoted value" (b c))"#).unwrap();
-        assert_eq!(s.head(), Some("a"));
-        assert_eq!(s.as_list().unwrap()[1].as_atom(), Some("quoted value"));
-        assert_eq!(
-            s.get("b").and_then(|b| b.as_list()).map(|l| l.len()),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn unterminated_string_is_an_error() {
-        assert!(Sexpr::parse(r#"(a "oops)"#).is_err());
     }
 }

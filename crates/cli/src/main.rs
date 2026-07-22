@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::{
-    check_rc_cutoff, generate_bom, parse_netlist_file, simulate_ac, validate_erc, CircuitSource,
+    analytic_check, generate_bom, parse_netlist_file, simulate_ac, validate_erc, CircuitSource,
     Finding, PipelineReport, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
@@ -111,8 +111,9 @@ fn run(circuit: PathBuf) -> Result<()> {
         ac.passband_gain_db().unwrap_or(0.0)
     ))));
 
-    // Stage: verify — assert the simulated cutoff against the textbook value.
-    report.push(check_rc_cutoff(&model, &ac, 0.02));
+    // Stage: verify — assert the simulated response against the textbook value
+    // for this topology (RC cutoff, op-amp gain, …).
+    report.push(analytic_check(&model, &ac, 0.02));
 
     // Stage: bom — group parts into a BOM, write CSV, summarize.
     let bom = generate_bom(&model);

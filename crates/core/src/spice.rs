@@ -4,16 +4,37 @@
 //! harness (a 1 V AC source on the input net, an `.ac` sweep), runs `ngspice -b`,
 //! and parses the frequency response back out.
 //!
-//! Phase 0 scope: passive R/C/L parts and the IN/OUT/GND net-name convention.
-//! Active devices (op-amps, etc.) and richer harnesses come with later circuits.
+//! Parts are emitted from the [`SpiceModel`] they carry (resolved from the
+//! component by [`crate::symbols`]): primitives (R/C/L) directly, modelled
+//! devices as subckt instances with `.include` and supply rails. The generator
+//! has no per-device knowledge — the model travels with the component.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::source::CircuitSource;
 use crate::stage::StageError;
 use crate::tools::find_on_path;
+
+/// How a part is instantiated in SPICE. Carried by the component (resolved from
+/// its symbol, and later the parts library), never special-cased in the
+/// generator. Primitives (R/C/L) have no `SpiceModel` — they're emitted directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpiceModel {
+    /// A subcircuit instance: `X<ref> <nodes…> <subckt>`, with `nodes` taken
+    /// from the part's pins in `pin_order`, and `.include <include>` emitted once.
+    Subckt {
+        /// The `.subckt` name to instantiate.
+        subckt: String,
+        /// SPICE library file to `.include`.
+        include: PathBuf,
+        /// Part pin numbers in the subckt's terminal order.
+        pin_order: Vec<String>,
+        /// Optional parameter string (e.g. `GAIN=20k`); `None` uses subckt defaults.
+        params: Option<String>,
+    },
+}
 
 /// A logarithmic AC sweep (points per decade, from `start_hz` to `stop_hz`).
 #[derive(Debug, Clone)]
@@ -34,12 +55,16 @@ impl Default for AcSweep {
 }
 
 /// Which nets form the AC test harness, plus the sweep. The defaults encode the
-/// Phase 0 convention: drive `IN`, probe `OUT`, `GND`/`0` is ground.
+/// Phase 0 convention: drive `IN`, probe `OUT`, `GND`/`0` is ground, and any
+/// `VCC`/`VEE` supply nets get ±15 V rails.
 #[derive(Debug, Clone)]
 pub struct SimConfig {
     pub input_net: String,
     pub output_net: String,
     pub ground_nets: Vec<String>,
+    /// Supply nets and their DC voltage; a source is emitted for each that the
+    /// circuit actually uses (e.g. an op-amp's `VCC`/`VEE`).
+    pub supplies: Vec<(String, f64)>,
     pub ac: AcSweep,
 }
 
@@ -49,6 +74,7 @@ impl Default for SimConfig {
             input_net: "IN".into(),
             output_net: "OUT".into(),
             ground_nets: vec!["GND".into(), "0".into()],
+            supplies: vec![("VCC".into(), 15.0), ("VEE".into(), -15.0)],
             ac: AcSweep::default(),
         }
     }
@@ -124,8 +150,8 @@ fn pin_net_map(circuit: &dyn CircuitSource) -> HashMap<(String, String), String>
     map
 }
 
-/// Format a frequency for a SPICE card without scientific notation.
-fn fmt_hz(x: f64) -> String {
+/// Format a number for a SPICE card without scientific notation.
+fn fmt_num(x: f64) -> String {
     if x.fract() == 0.0 {
         format!("{}", x as i64)
     } else {
@@ -134,9 +160,15 @@ fn fmt_hz(x: f64) -> String {
 }
 
 /// Generate an ngspice AC deck for `circuit`, writing results to `data_path`.
+///
+/// `models` maps a reference designator to the SPICE model resolved for that
+/// component (see [`crate::symbols::resolve_models`]). Parts with a model are
+/// instantiated as subcircuits; parts without one are emitted as SPICE
+/// primitives (R/C/L). The generator contains no per-device knowledge.
 pub fn generate_ac_deck(
     circuit: &dyn CircuitSource,
     config: &SimConfig,
+    models: &HashMap<String, SpiceModel>,
     data_path: &Path,
 ) -> Result<String, StageError> {
     let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
@@ -155,33 +187,60 @@ pub fn generate_ac_deck(
     }
 
     let pinmap = pin_net_map(circuit);
-    let mut lines = vec![format!("* legion-of-bom AC deck for {}", circuit.name())];
+    let node_at = |refdes: &str, pin: &str| -> Option<String> {
+        pinmap
+            .get(&(refdes.to_string(), pin.to_string()))
+            .map(|net| config.node(net))
+    };
 
+    let mut includes: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut components = Vec::new();
     let mut unsupported = Vec::new();
+
     for part in circuit.parts() {
         let refdes = &part.refdes.0;
+
+        // A part that carries a SPICE model is instantiated from that model.
+        if let Some(SpiceModel::Subckt {
+            subckt,
+            include,
+            pin_order,
+            params,
+        }) = models.get(refdes)
+        {
+            includes.insert(include.clone());
+            let mut nodes = Vec::with_capacity(pin_order.len());
+            for pin in pin_order {
+                let node = node_at(refdes, pin).ok_or_else(|| {
+                    StageError::Other(format!("{refdes}: pin {pin} is not connected to a net"))
+                })?;
+                nodes.push(node);
+            }
+            let mut line = format!("X{refdes} {} {subckt}", nodes.join(" "));
+            if let Some(params) = params {
+                line.push(' ');
+                line.push_str(params);
+            }
+            components.push(line);
+            continue;
+        }
+
+        // Otherwise a SPICE primitive, by reference-designator letter.
         match refdes.chars().next().unwrap_or('?').to_ascii_uppercase() {
             'R' | 'C' | 'L' => {
-                let n1 = pinmap.get(&(refdes.clone(), "1".to_string()));
-                let n2 = pinmap.get(&(refdes.clone(), "2".to_string()));
-                let (Some(n1), Some(n2)) = (n1, n2) else {
+                let (Some(n1), Some(n2)) = (node_at(refdes, "1"), node_at(refdes, "2")) else {
                     return Err(StageError::Other(format!(
                         "{refdes}: expected pins 1 and 2 to be connected to nets"
                     )));
                 };
-                lines.push(format!(
-                    "{refdes} {} {} {}",
-                    config.node(n1),
-                    config.node(n2),
-                    part.value
-                ));
+                components.push(format!("{refdes} {n1} {n2} {}", part.value));
             }
             _ => unsupported.push(refdes.clone()),
         }
     }
     if !unsupported.is_empty() {
         return Err(StageError::Other(format!(
-            "AC deck generation supports only R/C/L at Phase 0; unsupported: {}",
+            "no SPICE model or primitive mapping for: {}",
             unsupported.join(", ")
         )));
     }
@@ -193,6 +252,22 @@ pub fn generate_ac_deck(
             config.input_net
         )));
     }
+
+    let mut lines = vec![format!("* legion-of-bom AC deck for {}", circuit.name())];
+    for include in &includes {
+        lines.push(format!(".include {}", include.display()));
+    }
+    // Supply rails for any supply net the circuit actually uses.
+    for (net, volts) in &config.supplies {
+        if net_names.contains(net.as_str()) {
+            lines.push(format!(
+                "V{net}_supply {} 0 {}",
+                config.node(net),
+                fmt_num(*volts)
+            ));
+        }
+    }
+    lines.extend(components);
     // 1 V AC source driving the input against ground.
     lines.push(format!("Vlob_src {in_node} 0 DC 0 AC 1"));
 
@@ -201,8 +276,8 @@ pub fn generate_ac_deck(
     lines.push(format!(
         "ac dec {} {} {}",
         config.ac.points_per_decade,
-        fmt_hz(config.ac.start_hz),
-        fmt_hz(config.ac.stop_hz)
+        fmt_num(config.ac.start_hz),
+        fmt_num(config.ac.stop_hz)
     ));
     lines.push(format!("wrdata {} vdb({})", data_path.display(), out_node));
     lines.push(".endc".into());
@@ -227,7 +302,15 @@ pub fn simulate_ac(
     let data_path = work_dir.join(format!("{name}_ac.dat"));
     let deck_path = work_dir.join(format!("{name}.cir"));
 
-    let deck = generate_ac_deck(circuit, config, &data_path)?;
+    // Resolve each modelled component's SPICE model from its symbol (the parts
+    // library will be this source later). Without a symbol dir, only primitives
+    // (R/C/L) can be simulated.
+    let models = match crate::skidl::kicad_symbol_dir() {
+        Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
+        None => HashMap::new(),
+    };
+
+    let deck = generate_ac_deck(circuit, config, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
 
     let output = Command::new(&ngspice)
@@ -315,7 +398,9 @@ mod tests {
     #[test]
     fn deck_maps_ground_and_harness() {
         let c = rc_lowpass();
-        let deck = generate_ac_deck(&c, &SimConfig::default(), Path::new("/tmp/x.dat")).unwrap();
+        let models = HashMap::new();
+        let deck =
+            generate_ac_deck(&c, &SimConfig::default(), &models, Path::new("/tmp/x.dat")).unwrap();
         assert!(deck.contains("R1 IN OUT 1k"), "deck:\n{deck}");
         assert!(
             deck.contains("C1 OUT 0 159n"),
@@ -324,22 +409,97 @@ mod tests {
         assert!(deck.contains("Vlob_src IN 0 DC 0 AC 1"), "deck:\n{deck}");
         assert!(deck.contains("ac dec 100 1 1000000"), "deck:\n{deck}");
         assert!(deck.contains("vdb(OUT)"), "deck:\n{deck}");
+        // No supply rails when the circuit uses no supply nets.
+        assert!(!deck.contains("_supply"), "deck:\n{deck}");
     }
 
     #[test]
     fn deck_rejects_missing_output_net() {
         let mut c = rc_lowpass();
         c.nets.retain(|n| n.name != "OUT");
-        let err = generate_ac_deck(&c, &SimConfig::default(), Path::new("/tmp/x.dat")).unwrap_err();
+        let err = generate_ac_deck(
+            &c,
+            &SimConfig::default(),
+            &HashMap::new(),
+            Path::new("/tmp/x.dat"),
+        )
+        .unwrap_err();
         assert!(matches!(err, StageError::Other(_)));
     }
 
     #[test]
-    fn deck_rejects_active_parts_at_phase0() {
+    fn deck_rejects_part_with_no_model_or_primitive() {
         let mut c = rc_lowpass();
-        c.parts.push(Part::new("U1", "TL072"));
-        let err = generate_ac_deck(&c, &SimConfig::default(), Path::new("/tmp/x.dat")).unwrap_err();
+        c.parts.push(Part::new("U1", "TL072")); // no model resolved, not a primitive
+        let err = generate_ac_deck(
+            &c,
+            &SimConfig::default(),
+            &HashMap::new(),
+            Path::new("/tmp/x.dat"),
+        )
+        .unwrap_err();
         assert!(matches!(err, StageError::Other(msg) if msg.contains("U1")));
+    }
+
+    #[test]
+    fn deck_instantiates_a_subckt_model_with_rails() {
+        // An op-amp part carrying a resolved subckt model → X-line + .include +
+        // supply rails, no per-device branch in the generator.
+        let c = Circuit {
+            name: "amp".into(),
+            parts: vec![
+                Part {
+                    refdes: "U1".into(),
+                    value: "OPAMP".into(),
+                    footprint: None,
+                    library_part: Some("Simulation_SPICE:OPAMP".into()),
+                },
+                Part::new("R1", "9k"),
+                Part::new("R2", "1k"),
+            ],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("U1", "1")]),
+                Net::new(
+                    "FB",
+                    vec![
+                        PinRef::new("U1", "2"),
+                        PinRef::new("R1", "2"),
+                        PinRef::new("R2", "1"),
+                    ],
+                ),
+                Net::new("OUT", vec![PinRef::new("U1", "5"), PinRef::new("R1", "1")]),
+                Net::new("VCC", vec![PinRef::new("U1", "3")]),
+                Net::new("VEE", vec![PinRef::new("U1", "4")]),
+                Net::new("GND", vec![PinRef::new("R2", "2")]),
+            ],
+        };
+        let mut models = HashMap::new();
+        models.insert(
+            "U1".to_string(),
+            SpiceModel::Subckt {
+                subckt: "kicad_builtin_opamp".into(),
+                include: PathBuf::from("/k/Simulation_SPICE.sp"),
+                pin_order: vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()],
+                params: None,
+            },
+        );
+        let deck =
+            generate_ac_deck(&c, &SimConfig::default(), &models, Path::new("/tmp/x.dat")).unwrap();
+        // Nodes in subckt terminal order: pins 1,2,3,4,5 → IN FB VCC VEE OUT.
+        assert!(
+            deck.contains("XU1 IN FB VCC VEE OUT kicad_builtin_opamp"),
+            "deck:\n{deck}"
+        );
+        assert!(
+            deck.contains(".include /k/Simulation_SPICE.sp"),
+            "deck:\n{deck}"
+        );
+        assert!(deck.contains("VVCC_supply VCC 0 15"), "deck:\n{deck}");
+        assert!(deck.contains("VVEE_supply VEE 0 -15"), "deck:\n{deck}");
+        assert!(
+            deck.contains("R1 OUT FB 9k") || deck.contains("R1 FB OUT 9k"),
+            "deck:\n{deck}"
+        );
     }
 
     #[test]

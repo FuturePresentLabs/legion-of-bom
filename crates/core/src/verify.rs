@@ -83,6 +83,114 @@ pub fn check_rc_cutoff(circuit: &dyn CircuitSource, ac: &AcResult, rel_tol: f64)
     }
 }
 
+/// Output net + ground convention (matches [`SimConfig`](crate::spice::SimConfig)
+/// defaults) used to identify the feedback vs ground resistor topologically.
+const OUTPUT_NET: &str = "OUT";
+
+fn is_ground_net(name: &str) -> bool {
+    name.eq_ignore_ascii_case("GND") || name == "0"
+}
+
+/// Net names a given reference designator connects to.
+fn nets_of<'a>(circuit: &'a dyn CircuitSource, refdes: &str) -> Vec<&'a str> {
+    circuit
+        .nets()
+        .iter()
+        .filter(|n| n.pins.iter().any(|p| p.refdes.0 == refdes))
+        .map(|n| n.name.as_str())
+        .collect()
+}
+
+/// Check the simulated passband gain against `1 + Rf/Rg` for a non-inverting amp.
+///
+/// The feedback and ground resistors are identified topologically (feedback
+/// touches the output net, ground touches GND) so the check doesn't depend on
+/// reference-designator names. Non-matching topologies are skipped.
+pub fn check_noninverting_gain(
+    circuit: &dyn CircuitSource,
+    ac: &AcResult,
+    rel_tol: f64,
+) -> StageOutcome {
+    let resistors: Vec<(&str, &str)> = circuit
+        .parts()
+        .iter()
+        .filter(|p| {
+            p.refdes
+                .0
+                .chars()
+                .next()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&'R'))
+        })
+        .map(|p| (p.refdes.0.as_str(), p.value.as_str()))
+        .collect();
+    if resistors.len() != 2 {
+        return StageOutcome::passed(STAGE).with(Finding::warning(format!(
+            "non-inverting gain check skipped: expected 2 resistors, found {}",
+            resistors.len()
+        )));
+    }
+
+    let mut feedback = None;
+    let mut ground = None;
+    for (refdes, value) in &resistors {
+        let nets = nets_of(circuit, refdes);
+        if nets.contains(&OUTPUT_NET) {
+            feedback = Some((*refdes, *value));
+        }
+        if nets.iter().any(|n| is_ground_net(n)) {
+            ground = Some((*refdes, *value));
+        }
+    }
+    let (Some((rf_ref, rf_val)), Some((rg_ref, rg_val))) = (feedback, ground) else {
+        return StageOutcome::passed(STAGE).with(Finding::warning(
+            "non-inverting gain check skipped: could not identify feedback/ground resistors"
+                .to_string(),
+        ));
+    };
+    if rf_ref == rg_ref {
+        return StageOutcome::passed(STAGE).with(Finding::warning(
+            "non-inverting gain check skipped: one resistor spans OUT and GND".to_string(),
+        ));
+    }
+
+    let (Some(rf), Some(rg)) = (parse_eng_value(rf_val), parse_eng_value(rg_val)) else {
+        return StageOutcome::failed(
+            STAGE,
+            format!("could not parse Rf='{rf_val}', Rg='{rg_val}'"),
+        );
+    };
+
+    let expected = 1.0 + rf / rg;
+    let expected_db = 20.0 * expected.log10();
+    let Some(sim_db) = ac.passband_gain_db() else {
+        return StageOutcome::failed(STAGE, "no simulated gain available".to_string());
+    };
+    let simulated = 10f64.powf(sim_db / 20.0);
+    let rel_err = (simulated - expected).abs() / expected;
+    let msg = format!(
+        "non-inverting gain: expected {expected:.3}× ({expected_db:.2} dB, 1+Rf/Rg; Rf={rf_ref}, \
+         Rg={rg_ref}), simulated {simulated:.3}× ({sim_db:.2} dB), error {:.3}% (tol {:.1}%)",
+        rel_err * 100.0,
+        rel_tol * 100.0
+    );
+
+    if rel_err <= rel_tol {
+        StageOutcome::passed(STAGE).with(Finding::info(msg))
+    } else {
+        StageOutcome::failed(STAGE, msg)
+    }
+}
+
+/// Run the analytic check appropriate to the circuit's topology: op-amp gain if
+/// there's an ideal op-amp, otherwise the RC cutoff.
+pub fn analytic_check(circuit: &dyn CircuitSource, ac: &AcResult, rel_tol: f64) -> StageOutcome {
+    if circuit.parts().iter().any(|p| p.is_ideal_opamp()) {
+        check_noninverting_gain(circuit, ac, rel_tol)
+    } else {
+        check_rc_cutoff(circuit, ac, rel_tol)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +256,73 @@ mod tests {
         let outcome = check_rc_cutoff(&circuit, &ac, 0.02);
         assert!(outcome.passed); // skipped, not failed
         assert!(!outcome.has_errors());
+    }
+
+    fn opamp_amp(rf: &str, rg: &str) -> Circuit {
+        Circuit {
+            name: "amp".into(),
+            parts: vec![
+                Part {
+                    refdes: "U1".into(),
+                    value: "OPAMP".into(),
+                    footprint: None,
+                    library_part: Some("Simulation_SPICE:OPAMP".into()),
+                },
+                Part::new("R1", rf), // feedback: OUT ↔ FB
+                Part::new("R2", rg), // ground:   FB ↔ GND
+            ],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("U1", "1")]),
+                Net::new(
+                    "FB",
+                    vec![
+                        PinRef::new("U1", "2"),
+                        PinRef::new("R1", "2"),
+                        PinRef::new("R2", "1"),
+                    ],
+                ),
+                Net::new("OUT", vec![PinRef::new("U1", "5"), PinRef::new("R1", "1")]),
+                Net::new("GND", vec![PinRef::new("R2", "2")]),
+            ],
+        }
+    }
+
+    fn flat_response(gain_db: f64) -> AcResult {
+        AcResult {
+            points: vec![
+                AcPoint {
+                    freq_hz: 1.0,
+                    mag_db: gain_db,
+                },
+                AcPoint {
+                    freq_hz: 1e6,
+                    mag_db: gain_db,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn gain_passes_when_matching() {
+        // Rf=9k, Rg=1k → gain 10 → 20 dB.
+        let outcome = check_noninverting_gain(&opamp_amp("9k", "1k"), &flat_response(20.0), 0.02);
+        assert!(outcome.passed, "{:?}", outcome.findings);
+    }
+
+    #[test]
+    fn gain_fails_when_off() {
+        // Analytic gain 10 (20 dB) but the sim says 6 dB (~2×) → fail.
+        let outcome = check_noninverting_gain(&opamp_amp("9k", "1k"), &flat_response(6.0), 0.02);
+        assert!(!outcome.passed);
+        assert!(outcome.has_errors());
+    }
+
+    #[test]
+    fn dispatcher_routes_by_topology() {
+        // Op-amp circuit → gain check applies and passes.
+        assert!(analytic_check(&opamp_amp("9k", "1k"), &flat_response(20.0), 0.02).passed);
+        // RC circuit → cutoff check applies.
+        let rc = rc_circuit("1k", "159n");
+        assert!(analytic_check(&rc, &response_with_cutoff(1000.97), 0.02).passed);
     }
 }

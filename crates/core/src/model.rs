@@ -50,6 +50,14 @@ impl Part {
         self.footprint = Some(footprint.into());
         self
     }
+
+    /// Whether this is KiCad's ideal `Simulation_SPICE:OPAMP` symbol — an ideal
+    /// op-amp for simulation (modelled as a VCVS), not a real silicon device.
+    pub fn is_ideal_opamp(&self) -> bool {
+        self.library_part
+            .as_deref()
+            .is_some_and(|lp| lp == "OPAMP" || lp.ends_with(":OPAMP"))
+    }
 }
 
 /// A reference to one pin of one part, as it appears on a net.

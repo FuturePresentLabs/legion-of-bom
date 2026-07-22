@@ -13,10 +13,12 @@
 pub mod bom;
 pub mod model;
 pub mod netlist;
+mod sexpr;
 pub mod skidl;
 pub mod source;
 pub mod spice;
 pub mod stage;
+mod symbols;
 pub mod tools;
 pub mod units;
 pub mod validate;
@@ -32,4 +34,4 @@ pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutco
 pub use tools::{find_on_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
 pub use validate::validate_erc;
-pub use verify::check_rc_cutoff;
+pub use verify::{analytic_check, check_noninverting_gain, check_rc_cutoff};
