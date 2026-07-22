@@ -10,6 +10,7 @@
 //! The CLI (`lob`) and the eventual web backend are thin wrappers over this
 //! library — anything one surface can do, the other can too.
 
+pub mod board;
 pub mod bom;
 pub mod fetch;
 pub mod jlcpcb;
@@ -28,6 +29,7 @@ pub mod units;
 pub mod validate;
 pub mod verify;
 
+pub use board::{generate_board, BoardError, BoardOptions, GridPlacer, Placement, Placer};
 pub use bom::{generate_bom, Bom, BomLine};
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};

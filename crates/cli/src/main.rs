@@ -11,12 +11,12 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use legion_of_bom_core::skidl::kicad_symbol_dir;
+use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, default_parts_dir, fetch_from_jlcpcb, fetch_from_kicad, generate_bom,
-    parse_netlist_file, simulate_ac, validate_erc, CircuitSource, Finding, JlcpcbClient,
-    MouserClient, PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus,
-    Severity, SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, default_parts_dir, fetch_from_jlcpcb, fetch_from_kicad, generate_board,
+    generate_bom, parse_netlist_file, simulate_ac, validate_erc, BoardOptions, CircuitSource,
+    Finding, JlcpcbClient, MouserClient, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -53,6 +53,14 @@ enum Command {
         #[arg(long)]
         price: bool,
         /// Also write the BOM CSV to this path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Generate a .kicad_pcb board file (footprints placed, unrouted) from a circuit.
+    Board {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Write the board here (default: out/<name>/<name>.kicad_pcb).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -113,6 +121,7 @@ fn main() -> ExitCode {
             price,
             out,
         } => bom_cmd(circuit, price, out),
+        Command::Board { circuit, out } => board_cmd(circuit, out),
     };
 
     match result {
@@ -209,6 +218,39 @@ fn run(circuit: PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("pipeline reported stage failures")
     }
+}
+
+/// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
+fn board_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+
+    let footprint_dir = kicad_footprint_dir()
+        .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    let board = generate_board(&model, &BoardOptions::new(footprint_dir))?;
+
+    let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
+    std::fs::write(&path, board).with_context(|| format!("writing {}", path.display()))?;
+    println!("wrote {}", path.display());
+    println!(
+        "  footprints placed (grid), unrouted — validate: kicad-cli pcb drc {}",
+        path.display()
+    );
+    println!(
+        "  export: kicad-cli pcb export gerbers|pos {}",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Handle `lob bom <circuit> [--price] [--out]`.

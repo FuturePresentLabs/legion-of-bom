@@ -22,6 +22,24 @@ pub const SYMBOL_ENV: &str = "KICAD9_SYMBOL_DIR";
 pub const MACOS_KICAD_SYMBOLS: &str =
     "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols";
 
+/// The env var for KiCad footprint libraries, and the macOS default.
+pub const FOOTPRINT_ENV: &str = "KICAD9_FOOTPRINT_DIR";
+pub const MACOS_KICAD_FOOTPRINTS: &str =
+    "/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints";
+
+/// Resolve the KiCad footprint directory: `KICAD9_FOOTPRINT_DIR` if it points at
+/// a real directory, else the macOS default if it exists.
+pub fn kicad_footprint_dir() -> Option<std::path::PathBuf> {
+    if let Some(val) = std::env::var_os(FOOTPRINT_ENV) {
+        let p = std::path::PathBuf::from(val);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let default = std::path::Path::new(MACOS_KICAD_FOOTPRINTS);
+    default.is_dir().then(|| default.to_path_buf())
+}
+
 /// A Python interpreter and whether it came from the project venv.
 #[derive(Debug, Clone)]
 pub struct PythonInfo {

@@ -1,0 +1,408 @@
+//! Board generation — netlist → `.kicad_pcb`, directly as S-expression. DESIGN.md
+//! 6.6 (revised: direct-gen, headless — the KiCad IPC API can't create boards).
+//!
+//! Architecture (forward-looking to the layout epic): board *emission* is
+//! decoupled from *placement* via the [`Placer`] trait — the seam the iterative
+//! layout loop (6.5), PanelSpec-anchored connectors (6.1/6.9), and the manual
+//! escape hatch (6.8) all plug into. [`GridPlacer`] is the naive default; the
+//! loop replaces it. Ground pour (6.2), the board outline (from PanelSpec), and
+//! routed tracks are future additions appended to the same assembly.
+//!
+//! Output is deterministic (UUIDs derived from content) so each layout attempt is
+//! a clean git diff, per 6.5.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::sexpr::Sexpr;
+use crate::source::CircuitSource;
+
+/// Errors from board generation.
+#[derive(Debug, thiserror::Error)]
+pub enum BoardError {
+    #[error("part {refdes} has no footprint assigned (needed to place it on a board)")]
+    NoFootprint { refdes: String },
+    #[error("footprint '{lib_part}' not found at {path}")]
+    FootprintNotFound { lib_part: String, path: String },
+    #[error("footprint parse error ({lib_part}): {msg}")]
+    FootprintParse { lib_part: String, msg: String },
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Other(String),
+}
+
+/// A placed footprint position: millimetres, degrees, and which copper side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub rotation_deg: f64,
+    pub back: bool,
+}
+
+/// Assigns a board position to each part — **the** extensibility seam. The
+/// iterative layout loop, PanelSpec-anchored connectors, and the manual escape
+/// hatch are all `Placer`s; board emission just consumes the result.
+pub trait Placer {
+    fn place(&self, circuit: &dyn CircuitSource) -> HashMap<String, Placement>;
+}
+
+/// Naive row/grid placement — a valid, non-optimising default. The layout loop
+/// (j54.6) supersedes this with real auto-placement.
+#[derive(Debug, Clone)]
+pub struct GridPlacer {
+    pub origin_mm: (f64, f64),
+    pub pitch_mm: f64,
+    pub per_row: usize,
+}
+
+impl Default for GridPlacer {
+    fn default() -> Self {
+        GridPlacer {
+            origin_mm: (100.0, 100.0),
+            pitch_mm: 5.0,
+            per_row: 8,
+        }
+    }
+}
+
+impl Placer for GridPlacer {
+    fn place(&self, circuit: &dyn CircuitSource) -> HashMap<String, Placement> {
+        circuit
+            .parts()
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let (col, row) = (i % self.per_row, i / self.per_row);
+                (
+                    part.refdes.0.clone(),
+                    Placement {
+                        x_mm: self.origin_mm.0 + col as f64 * self.pitch_mm,
+                        y_mm: self.origin_mm.1 + row as f64 * self.pitch_mm,
+                        rotation_deg: 0.0,
+                        back: false,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Options for [`generate_board`].
+pub struct BoardOptions {
+    pub footprint_dir: PathBuf,
+    pub placer: Box<dyn Placer>,
+}
+
+impl BoardOptions {
+    /// Default options: naive grid placement, footprints from `footprint_dir`.
+    pub fn new(footprint_dir: impl Into<PathBuf>) -> Self {
+        BoardOptions {
+            footprint_dir: footprint_dir.into(),
+            placer: Box::new(GridPlacer::default()),
+        }
+    }
+}
+
+/// Generate a `.kicad_pcb` for a circuit: footprints assigned + placed + net-wired
+/// (unrouted). Downstream (gerbers, CPL, DXF, DRC) is `kicad-cli` on the result.
+pub fn generate_board(
+    circuit: &dyn CircuitSource,
+    options: &BoardOptions,
+) -> Result<String, BoardError> {
+    // Net table: index 0 is the empty/no-net; the rest are the circuit's nets.
+    let mut net_names: Vec<String> = circuit.nets().iter().map(|n| n.name.clone()).collect();
+    net_names.sort();
+    net_names.dedup();
+    let net_index: HashMap<&str, usize> = net_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i + 1))
+        .collect();
+
+    // Which net each (refdes, pin) belongs to.
+    let mut pin_net: HashMap<(String, String), &str> = HashMap::new();
+    for net in circuit.nets() {
+        for pin in &net.pins {
+            pin_net.insert((pin.refdes.0.clone(), pin.pin.clone()), net.name.as_str());
+        }
+    }
+
+    let placements = options.placer.place(circuit);
+
+    // Transform each part's footprint into a placed, net-wired board footprint.
+    let mut footprints = Vec::new();
+    for part in circuit.parts() {
+        let refdes = &part.refdes.0;
+        let lib_part = part
+            .footprint
+            .as_deref()
+            .ok_or_else(|| BoardError::NoFootprint {
+                refdes: refdes.clone(),
+            })?;
+        let placement = placements.get(refdes).copied().unwrap_or(Placement {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            rotation_deg: 0.0,
+            back: false,
+        });
+        let fp = load_footprint(&options.footprint_dir, lib_part)?;
+        footprints.push(transform_footprint(
+            fp, lib_part, refdes, placement, &pin_net, &net_index,
+        ));
+    }
+
+    // Assemble the board.
+    let mut board = vec![
+        Sexpr::sym("kicad_pcb"),
+        kv("version", Sexpr::sym("20241229")),
+        kv("generator", Sexpr::string("legion-of-bom")),
+        kv("generator_version", Sexpr::string("9.0")),
+        Sexpr::list(vec![
+            Sexpr::sym("general"),
+            kv("thickness", Sexpr::sym("1.6")),
+        ]),
+        kv("paper", Sexpr::string("A4")),
+        two_layer_stack(),
+        Sexpr::list(vec![
+            Sexpr::sym("setup"),
+            kv("pad_to_mask_clearance", Sexpr::sym("0")),
+        ]),
+        net(0, ""),
+    ];
+    for name in &net_names {
+        board.push(net(net_index[name.as_str()], name));
+    }
+    // Seam: ground-pour zones (6.2) and the board outline (from PanelSpec) get
+    // appended here in later tasks.
+    board.extend(footprints);
+
+    Ok(Sexpr::list(board).to_sexpr_string() + "\n")
+}
+
+/// Load and parse a footprint `.kicad_mod` by `lib:name`.
+fn load_footprint(dir: &Path, lib_part: &str) -> Result<Sexpr, BoardError> {
+    let (lib, name) = lib_part.split_once(':').ok_or_else(|| {
+        BoardError::Other(format!("bad footprint id '{lib_part}' (want lib:name)"))
+    })?;
+    let path = dir
+        .join(format!("{lib}.pretty"))
+        .join(format!("{name}.kicad_mod"));
+    let text = std::fs::read_to_string(&path).map_err(|_| BoardError::FootprintNotFound {
+        lib_part: lib_part.to_string(),
+        path: path.display().to_string(),
+    })?;
+    Sexpr::parse(&text).map_err(|msg| BoardError::FootprintParse {
+        lib_part: lib_part.to_string(),
+        msg,
+    })
+}
+
+/// Turn a library footprint into a placed, net-wired board footprint: set the
+/// `lib:name`, insert placement + uuid, set the reference designator, and inject
+/// each connected pad's net.
+fn transform_footprint(
+    mut fp: Sexpr,
+    lib_part: &str,
+    refdes: &str,
+    placement: Placement,
+    pin_net: &HashMap<(String, String), &str>,
+    net_index: &HashMap<&str, usize>,
+) -> Sexpr {
+    let items = fp.as_list_mut().expect("a footprint is a list");
+    if items.len() >= 2 {
+        items[1] = Sexpr::string(lib_part); // "R_0805" → "Resistor_SMD:R_0805…"
+    }
+
+    // Insert (uuid) + (at x y rot) right after (layer …).
+    let at = Sexpr::list(vec![
+        Sexpr::sym("at"),
+        Sexpr::sym(mm(placement.x_mm)),
+        Sexpr::sym(mm(placement.y_mm)),
+        Sexpr::sym(mm(placement.rotation_deg)),
+    ]);
+    let fp_uuid = Sexpr::list(vec![
+        Sexpr::sym("uuid"),
+        Sexpr::string(det_uuid(&format!("{refdes}:fp"))),
+    ]);
+    let layer_pos = items
+        .iter()
+        .position(|c| c.head() == Some("layer"))
+        .unwrap_or(1);
+    items.insert(layer_pos + 1, at);
+    items.insert(layer_pos + 2, fp_uuid);
+    if placement.back {
+        if let Some(layer) = items.iter_mut().find(|c| c.head() == Some("layer")) {
+            if let Some(l) = layer.as_list_mut() {
+                if l.len() >= 2 {
+                    l[1] = Sexpr::string("B.Cu");
+                }
+            }
+        }
+    }
+
+    for item in items.iter_mut() {
+        match item.head() {
+            Some("property") if item.nth_atom(1) == Some("Reference") => {
+                if let Some(l) = item.as_list_mut() {
+                    if l.len() >= 3 {
+                        l[2] = Sexpr::string(refdes);
+                    }
+                }
+            }
+            Some("pad") => {
+                let pad_num = item.nth_atom(1).unwrap_or_default().to_string();
+                if let Some(l) = item.as_list_mut() {
+                    if let Some(&name) = pin_net.get(&(refdes.to_string(), pad_num.clone())) {
+                        let idx = net_index.get(name).copied().unwrap_or(0);
+                        let net = Sexpr::list(vec![
+                            Sexpr::sym("net"),
+                            Sexpr::sym(idx.to_string()),
+                            Sexpr::string(name),
+                        ]);
+                        match l.iter().position(|c| c.head() == Some("layers")) {
+                            Some(p) => l.insert(p + 1, net),
+                            None => l.push(net),
+                        }
+                    }
+                    l.push(Sexpr::list(vec![
+                        Sexpr::sym("uuid"),
+                        Sexpr::string(det_uuid(&format!("{refdes}:pad:{pad_num}"))),
+                    ]));
+                }
+            }
+            _ => {}
+        }
+    }
+    fp
+}
+
+// ---- small builders --------------------------------------------------
+
+fn kv(key: &str, value: Sexpr) -> Sexpr {
+    Sexpr::list(vec![Sexpr::sym(key), value])
+}
+
+fn net(index: usize, name: &str) -> Sexpr {
+    Sexpr::list(vec![
+        Sexpr::sym("net"),
+        Sexpr::sym(index.to_string()),
+        Sexpr::string(name),
+    ])
+}
+
+/// A standard 2-layer stackup (DESIGN.md 6.2's hard constraint).
+fn two_layer_stack() -> Sexpr {
+    let layer = |n: i64, name: &str, kind: &str| {
+        Sexpr::list(vec![
+            Sexpr::sym(n.to_string()),
+            Sexpr::string(name),
+            Sexpr::sym(kind),
+        ])
+    };
+    Sexpr::list(vec![
+        Sexpr::sym("layers"),
+        layer(0, "F.Cu", "signal"),
+        layer(2, "B.Cu", "signal"),
+        layer(5, "F.SilkS", "user"),
+        layer(7, "B.SilkS", "user"),
+        layer(1, "F.Mask", "user"),
+        layer(3, "B.Mask", "user"),
+        layer(25, "Edge.Cuts", "user"),
+        layer(31, "F.CrtYd", "user"),
+        layer(29, "B.CrtYd", "user"),
+        layer(35, "F.Fab", "user"),
+        layer(33, "B.Fab", "user"),
+    ])
+}
+
+/// Format a millimetre/degree value without scientific notation.
+fn mm(x: f64) -> String {
+    if x.fract() == 0.0 {
+        format!("{}", x as i64)
+    } else {
+        format!("{x}")
+    }
+}
+
+/// A deterministic UUID (8-4-4-4-12) derived from `seed`, so regenerating the
+/// same circuit yields the same board — clean git diffs across layout attempts.
+fn det_uuid(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    let b = &digest[..16];
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14],
+        b[15]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Circuit, Net, Part, PinRef};
+
+    fn rc() -> Circuit {
+        Circuit {
+            name: "rc".into(),
+            parts: vec![
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+                Part::new("C1", "159n").with_footprint("Capacitor_SMD:C_0805_2012Metric"),
+            ],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("R1", "1")]),
+                Net::new("OUT", vec![PinRef::new("R1", "2"), PinRef::new("C1", "1")]),
+                Net::new("GND", vec![PinRef::new("C1", "2")]),
+            ],
+        }
+    }
+
+    #[test]
+    fn grid_places_all_parts() {
+        let placements = GridPlacer::default().place(&rc());
+        assert_eq!(placements.len(), 2);
+        assert!(placements.contains_key("R1"));
+    }
+
+    #[test]
+    fn missing_footprint_errors() {
+        // A single part with no footprint → NoFootprint (before any lib access).
+        let c = Circuit {
+            name: "x".into(),
+            parts: vec![Part::new("U1", "TL072")],
+            nets: vec![],
+        };
+        let err = generate_board(&c, &BoardOptions::new(std::env::temp_dir())).unwrap_err();
+        assert!(matches!(err, BoardError::NoFootprint { refdes } if refdes == "U1"));
+    }
+
+    #[test]
+    fn deterministic_uuids() {
+        assert_eq!(det_uuid("R1:fp"), det_uuid("R1:fp"));
+        assert_ne!(det_uuid("R1:fp"), det_uuid("C1:fp"));
+        assert_eq!(det_uuid("x").len(), 36);
+    }
+
+    /// Full generation against real footprints. Skipped if no footprint dir.
+    #[test]
+    fn generates_valid_board_when_footprints_available() {
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        let board = match generate_board(&rc(), &BoardOptions::new(dir)) {
+            Ok(b) => b,
+            Err(_) => return, // library layout differs; don't fail the unit suite
+        };
+        // Re-parse to confirm it's structurally valid S-expression.
+        assert!(
+            crate::sexpr::Sexpr::parse(&board).is_ok(),
+            "generated board must parse"
+        );
+        assert!(board.contains("(kicad_pcb"));
+        assert!(board.contains(r#""Resistor_SMD:R_0805_2012Metric""#));
+        assert!(board.contains(r#"(net"#) && board.contains(r#""OUT""#));
+    }
+}

@@ -1,0 +1,25 @@
+** Drc report for rc_lowpass.kicad_pcb **
+** Created on 2026-07-22T05:43:29 **
+** Report includes: Errors, Warnings **
+
+** Found 1 DRC violations **
+[invalid_outline]: Board has malformed outline (no edges found on Edge.Cuts layer)
+    Local override; error
+    @(0.0000 mm, 0.0000 mm): PCB
+
+** Found 1 unconnected pads **
+[unconnected_items]: Missing connection between items
+    Local override; error
+    @(99.0500 mm, 100.0000 mm): Pad 1 [OUT] of C1 on F.Cu
+    @(105.9125 mm, 100.0000 mm): Pad 2 [OUT] of R1 on F.Cu
+
+** Found 0 Footprint errors **
+
+** Ignored checks **
+    - Footprint has no courtyard defined
+    - Track endpoint not centered on via
+    - Tuning profile track geometries
+    - Footprint doesn't match symbol's footprint filters
+    - Footprint component type doesn't match footprint pads
+
+** End of Report **
