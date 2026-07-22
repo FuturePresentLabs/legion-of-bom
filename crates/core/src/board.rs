@@ -5,8 +5,9 @@
 //! decoupled from *placement* via the [`Placer`] trait — the seam the iterative
 //! layout loop (6.5), PanelSpec-anchored connectors (6.1/6.9), and the manual
 //! escape hatch (6.8) all plug into. [`GridPlacer`] is the naive default; the
-//! loop replaces it. Ground pour (6.2), the board outline (from PanelSpec), and
-//! routed tracks are future additions appended to the same assembly.
+//! loop replaces it. Routing is a second seam — the [`Router`] trait (see the
+//! [`route`](crate::route) module) — so tracks, the ground pour (6.2), and the
+//! board outline are all appended to the same assembly by the generator.
 //!
 //! Output is deterministic (UUIDs derived from content) so each layout attempt is
 //! a clean git diff, per 6.5.
@@ -16,6 +17,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::route::{
+    track_sexpr, via_sexpr, GridRouter, PadLayer, PadPoint, RouteNet, RouteOptions, Router,
+};
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
 
@@ -95,6 +99,11 @@ impl Placer for GridPlacer {
 pub struct BoardOptions {
     pub footprint_dir: PathBuf,
     pub placer: Box<dyn Placer>,
+    /// Router that turns placed pads + nets into copper tracks; `None` leaves the
+    /// board unrouted (pads + pour only).
+    pub router: Option<Box<dyn Router>>,
+    /// Track/via geometry for the router.
+    pub route_options: RouteOptions,
     /// Net to flood the bottom-layer ground pour to (DESIGN 6.2's default
     /// convention); `None` disables the pour.
     pub ground_net: Option<String>,
@@ -103,23 +112,38 @@ pub struct BoardOptions {
 }
 
 impl BoardOptions {
-    /// Default options: grid placement, a `GND` ground pour, 5 mm outline margin.
+    /// Default options: grid placement, MST routing, a `GND` ground pour, 5 mm
+    /// outline margin.
     pub fn new(footprint_dir: impl Into<PathBuf>) -> Self {
         BoardOptions {
             footprint_dir: footprint_dir.into(),
             placer: Box::new(GridPlacer::default()),
+            router: Some(Box::new(GridRouter)),
+            route_options: RouteOptions::default(),
             ground_net: Some("GND".into()),
             outline_margin_mm: 5.0,
         }
     }
 }
 
-/// Generate a `.kicad_pcb` for a circuit: footprints assigned + placed + net-wired
-/// (unrouted). Downstream (gerbers, CPL, DXF, DRC) is `kicad-cli` on the result.
+/// Generate a `.kicad_pcb` for a circuit: footprints assigned + placed + net-wired,
+/// then routed into copper tracks (unless `options.router` is `None`). Downstream
+/// (gerbers, CPL, DXF, DRC) is `kicad-cli` on the result.
 pub fn generate_board(
     circuit: &dyn CircuitSource,
     options: &BoardOptions,
 ) -> Result<String, BoardError> {
+    Ok(generate_board_report(circuit, options)?.0)
+}
+
+/// Like [`generate_board`], but also returns any routing **conflicts** — nets the
+/// router could not fully connect (handed off to the iterative loop or manual
+/// routing). Callers should surface these rather than ship a silently incomplete
+/// board.
+pub fn generate_board_report(
+    circuit: &dyn CircuitSource,
+    options: &BoardOptions,
+) -> Result<(String, Vec<String>), BoardError> {
     // Net table: index 0 is the empty/no-net; the rest are the circuit's nets.
     let mut net_names: Vec<String> = circuit.nets().iter().map(|n| n.name.clone()).collect();
     net_names.sort();
@@ -140,8 +164,10 @@ pub fn generate_board(
 
     let placements = options.placer.place(circuit);
 
-    // Transform each part's footprint into a placed, net-wired board footprint.
+    // Transform each part's footprint into a placed, net-wired board footprint,
+    // and collect every connected pad's absolute position (for routing).
     let mut footprints = Vec::new();
+    let mut net_pads: HashMap<usize, RouteNet> = HashMap::new();
     for part in circuit.parts() {
         let refdes = &part.refdes.0;
         let lib_part = part
@@ -157,6 +183,33 @@ pub fn generate_board(
             back: false,
         });
         let fp = load_footprint(&options.footprint_dir, lib_part)?;
+        for pad in footprint_pads(&fp) {
+            if let Some(&name) = pin_net.get(&(refdes.clone(), pad.num.clone())) {
+                let Some(&idx) = net_index.get(name) else {
+                    continue;
+                };
+                let (x, y) = place_point(placement, pad.px, pad.py);
+                // A back-placed footprint mirrors its pads to the other side.
+                let layer = pad_layer_on_board(pad.layer, placement.back);
+                net_pads
+                    .entry(idx)
+                    .or_insert_with(|| RouteNet {
+                        net_idx: idx,
+                        name: name.to_string(),
+                        pads: Vec::new(),
+                    })
+                    .pads
+                    .push(PadPoint {
+                        refdes: refdes.clone(),
+                        pad: pad.num,
+                        x_mm: x,
+                        y_mm: y,
+                        w_mm: pad.w,
+                        h_mm: pad.h,
+                        layer,
+                    });
+            }
+        }
         footprints.push(transform_footprint(
             fp, lib_part, refdes, placement, &pin_net, &net_index,
         ));
@@ -196,7 +249,106 @@ pub fn generate_board(
     }
     board.extend(footprints);
 
-    Ok(Sexpr::list(board).to_sexpr_string() + "\n")
+    // Route the nets into copper tracks (DESIGN 6.5). Ground still gets the pour;
+    // routing traces the rest (and any multi-pad ground net) on the copper layers.
+    let mut conflicts = Vec::new();
+    if let Some(router) = &options.router {
+        let nets: Vec<RouteNet> = net_pads.into_values().collect();
+        let routed = router.route(&nets, &options.route_options);
+        for track in &routed.tracks {
+            board.push(track_sexpr(track));
+        }
+        for via in &routed.vias {
+            board.push(via_sexpr(
+                via,
+                &options.route_options.front,
+                &options.route_options.back,
+            ));
+        }
+        conflicts = routed.conflicts;
+    }
+
+    Ok((Sexpr::list(board).to_sexpr_string() + "\n", conflicts))
+}
+
+/// A footprint pad's local geometry, for routing.
+struct FpPad {
+    num: String,
+    px: f64,
+    py: f64,
+    w: f64,
+    h: f64,
+    layer: PadLayer,
+}
+
+/// A footprint's pads (number, local offset, size, side) for pads carrying an
+/// `(at …)`. Pad numbering matches [`transform_footprint`].
+fn footprint_pads(fp: &Sexpr) -> Vec<FpPad> {
+    let mut pads = Vec::new();
+    for item in fp.as_list().unwrap_or(&[]) {
+        if item.head() != Some("pad") {
+            continue;
+        }
+        let Some(num) = item.nth_atom(1) else {
+            continue;
+        };
+        let Some(at) = item.get("at") else {
+            continue;
+        };
+        let px = at.nth_atom(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let py = at.nth_atom(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let size = item.get("size");
+        let w = size
+            .and_then(|s| s.nth_atom(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let h = size
+            .and_then(|s| s.nth_atom(2))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let layers: Vec<&str> = item
+            .get("layers")
+            .and_then(|l| l.as_list())
+            .map(|items| items.iter().skip(1).filter_map(|c| c.as_atom()).collect())
+            .unwrap_or_default();
+        let front = layers.iter().any(|l| *l == "F.Cu" || l.starts_with("*."));
+        let back = layers.iter().any(|l| *l == "B.Cu" || l.starts_with("*."));
+        let layer = match (front, back) {
+            (true, true) => PadLayer::Both,
+            (false, true) => PadLayer::Back,
+            _ => PadLayer::Front,
+        };
+        pads.push(FpPad {
+            num: num.to_string(),
+            px,
+            py,
+            w,
+            h,
+            layer,
+        });
+    }
+    pads
+}
+
+/// A footprint placed on the back mirrors its pads to the opposite copper.
+fn pad_layer_on_board(local: PadLayer, back: bool) -> PadLayer {
+    match (local, back) {
+        (PadLayer::Both, _) => PadLayer::Both,
+        (PadLayer::Front, false) | (PadLayer::Back, true) => PadLayer::Front,
+        (PadLayer::Back, false) | (PadLayer::Front, true) => PadLayer::Back,
+    }
+}
+
+/// Absolute board position of a pad at local offset `(px, py)` on a footprint
+/// placed per `placement`. Rotation follows KiCad's `RotatePoint` convention
+/// (`x' = px·cosθ + py·sinθ`, `y' = py·cosθ − px·sinθ`); the grid placer only
+/// emits rotation 0 today, so that identity path is what ships — the formula is
+/// validated against KiCad ground truth when the layout loop introduces angles.
+fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
+    let (s, c) = placement.rotation_deg.to_radians().sin_cos();
+    let rx = px * c + py * s;
+    let ry = py * c - px * s;
+    (placement.x_mm + rx, placement.y_mm + ry)
 }
 
 /// Load and parse a footprint `.kicad_mod` by `lib:name`.
@@ -423,18 +575,25 @@ fn two_layer_stack() -> Sexpr {
     ])
 }
 
-/// Format a millimetre/degree value without scientific notation.
-fn mm(x: f64) -> String {
-    if x.fract() == 0.0 {
-        format!("{}", x as i64)
+/// Format a millimetre/degree value: rounded to KiCad's 1 nm resolution, no
+/// scientific notation, trailing zeros trimmed (avoids float-noise like
+/// `99.14999999999999` in generated coordinates).
+pub(crate) fn mm(x: f64) -> String {
+    let r = (x * 1e6).round() / 1e6;
+    if r == 0.0 {
+        return "0".into(); // also normalises -0.0
+    }
+    if r.fract() == 0.0 {
+        format!("{}", r as i64)
     } else {
-        format!("{x}")
+        let s = format!("{r:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
 /// A deterministic UUID (8-4-4-4-12) derived from `seed`, so regenerating the
 /// same circuit yields the same board — clean git diffs across layout attempts.
-fn det_uuid(seed: &str) -> String {
+pub(crate) fn det_uuid(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     let b = &digest[..16];
     format!(
@@ -484,6 +643,35 @@ mod tests {
     }
 
     #[test]
+    fn place_point_identity_at_rotation_zero() {
+        let p = Placement {
+            x_mm: 100.0,
+            y_mm: 50.0,
+            rotation_deg: 0.0,
+            back: false,
+        };
+        // Rotation 0 (what GridPlacer emits) is a pure translation.
+        assert_eq!(place_point(p, 0.9125, 0.0), (100.9125, 50.0));
+        assert_eq!(place_point(p, -0.9125, 0.0), (99.0875, 50.0));
+    }
+
+    #[test]
+    fn place_point_rotates_per_kicad_convention() {
+        let p = Placement {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            rotation_deg: 90.0,
+            back: false,
+        };
+        // KiCad RotatePoint: (1,0) at 90° -> (0,-1).
+        let (x, y) = place_point(p, 1.0, 0.0);
+        assert!(
+            (x - 0.0).abs() < 1e-9 && (y + 1.0).abs() < 1e-9,
+            "got ({x},{y})"
+        );
+    }
+
+    #[test]
     fn deterministic_uuids() {
         assert_eq!(det_uuid("R1:fp"), det_uuid("R1:fp"));
         assert_ne!(det_uuid("R1:fp"), det_uuid("C1:fp"));
@@ -515,5 +703,51 @@ mod tests {
             "needs a ground pour"
         );
         assert!(board.contains(r#"(net_name "GND")"#), "pour flooded to GND");
+        // Routed: the OUT net (R1.2 ↔ C1.1) becomes a copper track.
+        assert!(
+            board.contains("(segment"),
+            "the multi-pad OUT net must be routed as a track"
+        );
+    }
+
+    /// A four-part two-stage RC ladder — the grid placer lines all pads up, so a
+    /// naive router would short; the maze router must connect every net without
+    /// conflicts, and generation must be deterministic (clean git diffs, 6.5).
+    #[test]
+    fn ladder_routes_completely_and_deterministically() {
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        let ladder = Circuit {
+            name: "ladder".into(),
+            parts: vec![
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+                Part::new("R2", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+                Part::new("C1", "159n").with_footprint("Capacitor_SMD:C_0805_2012Metric"),
+                Part::new("C2", "159n").with_footprint("Capacitor_SMD:C_0805_2012Metric"),
+            ],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("R1", "1")]),
+                Net::new(
+                    "MID",
+                    vec![
+                        PinRef::new("R1", "2"),
+                        PinRef::new("C1", "1"),
+                        PinRef::new("R2", "1"),
+                    ],
+                ),
+                Net::new("OUT", vec![PinRef::new("R2", "2"), PinRef::new("C2", "1")]),
+                Net::new("GND", vec![PinRef::new("C1", "2"), PinRef::new("C2", "2")]),
+            ],
+        };
+        let (board, conflicts) = match generate_board_report(&ladder, &BoardOptions::new(&dir)) {
+            Ok(b) => b,
+            Err(_) => return, // library layout differs; don't fail the unit suite
+        };
+        assert!(conflicts.is_empty(), "every net must route: {conflicts:?}");
+        assert!(board.contains("(segment"), "must have routed tracks");
+        // Deterministic: regenerating the same circuit yields byte-identical output.
+        let (again, _) = generate_board_report(&ladder, &BoardOptions::new(&dir)).unwrap();
+        assert_eq!(board, again, "board generation must be deterministic");
     }
 }

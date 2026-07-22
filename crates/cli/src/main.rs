@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, default_parts_dir, fetch_from_jlcpcb, fetch_from_kicad, generate_board,
+    analytic_check, default_parts_dir, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
     generate_bom, parse_netlist_file, simulate_ac, validate_erc, BoardOptions, CircuitSource,
     Finding, JlcpcbClient, MouserClient, PartRecord, PartResolution, PartsLibrary, PipelineReport,
     ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
@@ -56,7 +56,7 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Generate a .kicad_pcb board file (footprints placed, unrouted) from a circuit.
+    /// Generate a .kicad_pcb board file (footprints placed + routed) from a circuit.
     Board {
         /// Path to the circuit definition (e.g. a SKiDL script).
         circuit: PathBuf,
@@ -237,12 +237,23 @@ fn board_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
 
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    let board = generate_board(&model, &BoardOptions::new(footprint_dir))?;
+    let (board, conflicts) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
 
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
-    std::fs::write(&path, board).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
+    let tracks = board.matches("(segment").count();
+    let vias = board.matches("(via").count();
     println!("wrote {}", path.display());
-    println!("  footprints placed (grid), unrouted, outline + GND pour");
+    println!("  placed (grid) + routed: {tracks} tracks, {vias} vias, outline + GND pour");
+    if !conflicts.is_empty() {
+        eprintln!(
+            "  ⚠ {} connection(s) left unrouted (for manual/iterative routing):",
+            conflicts.len()
+        );
+        for c in &conflicts {
+            eprintln!("      - {c}");
+        }
+    }
     println!("  validate: kicad-cli pcb drc {}", path.display());
     println!("  export:   kicad-cli pcb export gerbers --check-zones (fills the pour) | export pos (CPL)");
     Ok(())

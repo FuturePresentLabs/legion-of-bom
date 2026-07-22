@@ -18,6 +18,7 @@ pub mod model;
 pub mod mouser;
 pub mod netlist;
 pub mod parts;
+pub mod route;
 mod sexpr;
 pub mod skidl;
 pub mod source;
@@ -29,7 +30,9 @@ pub mod units;
 pub mod validate;
 pub mod verify;
 
-pub use board::{generate_board, BoardError, BoardOptions, GridPlacer, Placement, Placer};
+pub use board::{
+    generate_board, generate_board_report, BoardError, BoardOptions, GridPlacer, Placement, Placer,
+};
 pub use bom::{generate_bom, Bom, BomLine};
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
@@ -39,6 +42,10 @@ pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
+};
+pub use route::{
+    GridRouter, MstRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput, Router, Track,
+    Via,
 };
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
