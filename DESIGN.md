@@ -137,7 +137,7 @@ control as first-class stages rather than afterthoughts.
 ### 2.2 Orchestration model
 A Rust core library (`legion-of-bom-core`) exposes each pipeline stage as a composable
 function/trait. A CLI (`lob`) wraps the library for local, scriptable use. A web
-backend (axum — same stack as Underst[118;1:3uory) wraps the *same* library for the hosted
+backend (axum — same stack as Understory) wraps the *same* library for the hosted
 dashboard, so nothing is web-only — anything the dashboard can do, the CLI can do
 headless.
 
@@ -152,7 +152,7 @@ everything that consumes circuit data.
 - **FuturePresentLabs/legion-of-bom** — the tool itself (core lib + CLI + web
   backend), AGPLv3
 - **Board/circuit repos** — one per project (e.g. `puget-audio-2opfm`,
-  `puget-audio-slew-limiter`), each can hold multiple related circuits, plain git.
+  `puget-audio-slew-limit[118;1:3uer`), each can hold multiple related circuits, plain git.
   In v1, these are local clones on the machine running `lob` — the CLI/backend
   shells out to `git` directly, no remote-hosting integration yet. The
   Forestry.io-for-KiCad model (connecting to *someone else's* remote repo) is a v2+
