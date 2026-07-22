@@ -11,12 +11,14 @@
 //! library — anything one surface can do, the other can too.
 
 pub mod model;
+pub mod netlist;
 pub mod skidl;
 pub mod source;
 pub mod stage;
 pub mod tools;
 
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
+pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};

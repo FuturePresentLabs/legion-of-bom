@@ -2,8 +2,8 @@
 //!
 //! A thin wrapper over `legion-of-bom-core`. The `run` subcommand is where the
 //! Phase 0 pipeline (SKiDL run -> parse -> validate -> simulate -> verify ->
-//! BOM) gets wired in; see the beads "Phase 0" epic. Today it only resolves the
-//! circuit path and prints the planned stages.
+//! BOM) gets wired in; see the beads "Phase 0" epic. Stages 1-2 (SKiDL runner,
+//! netlist parse) are live; validate/simulate/verify/bom are still to come.
 
 mod doctor;
 
@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use legion_of_bom_core::SkidlRunner;
+use legion_of_bom_core::{parse_netlist_file, CircuitSource, SkidlRunner};
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
 #[derive(Debug, Parser)]
@@ -93,7 +93,16 @@ fn run(circuit: PathBuf) -> Result<()> {
         None => println!("             ERC: (no report emitted)"),
     }
 
-    println!("  … parse -> validate -> simulate -> verify -> bom: not yet implemented");
+    // Stage 2: parse the netlist into the internal Circuit model.
+    let circuit =
+        parse_netlist_file(&skidl_run.netlist_path).with_context(|| "parse stage failed")?;
+    println!(
+        "  ✓ parse     {} parts, {} nets",
+        circuit.parts().len(),
+        circuit.nets().len()
+    );
+
+    println!("  … validate -> simulate -> verify -> bom: not yet implemented");
     println!("    (see the beads 'Phase 0' epic)");
     Ok(())
 }
