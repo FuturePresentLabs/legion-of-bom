@@ -32,22 +32,33 @@ pub struct Part {
     pub footprint: Option<String>,
     /// Source library part, if known (`"Device:R"`). Frontend-provided hint.
     pub library_part: Option<String>,
+    /// Manufacturer part number, if the circuit declares one (an `MPN` field).
+    /// The key that resolves against the global parts library. Generic passives
+    /// usually have none.
+    pub mpn: Option<String>,
 }
 
 impl Part {
-    /// A part with just a refdes and value; no footprint or library part yet.
+    /// A part with just a refdes and value; no footprint, library part, or MPN.
     pub fn new(refdes: impl Into<RefDes>, value: impl Into<String>) -> Self {
         Part {
             refdes: refdes.into(),
             value: value.into(),
             footprint: None,
             library_part: None,
+            mpn: None,
         }
     }
 
     /// Builder-style: attach a footprint.
     pub fn with_footprint(mut self, footprint: impl Into<String>) -> Self {
         self.footprint = Some(footprint.into());
+        self
+    }
+
+    /// Builder-style: attach an MPN.
+    pub fn with_mpn(mut self, mpn: impl Into<String>) -> Self {
+        self.mpn = Some(mpn.into());
         self
     }
 

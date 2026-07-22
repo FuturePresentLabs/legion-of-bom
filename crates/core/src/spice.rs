@@ -453,6 +453,7 @@ mod tests {
                     value: "OPAMP".into(),
                     footprint: None,
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
+                    mpn: None,
                 },
                 Part::new("R1", "9k"),
                 Part::new("R2", "1k"),

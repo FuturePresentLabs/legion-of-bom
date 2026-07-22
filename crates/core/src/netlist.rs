@@ -59,11 +59,13 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
             let library_part = comp
                 .get("libsource")
                 .and_then(|ls| Some(format!("{}:{}", ls.field("lib")?, ls.field("part")?)));
+            let mpn = field_value(comp, "MPN");
             parts.push(Part {
                 refdes: RefDes(refdes.to_string()),
                 value,
                 footprint,
                 library_part,
+                mpn,
             });
         }
     }
@@ -93,6 +95,22 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
         parts,
         nets,
     })
+}
+
+/// Value of a component's custom field named `wanted` (case-insensitive), from
+/// its `(fields (field (name "X") "value") …)` block. Empty values → `None`.
+fn field_value(comp: &Sexpr, wanted: &str) -> Option<String> {
+    comp.get("fields")?
+        .get_all("field")
+        .into_iter()
+        .find(|f| {
+            f.get("name")
+                .and_then(|n| n.nth_atom(1))
+                .is_some_and(|n| n.eq_ignore_ascii_case(wanted))
+        })
+        .and_then(|f| f.nth_atom(2))
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -170,5 +188,24 @@ mod tests {
     fn rejects_non_netlist() {
         let err = parse_netlist_str("(something_else (foo))", "x").unwrap_err();
         assert!(matches!(err, StageError::Other(_)));
+    }
+
+    #[test]
+    fn extracts_mpn_field() {
+        let nl = r#"
+        (export (version "E")
+          (components
+            (comp (ref "U1") (value "LM13700")
+              (fields (field (name "MPN") "LM13700") (field (name "Footprint") "Package_DIP:DIP-16"))
+              (libsource (lib "Amplifier_Operational") (part "LM13700")))
+            (comp (ref "R1") (value "1k")
+              (libsource (lib "Device") (part "R"))))
+          (nets))"#;
+        let c = parse_netlist_str(nl, "x").unwrap();
+        let u1 = c.parts.iter().find(|p| p.refdes.0 == "U1").unwrap();
+        assert_eq!(u1.mpn.as_deref(), Some("LM13700"));
+        // A generic part with no MPN field resolves to None.
+        let r1 = c.parts.iter().find(|p| p.refdes.0 == "R1").unwrap();
+        assert_eq!(r1.mpn, None);
     }
 }

@@ -267,6 +267,7 @@ mod tests {
                     value: "OPAMP".into(),
                     footprint: None,
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
+                    mpn: None,
                 },
                 Part::new("R1", rf), // feedback: OUT ↔ FB
                 Part::new("R2", rg), // ground:   FB ↔ GND

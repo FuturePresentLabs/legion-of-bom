@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::source::CircuitSource;
 use crate::tools::find_on_path;
 
 /// The parts-library schema. `mpn` is the natural key across all three tables
@@ -290,6 +291,66 @@ impl PartsLibrary {
     }
 }
 
+/// How a circuit part resolves against the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionStatus {
+    /// The part declares no MPN (a generic passive) — nothing to resolve.
+    NoMpn,
+    /// Has an MPN, but it isn't in the library.
+    Unknown,
+    /// In the library, but not yet human-verified.
+    Unverified,
+    /// In the library and human-verified.
+    Verified,
+}
+
+/// The result of resolving one circuit part against the library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartResolution {
+    pub refdes: String,
+    pub mpn: Option<String>,
+    /// The library record, if the MPN was present and found.
+    pub record: Option<PartRecord>,
+    pub status: ResolutionStatus,
+}
+
+impl PartsLibrary {
+    /// Resolve every part of a circuit against the library by MPN. This is the
+    /// bridge circuits cross to reach verified part data — and what BOM pricing
+    /// and the verification gate build on. okm.7.
+    pub fn resolve_circuit(
+        &self,
+        circuit: &dyn CircuitSource,
+    ) -> Result<Vec<PartResolution>, PartsError> {
+        let mut resolutions = Vec::with_capacity(circuit.parts().len());
+        for part in circuit.parts() {
+            let refdes = part.refdes.0.clone();
+            let Some(mpn) = part.mpn.clone() else {
+                resolutions.push(PartResolution {
+                    refdes,
+                    mpn: None,
+                    record: None,
+                    status: ResolutionStatus::NoMpn,
+                });
+                continue;
+            };
+            let record = self.get_part(&mpn)?;
+            let status = match &record {
+                None => ResolutionStatus::Unknown,
+                Some(r) if r.verified_by_human => ResolutionStatus::Verified,
+                Some(_) => ResolutionStatus::Unverified,
+            };
+            resolutions.push(PartResolution {
+                refdes,
+                mpn: Some(mpn),
+                record,
+                status,
+            });
+        }
+        Ok(resolutions)
+    }
+}
+
 /// The default cross-project parts-library location (override with `LOB_PARTS_DIR`).
 pub fn default_parts_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOB_PARTS_DIR") {
@@ -400,6 +461,44 @@ mod tests {
 
         assert_eq!(lib.list_mpns().expect("list"), vec!["LM13700"]);
         assert!(lib.get_part("NONEXISTENT").expect("get").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Resolve a circuit's parts by MPN against the library. Skipped if no dolt.
+    #[test]
+    fn resolve_circuit_by_mpn_when_dolt_available() {
+        use crate::model::{Circuit, Part};
+
+        if find_on_path("dolt").is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lob-resolve-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = PartsLibrary::open(&root).expect("open");
+
+        lib.upsert_part(&PartRecord::new("LM13700"))
+            .expect("upsert verified");
+        lib.mark_verified("LM13700", "tester").expect("verify");
+        lib.upsert_part(&PartRecord::new("TL072"))
+            .expect("upsert unverified");
+
+        let circuit = Circuit {
+            name: "c".into(),
+            parts: vec![
+                Part::new("U1", "x").with_mpn("LM13700"), // verified
+                Part::new("U2", "x").with_mpn("TL072"),   // unverified
+                Part::new("U3", "x").with_mpn("FOO999"),  // unknown
+                Part::new("R1", "1k"),                    // no MPN
+            ],
+            nets: vec![],
+        };
+        let res = lib.resolve_circuit(&circuit).expect("resolve");
+        let status = |rd: &str| res.iter().find(|r| r.refdes == rd).unwrap().status;
+        assert_eq!(status("U1"), ResolutionStatus::Verified);
+        assert_eq!(status("U2"), ResolutionStatus::Unverified);
+        assert_eq!(status("U3"), ResolutionStatus::Unknown);
+        assert_eq!(status("R1"), ResolutionStatus::NoMpn);
 
         let _ = std::fs::remove_dir_all(&root);
     }
