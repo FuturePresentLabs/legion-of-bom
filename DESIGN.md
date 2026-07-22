@@ -47,10 +47,13 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
 
 7. **Panel Design**
    7.1 DXF output (filled — see body)
-   7.2 SVG output
+   7.2 SVG output (priority raised — see 7.7)
    7.3 KiCad-native panel workflow
    7.4 Mechanical fit checks against PCB (jack/pot alignment)
    7.5 Manual order tracking — no fab-vendor API available (filled — see body)
+   7.6 Visual BOM / component sorting sheet (filled — see body)
+   7.7 Drilling jigs + Lightburn SVG (filled — see body)
+   7.8 Build-guide rendering (filled — see body)
 
 8. **Manufacturing Outputs**
    8.1 Gerbers via KiCad (v1 path)
@@ -117,7 +120,7 @@ machine, no network-facing component. That proves the loop before any real Puget
 Audio product design goes through it. Full "done" (later phases): a user defines a
 circuit in SKiDL (or a future DSL) inside a git repo; legion-of-bom runs the same
 pipeline, can quote and place a JLCPCB PCBA order via their API, tracks inventory in
-Dolt, and [118;1:3utriggers reorders — through a web dashboard, usable by more than one
+Dolt, and triggers reorders — through a web dashboard, usable by more than one
 tenant/business.
 
 ### 1.3 Non-goals (v1)
@@ -497,6 +500,50 @@ commands standing in for what an API webhook would otherwise do automatically.
 later, or if this becomes a big enough part of operations to justify it, the
 manual `mark-ordered` step gets replaced by an actual API call updating the
 same table — the schema doesn't need to change, just how `status` gets set.
+
+### 7.6 Visual BOM / component sorting sheet
+Same underlying data as Section 9.1's BOM — grouped and rendered for a human
+sorting physical parts by hand, not for procurement. No new data dependency:
+this is a rendering template layered on the existing BOM output, cheapest
+item in this set of additions. General enough to apply to any format, not
+Guitar-Pedal-specific.
+
+### 7.7 Drilling jigs + Lightburn SVG
+Two related outputs, both consuming data `PanelSpec` (Section 6.9) already
+produces:
+
+- **3D-printable drilling jigs** — STL generated from the anchored-cutout
+  hole positions already computed for DXF export (7.1), targeted at a small,
+  fixed library of standard enclosure sizes (1590B, 1590BB, 125B, etc.) —
+  exactly the kind of format-specific standardization Guitar Pedal has and
+  Eurorack (bespoke per-module panels) mostly doesn't, which is why this
+  lands here rather than as a general Section 7 feature.
+- **Laser SVG for Lightburn** — this is Section 7.2 (SVG output), previously
+  deprioritized for lack of a concrete use case. Pedal enclosure engraving
+  and laser-cut drilling templates are that use case — priority raised for
+  the Guitar Pedal line specifically, not a general re-prioritization of 7.2.
+
+Both are alternate exports of geometry the pipeline already computes for DXF
+— real work, but not a new data problem.
+
+### 7.8 Build-guide rendering
+The one genuinely new subsystem in this set, not a reformat of existing data.
+Needs two things that don't exist elsewhere in the pipeline yet:
+
+- **Rendered board views** — a populated-board 3D render (KiCad's rendering
+  capability, same general approach `protorack-kicad`/`pcb2blender` use per
+  LIBRARIES.md) with a highlight box overlaid at the current step's footprint
+  position. Deliberately not real photography — avoids needing physical units
+  reshot per board revision, which real photos would require.
+- **Build sequencing** — a step order (typically low-profile-first: resistors
+  → diodes → sockets → caps → tall/tall-bodied parts last) that has to be
+  derived or specified per circuit; nothing in the pipeline currently produces
+  this. Real new scope, sized as its own small epic rather than a BOM-export
+  add-on.
+
+Scope note for all of 7.6–7.8: layered on top of the Guitar Pedal `PanelSpec`
+implementation, not before it exists — same gating already applied to
+500-series and the rest of the layout epic.
 
 ---
 
