@@ -13,6 +13,7 @@
 pub mod bom;
 pub mod fetch;
 pub mod model;
+pub mod mouser;
 pub mod netlist;
 pub mod parts;
 mod sexpr;
@@ -29,6 +30,7 @@ pub mod verify;
 pub use bom::{generate_bom, Bom, BomLine};
 pub use fetch::fetch_from_kicad;
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
+pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,

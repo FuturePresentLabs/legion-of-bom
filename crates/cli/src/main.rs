@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::kicad_symbol_dir;
 use legion_of_bom_core::{
     analytic_check, default_parts_dir, fetch_from_kicad, generate_bom, parse_netlist_file,
-    simulate_ac, validate_erc, CircuitSource, Finding, PartRecord, PartResolution, PartsLibrary,
-    PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    simulate_ac, validate_erc, CircuitSource, Finding, MouserClient, PartRecord, PartResolution,
+    PartsLibrary, PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -43,6 +43,17 @@ enum Command {
     Parts {
         #[command(subcommand)]
         action: PartsCmd,
+    },
+    /// Generate a BOM for a circuit, optionally priced live from Mouser.
+    Bom {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Look up live unit price + stock from Mouser (needs MOUSER_API_KEY).
+        #[arg(long)]
+        price: bool,
+        /// Also write the BOM CSV to this path.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -78,6 +89,8 @@ enum PartsCmd {
 }
 
 fn main() -> ExitCode {
+    // Load .env (API keys) before anything reads the environment.
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
@@ -85,6 +98,11 @@ fn main() -> ExitCode {
         Command::Run { circuit } => run(circuit),
         Command::Doctor => doctor::run(),
         Command::Parts { action } => parts_cmd(action),
+        Command::Bom {
+            circuit,
+            price,
+            out,
+        } => bom_cmd(circuit, price, out),
     };
 
     match result {
@@ -181,6 +199,63 @@ fn run(circuit: PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("pipeline reported stage failures")
     }
+}
+
+/// Handle `lob bom <circuit> [--price] [--out]`.
+fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let mut bom = generate_bom(&parse_netlist_file(&run.netlist_path)?);
+
+    if price {
+        let client = MouserClient::from_env()
+            .with_context(|| "live pricing needs MOUSER_API_KEY (put it in .env)")?;
+        let mut priced = 0usize;
+        for line in &mut bom.lines {
+            let Some(mpn) = line.mpn.clone() else {
+                continue;
+            };
+            match client.search_mpn(&mpn) {
+                Ok(Some(pp)) => match pp.unit_price_at(line.qty() as u64) {
+                    Some(unit) => {
+                        line.set_unit_price(unit);
+                        priced += 1;
+                        let stock = pp
+                            .in_stock
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "?".into());
+                        eprintln!(
+                            "  priced {mpn} → {} @ ${unit:.4} ({stock} in stock)",
+                            pp.mpn
+                        );
+                    }
+                    None => eprintln!("  {mpn}: matched {} but no price breaks", pp.mpn),
+                },
+                Ok(None) => eprintln!("  no Mouser match: {mpn}"),
+                Err(e) => eprintln!("  pricing {mpn}: {e}"),
+            }
+        }
+        eprintln!("priced {priced} line(s)\n");
+    }
+
+    print!("{}", bom.to_table());
+    if let Some(total) = bom.total() {
+        println!("\nTotal: ${total:.2}");
+    }
+    if let Some(out) = out {
+        std::fs::write(&out, bom.to_csv()).with_context(|| format!("writing {}", out.display()))?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
 }
 
 /// Handle `lob parts …` against the global parts library.

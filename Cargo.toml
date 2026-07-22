@@ -13,6 +13,8 @@ authors = ["Future Present Labs"]
 legion-of-bom-core = { path = "crates/core" }
 thiserror = "2"
 serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+dotenvy = "0.15"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
