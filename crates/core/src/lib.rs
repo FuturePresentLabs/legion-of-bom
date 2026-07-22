@@ -10,6 +10,7 @@
 //! The CLI (`lob`) and the eventual web backend are thin wrappers over this
 //! library — anything one surface can do, the other can too.
 
+pub mod bom;
 pub mod model;
 pub mod netlist;
 pub mod skidl;
@@ -18,8 +19,10 @@ pub mod spice;
 pub mod stage;
 pub mod tools;
 pub mod units;
+pub mod validate;
 pub mod verify;
 
+pub use bom::{generate_bom, Bom, BomLine};
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use skidl::{SkidlRun, SkidlRunner};
@@ -28,4 +31,5 @@ pub use spice::{simulate_ac, AcPoint, AcResult, SimConfig};
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
 pub use tools::{find_on_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
+pub use validate::validate_erc;
 pub use verify::check_rc_cutoff;

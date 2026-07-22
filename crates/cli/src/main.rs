@@ -1,9 +1,8 @@
 //! `lob` — the legion-of-bom command-line interface.
 //!
-//! A thin wrapper over `legion-of-bom-core`. The `run` subcommand is where the
-//! Phase 0 pipeline (SKiDL run -> parse -> validate -> simulate -> verify ->
-//! BOM) gets wired in; see the beads "Phase 0" epic. Stages 1-2 (SKiDL runner,
-//! netlist parse) are live; validate/simulate/verify/bom are still to come.
+//! A thin wrapper over `legion-of-bom-core`. The `run` subcommand runs the full
+//! Phase 0 pipeline — SKiDL run → parse → validate → simulate → verify → BOM —
+//! and reports per-stage pass/fail, exiting non-zero on any failure.
 
 mod doctor;
 
@@ -13,8 +12,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::{
-    check_rc_cutoff, parse_netlist_file, simulate_ac, CircuitSource, Finding, PipelineReport,
-    Severity, SimConfig, SkidlRunner, StageOutcome,
+    check_rc_cutoff, generate_bom, parse_netlist_file, simulate_ac, validate_erc, CircuitSource,
+    Finding, PipelineReport, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -86,14 +85,10 @@ fn run(circuit: PathBuf) -> Result<()> {
     let skidl_run = runner
         .run(&circuit)
         .with_context(|| "SKiDL stage failed (try `lob doctor`)")?;
-    let mut skidl_outcome = StageOutcome::passed("skidl").with(Finding::info(format!(
+    report.push(StageOutcome::passed("skidl").with(Finding::info(format!(
         "netlist: {}",
         skidl_run.netlist_path.display()
-    )));
-    if let Some(erc) = &skidl_run.erc_report {
-        skidl_outcome = skidl_outcome.with(Finding::info(format!("ERC: {}", erc_summary(erc))));
-    }
-    report.push(skidl_outcome);
+    ))));
 
     // Stage: parse the netlist into the internal Circuit model.
     let model =
@@ -103,6 +98,9 @@ fn run(circuit: PathBuf) -> Result<()> {
         model.parts().len(),
         model.nets().len()
     ))));
+
+    // Stage: validate — surface ERC results as structured findings.
+    report.push(validate_erc(skidl_run.erc_report.as_deref()));
 
     // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep.
     let ac = simulate_ac(&model, &SimConfig::default(), &work_dir)
@@ -116,7 +114,28 @@ fn run(circuit: PathBuf) -> Result<()> {
     // Stage: verify — assert the simulated cutoff against the textbook value.
     report.push(check_rc_cutoff(&model, &ac, 0.02));
 
+    // Stage: bom — group parts into a BOM, write CSV, summarize.
+    let bom = generate_bom(&model);
+    let csv_path = work_dir.join(format!("{stem}_bom.csv"));
+    std::fs::write(&csv_path, bom.to_csv()).with_context(|| "writing BOM CSV")?;
+    let mut bom_outcome = StageOutcome::passed("bom").with(Finding::info(format!(
+        "{} line(s), {} component(s); wrote {}",
+        bom.lines.len(),
+        bom.component_count(),
+        csv_path.display()
+    )));
+    let missing = bom.parts_without_footprint();
+    if !missing.is_empty() {
+        bom_outcome = bom_outcome.with(Finding::warning(format!(
+            "no footprint: {}",
+            missing.join(", ")
+        )));
+    }
+    report.push(bom_outcome);
+
     print_report(&report);
+    println!("\nBOM\n{}", bom.to_table());
+
     if report.passed() {
         Ok(())
     } else {
@@ -151,19 +170,6 @@ fn print_report(report: &PipelineReport) {
             report.outcomes.len()
         );
     }
-}
-
-/// One-line summary from a SKiDL ERC report: the counts line if present, else
-/// the first non-empty line.
-fn erc_summary(report: &str) -> String {
-    report
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .find(|l| l.contains("warnings found") || l.contains("errors found"))
-        .or_else(|| report.lines().map(str::trim).find(|l| !l.is_empty()))
-        .unwrap_or("(empty)")
-        .to_string()
 }
 
 /// Initialize tracing. `RUST_LOG` wins if set; otherwise `-v` picks the level.
