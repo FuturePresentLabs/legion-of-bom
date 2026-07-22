@@ -25,23 +25,44 @@ to "double check."
 **Rule: circuit definition tools may not accept pin/parametric data from model
 memory. Only from a fetched, cited source.**
 
-### 1.1 Sourcing datasheets from distributor APIs, not general web search
-JLCPCB's Parts API, Mouser's Search API, and DigiKey's Product Information API
-all return a canonical datasheet URL as a field on the part record — this is
-the trusted source, not a general web search for "LM13700 datasheet" which
-could surface a mirror, a wrong revision, or a similar-but-different part.
-`search_part` (Section 2) resolves a part number to one or more distributor
-records; the datasheet URL comes from that record, never from a freeform
-search.
+### 1.1 Sourcing pinout/symbol data: structured libraries first, PDF as fallback
+Two kinds of source exist, and they shouldn't be treated as equivalent:
+
+- **Structured CAD library data** — DigiKey maintains an official, in-house
+  KiCad library built by their own applications engineering team; JLCPCB's
+  EasyEDA/LCSC library is reachable through the same Parts API already in use
+  and has existing conversion tooling into KiCad format; SnapEDA/Ultra
+  Librarian/SamacSys host a much larger but more variable-trust set (mixed
+  professional and community-contributed content, with a verification badge
+  worth checking). All of these already encode pin-number-to-pin-name mapping
+  as structured data — someone had to get it right to use it in a schematic
+  tool at all — which is a fundamentally better extraction source than parsing
+  it back out of PDF prose.
+- **PDF datasheets** — still the source of truth for absolute max ratings and
+  anything not captured in a symbol file, and useful as a cross-check against
+  a CAD library entry, but not the primary pinout-extraction path when a
+  structured library entry already exists.
+
+**Trust order for `fetch_datasheet` / pinout extraction:** distributor-official
+library (DigiKey KiCad library, JLCPCB/EasyEDA) → broader CAD library
+(SnapEDA/Ultra Librarian, checking verification status) → PDF datasheet
+extraction as the fallback when no library entry exists yet, and always as a
+cross-check source for ratings regardless of which library was used for the
+pinout. The datasheet URL itself, when PDF parsing is needed, still comes only
+from a distributor API record (JLCPCB/Mouser/DigiKey), never a general web
+search — that part of the rule doesn't change.
 
 ### 1.2 Fetch and extract, don't recall
-`fetch_datasheet` (Section 2) actually retrieves the PDF from the distributor-
-sourced URL and extracts text/tables — pin assignment tables, absolute max
-ratings, package info. This is a real fetch-and-parse operation, not a cached
-"the model already knows this part" shortcut. Extracted data is written to a
-**global, Dolt-backed parts library** (not a per-project git sidecar file) —
-verification is confirmed decision-scope: once a part is verified, it's
-verified for every future project, not re-verified per repo. This mirrors the
+`fetch_datasheet` (Section 2) retrieves structured pin/footprint data from a
+CAD library per the trust order above, or extracts text/tables from a PDF
+datasheet when no library entry exists — pin assignment tables, absolute max
+ratings, package info. Either way, this is a real fetch-and-parse operation,
+not a cached "the model already knows this part" shortcut. Extracted data is
+written to a **global, Dolt-backed parts library** (not a per-project git
+sidecar file) — this is **core `legion-of-bom-core` architecture, not an
+MCP-only construct** (see Section 1.4 below): once a part is verified, it's
+verified for every future project and every entry point (CLI, MCP, future web
+UI alike), not re-verified per repo or per interface. This mirrors the
 Dolt-vs-git storage split already decided in DESIGN.md Section 2.6: circuit
 definitions are project-specific and belong in git; verified part data is
 cross-project structured data that needs to be queried and reused, which is
@@ -83,7 +104,7 @@ file. First use of a new part still triggers the one-time human verification
 step (Section 3); every subsequent project reusing that MPN reads
 already-verified data for free.
 
-### 1.3 Every extracted fact carries a citation, not just a value
+### 1.3 Every extracted fact carries a[118;1:3u citation, not just a value
 Every row in `part_pins` and `part_ratings` carries a `cited_page` back to the
 source datasheet — never a bare value with no traceable origin. `parts.
 verified_by_human` starts `FALSE` on every new part row. This is the field
@@ -91,16 +112,29 @@ the "resolved open questions" gate (Section 3) actually checks — not "did we
 fetch a datasheet" but "did a human confirm the extraction was read
 correctly."
 
-### 1.4 Cross-check on anything safety/money-relevant
+### 1.4 This is core `legion-of-bom-core` architecture, not an MCP-only construct
+This is worth stating plainly because it changes where the enforcement actually
+lives: the parts library, the `verified_by_human` gate, and the checks that
+block `layout`/`generate_bom` are **pipeline-core behavior**, not something
+bolted onto the MCP tool wrapper. An MCP tool call and a direct `lob layout`
+CLI invocation hit the exact same check inside `legion-of-bom-core` — the MCP
+tool doesn't independently re-implement the gate, it just inherits it by
+calling into the same library (per DESIGN.md Section 2.2's "CLI and web share
+one core" principle). Practical consequence: DESIGN.md's Validation Layer
+(Section 4) and BOM & PCBA Pipeline (Section 9) need this gate specified
+there too, not just here — MCP.md describes the *agent-facing* shape of a
+check that has to exist regardless of who or what is driving the pipeline.
+
+### 1.5 Cross-check on anything safety/money-relevant
 For pin assignments and absolute max ratings specifically (the two categories
 where an error causes physical damage or a bad board respin), the extraction
 tool should attempt to fetch from **two independent sources** where possible
-(e.g. the distributor-hosted copy and the manufacturer's own site) and flag a
-mismatch rather than silently picking one. Parametric data that's just "nice
-to know" (typical values, graphs) doesn't need this — the gate is proportional
-to what breaks if it's wrong.
+(e.g. a distributor-official CAD library entry and the manufacturer's own PDF)
+and flag a mismatch rather than silently picking one. Parametric data that's
+just "nice to know" (typical values, graphs) doesn't need this — the gate is
+proportional to what breaks if it's wrong.
 
-### 1.5 What this does NOT solve
+### 1.6 What this does NOT solve
 This makes pinout/rating *extraction* reliable. It does not make *topology
 selection* reliable — an agent can correctly extract a real LM13700 pinout and
 still put it in a bad circuit. That's what `research_topology`'s citation
@@ -119,12 +153,12 @@ DESIGN.md) — this is the local-first MCP server, not a hosted SaaS surface.
 | `create_project` | Scaffold a new board repo from a `PanelProfile` (format: Eurorack/Pedal/Rack/Desktop) | No |
 | `research_topology` | Search for real reference circuits for a given function (e.g. "crossfader"); returns candidate topologies + citations | No |
 | `search_part` | Resolve a part number or functional need to distributor records (JLCPCB/Mouser/DigiKey), including datasheet URL | No |
-| `fetch_datasheet` | Fetch + extract pin/rating data from a distributor-sourced datasheet URL into a cited sidecar file | No |
-| `define_circuit` | Write/update the SKiDL circuit definiti[118;1:3uon, referencing sidecar part data (not model memory) | No |
+| `fetch_datasheet` | Fetch structured pin/rating data (CAD library or PDF fallback, per Section 1.1) into the global parts library | No |
+| `define_circuit` | Write/update the SKiDL circuit definition, referencing verified part data (not model memory) | No |
 | `validate` | Run ERC | No |
 | `simulate` | Run ngspice / PedalKernel simulation | No |
-| `layout` | Run the iterative layout loop (DESIGN.md Section 6) | **Yes — requires open-questions checklist clear + all used parts `verified_by_human: true`** |
-| `generate_bom` | Generate BOM/CPL with live pricing/stock from JLCPCB, Mouser, DigiKey APIs | **Yes — same gate as `layout`** |
+| `layout` | Run the iterative layout loop (DESIGN.md Section 6) | **Yes — enforced by `legion-of-bom-core` (Section 1.4), same for CLI and MCP: requires open-questions checklist clear + all used parts `verified_by_human = TRUE`** |
+| `generate_bom` | Generate BOM/CPL with live pricing/stock from JLCPCB, Mouser, DigiKey APIs | **Yes — same core-enforced gate as `layout`** |
 | `submit_for_approval` | Package design + BOM + cost + sourcing status into a human-reviewable summary | No (this *is* the human touchpoint) |
 | `place_order` | Actually submit a PCBA/parts order | **Human-only. Not agent-callable. No MCP tool exists for this — it's a manual action outside the MCP surface entirely.** |
 
@@ -134,9 +168,11 @@ no `place_order` MCP tool. If we ever build one, that's a deliberate,
 separate decision, not a default the agent surface grows into by accident.
 
 ### 2.2 The verification gate, concretely
-`layout` and `generate_bom` check, before running:
-- Every part referenced in the circuit has a sidecar file with
-  `verified_by_human: true`
+Before `layout` or `generate_bom` run — whether invoked via MCP or the `lob`
+CLI directly, since this lives in `legion-of-bom-core` per Section 1.4, not
+in the MCP wrapper — the check confirms:
+- Every part referenced in the circuit has a `parts` row with
+  `verified_by_human = TRUE` in the global library
 - The circuit's open-questions checklist (per the pattern in
   `slew-limiter-circuit.md`) has no unresolved items
 If either check fails, the tool returns the specific blocking items rather

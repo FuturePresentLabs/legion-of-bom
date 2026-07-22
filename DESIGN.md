@@ -22,10 +22,12 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    3.2 Path to a native Rust DSL (v2+)
    3.3 DSL-agnostic circuit IR — what it must capture to support multiple frontends
    3.4 Reusable component/subcircuit library (op-amp stages, OTA stages, RIAA networks, etc.)
+   3.5 Global parts library (pinout/rating verification — see also MCP.md)
 
 4. **Validation Layer**
    4.1 ERC (first pass) — what it catches, what it doesn't
    4.2 Project-specific rule extensions (Eurorack power header conventions, panel mount checks)
+   4.3 Parts verification gate (filled — see body)
 
 5. **Simulation Layer**
    5.1 ngspice integration
@@ -57,7 +59,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    9.1 BOM generation from IR
    9.2 CPL (component placement list) generation
    9.3 JLCPCB API integration (quoting, order creation, tracking)
-   9.4 BOM accuracy/verification — this has to be airtight
+   9.4 BOM accuracy/verification — this has to be airtight (filled — see body)
    9.5 Multi-vendor part sourcing rules (JLCPCB basic vs extended, LCSC fallback)
 
 10. **Thru-Hole BOM & Ordering**
@@ -135,11 +137,11 @@ control as first-class stages rather than afterthoughts.
 ### 2.2 Orchestration model
 A Rust core library (`legion-of-bom-core`) exposes each pipeline stage as a composable
 function/trait. A CLI (`lob`) wraps the library for local, scriptable use. A web
-backend (axum — same stack as Understory) wraps the *same* library for the hosted
+backend (axum — same stack as Underst[118;1:3uory) wraps the *same* library for the hosted
 dashboard, so nothing is web-only — anything the dashboard can do, the CLI can do
 headless.
 
-### 2.3 [118;1:3uCanonical circuit representation
+### 2.3 Canonical circuit representation
 Deferred per decision: SKiDL-native for now, IR extracted once a second DSL is real.
 Flag for later sections: pipeline stages downstream of circuit definition
 (validation, sim, layout) should still be written against a thin internal interface
@@ -206,6 +208,34 @@ having 2+ circuits before anything gets extracted into a shared `circuits/lib`
 module. Revisit after Phase 0 and the slew limiter (Phase 1) are both done — by then
 there'll be enough real examples (RC filter, op-amp gain stage, OTA slew stage) to
 know what's actually common.
+
+### 3.5 Global parts library (pinout/rating verification)
+`define_circuit` — whether invoked directly (writing SKiDL by hand), via the
+`lob` CLI, or via an MCP-driving agent (see MCP.md) — resolves parts by MPN
+against a **global, Dolt-backed parts library**, not model/training memory and
+not a per-project file. This is core `legion-of-bom-core` architecture, not an
+agent-only construct: the same trust rules apply regardless of entry point.
+
+- **Sourcing order**: distributor-official CAD library (DigiKey's in-house
+  KiCad library, JLCPCB/EasyEDA) → broader CAD library (SnapEDA/Ultra
+  Librarian, checking verification status) → PDF datasheet extraction as
+  fallback, sourced only from a distributor API's datasheet URL field, never a
+  general web search
+- **Every extracted pin/rating carries a citation** (source, page/section) —
+  see MCP.md Section 1 for the full schema (`parts`, `part_pins`,
+  `part_ratings` tables)
+- **`verified_by_human` gates real use**: a part can be fetched and extracted
+  automatically, but `layout` and `generate_bom` (Section 6, Section 9) refuse
+  to run against any part that hasn't been human-confirmed at least once.
+  Verification is global and one-time per part — reused across every future
+  project, not re-checked per repo
+- This exists specifically to prevent a repeat of the LM13700-pinout-from-
+  memory mistake made earlier in this project — the fix is structural
+  (a gate the pipeline enforces) rather than a process reminder to double-check
+
+Full detail, tool schemas, and the agent-facing flow live in MCP.md — that
+document describes the agent surface of this same core mechanism, not a
+separate implementation of it.
 
 ---
 
@@ -333,3 +363,41 @@ the case where layout mistakes are audible and hard to diagnose after the fact,
 this escape hatch is treated as a feature, not a shortfall — the loop's job is
 to auto-resolve what's mechanically resolvable and clearly surface what needs
 judgment.
+
+---
+
+## 4. Validation Layer
+
+*(4.1 ERC and 4.2 project-specific rule extensions remain TOC-only — filling
+in 4.3 out of order because it's a cross-cutting concern that also touches
+Sections 3 and 9)*
+
+### 4.3 Parts verification gate
+Before `layout` (Section 6) or `generate_bom` (Section 9) run, validation
+checks that every part referenced in the circuit has `verified_by_human =
+TRUE` in the global parts library (Section 3.5) and that the circuit's
+open-questions checklist has no unresolved items. This is enforced inside
+`legion-of-bom-core` itself — identical behavior whether the pipeline is
+driven by the `lob` CLI directly or by an agent through MCP (see MCP.md
+Section 1.4 and 2.2). Failing either check blocks the run and surfaces the
+specific unresolved items rather than proceeding on unverified data — the
+structural fix for the LM13700-pinout-from-memory mistake made earlier in
+this project.
+
+---
+
+## 9. BOM & PCBA Pipeline
+
+*(9.1–9.3 and 9.5 remain TOC-only — filling in 9.4 out of order for the same
+reason as 4.3 above)*
+
+### 9.4 BOM accuracy/verification — this has to be airtight
+BOM generation reads part records (pricing, stock, footprint) from the same
+global parts library used by circuit definition and layout (Section 3.5), not
+a separate lookup. Practical consequence: a part's `verified_by_human` status
+is not just a layout-time gate — `generate_bom` checks it too, for the same
+reason. An unverified pinout is a layout risk; an unverified part record feeding
+a real JLCPCB/Mouser/DigiKey order is a money risk on top of that, since a
+misidentified part (wrong package, wrong footprint, wrong voltage rating) can
+turn into a bad PCBA order rather than just a bad board file. Same gate,
+enforced at the same core layer, for both reasons at once.
