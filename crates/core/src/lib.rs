@@ -11,11 +11,13 @@
 //! library — anything one surface can do, the other can too.
 
 pub mod model;
+pub mod skidl;
 pub mod source;
 pub mod stage;
 pub mod tools;
 
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
+pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
 pub use tools::{find_on_path, phase0_tools, Tool, ToolStatus};

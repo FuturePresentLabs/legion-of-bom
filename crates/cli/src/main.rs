@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use legion_of_bom_core::SkidlRunner;
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
 #[derive(Debug, Parser)]
@@ -56,17 +57,58 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the pipeline against a circuit. Skeleton: the Phase 0 stages plug in here.
+/// Run the pipeline against a circuit.
+///
+/// Stage 1 (SKiDL runner) is wired; parse -> validate -> simulate -> verify ->
+/// bom are the remaining Phase 0 tasks and plug in below.
 fn run(circuit: PathBuf) -> Result<()> {
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
 
-    tracing::info!(circuit = %circuit.display(), "lob run (skeleton)");
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+
+    tracing::info!(circuit = %circuit.display(), "lob run");
     println!("lob run: {}", circuit.display());
-    println!("planned stages: skidl -> parse -> validate -> simulate -> verify -> bom");
-    println!("(stages not yet implemented — see the beads 'Phase 0' epic)");
+
+    // Stage 1: SKiDL — run the script, capture the netlist + ERC report.
+    let runner = SkidlRunner::discover(&work_dir);
+    let skidl_run = runner
+        .run(&circuit)
+        .with_context(|| "SKiDL stage failed (try `lob doctor`)")?;
+
+    println!(
+        "  ✓ skidl     netlist: {}",
+        skidl_run.netlist_path.display()
+    );
+    match &skidl_run.erc_report {
+        Some(report) => {
+            let summary = erc_summary(report);
+            println!("             ERC: {summary}");
+        }
+        None => println!("             ERC: (no report emitted)"),
+    }
+
+    println!("  … parse -> validate -> simulate -> verify -> bom: not yet implemented");
+    println!("    (see the beads 'Phase 0' epic)");
     Ok(())
+}
+
+/// One-line summary from a SKiDL ERC report: the counts line if present, else
+/// the first non-empty line.
+fn erc_summary(report: &str) -> String {
+    report
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|l| l.contains("warnings found") || l.contains("errors found"))
+        .or_else(|| report.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("(empty)")
+        .to_string()
 }
 
 /// Initialize tracing. `RUST_LOG` wins if set; otherwise `-v` picks the level.
