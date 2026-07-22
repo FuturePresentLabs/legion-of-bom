@@ -240,3 +240,26 @@ per-part verification in step 5. Step 11 stays yours on purpose.
       Mattermost use: AGPL protects the community edition from silent
       competing forks, CLA preserves the company's ability to sell a
       proprietary version of the same code. No repo split needed.
+
+
+---
+
+MCP tools for BTS creatives
+
+All of these are thin wrappers over commands the pipeline already uses or was going to need — nothing here is new engineering, mostly new call sites:
+
+export_schematic_image — kicad-cli sch export svg (or pdf), headless, no GUI dependency. Clean schematic shots for free.
+export_pcb_layout_image — kicad-cli pcb export svg, with a layer-set param (e.g. silkscreen+copper for a "clean" shot, all layers for an "X-ray" shot). Same export path as gerbers, just SVG instead of Gerber.
+export_pcb_3d_render — kicad-cli pcb export step, then either (a) screenshot KiCad's own 3D viewer over the existing IPC connection you already use for layout/panels — fastest, lowest quality — or (b) feed the STEP into a headless Blender render for a real hero shot. Start with (a), upgrade later.
+export_gerber_preview — gerbers aren't visually pretty on their own; render them to a bitmap via something like tracespace/pcb-stackup (JS) or gerbv (CLI) for a "here's the copper" shot.
+export_bom_table_image — the BOM epic already produces a table; a simple HTML→PNG render (headless Chromium, or even just styled markdown → image) turns that into something postable.
+export_panel_preview — the DXF export (7.1) already exists for fab ordering; adding the SVG sibling (7.2, currently deprioritized since fab vendors only want DXF) is now worth bumping up specifically for this — it's the one that makes the front-panel art actually look good in a shot, which DXF alone doesn't buy you.
+The agent + skill
+
+creative-bts-package as a skill, driven by an agent that:
+
+Takes a project repo path + git ref (so a "package" is tied to a specific commit/revision, consistent with how the pipeline already treats attempts as commits)
+Calls the export tools above in sequence, writes outputs to a dated folder
+Diffs against the last package's git ref to know what actually changed (new part, routing revision, panel tweak) — that diff is the natural hook for autolayout's voiceover script, so the agent can draft a one-paragraph "what's new" caption stub alongside the images instead of you writing it from scratch each time
+
+That's genuinely not a big lift — it's an orchestration skill over exports that mostly already exist or are single kicad-cli calls away, plus a git diff you get for free because everything's already version-controlled. The only real new work is the SVG panel export (bumping 7.2 forward) and picking option 1 vs. 2 for the 3D render.

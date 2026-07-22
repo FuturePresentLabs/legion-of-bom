@@ -11,10 +11,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use legion_of_bom_core::skidl::kicad_symbol_dir;
 use legion_of_bom_core::{
-    analytic_check, default_parts_dir, generate_bom, parse_netlist_file, simulate_ac, validate_erc,
-    CircuitSource, Finding, PartRecord, PartsLibrary, PipelineReport, Severity, SimConfig,
-    SkidlRunner, StageOutcome,
+    analytic_check, default_parts_dir, fetch_from_kicad, generate_bom, parse_netlist_file,
+    simulate_ac, validate_erc, CircuitSource, Finding, PartRecord, PartsLibrary, PipelineReport,
+    Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -58,6 +59,13 @@ enum PartsCmd {
         manufacturer: Option<String>,
         #[arg(long)]
         datasheet: Option<String>,
+    },
+    /// Fetch a part's pins + datasheet from a source into the library (unverified).
+    Fetch {
+        mpn: String,
+        /// Source: `kicad` (installed KiCad library). Distributor APIs come next.
+        #[arg(long, default_value = "kicad")]
+        source: String,
     },
     /// Mark a part human-verified (the gate real ordering/layout checks).
     Verify {
@@ -211,6 +219,23 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             lib.mark_verified(&mpn, &by)?;
             lib.commit(&format!("parts: verify {mpn}"))?;
             println!("verified {mpn} (by {by})");
+        }
+        PartsCmd::Fetch { mpn, source } => {
+            let part = match source.as_str() {
+                "kicad" => {
+                    let dir = kicad_symbol_dir()
+                        .context("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")?;
+                    fetch_from_kicad(&mpn, dir.path())?
+                }
+                other => anyhow::bail!(
+                    "unknown source '{other}' (only `kicad` so far; JLCPCB/Mouser next)"
+                ),
+            };
+            lib.upsert_part(&part)?;
+            lib.commit(&format!("parts: fetch {mpn} from {source}"))?;
+            println!("fetched {mpn} from {source}:");
+            print_part(&part);
+            println!("\n(unverified — run `lob parts verify {mpn}` after confirming)");
         }
     }
     Ok(())

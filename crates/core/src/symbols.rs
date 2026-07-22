@@ -12,7 +12,7 @@
 //! the Dolt-backed parts library becomes the (verified, cited) source of these
 //! models instead of reading symbol files directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::sexpr::Sexpr;
@@ -120,6 +120,99 @@ fn model_from_symbol(
         pin_order,
         params: None,
     }))
+}
+
+/// Structured data read from a KiCad symbol — pins plus key properties. Used by
+/// the parts library's KiCad-library fetch source ([`crate::fetch`], okm.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolData {
+    /// `(pin_number, pin_name)`, sorted by pin number.
+    pub pins: Vec<(String, String)>,
+    pub datasheet: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Find which `<lib>.kicad_sym` in `symbol_dir` defines a symbol named `part`.
+pub fn find_symbol_lib(symbol_dir: &Path, part: &str) -> Result<Option<String>, StageError> {
+    let needle = format!("(symbol \"{part}\"");
+    let mut libs: Vec<PathBuf> = std::fs::read_dir(symbol_dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("kicad_sym"))
+        .collect();
+    libs.sort();
+    for path in libs {
+        if std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains(&needle)
+        {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                return Ok(Some(stem.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Read a symbol's pins + `Datasheet`/`Description` properties from a library.
+/// Pins are collected from the symbol's nested unit sub-symbols and de-duplicated.
+pub fn read_symbol(
+    symbol_dir: &Path,
+    lib: &str,
+    part: &str,
+) -> Result<Option<SymbolData>, StageError> {
+    let path = symbol_dir.join(format!("{lib}.kicad_sym"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| StageError::Other(format!("reading {}: {e}", path.display())))?;
+    let root = Sexpr::parse(&text)
+        .map_err(|e| StageError::Other(format!("parsing {}: {e}", path.display())))?;
+    let Some(sym) = root
+        .get_all("symbol")
+        .into_iter()
+        .find(|s| s.nth_atom(1) == Some(part))
+    else {
+        return Ok(None);
+    };
+
+    let prop = |name: &str| {
+        sym.get_all("property")
+            .into_iter()
+            .find(|p| p.nth_atom(1) == Some(name))
+            .and_then(|p| p.nth_atom(2))
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    };
+
+    let mut pins: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    for unit in sym.get_all("symbol") {
+        for pin in unit.get_all("pin") {
+            let number = pin
+                .get("number")
+                .and_then(|n| n.nth_atom(1))
+                .unwrap_or_default();
+            if number.is_empty() || !seen.insert(number.to_string()) {
+                continue;
+            }
+            let name = pin
+                .get("name")
+                .and_then(|n| n.nth_atom(1))
+                .unwrap_or_default();
+            pins.push((number.to_string(), name.to_string()));
+        }
+    }
+    pins.sort_by_key(|p| pin_sort_key(&p.0));
+
+    Ok(Some(SymbolData {
+        pins,
+        datasheet: prop("Datasheet"),
+        description: prop("Description"),
+    }))
+}
+
+/// Sort key that orders pin numbers numerically when possible, else lexically.
+fn pin_sort_key(n: &str) -> (u64, String) {
+    (n.parse::<u64>().unwrap_or(u64::MAX), n.to_string())
 }
 
 /// Expand a `${…SYMBOL_DIR}` prefix in a `Sim.Library` path to the real dir.
