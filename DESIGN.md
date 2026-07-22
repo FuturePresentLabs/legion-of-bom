@@ -43,6 +43,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    6.6 KiCad pcbnew integration (from IR/netlist to board file)
    6.7 DFM checks (JLCDFM + mechanical/3D collision checks)
    6.8 Manual layout escape hatch — where the human loop stays in
+   6.9 PanelSpec trait — the format-agnostic seam (filled — see body)
 
 7. **Panel Design**
    7.1 DXF output (filled — see body)
@@ -116,7 +117,7 @@ machine, no network-facing component. That proves the loop before any real Puget
 Audio product design goes through it. Full "done" (later phases): a user defines a
 circuit in SKiDL (or a future DSL) inside a git repo; legion-of-bom runs the same
 pipeline, can quote and place a JLCPCB PCBA order via their API, tracks inventory in
-Dolt, and triggers reorders — through a web dashboard, usable by more than one
+Dolt, and [118;1:3utriggers reorders — through a web dashboard, usable by more than one
 tenant/business.
 
 ### 1.3 Non-goals (v1)
@@ -151,7 +152,7 @@ everything that consumes circuit data.
 
 ### 2.4 Repo & project structure
 - **FuturePresentLabs/legion-of-bom** — the tool itself (core lib + CLI + web
-  ba[118;1:3uckend), AGPLv3
+  backend), AGPLv3
 - **Board/circuit repos** — one per project (e.g. `puget-audio-2opfm`,
   `puget-audio-slew-limiter`), each can hold multiple related circuits, plain git.
   In v1, these are local clones on the machine running `lob` — the CLI/backend
@@ -390,6 +391,32 @@ the case where layout mistakes are audible and hard to diagnose after the fact,
 this escape hatch is treated as a feature, not a shortfall — the loop's job is
 to auto-resolve what's mechanically resolvable and clearly surface what needs
 judgment.
+
+### 6.9 PanelSpec trait — the format-agnostic seam
+Same move as Section 3.3's deferred circuit IR, applied to panels: rather than
+designing shared geometry across all four formats now (Eurorack, Guitar
+Pedal, Rack Mount, 500-series) — or the reverse mistake of hard-coding
+Eurorack-specific concepts (HP, U) directly into layout code — a thin
+`PanelSpec` trait is defined now, implemented fully for Eurorack only (what's
+actually shipping), with the other formats' implementations deferred until
+one of them is actually being built.
+
+**Shape of the trait**: dimensions in mm (each format's native units —
+HP/U for Eurorack, enclosure size class for pedals, rack U-height ×
+19"-fraction, 500-series' fixed slot — translate into mm through the
+implementation, not exposed as universal concepts to the rest of the
+pipeline), a mounting-hole list, and a list of anchored cutouts (position,
+rotation, footprint reference) that Section 7's DXF export and Section 6's
+layout loop both read through the trait rather than assuming Eurorack.
+
+**Why this isn't "design all four now" or "hard-code Eurorack now"**: the
+four formats aren't similar enough to unify speculatively. 500-series in
+particular is mechanically the odd one out — audio I/O typically runs through
+a card-edge connector into the shared lunchbox bus, not individual
+front-panel jacks the way Eurorack/pedal/rack all work — forcing it into the
+same anchored-jack-pot cutout model used for the other three would be wrong,
+not just incomplete, so its `PanelSpec` implementation waits until it's
+actually being built rather than being guessed at now.
 
 ---
 
