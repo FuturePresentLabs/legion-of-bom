@@ -8,6 +8,7 @@
 //!     LIBRARIES.md §1) — yields pins + the symbol's datasheet URL.
 //!   - [`fetch_from_jlcpcb`]: JLCPCB's authoritative distributor data by LCSC
 //!     code — yields datasheet URL + structured parameters (ratings) + MPN.
+//!
 //! PDF-page citations (`cited_page`) come from a future PDF-extraction source.
 
 use std::path::Path;
