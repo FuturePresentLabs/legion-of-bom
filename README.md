@@ -32,6 +32,10 @@ values — so the loop is trustworthy before a real board depends on it.
   report types. Deliberately DSL-agnostic (DESIGN.md 2.3/3.3).
 - **`lob`** (`crates/cli`) — the command-line interface, a thin wrapper over the
   core library.
+- **Parts library** — a global, Dolt-backed store of verified part definitions
+  (pinout, ratings, SPICE models) keyed by MPN; cross-project and version-
+  controlled. Requires [`dolt`](https://github.com/dolthub/dolt). Try
+  `lob parts add <MPN> --manufacturer …`, `lob parts show <MPN>`.
 - **MCP server** — next interface after the CLI, over the same core library.
 - **Web backend / UI** — deferred (axum + Slint/React later); nothing is web-only.
 

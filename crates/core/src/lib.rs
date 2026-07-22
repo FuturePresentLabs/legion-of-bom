@@ -13,6 +13,7 @@
 pub mod bom;
 pub mod model;
 pub mod netlist;
+pub mod parts;
 mod sexpr;
 pub mod skidl;
 pub mod source;
@@ -27,6 +28,7 @@ pub mod verify;
 pub use bom::{generate_bom, Bom, BomLine};
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
+pub use parts::{default_parts_dir, PartRecord, PartsError, PartsLibrary, PinRecord, RatingRecord};
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
 pub use spice::{simulate_ac, AcPoint, AcResult, SimConfig};

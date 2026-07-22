@@ -8,3 +8,4 @@ description = "Core pipeline library for legion-of-bom: circuit model, stage tra
 
 [dependencies]
 thiserror.workspace = true
+serde_json.workspace = true

@@ -12,8 +12,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::{
-    analytic_check, generate_bom, parse_netlist_file, simulate_ac, validate_erc, CircuitSource,
-    Finding, PipelineReport, Severity, SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, default_parts_dir, generate_bom, parse_netlist_file, simulate_ac, validate_erc,
+    CircuitSource, Finding, PartRecord, PartsLibrary, PipelineReport, Severity, SimConfig,
+    SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -37,6 +38,33 @@ enum Command {
     },
     /// Check that the external toolchain (ngspice, kicad-cli, SKiDL) is available.
     Doctor,
+    /// Inspect and edit the global, Dolt-backed parts library.
+    Parts {
+        #[command(subcommand)]
+        action: PartsCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PartsCmd {
+    /// List all MPNs in the library.
+    List,
+    /// Show a part (pins, ratings, verification status) by MPN.
+    Show { mpn: String },
+    /// Add or update a part's metadata (unverified; pins/ratings come from fetch).
+    Add {
+        mpn: String,
+        #[arg(long)]
+        manufacturer: Option<String>,
+        #[arg(long)]
+        datasheet: Option<String>,
+    },
+    /// Mark a part human-verified (the gate real ordering/layout checks).
+    Verify {
+        mpn: String,
+        #[arg(long, default_value = "cli-user")]
+        by: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -46,6 +74,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Run { circuit } => run(circuit),
         Command::Doctor => doctor::run(),
+        Command::Parts { action } => parts_cmd(action),
     };
 
     match result {
@@ -141,6 +170,98 @@ fn run(circuit: PathBuf) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("pipeline reported stage failures")
+    }
+}
+
+/// Handle `lob parts …` against the global parts library.
+fn parts_cmd(action: PartsCmd) -> Result<()> {
+    let lib = PartsLibrary::open(default_parts_dir())
+        .with_context(|| "opening the parts library (is `dolt` installed?)")?;
+    match action {
+        PartsCmd::List => {
+            let mpns = lib.list_mpns()?;
+            if mpns.is_empty() {
+                println!("(parts library is empty)");
+            }
+            for mpn in mpns {
+                println!("{mpn}");
+            }
+        }
+        PartsCmd::Show { mpn } => match lib.get_part(&mpn)? {
+            None => println!("not found: {mpn}"),
+            Some(part) => print_part(&part),
+        },
+        PartsCmd::Add {
+            mpn,
+            manufacturer,
+            datasheet,
+        } => {
+            // Preserve existing pins/ratings/verification; update metadata only.
+            let mut part = lib.get_part(&mpn)?.unwrap_or_else(|| PartRecord::new(&mpn));
+            part.manufacturer = manufacturer.or(part.manufacturer);
+            part.datasheet_url = datasheet.or(part.datasheet_url);
+            lib.upsert_part(&part)?;
+            lib.commit(&format!("parts: add/update {mpn}"))?;
+            println!("saved {mpn}");
+        }
+        PartsCmd::Verify { mpn, by } => {
+            if lib.get_part(&mpn)?.is_none() {
+                anyhow::bail!("no such part: {mpn}");
+            }
+            lib.mark_verified(&mpn, &by)?;
+            lib.commit(&format!("parts: verify {mpn}"))?;
+            println!("verified {mpn} (by {by})");
+        }
+    }
+    Ok(())
+}
+
+fn print_part(part: &PartRecord) {
+    println!("MPN:          {}", part.mpn);
+    println!(
+        "manufacturer: {}",
+        part.manufacturer.as_deref().unwrap_or("-")
+    );
+    println!(
+        "datasheet:    {}",
+        part.datasheet_url.as_deref().unwrap_or("-")
+    );
+    let verified = if part.verified_by_human {
+        format!(
+            "yes{}",
+            part.verified_by
+                .as_deref()
+                .map(|b| format!(" (by {b})"))
+                .unwrap_or_default()
+        )
+    } else {
+        "no".to_string()
+    };
+    println!("verified:     {verified}");
+    if !part.pins.is_empty() {
+        println!("pins:");
+        for pin in &part.pins {
+            let cite = pin
+                .cited_page
+                .map(|p| format!("  [p.{p}]"))
+                .unwrap_or_default();
+            println!("  {:>3} = {}{cite}", pin.pin_number, pin.pin_name);
+        }
+    }
+    if !part.ratings.is_empty() {
+        println!("ratings:");
+        for r in &part.ratings {
+            let unit = r
+                .unit
+                .as_deref()
+                .map(|u| format!(" {u}"))
+                .unwrap_or_default();
+            let cite = r
+                .cited_page
+                .map(|p| format!("  [p.{p}]"))
+                .unwrap_or_default();
+            println!("  {} = {}{unit}{cite}", r.name, r.value);
+        }
     }
 }
 
