@@ -1,0 +1,9 @@
+# Python dependencies for the SKiDL circuit-definition stage (Phase 0).
+#
+# Install into the project virtualenv:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# See docs/TOOLING.md for the full toolchain (ngspice, kicad-cli, symbol libs).
+
+skidl==2.2.3

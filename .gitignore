@@ -3,6 +3,11 @@
 **/*.rs.bk
 # Cargo.lock IS committed: this is a binary/app workspace (lob), not a library.
 
+# Python virtualenv for the SKiDL stage (recreate from requirements.txt)
+/.venv/
+__pycache__/
+*.pyc
+
 # Local pipeline outputs / scratch (generated netlists, boards, gerbers)
 /out/
 

@@ -13,7 +13,9 @@
 pub mod model;
 pub mod source;
 pub mod stage;
+pub mod tools;
 
 pub use model::{Circuit, Net, Part, PinRef, RefDes};
 pub use source::CircuitSource;
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
+pub use tools::{find_on_path, phase0_tools, Tool, ToolStatus};

@@ -5,6 +5,8 @@
 //! BOM) gets wired in; see the beads "Phase 0" epic. Today it only resolves the
 //! circuit path and prints the planned stages.
 
+mod doctor;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -30,6 +32,8 @@ enum Command {
         /// Path to the circuit definition (e.g. a SKiDL script).
         circuit: PathBuf,
     },
+    /// Check that the external toolchain (ngspice, kicad-cli, SKiDL) is available.
+    Doctor,
 }
 
 fn main() -> ExitCode {
@@ -38,6 +42,7 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Run { circuit } => run(circuit),
+        Command::Doctor => doctor::run(),
     };
 
     match result {
