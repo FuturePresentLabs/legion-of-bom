@@ -1,0 +1,18 @@
+[package]
+name = "legion-of-bom-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "lob: command-line interface for the legion-of-bom pipeline."
+
+[[bin]]
+name = "lob"
+path = "src/main.rs"
+
+[dependencies]
+legion-of-bom-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

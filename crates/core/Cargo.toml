@@ -1,0 +1,10 @@
+[package]
+name = "legion-of-bom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core pipeline library for legion-of-bom: circuit model, stage traits, BOM."
+
+[dependencies]
+thiserror.workspace = true

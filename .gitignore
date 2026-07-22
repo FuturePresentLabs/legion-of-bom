@@ -1,3 +1,13 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+# Cargo.lock IS committed: this is a binary/app workspace (lob), not a library.
+
+# Local pipeline outputs / scratch (generated netlists, boards, gerbers)
+/out/
+
+# OS / editor
+.DS_Store
 
 # Beads / Dolt files (added by bd init)
 .dolt/

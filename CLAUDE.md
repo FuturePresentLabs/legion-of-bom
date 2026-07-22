@@ -60,18 +60,44 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+Rust workspace. Run the gates in this order — cheapest feedback first — and run
+fmt/clippy often:
 
 ```bash
-# Example:
-# npm install
-# npm test
+cargo check          # fast type/borrow check (run first, run often)
+cargo test           # unit tests
+cargo build          # produce the lob binary
+
+cargo fmt --check    # formatting; `cargo fmt` to fix
+cargo clippy --all-targets --all-features -- -D warnings   # lints, warnings are errors
+
+cargo run -p legion-of-bom-cli -- run <circuit>            # exercise the CLI
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+Cargo workspace (see `DESIGN.md` for the full design):
+
+- **`crates/core`** (`legion-of-bom-core`) — the pipeline library. Circuit model
+  (`model.rs`), the `CircuitSource` trait every stage reads through (`source.rs`),
+  the `Stage` traits + `PipelineReport`/`StageError` (`stage.rs`). Deliberately
+  DSL-agnostic (DESIGN.md 2.3/3.3): the only planned producer today is a parsed
+  SKiDL-generated KiCad netlist, but no stage may depend on that.
+- **`crates/cli`** (`lob`) — thin CLI wrapper over the core library. `lob run
+  <circuit>` is where the Phase 0 pipeline stages get wired in.
+- **MCP server / web backend / UI** — deferred; all wrap the same core library so
+  nothing is surface-only.
+
+The roadmap lives in beads as one epic per DESIGN.md §14 phase. The Phase 0 epic is
+the shortest path to a working end-to-end loop.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Pipeline stages consume circuits **only** through the `CircuitSource` trait,
+  never a concrete DSL/netlist type — so a future DSL or extracted IR is one new
+  impl, not a rewrite.
+- Stages that *ran but found problems* return a `StageOutcome` (findings +
+  pass/fail); stages that *could not run* (missing tool, bad input) return
+  `StageError`. Keep that distinction.
+- External-tool stages (SKiDL, ngspice, KiCad) shell out and must fail gracefully
+  when the tool is absent — never panic.
