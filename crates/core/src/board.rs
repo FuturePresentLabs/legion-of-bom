@@ -95,14 +95,21 @@ impl Placer for GridPlacer {
 pub struct BoardOptions {
     pub footprint_dir: PathBuf,
     pub placer: Box<dyn Placer>,
+    /// Net to flood the bottom-layer ground pour to (DESIGN 6.2's default
+    /// convention); `None` disables the pour.
+    pub ground_net: Option<String>,
+    /// Margin (mm) added around the placed parts for the board outline.
+    pub outline_margin_mm: f64,
 }
 
 impl BoardOptions {
-    /// Default options: naive grid placement, footprints from `footprint_dir`.
+    /// Default options: grid placement, a `GND` ground pour, 5 mm outline margin.
     pub fn new(footprint_dir: impl Into<PathBuf>) -> Self {
         BoardOptions {
             footprint_dir: footprint_dir.into(),
             placer: Box::new(GridPlacer::default()),
+            ground_net: Some("GND".into()),
+            outline_margin_mm: 5.0,
         }
     }
 }
@@ -176,8 +183,17 @@ pub fn generate_board(
     for name in &net_names {
         board.push(net(net_index[name.as_str()], name));
     }
-    // Seam: ground-pour zones (6.2) and the board outline (from PanelSpec) get
-    // appended here in later tasks.
+    // Board outline (bounding box of placed parts + margin) + bottom-layer
+    // ground pour (DESIGN 6.2). A real panel-driven outline arrives with
+    // PanelSpec (j54.10); this is a valid rectangular first cut.
+    if let Some(rect) = outline_rect(&placements, options.outline_margin_mm) {
+        board.push(edge_cuts_rect(rect));
+        if let Some(gnd) = &options.ground_net {
+            if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
+                board.push(ground_zone(net_index[name.as_str()], name, rect));
+            }
+        }
+    }
     board.extend(footprints);
 
     Ok(Sexpr::list(board).to_sexpr_string() + "\n")
@@ -284,6 +300,94 @@ fn transform_footprint(
 
 fn kv(key: &str, value: Sexpr) -> Sexpr {
     Sexpr::list(vec![Sexpr::sym(key), value])
+}
+
+/// `(min_x, min_y, max_x, max_y)`.
+type Rect = (f64, f64, f64, f64);
+
+/// Bounding box of the placements, expanded by `margin`; `None` if no parts.
+fn outline_rect(placements: &HashMap<String, Placement>, margin: f64) -> Option<Rect> {
+    if placements.is_empty() {
+        return None;
+    }
+    let mut r = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in placements.values() {
+        r.0 = r.0.min(p.x_mm);
+        r.1 = r.1.min(p.y_mm);
+        r.2 = r.2.max(p.x_mm);
+        r.3 = r.3.max(p.y_mm);
+    }
+    Some((r.0 - margin, r.1 - margin, r.2 + margin, r.3 + margin))
+}
+
+/// An `Edge.Cuts` rectangle — the board outline.
+fn edge_cuts_rect((x1, y1, x2, y2): Rect) -> Sexpr {
+    Sexpr::list(vec![
+        Sexpr::sym("gr_rect"),
+        Sexpr::list(vec![
+            Sexpr::sym("start"),
+            Sexpr::sym(mm(x1)),
+            Sexpr::sym(mm(y1)),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("end"),
+            Sexpr::sym(mm(x2)),
+            Sexpr::sym(mm(y2)),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("stroke"),
+            kv("width", Sexpr::sym("0.15")),
+            kv("type", Sexpr::sym("solid")),
+        ]),
+        kv("fill", Sexpr::sym("no")),
+        kv("layer", Sexpr::string("Edge.Cuts")),
+        kv("uuid", Sexpr::string(det_uuid("edge.cuts"))),
+    ])
+}
+
+/// A bottom-layer (`B.Cu`) ground pour over `rect`, flooded to `net`.
+fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect) -> Sexpr {
+    let xy =
+        |x: f64, y: f64| Sexpr::list(vec![Sexpr::sym("xy"), Sexpr::sym(mm(x)), Sexpr::sym(mm(y))]);
+    Sexpr::list(vec![
+        Sexpr::sym("zone"),
+        kv("net", Sexpr::sym(net_idx.to_string())),
+        kv("net_name", Sexpr::string(net_name)),
+        kv("layer", Sexpr::string("B.Cu")),
+        kv("uuid", Sexpr::string(det_uuid("gnd.zone"))),
+        Sexpr::list(vec![
+            Sexpr::sym("hatch"),
+            Sexpr::sym("edge"),
+            Sexpr::sym("0.5"),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("connect_pads"),
+            kv("clearance", Sexpr::sym("0.2")),
+        ]),
+        kv("min_thickness", Sexpr::sym("0.25")),
+        kv("filled_areas_thickness", Sexpr::sym("no")),
+        Sexpr::list(vec![
+            Sexpr::sym("fill"),
+            Sexpr::sym("yes"),
+            kv("thermal_gap", Sexpr::sym("0.5")),
+            kv("thermal_bridge_width", Sexpr::sym("0.5")),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("polygon"),
+            Sexpr::list(vec![
+                Sexpr::sym("pts"),
+                xy(x1, y1),
+                xy(x2, y1),
+                xy(x2, y2),
+                xy(x1, y2),
+            ]),
+        ]),
+    ])
 }
 
 fn net(index: usize, name: &str) -> Sexpr {
@@ -404,5 +508,12 @@ mod tests {
         assert!(board.contains("(kicad_pcb"));
         assert!(board.contains(r#""Resistor_SMD:R_0805_2012Metric""#));
         assert!(board.contains(r#"(net"#) && board.contains(r#""OUT""#));
+        // Board outline (Edge.Cuts) + bottom ground pour (DESIGN 6.2).
+        assert!(board.contains(r#""Edge.Cuts""#), "needs a board outline");
+        assert!(
+            board.contains("(zone") && board.contains(r#""B.Cu""#),
+            "needs a ground pour"
+        );
+        assert!(board.contains(r#"(net_name "GND")"#), "pour flooded to GND");
     }
 }

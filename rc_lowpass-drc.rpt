@@ -1,11 +1,8 @@
 ** Drc report for rc_lowpass.kicad_pcb **
-** Created on 2026-07-22T05:43:29 **
+** Created on 2026-07-22T05:50:21 **
 ** Report includes: Errors, Warnings **
 
-** Found 1 DRC violations **
-[invalid_outline]: Board has malformed outline (no edges found on Edge.Cuts layer)
-    Local override; error
-    @(0.0000 mm, 0.0000 mm): PCB
+** Found 0 DRC violations **
 
 ** Found 1 unconnected pads **
 [unconnected_items]: Missing connection between items

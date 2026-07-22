@@ -242,14 +242,9 @@ fn board_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
     std::fs::write(&path, board).with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
-    println!(
-        "  footprints placed (grid), unrouted — validate: kicad-cli pcb drc {}",
-        path.display()
-    );
-    println!(
-        "  export: kicad-cli pcb export gerbers|pos {}",
-        path.display()
-    );
+    println!("  footprints placed (grid), unrouted, outline + GND pour");
+    println!("  validate: kicad-cli pcb drc {}", path.display());
+    println!("  export:   kicad-cli pcb export gerbers --check-zones (fills the pour) | export pos (CPL)");
     Ok(())
 }
 
