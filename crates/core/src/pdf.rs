@@ -145,15 +145,16 @@ impl Page {
         );
     }
 
-    /// Draw the document's shared image (`/Im0`) under a `cm` transform, clipped
-    /// to the rectangle `clip` (so an oversized image shows only there).
-    pub fn draw_image(&mut self, cm: [f64; 6], clip: (f64, f64, f64, f64)) {
+    /// Draw the document's shared image `/Im{im}` under a `cm` transform, clipped
+    /// to the rectangle `clip` (so an oversized image shows only there). `im`
+    /// indexes the `images` slice passed to [`document`].
+    pub fn draw_image(&mut self, cm: [f64; 6], clip: (f64, f64, f64, f64), im: usize) {
         let [a, b, c, d, e, ff] = cm;
         let (cx, cy, cw, ch) = clip;
         let _ = writeln!(
             self.ops,
             "q {cx:.2} {cy:.2} {cw:.2} {ch:.2} re W n \
-             {a:.5} {b:.5} {c:.5} {d:.5} {e:.3} {ff:.3} cm /Im0 Do Q"
+             {a:.5} {b:.5} {c:.5} {d:.5} {e:.3} {ff:.3} cm /Im{im} Do Q"
         );
     }
 
@@ -171,7 +172,9 @@ impl Page {
     }
 }
 
-/// Escape a string for a PDF literal `( … )`.
+/// Escape a string for a PDF literal `( … )`. The base font is WinAnsi, so common
+/// Unicode punctuation is transliterated to ASCII (an em dash rendered as `?`
+/// looks like a bug); anything else non-ASCII falls back to `?`.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -180,7 +183,11 @@ fn escape(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            // Non-ASCII would need proper encoding; approximate with '?'.
+            '—' | '–' => out.push('-'),
+            '×' => out.push('x'),
+            '→' => out.push_str("->"),
+            '“' | '”' => out.push('"'),
+            '‘' | '’' => out.push('\''),
             c if (c as u32) < 128 => out.push(c),
             _ => out.push('?'),
         }
@@ -188,10 +195,10 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Assemble `pages` into a complete PDF document (A4). `image`, if present, is
-/// embedded once as the shared `/Im0` XObject and available to every page's
-/// [`draw_image`](Page::draw_image).
-pub fn document(pages: &[Page], image: Option<&Image>) -> Vec<u8> {
+/// Assemble `pages` into a complete PDF document (A4). Each image in `images` is
+/// embedded once as `/Im0`, `/Im1`, … (shared across pages) and referenced by a
+/// page's [`draw_image`](Page::draw_image) via its index.
+pub fn document(pages: &[Page], images: &[&Image]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &str| {
@@ -199,12 +206,17 @@ pub fn document(pages: &[Page], image: Option<&Image>) -> Vec<u8> {
         // Object N is the Nth offset pushed; xref maps entry N → offsets[N-1].
         out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", offsets.len()).as_bytes());
     };
-    // The shared image XObject (if any) is appended after the page/content objects.
-    let img_obj = 5 + 2 * pages.len();
-    let xobject = if image.is_some() {
-        format!(" /XObject << /Im0 {img_obj} 0 R >>")
-    } else {
+    // The image XObjects are appended after the page/content objects: /Im{k} is
+    // object (5 + 2·pages) + k.
+    let img_obj0 = 5 + 2 * pages.len();
+    let xobject = if images.is_empty() {
         String::new()
+    } else {
+        let entries: String = (0..images.len())
+            .map(|k| format!("/Im{k} {} 0 R", img_obj0 + k))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(" /XObject << {entries} >>")
     };
 
     out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
@@ -256,8 +268,8 @@ pub fn document(pages: &[Page], image: Option<&Image>) -> Vec<u8> {
         );
     }
 
-    // Shared image XObject (raw JPEG via DCTDecode).
-    if let Some(img) = image {
+    // Shared image XObjects (raw JPEG via DCTDecode), in /Im0, /Im1, … order.
+    for img in images {
         offsets.push(out.len());
         out.extend_from_slice(
             format!(
@@ -296,6 +308,8 @@ mod tests {
     #[test]
     fn escapes_pdf_literals() {
         assert_eq!(escape("a(b)c\\d"), "a\\(b\\)c\\\\d");
+        // Common Unicode punctuation transliterates to ASCII, not '?'.
+        assert_eq!(escape("2 — 3 × 4"), "2 - 3 x 4");
     }
 
     #[test]
@@ -304,7 +318,7 @@ mod tests {
         p.set_fill(1.0, 0.0, 0.0);
         p.rect(10.0, 10.0, 50.0, 20.0, Paint::Fill);
         p.text(10.0, 40.0, 12.0, Font::Bold, "Step 1");
-        let bytes = document(&[p], None);
+        let bytes = document(&[p], &[]);
         assert!(bytes.starts_with(b"%PDF-1.7"));
         assert!(bytes.ends_with(b"%%EOF\n"));
         let s = String::from_utf8_lossy(&bytes);

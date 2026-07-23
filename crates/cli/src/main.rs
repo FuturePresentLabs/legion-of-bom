@@ -480,25 +480,45 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
 
     let guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Diagram: a photorealistic UNPOPULATED board render (bare pads a builder
-    // populates) when kicad-cli is available; fall back to the schematic top-down.
+    // Diagram: photorealistic UNPOPULATED board renders (bare pads a builder
+    // populates) when kicad-cli is available — top always, plus the bottom side
+    // when any part mounts on the back; fall back to the schematic top-down.
     std::fs::create_dir_all(&work_dir)?;
     let board_file = work_dir.join(format!("{stem}.kicad_pcb"));
     std::fs::write(&board_file, &board)?;
     let kicad_cli = kicad_cli_path();
-    let render = kicad_cli
+    let any_back = guide
+        .steps
+        .iter()
+        .any(|s| s.parts.iter().any(|p| p.back));
+    let top = kicad_cli
         .as_ref()
-        .and_then(|k| render_board_png(&board_file, k, true).ok());
-    match &render {
-        Some((_, w, h)) => println!("  diagram: photoreal bare-board render ({w}×{h})"),
+        .and_then(|k| render_board_png(&board_file, k, true, false).ok());
+    let bottom = if any_back {
+        kicad_cli
+            .as_ref()
+            .and_then(|k| render_board_png(&board_file, k, true, true).ok())
+    } else {
+        None
+    };
+    match &top {
+        Some((_, w, h)) => println!(
+            "  diagram: photoreal bare-board render ({w}×{h}){}",
+            if bottom.is_some() { " + bottom side" } else { "" }
+        ),
         None => println!("  diagram: schematic top-down (kicad-cli not found)"),
     }
-    let board_png = render.as_ref().map(|(png, w, h)| BoardPng {
+    let top_png = top.as_ref().map(|(png, w, h)| BoardPng {
         png,
         width: *w,
         height: *h,
     });
-    let html = guide_to_html(&guide, board_png);
+    let bottom_png = bottom.as_ref().map(|(png, w, h)| BoardPng {
+        png,
+        width: *w,
+        height: *h,
+    });
+    let html = guide_to_html(&guide, top_png, bottom_png);
 
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}-guide.html")));
     if let Some(parent) = path.parent() {
@@ -512,11 +532,15 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     }
 
     // Native print-ready PDF, one step per page (self-contained, no browser).
-    // Embeds the same photoreal render (PNG→JPEG for DCTDecode), else schematic.
-    let board_jpeg = render.as_ref().and_then(|(png, _, _)| png_to_jpeg(png));
+    // Embeds the same photoreal renders (PNG→JPEG for DCTDecode), else schematic.
+    let top_jpeg = top.as_ref().and_then(|(png, _, _)| png_to_jpeg(png));
+    let bottom_jpeg = bottom.as_ref().and_then(|(png, _, _)| png_to_jpeg(png));
     let pdf_path = path.with_extension("pdf");
-    std::fs::write(&pdf_path, guide_to_pdf(&guide, board_jpeg.as_deref()))
-        .with_context(|| format!("writing {}", pdf_path.display()))?;
+    std::fs::write(
+        &pdf_path,
+        guide_to_pdf(&guide, top_jpeg.as_deref(), bottom_jpeg.as_deref()),
+    )
+    .with_context(|| format!("writing {}", pdf_path.display()))?;
     println!(
         "wrote {} (print-ready, one step per page)",
         pdf_path.display()

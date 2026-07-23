@@ -132,7 +132,12 @@ struct Kind {
     title: &'static str,
 }
 
-// Order matters — this *is* the build sequence.
+// Order matters — this *is* the build sequence: low-profile → tall, so a part
+// never blocks soldering access to a shorter neighbour, and panel hardware
+// (pots, jacks) goes last since it mates to the front panel. Within this order,
+// build_guide does the BACK side first (SMD + power header) then the front.
+// `prefix_of` yields the whole letter prefix, so `RV`/`SW` never collide with
+// `R`/`S`.
 const KINDS: &[Kind] = &[
     Kind {
         prefix: "R",
@@ -143,24 +148,28 @@ const KINDS: &[Kind] = &[
         title: "Diodes & LEDs",
     },
     Kind {
-        prefix: "J",
-        title: "Connectors, sockets & headers",
+        prefix: "Q",
+        title: "Transistors",
     },
     Kind {
-        prefix: "SW",
-        title: "Switches",
+        prefix: "U",
+        title: "ICs & sockets",
     },
     Kind {
         prefix: "C",
         title: "Capacitors",
     },
     Kind {
-        prefix: "Q",
-        title: "Transistors",
+        prefix: "SW",
+        title: "Switches",
     },
     Kind {
-        prefix: "U",
-        title: "ICs",
+        prefix: "RV",
+        title: "Potentiometers & trimmers",
+    },
+    Kind {
+        prefix: "J",
+        title: "Connectors, jacks & headers",
     },
 ];
 
@@ -187,47 +196,38 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         .collect();
     parts.sort_by_key(|p| refdes_key(&p.refdes));
 
-    // Group into ordered steps by refdes prefix; anything unmatched is a final
-    // "remaining parts" step so nothing is silently dropped.
+    // Group into ordered steps by side then kind: the BACK side first (mostly SMD
+    // + the power header on our boards), then the front — each side low-profile →
+    // tall (KINDS order). Anything unmatched becomes a per-side "remaining" step
+    // so nothing is silently dropped.
     let mut steps = Vec::new();
     let mut used = vec![false; parts.len()];
-    for kind in KINDS {
-        let idxs: Vec<usize> = parts
-            .iter()
-            .enumerate()
-            .filter(|(i, p)| !used[*i] && prefix_of(&p.refdes) == kind.prefix)
-            .map(|(i, _)| i)
-            .collect();
-        if idxs.is_empty() {
+    for back in [true, false] {
+        let side_has = parts.iter().any(|p| p.back == back);
+        if !side_has {
             continue;
         }
-        let group: Vec<PlacedPart> = idxs
-            .iter()
-            .map(|&i| {
-                used[i] = true;
-                parts[i].clone()
-            })
-            .collect();
-        let caution = step_caution(&group);
-        steps.push(BuildStep {
-            title: kind.title.to_string(),
-            parts: group,
-            caution,
-        });
-    }
-    let remaining: Vec<PlacedPart> = parts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !used[*i])
-        .map(|(_, p)| p.clone())
-        .collect();
-    if !remaining.is_empty() {
-        let caution = step_caution(&remaining);
-        steps.push(BuildStep {
-            title: "Remaining parts".to_string(),
-            parts: remaining,
-            caution,
-        });
+        for kind in KINDS {
+            let group = take_group(&parts, &mut used, |p| {
+                p.back == back && prefix_of(&p.refdes) == kind.prefix
+            });
+            if group.is_empty() {
+                continue;
+            }
+            steps.push(BuildStep {
+                caution: step_caution(&group),
+                title: kind.title.to_string(),
+                parts: group,
+            });
+        }
+        let remaining = take_group(&parts, &mut used, |p| p.back == back);
+        if !remaining.is_empty() {
+            steps.push(BuildStep {
+                caution: step_caution(&remaining),
+                title: "Remaining parts".to_string(),
+                parts: remaining,
+            });
+        }
     }
 
     Ok(BuildGuide {
@@ -235,6 +235,44 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         outline: board_outline(board_pcb).unwrap_or((0.0, 0.0, 10.0, 10.0)),
         steps,
     })
+}
+
+/// Collect — and mark used — every not-yet-used part matching `pred`, preserving
+/// the pre-sorted refdes order.
+fn take_group(
+    parts: &[PlacedPart],
+    used: &mut [bool],
+    pred: impl Fn(&PlacedPart) -> bool,
+) -> Vec<PlacedPart> {
+    let mut group = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        if !used[i] && pred(p) {
+            used[i] = true;
+            group.push(p.clone());
+        }
+    }
+    group
+}
+
+/// Mirror a placed part's X about `axis` (the board centre), for drawing on the
+/// bottom-side render — `pcb render --side bottom` flips the board left↔right. The
+/// bbox's left/right edges swap; Y is unchanged. We mirror *coordinates* (not the
+/// SVG group), so overlay text stays upright and the refdes reads normally.
+fn mirror_part_x(p: &PlacedPart, axis: f64) -> PlacedPart {
+    let mx = |x: f64| 2.0 * axis - x;
+    let (bx0, by0, bx1, by1) = p.bbox;
+    PlacedPart {
+        cx: mx(p.cx),
+        bbox: (mx(bx1), by0, mx(bx0), by1),
+        pin1: p.pin1.map(|(x, y)| (mx(x), y)),
+        ..p.clone()
+    }
+}
+
+/// Whether a step mounts entirely on the back of the board (so it's shown on the
+/// bottom-side render, and flagged so the builder flips the board).
+fn step_is_back(step: &BuildStep) -> bool {
+    !step.parts.is_empty() && step.parts.iter().all(|p| p.back)
 }
 
 /// A step's polarity caution — from its first polarised part (parts in a
@@ -352,22 +390,75 @@ fn f(s: &str) -> Option<f64> {
     s.parse().ok()
 }
 
-/// Render the guide as a self-contained HTML page (inline CSS + one board diagram
-/// per step, the step's parts highlighted). When `board_svg` is `Some`, it is
-/// KiCad's real board plot (from [`fab::export_board_svg`](crate::fab)) used as
-/// the underlay with highlight boxes overlaid; otherwise a schematic top-down.
-pub fn guide_to_html(guide: &BuildGuide, board: Option<BoardPng>) -> String {
+/// Render the guide as a self-contained HTML page (inline CSS): a prep/sort sheet
+/// then one photoreal board diagram per step, the step's parts highlighted. `top`
+/// / `bottom` are unpopulated `pcb render`s ([`BoardPng`]); a back-side step is
+/// drawn on the `bottom` render (parts mirrored) so it matches the board in hand.
+/// Falls back to a schematic top-down when no render is available.
+pub fn guide_to_html(
+    guide: &BuildGuide,
+    top: Option<BoardPng>,
+    bottom: Option<BoardPng>,
+) -> String {
     let total = guide.steps.len();
+    let total_parts: usize = guide.steps.iter().map(|s| s.parts.len()).sum();
+    let any_back = guide.steps.iter().any(step_is_back);
+    let cxmm = (guide.outline.0 + guide.outline.2) / 2.0;
     let mut body = String::new();
     body.push_str(&format!(
-        "<h1>Build guide — {}</h1><p class=\"sub\">{total} steps, low-profile first. \
-         Highlighted parts are for the current step; place them on the bare board shown.</p>",
-        esc(&guide.name)
+        "<h1>Build guide — {}</h1><p class=\"sub\">{total} steps, {total_parts} parts. \
+         Work low-profile → tall{}. Match every polarity / pin-1 marker to the board \
+         silkscreen.</p>",
+        esc(&guide.name),
+        if any_back { ", back side first" } else { "" },
     ));
+
+    // Prep / sort sheet — pull and sort every part up front, in build order.
+    body.push_str(
+        "<section class=\"prep\"><h2>Before you start — pull &amp; sort your parts</h2>\
+         <table><tr><th>Group</th><th>Qty</th><th>Parts</th></tr>",
+    );
+    for step in &guide.steps {
+        let side = if step_is_back(step) {
+            " <span class=\"badge\">back</span>"
+        } else {
+            ""
+        };
+        let vals = group_by_value(&step.parts)
+            .into_iter()
+            .map(|(v, refs)| {
+                format!(
+                    "{}× {} <span class=\"refs\">({})</span>",
+                    refs.len(),
+                    esc(&v),
+                    esc(&refs.join(", "))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        body.push_str(&format!(
+            "<tr><td>{}{side}</td><td>{}</td><td>{vals}</td></tr>",
+            esc(&step.title),
+            step.parts.len(),
+        ));
+    }
+    body.push_str("</table></section>");
+
+    let mut placed = 0usize;
     for (i, step) in guide.steps.iter().enumerate() {
+        let n = step.parts.len();
+        placed += n;
+        let back_step = step_is_back(step);
+        let use_bottom = back_step && bottom.is_some();
+        let render = if use_bottom { &bottom } else { &top };
+        let parts: Vec<PlacedPart> = if use_bottom {
+            step.parts.iter().map(|p| mirror_part_x(p, cxmm)).collect()
+        } else {
+            step.parts.clone()
+        };
         let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
-        let svg = match &board {
-            Some(bp) => photoreal_board_svg(bp, guide.outline, &step.parts),
+        let svg = match render {
+            Some(bp) => photoreal_board_svg(bp, guide.outline, &parts),
             None => schematic_board_svg(guide, &highlight),
         };
         let mut list = String::new();
@@ -384,18 +475,19 @@ pub fn guide_to_html(guide: &BuildGuide, board: Option<BoardPng>) -> String {
             .as_deref()
             .map(|c| format!("<p class=\"caution\">⚠ {}</p>", esc(c)))
             .unwrap_or_default();
-        let back = step.parts.iter().any(|p| p.back);
-        let back_note = if back {
-            "<p class=\"caution\">↺ Some parts on this step mount on the BACK of the board.</p>"
+        let badge = if back_step {
+            "<span class=\"badge back\">↺ BACK side — shown from the back</span>"
         } else {
             ""
         };
         body.push_str(&format!(
-            "<section class=\"step\"><h2>Step {} of {total}: {}</h2>\
+            "<section class=\"step\"><h2>Step {} of {total}: {} {badge}</h2>\
+             <p class=\"prog\">Place {n} part{} — {placed} of {total_parts} placed when done.</p>\
              <div class=\"cols\"><div class=\"diagram\">{svg}</div>\
-             <div class=\"parts\"><ul>{list}</ul>{caution}{back_note}</div></div></section>",
+             <div class=\"parts\"><ul>{list}</ul>{caution}</div></div></section>",
             i + 1,
             esc(&step.title),
+            if n == 1 { "" } else { "s" },
         ));
     }
     format!(
@@ -408,13 +500,22 @@ pub fn guide_to_html(guide: &BuildGuide, board: Option<BoardPng>) -> String {
 const CSS: &str = "\
 body{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#222}\
 h1{margin-bottom:.2rem}.sub{color:#666;margin-top:0}\
+.prep{border-top:2px solid #eee;padding:1rem 0}\
+.prep table{border-collapse:collapse;width:100%;font-size:.95rem}\
+.prep th{text-align:left;color:#666;font-weight:600;border-bottom:1px solid #ddd;padding:.35rem .5rem}\
+.prep td{border-bottom:1px solid #f0f0f0;padding:.35rem .5rem;vertical-align:top}\
 .step{border-top:2px solid #eee;padding:1.2rem 0}h2{font-size:1.15rem}\
+.prog{color:#666;margin:.1rem 0 .7rem;font-size:.9rem}\
+.badge{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.02em;\
+background:#eef;color:#446;border-radius:4px;padding:.05rem .4rem;vertical-align:middle}\
+.badge.back{background:#fce8d6;color:#8a4b12}\
 .cols{display:flex;gap:1.5rem;flex-wrap:wrap;align-items:flex-start}\
 .diagram{flex:1 1 340px;min-width:280px}.parts{flex:1 1 240px}\
 svg{width:100%;height:auto;border:1px solid #eee;background:#fafafa;border-radius:6px}\
 ul{margin:0;padding-left:1.1rem}li{margin:.15rem 0}.refs{color:#555}\
 .caution{background:#fff6e0;border-left:3px solid #e0a800;padding:.5rem .7rem;border-radius:4px;margin:.6rem 0 0}\
 @media print{@page{margin:12mm;size:A4}body{margin:0;max-width:none}\
+.prep{break-after:page}\
 .step{break-before:page;break-inside:avoid;border-top:none;padding:0}\
 .step:first-of-type{break-before:avoid}h1,.sub{break-after:avoid}\
 .diagram,.parts{break-inside:avoid}svg{max-height:150mm}}";
@@ -484,22 +585,115 @@ fn pdf_marker(
     }
 }
 
-/// Render the guide as a print-ready PDF — one build step per A4 page (clean page
-/// breaks). Self-contained (no browser). When `board_jpeg` is `Some` (KiCad's
-/// real board plot rasterized to JPEG, A4 landscape / true mm), it's embedded as
-/// the diagram with highlight overlays; otherwise a schematic top-down.
-pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
-    let image = board_jpeg.and_then(|b| pdf::Image::from_jpeg(b.to_vec()));
+/// Render the guide as a print-ready PDF: a prep/sort page, then one build step
+/// per A4 page (clean page breaks), self-contained (no browser). `top_jpeg` /
+/// `bottom_jpeg` are the unpopulated `pcb render`s (PNG→JPEG); a back-side step is
+/// drawn on the bottom render (parts mirrored) so it matches the board in hand.
+/// Falls back to a schematic top-down when no render is available.
+pub fn guide_to_pdf(
+    guide: &BuildGuide,
+    top_jpeg: Option<&[u8]>,
+    bottom_jpeg: Option<&[u8]>,
+) -> Vec<u8> {
+    let top_img = top_jpeg.and_then(|b| pdf::Image::from_jpeg(b.to_vec()));
+    let bot_img = bottom_jpeg.and_then(|b| pdf::Image::from_jpeg(b.to_vec()));
+    let mut images: Vec<&pdf::Image> = Vec::new();
+    let top_idx = top_img.as_ref().map(|im| {
+        images.push(im);
+        images.len() - 1
+    });
+    let bot_idx = bot_img.as_ref().map(|im| {
+        images.push(im);
+        images.len() - 1
+    });
+
     let m = 36.0; // page margin (pt)
     let cw = pdf::A4_W - 2.0 * m; // content width
     let total = guide.steps.len();
+    let total_parts: usize = guide.steps.iter().map(|s| s.parts.len()).sum();
+    let any_back = guide.steps.iter().any(step_is_back);
     let (ox0, oy0, ox1, oy1) = guide.outline;
+    let cxmm = (ox0 + ox1) / 2.0;
     let (pad, top) = (2.0, pdf::A4_H - m);
     let (bx0, by0, bx1, by1) = (ox0 - pad, oy0 - pad, ox1 + pad, oy1 + pad);
     let (bw, bh) = ((bx1 - bx0).max(1.0), (by1 - by0).max(1.0));
 
     let mut pages = Vec::new();
+
+    // Prep / sort page — pull and sort every part first, in build order.
+    {
+        let mut pg = Page::new();
+        pg.set_fill(0.1, 0.1, 0.1);
+        pg.text(
+            m,
+            top,
+            20.0,
+            Font::Bold,
+            &format!("{} - build guide", guide.name),
+        );
+        pg.set_fill(0.3, 0.3, 0.3);
+        pg.text(
+            m,
+            top - 24.0,
+            11.0,
+            Font::Regular,
+            &format!(
+                "{total} steps, {total_parts} parts. Low-profile to tall{}. \
+                 Match every polarity / pin-1 mark to the silkscreen.",
+                if any_back { ", back side first" } else { "" }
+            ),
+        );
+        let mut ly = top - 52.0;
+        pg.set_fill(0.13, 0.13, 0.13);
+        pg.text(
+            m,
+            ly,
+            13.0,
+            Font::Bold,
+            "Before you start — pull & sort your parts:",
+        );
+        ly -= 22.0;
+        for step in &guide.steps {
+            let side = if step_is_back(step) { "   [BACK]" } else { "" };
+            pg.set_fill(0.13, 0.13, 0.13);
+            pg.text(
+                m,
+                ly,
+                11.5,
+                Font::Bold,
+                &format!("{}  ({}){side}", step.title, step.parts.len()),
+            );
+            ly -= 15.0;
+            for (v, refs) in group_by_value(&step.parts) {
+                pg.set_fill(0.35, 0.35, 0.35);
+                pg.text(
+                    m + 12.0,
+                    ly,
+                    10.5,
+                    Font::Regular,
+                    &format!("{}x  {}  ({})", refs.len(), v, refs.join(", ")),
+                );
+                ly -= 13.0;
+            }
+            ly -= 4.0;
+        }
+        pages.push(pg);
+    }
+
+    let mut placed = 0usize;
     for (i, step) in guide.steps.iter().enumerate() {
+        let n = step.parts.len();
+        placed += n;
+        let back_step = step_is_back(step);
+        let use_bottom = back_step && bot_idx.is_some();
+        let img = if use_bottom { &bot_img } else { &top_img };
+        let idx = if use_bottom { bot_idx } else { top_idx };
+        let step_parts: Vec<PlacedPart> = if use_bottom {
+            step.parts.iter().map(|p| mirror_part_x(p, cxmm)).collect()
+        } else {
+            step.parts.clone()
+        };
+
         let mut pg = Page::new();
         pg.set_fill(0.1, 0.1, 0.1);
         pg.text(
@@ -509,30 +703,47 @@ pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
             Font::Regular,
             &format!("{} - Step {} of {total}", guide.name, i + 1),
         );
-        pg.text(m, top - 24.0, 19.0, Font::Bold, &step.title);
+        let title = if back_step {
+            format!("{}  [BACK side]", step.title)
+        } else {
+            step.title.clone()
+        };
+        pg.text(m, top - 24.0, 19.0, Font::Bold, &title);
+        pg.set_fill(0.4, 0.4, 0.4);
+        pg.text(
+            m,
+            top - 40.0,
+            10.5,
+            Font::Regular,
+            &format!(
+                "Place {n} part{} - {placed} of {total_parts} placed when done.",
+                if n == 1 { "" } else { "s" }
+            ),
+        );
 
-        // Board diagram under the title.
-        let diag_top = top - 46.0; // page y of the diagram's top edge
+        // Board diagram under the title/progress.
+        let diag_top = top - 58.0;
         let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
         let diag_bottom;
 
-        if let Some(img) = &image {
-            // Photoreal render (W×H px, board centred, orthographic top). Fit it
-            // into the diagram region; map board-mm → image-px → page point so this
+        if let (Some(img), Some(idx)) = (img.as_ref(), idx) {
+            // Photoreal render (W×H px, board centred, orthographic). Fit it into
+            // the diagram region; map board-mm → image-px → page point so this
             // step's outlined markers land on the bare pads.
             let (iw, ih) = img.size();
             let ds = (cw / iw).min(360.0 / ih); // page pt per image px
             let (dw, dh) = (iw * ds, ih * ds);
             let ix = m + (cw - dw) / 2.0;
             let sc = PHOTOREAL_FIT * (iw / (ox1 - ox0)).min(ih / (oy1 - oy0)); // px/mm
-            let (cxmm, cymm) = ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0);
-            let mapx = |x: f64| ix + (iw / 2.0 + (x - cxmm) * sc) * ds;
-            let mapy = |y: f64| diag_top - (ih / 2.0 + (y - cymm) * sc) * ds;
+            let (cx, cy) = ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0);
+            let mapx = |x: f64| ix + (iw / 2.0 + (x - cx) * sc) * ds;
+            let mapy = |y: f64| diag_top - (ih / 2.0 + (y - cy) * sc) * ds;
             pg.draw_image(
                 [dw, 0.0, 0.0, dh, ix, diag_top - dh],
                 (ix, diag_top - dh, dw, dh),
+                idx,
             );
-            for p in &step.parts {
+            for p in &step_parts {
                 pdf_marker(&mut pg, p, &mapx, &mapy, sc * ds, false);
             }
             diag_bottom = diag_top - dh;
@@ -593,19 +804,19 @@ pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
             pg.text(m, ly, 11.0, Font::Bold, &format!("[!] {c}"));
             ly -= 15.0;
         }
-        if step.parts.iter().any(|p| p.back) {
+        if back_step {
             pg.set_fill(0.72, 0.45, 0.0);
             pg.text(
                 m,
                 ly,
                 11.0,
                 Font::Bold,
-                "[back] Some parts on this step mount on the BACK of the board.",
+                "[back] Flip the board - this step mounts on the BACK (shown from the back).",
             );
         }
         pages.push(pg);
     }
-    pdf::document(&pages, image.as_ref())
+    pdf::document(&pages, &images)
 }
 
 /// The highlight overlay for one part (SVG, board-mm coords): a rounded amber
@@ -773,7 +984,7 @@ mod tests {
         // Resistors before ICs.
         assert_eq!(g.steps.len(), 2);
         assert_eq!(g.steps[0].title, "Resistors");
-        assert_eq!(g.steps[1].title, "ICs");
+        assert_eq!(g.steps[1].title, "ICs & sockets");
         assert!(g.steps[1].caution.as_deref().unwrap().contains("pin 1"));
         // Values attached from the circuit.
         assert_eq!(g.steps[0].parts.len(), 2);
@@ -784,7 +995,7 @@ mod tests {
     #[test]
     fn html_highlights_and_is_self_contained() {
         let g = build_guide(&amp(), BOARD).unwrap();
-        let html = guide_to_html(&g, None);
+        let html = guide_to_html(&g, None, None);
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<svg"));
         assert!(html.contains("Step 1 of 2: Resistors"));
@@ -809,6 +1020,48 @@ mod tests {
         assert!(svg.contains(">R1</text>") && svg.contains(">R2</text>"));
         // Overlays sit in an mm→px transform group (so highlight_svg is reused).
         assert!(svg.contains("<g transform=\"translate("));
+    }
+
+    #[test]
+    fn back_side_steps_come_first_across_kinds() {
+        // R1 on the front, C1 on the back. Side grouping is outer, so the back
+        // capacitor is built before the front resistor even though R precedes C.
+        let board = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 105) (layer "Edge.Cuts"))
+          (footprint "R" (layer "F.Cu") (at 100 100 0)
+            (property "Reference" "R1") (pad "1" smd rect (at -1 0) (size 1 1)))
+          (footprint "C" (layer "B.Cu") (at 110 100 0)
+            (property "Reference" "C1") (pad "1" smd rect (at -1 0) (size 1 1))))"#;
+        let circ = Circuit {
+            name: "ds".into(),
+            parts: vec![Part::new("R1", "1k"), Part::new("C1", "10u")],
+            nets: vec![],
+        };
+        let g = build_guide(&circ, board).unwrap();
+        assert_eq!(g.steps[0].title, "Capacitors");
+        assert!(g.steps[0].parts.iter().all(|p| p.back), "cap step is back");
+        assert_eq!(g.steps[1].title, "Resistors");
+        assert!(g.steps[1].parts.iter().all(|p| !p.back), "resistor is front");
+    }
+
+    #[test]
+    fn mirror_part_x_flips_about_axis_keeping_y() {
+        let p = PlacedPart {
+            refdes: "C1".into(),
+            value: String::new(),
+            footprint: String::new(),
+            cx: 105.0,
+            cy: 100.0,
+            bbox: (104.0, 99.0, 106.0, 101.0),
+            back: true,
+            pin1: Some((104.0, 100.0)),
+            polarity: None,
+        };
+        let m = mirror_part_x(&p, 110.0);
+        assert_eq!(m.cx, 115.0); // 2·110 − 105
+        assert_eq!(m.bbox, (114.0, 99.0, 116.0, 101.0)); // L/R swapped + mirrored
+        assert_eq!(m.pin1, Some((116.0, 100.0)));
+        assert_eq!(m.cy, 100.0); // Y unchanged
     }
 
     #[test]

@@ -107,6 +107,7 @@ pub fn render_board_png(
     board: &Path,
     kicad_cli: &Path,
     bare: bool,
+    back: bool,
 ) -> Result<(Vec<u8>, u32, u32), StageError> {
     let stem = board
         .file_stem()
@@ -122,14 +123,15 @@ pub fn render_board_png(
     } else {
         board.to_path_buf()
     };
-    let out = tmp.join(format!("lob-{stem}-render.png"));
+    let side = if back { "bottom" } else { "top" };
+    let out = tmp.join(format!("lob-{stem}-render-{side}.png"));
     run_kicad(
         kicad_cli,
         &[
             "pcb",
             "render",
             "--side",
-            "top",
+            side,
             "--quality",
             "high",
             "--background",
