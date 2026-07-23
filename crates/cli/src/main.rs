@@ -84,6 +84,9 @@ enum Command {
         /// Package directory (default: out/<name>/fab).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Eurorack panel spec (TOML): build the vertical panel-anchored board.
+        #[arg(long)]
+        panel: Option<PathBuf>,
     },
     /// Generate a step-by-step visual assembly guide (HTML) from a circuit.
     Guide {
@@ -92,6 +95,9 @@ enum Command {
         /// Write the guide here (default: out/<name>/<name>-guide.html).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Eurorack panel spec (TOML): build the vertical panel-anchored board.
+        #[arg(long)]
+        panel: Option<PathBuf>,
     },
     /// Panel design: generate DXF, track orders.
     Panel {
@@ -203,8 +209,16 @@ fn main() -> ExitCode {
             panel,
         } => board_cmd(circuit, out, panel),
         Command::Drc { board } => drc_cmd(board),
-        Command::Fab { circuit, out } => fab_cmd(circuit, out),
-        Command::Guide { circuit, out } => guide_cmd(circuit, out),
+        Command::Fab {
+            circuit,
+            out,
+            panel,
+        } => fab_cmd(circuit, out, panel),
+        Command::Guide {
+            circuit,
+            out,
+            panel,
+        } => guide_cmd(circuit, out, panel),
         Command::Panel { action } => panel_cmd(action),
     };
 
@@ -430,7 +444,7 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
 
 /// Handle `lob fab <circuit> [--out]` — generate a board, gate it on DRC, and
 /// write the JLCPCB-ready manufacturing package (Gerbers + drill + CPL + BOM).
-fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Result<()> {
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -447,7 +461,8 @@ fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    let (board, conflicts) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
+    let options = board_options_with_panel(footprint_dir, &panel)?;
+    let (board, conflicts) = generate_board_report(&model, &options)?;
 
     let pkg = out.unwrap_or_else(|| work_dir.join("fab"));
     std::fs::create_dir_all(&pkg)?;
@@ -513,7 +528,7 @@ fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
 
 /// Handle `lob guide <circuit> [--out]` — generate a board and render a
 /// step-by-step visual assembly guide (HTML).
-fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Result<()> {
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -529,7 +544,8 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    let (board, _) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
+    let options = board_options_with_panel(footprint_dir, &panel)?;
+    let (board, _) = generate_board_report(&model, &options)?;
 
     let guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
 
