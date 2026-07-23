@@ -66,6 +66,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    9.3 JLCPCB API integration (quoting, order creation, tracking)
    9.4 BOM accuracy/verification — this has to be airtight (filled — see body)
    9.5 Multi-vendor part sourcing rules (JLCPCB basic vs extended, LCSC fallback)
+   9.6 Compatible-substitute suggestions (filled — see body)
 
 10. **Thru-Hole BOM & Ordering**
     10.1 Distributor sourcing (LCSC/Mouser/DigiKey)
@@ -103,7 +104,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
 
 ---
 
-## 1. Vision & Scope
+## 1. Vision & [118;1:3uScope
 
 ### 1.1 Problem statement
 Small electronics hardware businesses (starting with Puget Audio) currently manage
@@ -207,12 +208,39 @@ implementation right now is "read a SKiDL-generated netlist." This keeps the eve
 IR extraction to one new implementation of that trait instead of a rewrite.
 
 ### 3.4 Reusable component/subcircuit library
-Starts empty. Phase 0's two demo circuits are written as standalone SKiDL scripts,
-not yet abstracted into a library — deliberately, so real reuse patterns emerge from
-having 2+ circuits before anything gets extracted into a shared `circuits/lib`
-module. Revisit after Phase 0 and the slew limiter (Phase 1) are both done — by then
-there'll be enough real examples (RC filter, op-amp gain stage, OTA slew stage) to
-know what's actually common.
+No longer empty in practice — the LM13700 bias-generator work (control
+voltage → IABC) turned out to be genuinely shared between the slew limiter
+and crossfader, the first real evidence of reuse the deferred trigger
+condition was waiting for. Extracted into `circuits/lib`, git-native per the
+Section 2.6 storage split (circuit content, not structured cross-project
+data).
+
+**Each subcircuit entry declares what it needs from the part filling its
+role, not just which part was used** — this is what makes substitution
+(Section 9.6) possible without a hand-maintained pairwise compatibility
+table:
+
+```json
+{ "subcircuit": "unity_gain_buffer", "requires": {"min_gbw_mhz": 1, "max_vos_mv": 10} }
+{ "subcircuit": "crossfader_signal_path", "requires": {"min_gbw_mhz": 3, "max_vos_mv": 3, "max_noise_nv_hz": 15} }
+{ "subcircuit": "ota_bias_generator", "requires": {"part_family": "LM13700-compatible dual OTA"} }
+```
+
+A part that's a valid substitute for one role (e.g. TL072 in a buffer) isn't
+automatically valid for another (e.g. the crossfader's signal path, which
+needs tighter GBW/noise) — the requirement lives with the *role*, not as a
+property hung off a specific part pairing.
+
+### 3.4.1 What's shared vs. not — the LM13700 case, concretely
+Only the **bias generator** (CV-to-IABC resistor network) is genuinely
+reusable between the slew limiter and crossfader — same math, same purpose.
+The OTA *application* around it differs and stays circuit-specific: the slew
+limiter runs its OTA as a bounded current source (no diode linearization
+needed), the crossfader runs its OTA pair as a linear signal path (diode
+linearization required, per the derivation in `crossfader-circuit.md`).
+Modeling the whole LM13700 circuit as "one subcircuit, reused twice" would
+have been wrong — the boundary is narrower than the IC, and getting that
+boundary right mattered more than reusing as much code as possible.
 
 ### 3.5 Global parts library (pinout/rating/SPICE-model verification)
 **Status: in progress — tracked as epic `okm`, 5 P1 tasks open (schema,
@@ -565,3 +593,37 @@ a real JLCPCB/Mouser/DigiKey order is a money risk on top of that, since a
 misidentified part (wrong package, wrong footprint, wrong voltage rating) can
 turn into a bad PCBA order rather than just a bad board file. Same gate,
 enforced at the same core layer, for both reasons at once.
+
+### 9.6 Compatible-substitute suggestions
+**Advisory only — never automatic.** A pin-compatible part is not
+automatically an acceptable substitute for a specific circuit; it's a
+candidate that still has to clear the requirements of the *role* it would
+fill (Section 3.4's subcircuit `requires` blocks). Two-part mechanism:
+
+- **`pin_compatible_groups`** — a small, hand-maintained table of physically
+  drop-in part families (op-amp pinout-compatible groups, etc.), each with
+  its own `verified_by_human` flag. This is the only genuinely stable fact
+  worth caching, since footprint/pinout compatibility doesn't change.
+  ```sql
+  CREATE TABLE pin_compatible_groups (
+    group_id INT,
+    mpn VARCHAR(64),
+    package VARCHAR(32),
+    verified_by_human BOOLEAN DEFAULT FALSE
+  );
+  ```
+- **Live requirement check, not a stored relation** — at `generate_bom` time,
+  if a primary MPN has low/zero stock, pull every part sharing its
+  `pin_compatible_groups` entry and check each against the *subcircuit's*
+  declared requirements (using the already-stored `part_ratings` from
+  Section 3.5) — not a hardcoded "part X substitutes for part Y" fact, which
+  would silently ignore that the same substitution can be fine in one role
+  (a buffer) and wrong in another (a noise-sensitive signal path). Passing
+  candidates are surfaced to the human for approval at BOM time; nothing
+  swaps automatically.
+
+**Explicitly out of scope for now**: automatic board re-layout in response to
+a substitute with a different footprint ("intelligent respin"). Depends on
+the iterative layout loop (Section 6.5) being mature enough to safely
+re-run place/route/DRC unattended, which it isn't yet — revisit once layout
+itself is solid, not before.
