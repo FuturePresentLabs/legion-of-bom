@@ -15,10 +15,10 @@ use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_cpl,
     export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom,
-    guide_to_html, jlc_bom_csv, kicad_cli_path, panel_to_dxf, parse_netlist_file, run_drc,
-    simulate_ac, validate_erc, zip_dir, BoardOptions, CircuitSource, Finding, JlcpcbClient,
-    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, parse_netlist_file,
+    run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions, CircuitSource, Finding,
+    JlcpcbClient, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
+    PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -473,6 +473,15 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     for (i, step) in guide.steps.iter().enumerate() {
         println!("    {}. {} ({} parts)", i + 1, step.title, step.parts.len());
     }
+
+    // Native print-ready PDF, one step per page (self-contained, no browser).
+    let pdf_path = path.with_extension("pdf");
+    std::fs::write(&pdf_path, guide_to_pdf(&guide))
+        .with_context(|| format!("writing {}", pdf_path.display()))?;
+    println!(
+        "wrote {} (print-ready, one step per page)",
+        pdf_path.display()
+    );
     Ok(())
 }
 

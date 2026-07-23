@@ -11,8 +11,9 @@
 //! The diagram is a schematic top-down (accurate boxes, no render/camera
 //! dependency); overlaying on a photoreal render is a later refinement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+use crate::pdf::{self, Font, Page, Paint};
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
 
@@ -391,11 +392,145 @@ h1{margin-bottom:.2rem}.sub{color:#666;margin-top:0}\
 .diagram{flex:1 1 340px;min-width:280px}.parts{flex:1 1 240px}\
 svg{width:100%;height:auto;border:1px solid #eee;background:#fafafa;border-radius:6px}\
 ul{margin:0;padding-left:1.1rem}li{margin:.15rem 0}.refs{color:#555}\
-.caution{background:#fff6e0;border-left:3px solid #e0a800;padding:.5rem .7rem;border-radius:4px;margin:.6rem 0 0}";
+.caution{background:#fff6e0;border-left:3px solid #e0a800;padding:.5rem .7rem;border-radius:4px;margin:.6rem 0 0}\
+@media print{@page{margin:12mm;size:A4}body{margin:0;max-width:none}\
+.step{break-before:page;break-inside:avoid;border-top:none;padding:0}\
+.step:first-of-type{break-before:avoid}h1,.sub{break-after:avoid}\
+.diagram,.parts{break-inside:avoid}svg{max-height:150mm}}";
+
+/// Render the guide as a print-ready PDF — one build step per A4 page (clean page
+/// breaks). Self-contained (no browser), so it always works. Each page has the
+/// step's title, a top-down board diagram with the step's parts highlighted +
+/// polarity markers, the parts list, and any cautions.
+pub fn guide_to_pdf(guide: &BuildGuide) -> Vec<u8> {
+    let m = 36.0; // page margin (pt)
+    let cw = pdf::A4_W - 2.0 * m; // content width
+    let total = guide.steps.len();
+    let (ox0, oy0, ox1, oy1) = guide.outline;
+    let (pad, top) = (2.0, pdf::A4_H - m);
+    let (bx0, by0, bx1, by1) = (ox0 - pad, oy0 - pad, ox1 + pad, oy1 + pad);
+    let (bw, bh) = ((bx1 - bx0).max(1.0), (by1 - by0).max(1.0));
+
+    let mut pages = Vec::new();
+    for (i, step) in guide.steps.iter().enumerate() {
+        let mut pg = Page::new();
+        pg.set_fill(0.1, 0.1, 0.1);
+        pg.text(
+            m,
+            top,
+            13.0,
+            Font::Regular,
+            &format!("{} — Step {} of {total}", guide.name, i + 1),
+        );
+        pg.text(m, top - 24.0, 19.0, Font::Bold, &step.title);
+
+        // Board diagram, scaled to fit the region under the title.
+        let diag_top = top - 46.0; // page y of the board's top edge
+        let scale = (cw / bw).min(360.0 / bh);
+        let dw = bw * scale;
+        let rx = m + (cw - dw) / 2.0;
+        let mapx = |x: f64| rx + (x - bx0) * scale;
+        let mapy = |y: f64| diag_top - (y - by0) * scale;
+
+        pg.set_line_width(0.8);
+        pg.set_fill(0.93, 0.95, 0.93);
+        pg.set_stroke(0.2, 0.6, 0.4);
+        pg.rect(
+            mapx(ox0),
+            mapy(oy1),
+            (ox1 - ox0) * scale,
+            (oy1 - oy0) * scale,
+            Paint::FillStroke,
+        );
+
+        let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
+        for p in guide.steps.iter().flat_map(|s| &s.parts) {
+            let (cx0, cy0, cx1, cy1) = p.bbox;
+            let on = highlight.contains(p.refdes.as_str());
+            pg.set_line_width(if on { 0.8 } else { 0.4 });
+            if on {
+                pg.set_fill(0.89, 0.29, 0.29);
+                pg.set_stroke(0.63, 0.07, 0.07);
+            } else {
+                pg.set_fill(0.86, 0.86, 0.86);
+                pg.set_stroke(0.67, 0.67, 0.67);
+            }
+            pg.rect(
+                mapx(cx0),
+                mapy(cy1),
+                ((cx1 - cx0) * scale).max(1.0),
+                ((cy1 - cy0) * scale).max(1.0),
+                Paint::FillStroke,
+            );
+            if !on {
+                continue;
+            }
+            let fs = (scale * 1.4).clamp(5.0, 11.0);
+            pg.set_fill(1.0, 1.0, 1.0);
+            pg.text(
+                mapx(p.cx) - p.refdes.len() as f64 * fs * 0.25,
+                mapy(p.cy) - fs * 0.35,
+                fs,
+                Font::Bold,
+                &p.refdes,
+            );
+            if let (Some(pol), Some((qx, qy))) = (p.polarity, p.pin1) {
+                let r = (scale * 1.3).clamp(4.0, 9.0);
+                pg.set_line_width(0.4);
+                pg.set_fill(0.06, 0.06, 0.06);
+                pg.set_stroke(1.0, 1.0, 1.0);
+                pg.circle(mapx(qx), mapy(qy), r, Paint::FillStroke);
+                pg.set_fill(1.0, 1.0, 1.0);
+                pg.text(
+                    mapx(qx) - r * 0.3,
+                    mapy(qy) - r * 0.5,
+                    r * 1.2,
+                    Font::Bold,
+                    pol.label(),
+                );
+            }
+        }
+
+        // Parts list + cautions below the diagram.
+        let mut ly = (diag_top - bh * scale) - 30.0;
+        pg.set_fill(0.13, 0.13, 0.13);
+        pg.text(m, ly, 12.0, Font::Bold, "Parts for this step:");
+        ly -= 18.0;
+        for (value, refs) in group_by_value(&step.parts) {
+            pg.set_fill(0.13, 0.13, 0.13);
+            pg.text(
+                m + 8.0,
+                ly,
+                11.0,
+                Font::Regular,
+                &format!("{}x   {}   ({})", refs.len(), value, refs.join(", ")),
+            );
+            ly -= 15.0;
+        }
+        if let Some(c) = &step.caution {
+            ly -= 8.0;
+            pg.set_fill(0.72, 0.45, 0.0);
+            pg.text(m, ly, 11.0, Font::Bold, &format!("[!] {c}"));
+            ly -= 15.0;
+        }
+        if step.parts.iter().any(|p| p.back) {
+            pg.set_fill(0.72, 0.45, 0.0);
+            pg.text(
+                m,
+                ly,
+                11.0,
+                Font::Bold,
+                "[back] Some parts on this step mount on the BACK of the board.",
+            );
+        }
+        pages.push(pg);
+    }
+    pdf::document(&pages)
+}
 
 /// A top-down SVG of the board: outline + every part as a box, `highlight`ed
 /// parts filled red, the rest greyed.
-fn board_svg(guide: &BuildGuide, highlight: &std::collections::HashSet<&str>) -> String {
+fn board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String {
     let (x0, y0, x1, y1) = guide.outline;
     let (w, h) = (x1 - x0, y1 - y0);
     let pad = 2.0;
