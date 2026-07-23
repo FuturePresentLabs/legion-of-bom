@@ -532,6 +532,10 @@ fn transform_footprint(
                     if l.len() >= 3 {
                         l[2] = Sexpr::string(refdes);
                     }
+                    // Guarantee the refdes renders on silk: hand-assembly from the
+                    // BOM/build guide needs it visible. Some library footprints ship
+                    // the Reference hidden — drop any `(hide yes)` / bare `hide`.
+                    l.retain(|c| c.as_atom() != Some("hide") && c.head() != Some("hide"));
                 }
             }
             Some("pad") => {
@@ -852,6 +856,73 @@ mod tests {
         assert!(out.contains("(at -1.5 2)"), "x mirrored: {out}");
         assert!(out.contains(r#"(layer "B.SilkS")"#), "layer flipped: {out}");
         assert!(out.contains("mirror"), "back text mirrored: {out}");
+    }
+
+    /// Silkscreen v0 (DESIGN 6.10): a placed footprint keeps its library silk
+    /// (polarity/pin-1 graphics) and gets a *visible* refdes on silk — even when
+    /// the library ships the Reference hidden. Front stays on F.SilkS.
+    #[test]
+    fn transform_places_visible_refdes_and_keeps_silk_front() {
+        // A minimal footprint: hidden Reference on silk + a silk polarity line.
+        let fp = crate::sexpr::Sexpr::parse(
+            r#"(footprint "lib:CP" (layer "F.Cu")
+                 (property "Reference" "REF**" (at 0 -2) (layer "F.SilkS") (hide yes)
+                   (effects (font (size 1 1))))
+                 (fp_line (start -1 0) (end 1 0) (layer "F.SilkS"))
+                 (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))"#,
+        )
+        .unwrap();
+        let out = transform_footprint(
+            fp,
+            "lib:CP",
+            "C7",
+            Placement {
+                x_mm: 10.0,
+                y_mm: 10.0,
+                rotation_deg: 0.0,
+                back: false,
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .to_sexpr_string();
+        assert!(out.contains(r#""Reference" "C7""#), "refdes set: {out}");
+        assert!(!out.contains("hide"), "reference unhidden: {out}");
+        assert!(
+            out.contains(r#"(layer "F.SilkS")"#),
+            "silk kept on front: {out}"
+        );
+    }
+
+    /// A back-placed footprint mirrors its silk (refdes + graphics) to B.SilkS,
+    /// so the bottom-side legend reads correctly during assembly.
+    #[test]
+    fn transform_mirrors_silk_to_back() {
+        let fp = crate::sexpr::Sexpr::parse(
+            r#"(footprint "lib:CP" (layer "F.Cu")
+                 (property "Reference" "REF**" (at 0 -2) (layer "F.SilkS")
+                   (effects (font (size 1 1))))
+                 (fp_line (start -1 0) (end 1 0) (layer "F.SilkS"))
+                 (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu")))"#,
+        )
+        .unwrap();
+        let out = transform_footprint(
+            fp,
+            "lib:CP",
+            "C7",
+            Placement {
+                x_mm: 10.0,
+                y_mm: 10.0,
+                rotation_deg: 0.0,
+                back: true,
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .to_sexpr_string();
+        assert!(out.contains(r#"(layer "B.SilkS")"#), "silk on back: {out}");
+        assert!(!out.contains(r#"(layer "F.SilkS")"#), "no front silk: {out}");
+        assert!(out.contains("mirror"), "back refdes mirrored: {out}");
     }
 
     /// A part *declared* on the back must land flipped on the bottom copper + silk.
