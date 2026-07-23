@@ -15,7 +15,8 @@ use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_cpl,
     export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom,
-    guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, parse_netlist_file,
+    guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, panel_to_kicad_pcb,
+    parse_netlist_file,
     png_to_jpeg, render_board_png, run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions,
     BoardPng, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
     PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus, Severity,
@@ -147,6 +148,15 @@ enum PanelCmd {
         /// Path to the panel spec TOML.
         spec: PathBuf,
         /// Output DXF path (default: same name with .dxf extension).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Generate a panel PCB (.kicad_pcb) + gerbers from a panel spec TOML — the
+    /// "PCB panel" many Eurorack builders order instead of milled aluminium.
+    Pcb {
+        /// Path to the panel spec TOML.
+        spec: PathBuf,
+        /// Output .kicad_pcb path (default: same name with .kicad_pcb extension).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -726,6 +736,47 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 panel.mounting_holes().len(),
                 panel.cutouts().len(),
             );
+        }
+        PanelCmd::Pcb { spec, out } => {
+            let toml = std::fs::read_to_string(&spec)
+                .with_context(|| format!("reading {}", spec.display()))?;
+            let file = PanelFile::from_toml(&toml)
+                .with_context(|| format!("parsing {}", spec.display()))?;
+            let panel = file
+                .to_spec()
+                .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
+            let stem = spec
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("panel");
+            let pcb = panel_to_kicad_pcb(panel.as_ref(), stem);
+            let out_path = out.unwrap_or_else(|| spec.with_extension("kicad_pcb"));
+            std::fs::write(&out_path, pcb)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("wrote {}", out_path.display());
+            println!(
+                "  panel PCB: {:.2} mm × {:.2} mm ({} HP), {} hole(s), {} cutout(s)",
+                panel.width_mm(),
+                panel.height_mm(),
+                (panel.width_mm() / 5.08).round() as i64,
+                panel.mounting_holes().len(),
+                panel.cutouts().len(),
+            );
+            // Gerbers, if kicad-cli is available (panels are mechanical: Edge.Cuts + silk).
+            if let Some(kicad) = kicad_cli_path() {
+                let gdir = out_path.with_extension("").with_file_name(format!("{stem}-panel-gerbers"));
+                match export_gerbers(&out_path, &gdir, &kicad) {
+                    Ok(()) => {
+                        let zip = gdir.with_extension("zip");
+                        let zipped = zip_dir(&gdir, &zip).unwrap_or(false);
+                        println!(
+                            "  gerbers: {}",
+                            if zipped { zip.display().to_string() } else { gdir.display().to_string() }
+                        );
+                    }
+                    Err(e) => println!("  gerbers: skipped ({e})"),
+                }
+            }
         }
         PanelCmd::Status { module } => {
             let store = PanelOrders::open(default_panel_orders_dir())

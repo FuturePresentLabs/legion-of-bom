@@ -416,6 +416,96 @@ pub fn panel_to_dxf(panel: &dyn PanelSpec) -> String {
     s
 }
 
+/// Generate a **panel PCB** (`.kicad_pcb`): the outline, jack/pot/LED cutouts and
+/// mounting holes as `Edge.Cuts` loops (inner loops become board cutouts), plus a
+/// silkscreen title. This is the "PCB panel" many Eurorack builders order instead
+/// of a milled aluminium one — it runs through the same gerber export as any
+/// board. Mechanical only: no copper, no components.
+///
+/// Panel coordinates are measured from the bottom-left; KiCad's are top-down, so
+/// Y is flipped here.
+pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
+    use crate::board::{det_uuid, mm};
+    let (w, h) = (panel.width_mm(), panel.height_mm());
+    let fy = |y: f64| h - y;
+    let edge_rect = |x1: f64, y1: f64, x2: f64, y2: f64, seed: &str| {
+        format!(
+            "  (gr_rect (start {} {}) (end {} {}) (stroke (width 0.15) (type solid)) \
+             (fill no) (layer \"Edge.Cuts\") (uuid \"{}\"))\n",
+            mm(x1),
+            mm(y1),
+            mm(x2),
+            mm(y2),
+            det_uuid(seed)
+        )
+    };
+    let edge_circle = |cx: f64, cy: f64, r: f64, seed: &str| {
+        format!(
+            "  (gr_circle (center {} {}) (end {} {}) (stroke (width 0.15) (type solid)) \
+             (fill no) (layer \"Edge.Cuts\") (uuid \"{}\"))\n",
+            mm(cx),
+            mm(cy),
+            mm(cx + r),
+            mm(cy),
+            det_uuid(seed)
+        )
+    };
+
+    let mut s = String::new();
+    s.push_str(
+        "(kicad_pcb (version 20241229) (generator \"legion-of-bom\") (generator_version \"9.0\")\n\
+         \x20 (general (thickness 1.6))\n  (paper \"A4\")\n\
+         \x20 (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (5 \"F.SilkS\" user) \
+         (7 \"B.SilkS\" user) (1 \"F.Mask\" user) (3 \"B.Mask\" user) (25 \"Edge.Cuts\" user) \
+         (35 \"F.Fab\" user) (33 \"B.Fab\" user))\n\
+         \x20 (setup (pad_to_mask_clearance 0))\n  (net 0 \"\")\n",
+    );
+    // Panel outline.
+    s.push_str(&edge_rect(0.0, 0.0, w, h, "panel.outline"));
+    // Mounting holes.
+    for (i, hole) in panel.mounting_holes().iter().enumerate() {
+        s.push_str(&edge_circle(
+            hole.x_mm,
+            fy(hole.y_mm),
+            hole.diameter_mm / 2.0,
+            &format!("panel.hole.{i}"),
+        ));
+    }
+    // Cutouts (jack rects, pot/LED circles), as inner Edge.Cuts loops.
+    for (i, c) in panel.cutouts().iter().enumerate() {
+        let (cx, cy) = (c.x_mm, fy(c.y_mm));
+        let seed = format!("panel.cut.{i}");
+        match footprint_shape(&c.footprint) {
+            Some(CutoutShape::Circle { diameter_mm }) => {
+                s.push_str(&edge_circle(cx, cy, diameter_mm / 2.0, &seed))
+            }
+            Some(CutoutShape::RoundedRect {
+                width_mm,
+                height_mm,
+                ..
+            }) => s.push_str(&edge_rect(
+                cx - width_mm / 2.0,
+                cy - height_mm / 2.0,
+                cx + width_mm / 2.0,
+                cy + height_mm / 2.0,
+                &seed,
+            )),
+            None => s.push_str(&edge_circle(cx, cy, 1.5, &seed)),
+        }
+    }
+    // Title, silkscreen, reading up the panel.
+    s.push_str(&format!(
+        "  (gr_text \"{}\" (at {} {} 90) (layer \"F.SilkS\") (uuid \"{}\") \
+         (effects (font (size 2.5 2.5) (thickness 0.35))))\n",
+        title,
+        mm(w / 2.0),
+        mm(h / 2.0),
+        det_uuid("panel.title")
+    ));
+    s.push_str(")\n");
+    s
+}
+
 fn write_circle<W: std::fmt::Write>(w: &mut W, cx: f64, cy: f64, r: f64) -> std::fmt::Result {
     writeln!(w, "0")?;
     writeln!(w, "CIRCLE")?;
@@ -715,6 +805,21 @@ mod tests {
         assert_eq!(panel.width_mm(), 6.0 * 5.08);
         assert_eq!(panel.height_mm(), 128.5);
         assert_eq!(panel.thickness_mm(), 2.0);
+    }
+
+    #[test]
+    fn panel_pcb_has_outline_cutouts_and_title() {
+        let panel = EurorackPanel::new(6)
+            .with_cutout(15.24, 100.0, "Alpha9mm") // pot -> circle
+            .with_cutout(15.24, 30.0, "Thonkiconn"); // jack -> rect
+        let pcb = panel_to_kicad_pcb(&panel, "demo");
+        assert!(pcb.starts_with("(kicad_pcb"));
+        assert!(pcb.contains(r#"(layer "Edge.Cuts")"#));
+        assert!(pcb.contains("gr_circle"), "pot cutout as a circle");
+        // Outline rect + the jack cutout rect (≥2 gr_rect on Edge.Cuts).
+        assert!(pcb.matches("gr_rect").count() >= 2);
+        assert!(pcb.contains(r#"(gr_text "demo""#));
+        assert!(pcb.contains(r#"(layer "F.SilkS")"#));
     }
 
     #[test]
