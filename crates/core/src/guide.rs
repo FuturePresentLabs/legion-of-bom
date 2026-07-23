@@ -335,9 +335,11 @@ fn f(s: &str) -> Option<f64> {
     s.parse().ok()
 }
 
-/// Render the guide as a self-contained HTML page (inline CSS + one top-down SVG
-/// per step, the step's parts highlighted).
-pub fn guide_to_html(guide: &BuildGuide) -> String {
+/// Render the guide as a self-contained HTML page (inline CSS + one board diagram
+/// per step, the step's parts highlighted). When `board_svg` is `Some`, it is
+/// KiCad's real board plot (from [`fab::export_board_svg`](crate::fab)) used as
+/// the underlay with highlight boxes overlaid; otherwise a schematic top-down.
+pub fn guide_to_html(guide: &BuildGuide, board_svg: Option<&str>) -> String {
     let total = guide.steps.len();
     let mut body = String::new();
     body.push_str(&format!(
@@ -346,9 +348,11 @@ pub fn guide_to_html(guide: &BuildGuide) -> String {
         esc(&guide.name)
     ));
     for (i, step) in guide.steps.iter().enumerate() {
-        let highlight: std::collections::HashSet<&str> =
-            step.parts.iter().map(|p| p.refdes.as_str()).collect();
-        let svg = board_svg(guide, &highlight);
+        let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
+        let svg = match board_svg {
+            Some(kicad) => real_board_svg(kicad, guide.outline, &step.parts),
+            None => schematic_board_svg(guide, &highlight),
+        };
         let mut list = String::new();
         for (value, refs) in group_by_value(&step.parts) {
             list.push_str(&format!(
@@ -528,66 +532,105 @@ pub fn guide_to_pdf(guide: &BuildGuide) -> Vec<u8> {
     pdf::document(&pages)
 }
 
-/// A top-down SVG of the board: outline + every part as a box, `highlight`ed
-/// parts filled red, the rest greyed.
-fn board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String {
+/// The highlight overlay for one part (SVG, board-mm coords): a red box + white
+/// refdes + a polarity marker (K/+/1) at the reference pad, so the assembler can
+/// match it to the board's silkscreen mark. `fill_opacity` lets the real board
+/// show through when overlaid.
+fn highlight_svg(p: &PlacedPart, fs: f64, fill_opacity: f64) -> String {
+    let (bx0, by0, bx1, by1) = p.bbox;
+    let mut s = format!(
+        "<rect x=\"{bx0}\" y=\"{by0}\" width=\"{}\" height=\"{}\" rx=\"0.2\" fill=\"#e34a4a\" \
+         fill-opacity=\"{fill_opacity}\" stroke=\"#a11\" stroke-width=\"0.35\"/>\
+         <text x=\"{}\" y=\"{}\" font-size=\"{fs}\" text-anchor=\"middle\" \
+         dominant-baseline=\"middle\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
+        bx1 - bx0,
+        by1 - by0,
+        p.cx,
+        p.cy,
+        esc(&p.refdes)
+    );
+    if let (Some(pol), Some((mx, my))) = (p.polarity, p.pin1) {
+        let r = fs * 0.9;
+        s.push_str(&format!(
+            "<circle cx=\"{mx}\" cy=\"{my}\" r=\"{r}\" fill=\"#111\" stroke=\"#fff\" \
+             stroke-width=\"0.15\"/>\
+             <text x=\"{mx}\" y=\"{my}\" font-size=\"{}\" text-anchor=\"middle\" \
+             dominant-baseline=\"central\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
+            fs * 1.1,
+            pol.label(),
+        ));
+    }
+    s
+}
+
+/// The board pad bounding box's short dimension → a legible label size (mm).
+fn label_size(outline: (f64, f64, f64, f64)) -> f64 {
+    let (x0, y0, x1, y1) = outline;
+    ((x1 - x0).min(y1 - y0) / 30.0).clamp(0.7, 2.0)
+}
+
+/// A schematic top-down SVG: outline + every part as a box, `highlight`ed parts
+/// red, the rest greyed. The fallback when no real KiCad plot is available.
+fn schematic_board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String {
     let (x0, y0, x1, y1) = guide.outline;
     let (w, h) = (x1 - x0, y1 - y0);
     let pad = 2.0;
     let mut svg = format!(
-        "<svg viewBox=\"{} {} {} {}\" xmlns=\"http://www.w3.org/2000/svg\">",
+        "<svg viewBox=\"{} {} {} {}\" xmlns=\"http://www.w3.org/2000/svg\">\
+         <rect x=\"{x0}\" y=\"{y0}\" width=\"{w}\" height=\"{h}\" fill=\"#eef3ee\" \
+         stroke=\"#3a6\" stroke-width=\"0.3\"/>",
         x0 - pad,
         y0 - pad,
         w + 2.0 * pad,
         h + 2.0 * pad
     );
-    svg.push_str(&format!(
-        "<rect x=\"{x0}\" y=\"{y0}\" width=\"{w}\" height=\"{h}\" fill=\"#eef3ee\" \
-         stroke=\"#3a6\" stroke-width=\"0.3\"/>"
-    ));
-    // Collect all parts once (union across steps) so context boxes show greyed.
-    let all: Vec<&PlacedPart> = guide.steps.iter().flat_map(|s| &s.parts).collect();
-    let fs = (w.min(h) / 30.0).clamp(0.7, 2.0);
-    for p in all {
-        let (bx0, by0, bx1, by1) = p.bbox;
-        let on = highlight.contains(p.refdes.as_str());
-        let (fill, stroke, tw) = if on {
-            ("#e34a4a", "#a11", 0.35)
+    let fs = label_size(guide.outline);
+    for p in guide.steps.iter().flat_map(|s| &s.parts) {
+        if highlight.contains(p.refdes.as_str()) {
+            svg.push_str(&highlight_svg(p, fs, 0.85));
         } else {
-            ("#dcdcdc", "#aaa", 0.15)
-        };
-        svg.push_str(&format!(
-            "<rect x=\"{bx0}\" y=\"{by0}\" width=\"{}\" height=\"{}\" rx=\"0.2\" \
-             fill=\"{fill}\" fill-opacity=\"{}\" stroke=\"{stroke}\" stroke-width=\"{tw}\"/>",
-            bx1 - bx0,
-            by1 - by0,
-            if on { 0.85 } else { 0.5 },
-        ));
-        if on {
+            let (bx0, by0, bx1, by1) = p.bbox;
             svg.push_str(&format!(
-                "<text x=\"{}\" y=\"{}\" font-size=\"{fs}\" text-anchor=\"middle\" \
-                 dominant-baseline=\"middle\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
-                p.cx,
-                p.cy,
-                esc(&p.refdes)
+                "<rect x=\"{bx0}\" y=\"{by0}\" width=\"{}\" height=\"{}\" rx=\"0.2\" fill=\"#dcdcdc\" \
+                 fill-opacity=\"0.5\" stroke=\"#aaa\" stroke-width=\"0.15\"/>",
+                bx1 - bx0,
+                by1 - by0
             ));
-            // Polarity marker at the reference pad (pin 1 / + / cathode), so the
-            // assembler can match it to the board's silkscreen mark.
-            if let (Some(pol), Some((mx, my))) = (p.polarity, p.pin1) {
-                let r = fs * 0.9;
-                svg.push_str(&format!(
-                    "<circle cx=\"{mx}\" cy=\"{my}\" r=\"{r}\" fill=\"#111\" \
-                     stroke=\"#fff\" stroke-width=\"0.15\"/>\
-                     <text x=\"{mx}\" y=\"{my}\" font-size=\"{}\" text-anchor=\"middle\" \
-                     dominant-baseline=\"central\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
-                    fs * 1.1,
-                    pol.label(),
-                ));
-            }
         }
     }
     svg.push_str("</svg>");
     svg
+}
+
+/// KiCad's real board plot with the current step's parts highlighted on top. The
+/// KiCad SVG is in true board mm, so retargeting its viewBox to the board outline
+/// crops/zooms to the board and the highlight overlays (also board-mm) align.
+fn real_board_svg(kicad_svg: &str, outline: (f64, f64, f64, f64), parts: &[PlacedPart]) -> String {
+    let (x0, y0, x1, y1) = outline;
+    let pad = 2.0;
+    let vb = format!(
+        "{:.3} {:.3} {:.3} {:.3}",
+        x0 - pad,
+        y0 - pad,
+        (x1 - x0) + 2.0 * pad,
+        (y1 - y0) + 2.0 * pad
+    );
+    let base = retarget_viewbox(kicad_svg, &vb);
+    let fs = label_size(outline);
+    let overlay: String = parts.iter().map(|p| highlight_svg(p, fs, 0.42)).collect();
+    base.replacen("</svg>", &format!("{overlay}</svg>"), 1)
+}
+
+/// Replace an SVG document's `viewBox` value (crop/zoom without moving content).
+fn retarget_viewbox(svg: &str, viewbox: &str) -> String {
+    let key = "viewBox=\"";
+    if let Some(i) = svg.find(key) {
+        let start = i + key.len();
+        if let Some(len) = svg[start..].find('"') {
+            return format!("{}{viewbox}{}", &svg[..start], &svg[start + len..]);
+        }
+    }
+    svg.to_string()
 }
 
 /// Group a step's parts by value, preserving refdes order.
@@ -662,7 +705,7 @@ mod tests {
     #[test]
     fn html_highlights_and_is_self_contained() {
         let g = build_guide(&amp(), BOARD).unwrap();
-        let html = guide_to_html(&g);
+        let html = guide_to_html(&g, None);
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<svg"));
         assert!(html.contains("Step 1 of 2: Resistors"));

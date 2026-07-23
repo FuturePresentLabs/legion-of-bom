@@ -13,12 +13,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_cpl,
-    export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom,
-    guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, parse_netlist_file,
-    run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions, CircuitSource, Finding,
-    JlcpcbClient, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
-    PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_board_svg,
+    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
+    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
+    parse_netlist_file, run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions, CircuitSource,
+    Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution,
+    PartsLibrary, PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -461,7 +461,19 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     let (board, _) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
 
     let guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
-    let html = guide_to_html(&guide);
+
+    // Use KiCad's real board plot as the diagram underlay when kicad-cli is
+    // available; fall back to the schematic top-down otherwise.
+    std::fs::create_dir_all(&work_dir)?;
+    let board_file = work_dir.join(format!("{stem}.kicad_pcb"));
+    std::fs::write(&board_file, &board)?;
+    let real_svg = kicad_cli_path().and_then(|k| export_board_svg(&board_file, &k).ok());
+    if real_svg.is_some() {
+        println!("  diagram: real KiCad layout (via kicad-cli)");
+    } else {
+        println!("  diagram: schematic top-down (kicad-cli not found)");
+    }
+    let html = guide_to_html(&guide, real_svg.as_deref());
 
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}-guide.html")));
     if let Some(parent) = path.parent() {

@@ -66,6 +66,33 @@ pub fn export_gerbers(board: &Path, out_dir: &Path, kicad_cli: &Path) -> Result<
     Ok(())
 }
 
+/// Export a top-view SVG of the real board (copper, silk, fab outlines, edge) for
+/// the build-guide underlay ([`guide`](crate::guide)). Real board coordinates
+/// (mm) are preserved, so the guide's highlight boxes overlay accurately.
+pub fn export_board_svg(board: &Path, kicad_cli: &Path) -> Result<String, StageError> {
+    let stem = board
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("board");
+    let out = std::env::temp_dir().join(format!("lob-{stem}-guide.svg"));
+    run_kicad(
+        kicad_cli,
+        &[
+            "pcb",
+            "export",
+            "svg",
+            "--layers",
+            "F.Cu,B.Cu,F.Silkscreen,F.Fab,Edge.Cuts",
+            "--exclude-drawing-sheet",
+            "--mode-single",
+            "-o",
+            out.to_str().unwrap_or_default(),
+        ],
+        board,
+    )?;
+    Ok(std::fs::read_to_string(&out)?)
+}
+
 /// Zip `dir`'s contents (flat, files at the archive root) into `zip_path` — the
 /// form JLCPCB accepts for PCB upload. Uses the system `zip`; returns `false`
 /// (rather than erroring) if it isn't available, so the caller can fall back to

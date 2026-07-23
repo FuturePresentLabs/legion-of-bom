@@ -41,7 +41,9 @@ pub use board::{
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
-pub use fab::{export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos, zip_dir};
+pub use fab::{
+    export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos, zip_dir,
+};
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use guide::{build_guide, guide_to_html, guide_to_pdf, BuildGuide, BuildStep, PlacedPart};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
