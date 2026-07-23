@@ -51,6 +51,17 @@ impl PadLayer {
             PadLayer::Both => true,
         }
     }
+    /// The copper layers this pad connects to. A through-hole pad ([`Both`]) is on
+    /// both, so it bridges them for free — no via needed to change layers there.
+    ///
+    /// [`Both`]: PadLayer::Both
+    fn layers(self) -> &'static [usize] {
+        match self {
+            PadLayer::Front => &[FRONT],
+            PadLayer::Back => &[BACK],
+            PadLayer::Both => &[FRONT, BACK],
+        }
+    }
 }
 
 /// A pad rectangle in board coordinates (mm) — the input the router connects.
@@ -269,7 +280,8 @@ impl Router for GridRouter {
 
         // Paint every pad (and its clearance halo) as its net's territory. Do the
         // cores first so a halo never overwrites a real pad connection point.
-        let mut pad_cells: Vec<Vec<(usize, (usize, usize))>> = Vec::new(); // per routable net
+        // Per routable net: each pad's cell + which layers it connects.
+        let mut pad_cells: Vec<Vec<((usize, usize), PadLayer)>> = Vec::new();
         for net in nets {
             for pad in &net.pads {
                 for layer in [FRONT, BACK] {
@@ -299,15 +311,17 @@ impl Router for GridRouter {
             }
         }
 
-        // Record each routable net's pad cells (for source/target sets).
+        // Record each routable net's pad cells (for source/target sets). A pad is
+        // a connection point on every layer it touches — so a through-hole pad is
+        // reachable on both, letting the router meet it without a via.
         for net in &routable {
             let mut cells = Vec::new();
-            for (pi, pad) in net.pads.iter().enumerate() {
+            for pad in &net.pads {
                 let (c, r) = cell_of(pad.x_mm, pad.y_mm);
-                let layer = if pad.layer.on(FRONT) { FRONT } else { BACK };
-                cells.push((pi, (c, r)));
-                // Ensure the exact pad centre is a connection point for its net.
-                grid.set(c, r, layer, Cell::Owner(net.net_idx));
+                for &layer in pad.layer.layers() {
+                    grid.set(c, r, layer, Cell::Owner(net.net_idx));
+                }
+                cells.push(((c, r), pad.layer));
             }
             pad_cells.push(cells);
         }
@@ -321,37 +335,32 @@ impl Router for GridRouter {
             let via_cost = (opts.via_cost_mm * 1000.0) as i64;
 
             // Connected component: cells already part of this net's routed tree.
+            // A through-hole pad seeds both layers (it bridges them).
             let mut connected: Vec<(usize, usize, usize)> = Vec::new(); // (c,r,layer)
-            let (p0c, p0r) = pad_cells[ni][0].1;
-            let l0 = if net.pads[0].layer.on(FRONT) {
-                FRONT
-            } else {
-                BACK
-            };
-            connected.push((p0c, p0r, l0));
+            let ((p0c, p0r), p0layer) = pad_cells[ni][0];
+            for &l in p0layer.layers() {
+                connected.push((p0c, p0r, l));
+            }
 
             let mut pending: Vec<usize> = (1..net.pads.len()).collect();
             while let Some(k) = pending.pop() {
-                let (tc, tr) = pad_cells[ni][k].1;
-                let tl = if net.pads[k].layer.on(FRONT) {
-                    FRONT
-                } else {
-                    BACK
-                };
-                match grid.route_one(
-                    net.net_idx,
-                    &connected,
-                    (tc, tr, tl),
-                    step,
-                    via_cost,
-                    via_halo,
-                ) {
+                let ((tc, tr), tlayer) = pad_cells[ni][k];
+                // Reach the pad on any layer it touches (cheapest wins).
+                let targets: Vec<(usize, usize, usize)> =
+                    tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
+                match grid.route_one(net.net_idx, &connected, &targets, step, via_cost, via_halo) {
                     Some(path) => {
                         emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
                         for &(c, r, l) in &path {
                             grid.commit(c, r, l, net.net_idx, halo);
                             if !connected.contains(&(c, r, l)) {
                                 connected.push((c, r, l));
+                            }
+                        }
+                        // A through-hole target bridges both layers into the tree.
+                        for &l in tlayer.layers() {
+                            if !connected.contains(&(tc, tr, l)) {
+                                connected.push((tc, tr, l));
                             }
                         }
                         // Reserve each via's wider body so later nets keep clear.
@@ -467,7 +476,7 @@ impl Grid {
         &self,
         net: usize,
         sources: &[(usize, usize, usize)],
-        target: (usize, usize, usize),
+        targets: &[(usize, usize, usize)],
         step: i64,
         via_cost: i64,
         via_halo: isize,
@@ -483,12 +492,12 @@ impl Grid {
                 heap.push(Reverse((0i64, i)));
             }
         }
-        let tgt = self.idx(target.0, target.1, target.2);
+        let tgt: Vec<usize> = targets.iter().map(|&(c, r, l)| self.idx(c, r, l)).collect();
         while let Some(Reverse((d, i))) = heap.pop() {
             if d > dist[i] {
                 continue;
             }
-            if i == tgt {
+            if tgt.contains(&i) {
                 // Reconstruct.
                 let mut path = Vec::new();
                 let mut cur = i;
@@ -775,6 +784,38 @@ mod tests {
             h_mm: 1.0,
             layer: PadLayer::Front,
         }
+    }
+
+    fn pad_on(refdes: &str, num: &str, x: f64, y: f64, layer: PadLayer) -> PadPoint {
+        PadPoint {
+            layer,
+            ..pad(refdes, num, x, y)
+        }
+    }
+
+    #[test]
+    fn through_hole_pad_reached_without_a_via() {
+        // A back SMD pad and a through-hole pad on the same net. The through-hole
+        // pad is on both layers, so the router should meet it on the back — no via.
+        let net = RouteNet {
+            net_idx: 1,
+            name: "N".into(),
+            pads: vec![
+                pad_on("R1", "2", 100.0, 100.0, PadLayer::Back),
+                pad_on("J1", "1", 103.0, 100.0, PadLayer::Both),
+            ],
+        };
+        let out = GridRouter.route(&[net], &RouteOptions::default());
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+        assert!(!out.tracks.is_empty());
+        assert!(
+            out.vias.is_empty(),
+            "through-hole pad bridges layers — no via needed"
+        );
+        assert!(
+            out.tracks.iter().all(|t| t.layer == "B.Cu"),
+            "route stays on the back where both pads are reachable"
+        );
     }
 
     #[test]
