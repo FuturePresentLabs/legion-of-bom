@@ -13,11 +13,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, default_panel_orders_dir, default_parts_dir, fetch_from_jlcpcb,
-    fetch_from_kicad, generate_board_report, generate_bom, kicad_cli_path, panel_to_dxf,
-    parse_netlist_file, run_drc, simulate_ac, validate_erc, BoardOptions, CircuitSource, Finding,
-    JlcpcbClient, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
-    PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, default_panel_orders_dir, default_parts_dir, export_cpl, export_gerbers,
+    fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom, jlc_bom_csv,
+    kicad_cli_path, panel_to_dxf, parse_netlist_file, run_drc, simulate_ac, validate_erc, zip_dir,
+    BoardOptions, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus, Severity,
+    SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -69,6 +70,14 @@ enum Command {
     Drc {
         /// Path to the board file to check.
         board: PathBuf,
+    },
+    /// Build a DRC-gated manufacturing package (Gerbers + drill + JLCPCB CPL + BOM).
+    Fab {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Package directory (default: out/<name>/fab).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Panel design: generate DXF, track orders.
     Panel {
@@ -167,6 +176,7 @@ fn main() -> ExitCode {
         } => bom_cmd(circuit, price, out),
         Command::Board { circuit, out } => board_cmd(circuit, out),
         Command::Drc { board } => drc_cmd(board),
+        Command::Fab { circuit, out } => fab_cmd(circuit, out),
         Command::Panel { action } => panel_cmd(action),
     };
 
@@ -336,6 +346,89 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("{} DRC error(s)", report.error_count());
     }
+}
+
+/// Handle `lob fab <circuit> [--out]` — generate a board, gate it on DRC, and
+/// write the JLCPCB-ready manufacturing package (Gerbers + drill + CPL + BOM).
+fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+
+    // Generate the board.
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let footprint_dir = kicad_footprint_dir()
+        .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    let (board, conflicts) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
+
+    let pkg = out.unwrap_or_else(|| work_dir.join("fab"));
+    std::fs::create_dir_all(&pkg)?;
+    let board_path = pkg.join(format!("{stem}.kicad_pcb"));
+    std::fs::write(&board_path, &board)
+        .with_context(|| format!("writing {}", board_path.display()))?;
+    if !conflicts.is_empty() {
+        eprintln!("  ⚠ {} connection(s) left unrouted:", conflicts.len());
+        for c in &conflicts {
+            eprintln!("      - {c}");
+        }
+    }
+
+    let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
+
+    // DRC gate — do not ship a package for a board with errors.
+    let report = run_drc(&board_path, &kicad)?;
+    println!(
+        "DRC: {} error(s), {} warning(s)",
+        report.error_count(),
+        report.warning_count()
+    );
+    if !report.is_clean() {
+        for v in report.errors() {
+            eprintln!("  ✗ [{}] {}", v.kind, v.description);
+        }
+        anyhow::bail!(
+            "board has {} DRC error(s) — refusing to build a fab package",
+            report.error_count()
+        );
+    }
+
+    // Manufacturing outputs.
+    let gerber_dir = pkg.join("gerbers");
+    export_gerbers(&board_path, &gerber_dir, &kicad)?;
+    let zip_path = pkg.join(format!("{stem}-gerbers.zip"));
+    let zipped = zip_dir(&gerber_dir, &zip_path)?;
+    let cpl_path = pkg.join(format!("{stem}-cpl.csv"));
+    let placed = export_cpl(&board_path, &cpl_path, &kicad)?;
+    let bom = generate_bom(&model);
+    let bom_path = pkg.join(format!("{stem}-bom.csv"));
+    std::fs::write(&bom_path, jlc_bom_csv(&bom))
+        .with_context(|| format!("writing {}", bom_path.display()))?;
+
+    println!("fab package: {}", pkg.display());
+    if zipped {
+        println!("  PCB (upload this):   {}", zip_path.display());
+    } else {
+        println!(
+            "  gerbers + drill:     {}/  (zip it — system `zip` unavailable)",
+            gerber_dir.display()
+        );
+    }
+    println!("  CPL ({placed} placements): {}", cpl_path.display());
+    println!(
+        "  BOM ({} line items): {}",
+        bom.lines.len(),
+        bom_path.display()
+    );
+    println!("  → JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly");
+    Ok(())
 }
 
 /// Handle `lob bom <circuit> [--price] [--out]`.
