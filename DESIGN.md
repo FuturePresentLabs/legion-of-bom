@@ -317,15 +317,36 @@ free-placement problem to just the support components (passives, ICs) instead of
 the whole board, which is what makes an iterative loop tractable instead of a
 general NP-hard placement search.
 
+**Board side is a real, current requirement for Eurorack, not a deferred
+one.** The existing Super Synthesis resurrection line (PHRSR/SCANNER/EG/TVCA)
+is genuinely double-sided in production: SMD/PCBA components on one side,
+THT + silkscreen on the opposite side — with the power header as the sole
+exception (THT, but placed on the PCBA side rather than the THT side). This
+means every footprint in the anchored-cutout and free-placement data model
+needs a `side: front | back` attribute, and the format-specific 3D-model
+library (6.7) needs both-side clearance data, not just one. **Guitar Pedal
+stays single-sided** (matches real THT pedal convention, no change there) —
+this is an Eurorack-specific requirement, not a general one, and shouldn't
+be generalized into "all formats need both-side support" without evidence.
+
 ### 6.2 2-layer convention (ground pour default)
 Hard v1 constraint: 2 layers only, matching real fabrication experience and no
 near-term need for more. Default convention: bottom layer is a solid ground
 pour, top layer carries signal and power traces, with via stitching down to
-ground where needed. This substantially replaces manual star-ground topology
-work for most nets — a solid pour gives a low-impedance return path largely "for
-free," rather than requiring every ground connection to be individually routed
-to converge at one point. Reduces one of the most error-prone parts of analog
-layout (see the phono-preamp grounding discussion) to a default that mostly just
+ground where needed. **This needs reconciling with 6.1's double-sided
+requirement for Eurorack** — a solid ground pour on the back copper layer and
+components mounted on that same physical side aren't mutually exclusive (SMD
+parts can sit on a layer that's mostly ground-poured, routed around), but it
+means the "bottom = pure ground, no components" mental model implicitly
+carried through this section's earlier drafts was wrong for Eurorack
+specifically, even though it stayed true for the THT-pedal single-sided case.
+Worth a closer pass once double-sided placement logic is actually being
+built, not just flagged here. This substantially replaces manual star-ground
+topology work for most nets — a solid pour gives a low-impedance return path
+largely "for free," rather than requiring every ground connection to be
+individually routed to converge at one point. Reduces one of the most
+error-prone parts of analog layout (see the phono-preamp grounding
+discussion) to a default that mostly just
 works, with critical-net tagging (6.4) as the escape hatch for the nets where it
 doesn't.
 
