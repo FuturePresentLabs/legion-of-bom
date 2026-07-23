@@ -39,10 +39,22 @@ pub fn export_gerbers(board: &Path, out_dir: &Path, kicad_cli: &Path) -> Result<
     let dir = format!("{}{}", out_dir.display(), std::path::MAIN_SEPARATOR);
     run_kicad(
         kicad_cli,
-        &["pcb", "export", "gerbers", "--check-zones", "-o", &dir],
+        &[
+            "pcb",
+            "export",
+            "gerbers",
+            "--check-zones",
+            "--use-drill-file-origin",
+            "-o",
+            &dir,
+        ],
         board,
     )?;
-    run_kicad(kicad_cli, &["pcb", "export", "drill", "-o", &dir], board)?;
+    run_kicad(
+        kicad_cli,
+        &["pcb", "export", "drill", "--drill-origin", "plot", "-o", &dir],
+        board,
+    )?;
     Ok(())
 }
 
@@ -81,6 +93,7 @@ pub fn export_cpl(board: &Path, out: &Path, kicad_cli: &Path) -> Result<usize, S
             "csv",
             "--units",
             "mm",
+            "--use-drill-file-origin",
             "-o",
             tmp.to_str().unwrap_or_default(),
         ],

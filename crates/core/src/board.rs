@@ -282,6 +282,30 @@ pub fn generate_board_report(
         ));
     }
 
+    // Board outline (bounding box of the placed pads + margin). Computed before
+    // the setup block so the drill/place-file origin can anchor to it. A real
+    // panel-driven outline arrives with PanelSpec (j54.10); this is a valid
+    // rectangular first cut.
+    let outline = pad_bb.0.is_finite().then(|| {
+        let m = options.outline_margin_mm;
+        (pad_bb.0 - m, pad_bb.1 - m, pad_bb.2 + m, pad_bb.3 + m)
+    });
+
+    // Setup: anchor the drill/place-file origin at the board's bottom-left, so
+    // CPL/Gerber coordinates exported with `--use-drill-file-origin` are small
+    // and positive (see `fab::export_cpl`) rather than page-space.
+    let mut setup = vec![
+        Sexpr::sym("setup"),
+        kv("pad_to_mask_clearance", Sexpr::sym("0")),
+    ];
+    if let Some((minx, _, _, maxy)) = outline {
+        setup.push(Sexpr::list(vec![
+            Sexpr::sym("aux_axis_origin"),
+            Sexpr::sym(mm(minx)),
+            Sexpr::sym(mm(maxy)),
+        ]));
+    }
+
     // Assemble the board.
     let mut board = vec![
         Sexpr::sym("kicad_pcb"),
@@ -294,22 +318,13 @@ pub fn generate_board_report(
         ]),
         kv("paper", Sexpr::string("A4")),
         two_layer_stack(),
-        Sexpr::list(vec![
-            Sexpr::sym("setup"),
-            kv("pad_to_mask_clearance", Sexpr::sym("0")),
-        ]),
+        Sexpr::list(setup),
         net(0, ""),
     ];
     for name in &net_names {
         board.push(net(net_index[name.as_str()], name));
     }
-    // Board outline (bounding box of the placed pads + margin) + bottom-layer
-    // ground pour (DESIGN 6.2). A real panel-driven outline arrives with
-    // PanelSpec (j54.10); this is a valid rectangular first cut.
-    let outline = pad_bb.0.is_finite().then(|| {
-        let m = options.outline_margin_mm;
-        (pad_bb.0 - m, pad_bb.1 - m, pad_bb.2 + m, pad_bb.3 + m)
-    });
+    // Bottom-layer ground pour (DESIGN 6.2) over the outline.
     if let Some(rect) = outline {
         board.push(edge_cuts_rect(rect));
         if let Some(gnd) = &options.ground_net {
