@@ -455,6 +455,7 @@ mod tests {
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
                     mpn: None,
                     sim: None,
+                    side: None,
                 },
                 Part::new("R1", "9k"),
                 Part::new("R2", "1k"),

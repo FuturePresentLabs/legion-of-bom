@@ -39,6 +39,29 @@ pub struct SimModel {
     pub pins: Option<String>,
 }
 
+/// Which physical side of the board a part mounts on (DESIGN 6.1). Whether a
+/// board is single- or double-sided, and which parts go where, is a *design
+/// choice* declared per part — not derivable from SMD-vs-through-hole (Mutable
+/// boards are single-sided despite mixing both; Super Synthesis is double-sided).
+/// Parts default to `Front` (single-sided); a double-sided board declares the
+/// parts that belong on the `Back`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Front,
+    Back,
+}
+
+impl Side {
+    /// Parse a declared side (`front`/`top` → `Front`, `back`/`bottom` → `Back`).
+    pub fn parse(s: &str) -> Option<Side> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "front" | "top" | "f" => Some(Side::Front),
+            "back" | "bottom" | "b" => Some(Side::Back),
+            _ => None,
+        }
+    }
+}
+
 /// A single component instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Part {
@@ -57,11 +80,14 @@ pub struct Part {
     /// SPICE model carried by the part, if it declares one (`Sim.*` fields). A
     /// primitive (R/C/L) carries none. This is the seam the parts library fills.
     pub sim: Option<SimModel>,
+    /// The board side this part is declared to mount on (a `Side` field). `None`
+    /// means the default, front.
+    pub side: Option<Side>,
 }
 
 impl Part {
-    /// A part with just a refdes and value; no footprint, library part, MPN, or
-    /// model.
+    /// A part with just a refdes and value; no footprint, library part, MPN,
+    /// model, or side.
     pub fn new(refdes: impl Into<RefDes>, value: impl Into<String>) -> Self {
         Part {
             refdes: refdes.into(),
@@ -70,6 +96,7 @@ impl Part {
             library_part: None,
             mpn: None,
             sim: None,
+            side: None,
         }
     }
 
@@ -88,6 +115,12 @@ impl Part {
     /// Builder-style: attach a SPICE model.
     pub fn with_sim(mut self, sim: SimModel) -> Self {
         self.sim = Some(sim);
+        self
+    }
+
+    /// Builder-style: declare the board side this part mounts on.
+    pub fn with_side(mut self, side: Side) -> Self {
+        self.side = Some(side);
         self
     }
 }
@@ -186,5 +219,14 @@ mod tests {
     fn refdes_display_and_from() {
         let r: RefDes = "C7".into();
         assert_eq!(r.to_string(), "C7");
+    }
+
+    #[test]
+    fn side_parses_common_spellings() {
+        assert_eq!(Side::parse("front"), Some(Side::Front));
+        assert_eq!(Side::parse("Top"), Some(Side::Front));
+        assert_eq!(Side::parse("back"), Some(Side::Back));
+        assert_eq!(Side::parse("BOTTOM"), Some(Side::Back));
+        assert_eq!(Side::parse("sideways"), None);
     }
 }

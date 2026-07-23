@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::model::Side;
 use crate::route::{
     track_sexpr, via_sexpr, GridRouter, PadLayer, PadPoint, RouteNet, RouteOptions, Router,
 };
@@ -45,15 +46,6 @@ pub struct Placement {
     pub y_mm: f64,
     pub rotation_deg: f64,
     pub back: bool,
-}
-
-/// Which physical side of the board a part mounts on (DESIGN 6.1). Eurorack is
-/// double-sided — SMD/PCBA components on one side, through-hole + silkscreen on
-/// the other; a single-sided board (e.g. the guitar pedal) is all `Front`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Front,
-    Back,
 }
 
 /// What the placer needs to know about a part beyond the netlist: its footprint
@@ -207,8 +199,10 @@ pub fn generate_board_report(
         }
     }
 
-    // Pass 1: load each part's footprint and measure its keep-out extent + side,
-    // so the placer can space parts by real size and mount them on the right copper.
+    // Pass 1: load each part's footprint, measure its keep-out extent, and record
+    // its declared side (DESIGN 6.1). Side is a design choice the circuit declares
+    // per part — defaulting to the front (single-sided) — not something inferred
+    // from SMD-vs-through-hole. A double-sided board declares its back parts.
     let mut loaded: Vec<(&str, &str, Sexpr, Vec<FpPad>)> = Vec::new();
     let mut facts: HashMap<String, PartFacts> = HashMap::new();
     for part in circuit.parts() {
@@ -225,7 +219,7 @@ pub fn generate_board_report(
             refdes.to_string(),
             PartFacts {
                 extent: part_extent(&pads, COURTYARD_MARGIN_MM),
-                side: resolve_side(&pads),
+                side: part.side.unwrap_or(Side::Front),
             },
         );
         loaded.push((refdes, lib_part, fp, pads));
@@ -405,19 +399,6 @@ fn footprint_pads(fp: &Sexpr) -> Vec<FpPad> {
         });
     }
     pads
-}
-
-/// Which side a part mounts on (DESIGN 6.1's Eurorack convention): a through-hole
-/// part goes on the THT+silkscreen side (back), an SMD part on the PCBA side
-/// (front). A part with any through-hole pad (on `*.Cu`, i.e. [`PadLayer::Both`])
-/// counts as through-hole. (The power-header exception — THT but on the PCBA side
-/// — is a per-part override left to follow-up work.)
-fn resolve_side(pads: &[FpPad]) -> Side {
-    if pads.iter().any(|p| p.layer == PadLayer::Both) {
-        Side::Back
-    } else {
-        Side::Front
-    }
 }
 
 /// A part's placement keep-out `(width, height)` in mm: the bounding box of its
@@ -832,22 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_side_by_pad_technology() {
-        let smd = |n: &str| FpPad {
-            num: n.into(),
-            px: 0.0,
-            py: 0.0,
-            w: 1.0,
-            h: 1.0,
-            layer: PadLayer::Front,
-        };
-        let tht = |n: &str| FpPad {
-            layer: PadLayer::Both,
-            ..smd(n)
-        };
-        assert_eq!(resolve_side(&[smd("1"), smd("2")]), Side::Front);
-        // Any through-hole pad makes the part through-hole → back.
-        assert_eq!(resolve_side(&[smd("1"), tht("2")]), Side::Back);
+    fn parts_default_to_front_unless_declared() {
+        // No declared side → front (single-sided default).
+        let placements = GridPlacer::default().place(&rc(), &HashMap::new());
+        assert!(placements.values().all(|p| !p.back));
     }
 
     #[test]
@@ -870,33 +839,34 @@ mod tests {
         assert!(out.contains("mirror"), "back text mirrored: {out}");
     }
 
-    /// A through-hole part must land flipped on the bottom copper + silk.
+    /// A part *declared* on the back must land flipped on the bottom copper + silk.
     #[test]
-    fn through_hole_part_lands_on_bottom() {
+    fn back_declared_part_lands_on_bottom() {
         let Some(dir) = crate::skidl::kicad_footprint_dir() else {
             return;
         };
         let c = Circuit {
             name: "ds".into(),
             parts: vec![
+                // R1 defaults to the front; C1 is explicitly declared on the back.
                 Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
-                Part::new("J1", "Conn")
-                    .with_footprint("Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"),
+                Part::new("C1", "100n")
+                    .with_footprint("Capacitor_SMD:C_0805_2012Metric")
+                    .with_side(Side::Back),
             ],
             nets: vec![Net::new(
-                "IN",
-                vec![PinRef::new("R1", "1"), PinRef::new("J1", "1")],
+                "OUT",
+                vec![PinRef::new("R1", "2"), PinRef::new("C1", "1")],
             )],
         };
         let board = match generate_board(&c, &BoardOptions::new(&dir)) {
             Ok(b) => b,
             Err(_) => return,
         };
-        // The SMD R1 stays on front; the through-hole J1 is flipped to the back.
-        assert!(board.contains(r#""Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical""#));
+        // The back-declared C1 is flipped: its silk moves to B.SilkS.
         assert!(
             board.contains(r#""B.SilkS""#),
-            "back part silk moved to B.SilkS"
+            "back-declared part silk moved to B.SilkS"
         );
     }
 

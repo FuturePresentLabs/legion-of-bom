@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::model::{Circuit, Net, Part, PinRef, RefDes, SimModel};
+use crate::model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
 use crate::sexpr::Sexpr;
 use crate::stage::StageError;
 
@@ -68,6 +68,8 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 library: field_value(comp, "Sim.Library"),
                 pins: field_value(comp, "Sim.Pins"),
             });
+            // Which board side the circuit declares this part on (a `Side` field).
+            let side = field_value(comp, "Side").and_then(|s| Side::parse(&s));
             parts.push(Part {
                 refdes: RefDes(refdes.to_string()),
                 value,
@@ -75,6 +77,7 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 library_part,
                 mpn,
                 sim,
+                side,
             });
         }
     }
