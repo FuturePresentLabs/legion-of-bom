@@ -334,11 +334,13 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
     let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
 
     let report = run_drc(&board, &kicad)?;
+    let silk = report.silkscreen_collision_count();
     println!(
-        "DRC {}: {} error(s), {} warning(s), {} unconnected",
+        "DRC {}: {} error(s), {} warning(s) ({} silkscreen), {} unconnected",
         board.display(),
         report.error_count(),
         report.warning_count(),
+        silk,
         report.unconnected_count()
     );
     for v in report.errors() {
@@ -347,8 +349,23 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
             println!("      - {}", it.description);
         }
     }
-    for v in report.warnings() {
+    // Non-silk warnings; silkscreen collisions get their own section below.
+    for v in report.warnings().filter(|v| !v.is_silkscreen_collision()) {
         println!("  ⚠ [{}] {}", v.kind, v.description);
+    }
+    // Silkscreen collisions (DESIGN 6.10): not electrical, but they garble the
+    // refdes/polarity legend a hand-assembler reads — surface them explicitly.
+    if silk > 0 {
+        println!("  silkscreen ({silk}): refdes/marks over pads or overlapping —");
+        for v in report.silkscreen_collisions() {
+            let loc = v
+                .items
+                .iter()
+                .find_map(|it| it.pos)
+                .map(|p| format!(" @ ({:.1}, {:.1})", p.x, p.y))
+                .unwrap_or_default();
+            println!("      ▪ [{}] {}{}", v.kind, v.description, loc);
+        }
     }
     if report.is_clean() {
         println!("  ✓ no errors");

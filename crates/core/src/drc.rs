@@ -47,6 +47,19 @@ pub struct DrcViolation {
     pub items: Vec<DrcItem>,
 }
 
+impl DrcViolation {
+    /// Whether this is a **silkscreen collision** (DESIGN 6.10) — silk over a
+    /// pad/copper, silk over silk, or silk over the board edge — rather than an
+    /// electrical rule. Every KiCad silkscreen DRC key contains `silk`
+    /// (`silk_over_copper`, `silk_overlap`, `silk_edge_clearance`), so match on
+    /// that: a new key variant is caught without a spelling update. These pass
+    /// the copper/electrical checks silently, so the layout loop surfaces them
+    /// separately (they degrade a hand-assembler's legend, not the circuit).
+    pub fn is_silkscreen_collision(&self) -> bool {
+        self.kind.contains("silk")
+    }
+}
+
 /// One item referenced by a violation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DrcItem {
@@ -87,11 +100,23 @@ impl DrcReport {
         self.all().filter(|v| v.severity == "warning")
     }
 
+    /// Silkscreen collisions (DESIGN 6.10) — silk over pad/copper, silk-over-
+    /// silk, or silk over the board edge. Typically `warning` severity, so they
+    /// don't fail [`is_clean`](Self::is_clean); the layout loop's check step
+    /// surfaces and repairs them explicitly rather than letting the copper checks
+    /// swallow them.
+    pub fn silkscreen_collisions(&self) -> impl Iterator<Item = &DrcViolation> {
+        self.all().filter(|v| v.is_silkscreen_collision())
+    }
+
     pub fn error_count(&self) -> usize {
         self.errors().count()
     }
     pub fn warning_count(&self) -> usize {
         self.warnings().count()
+    }
+    pub fn silkscreen_collision_count(&self) -> usize {
+        self.silkscreen_collisions().count()
     }
     pub fn unconnected_count(&self) -> usize {
         self.unconnected_items.len()
@@ -174,6 +199,25 @@ mod tests {
         let clearance = r.errors().find(|v| v.kind == "clearance").unwrap();
         assert_eq!(clearance.items.len(), 2);
         assert_eq!(clearance.items[0].pos.unwrap().x, 100.0);
+    }
+
+    #[test]
+    fn surfaces_silkscreen_collisions() {
+        // Real KiCad 10 silk keys: silk_overlap (silk↔silk), silk_over_copper
+        // (silk↔pad). Both are warnings — not electrical — so is_clean ignores
+        // them, but the loop's check step must be able to enumerate them.
+        let json = r#"{"violations":[
+            {"type":"silk_overlap","severity":"warning","description":"Silkscreen clearance",
+             "items":[{"description":"Text 'C7'","pos":{"x":110.0,"y":95.0}}]},
+            {"type":"silk_over_copper","severity":"warning","description":"Silk over pad","items":[]},
+            {"type":"clearance","severity":"error","description":"Clearance","items":[]}
+        ]}"#;
+        let r = DrcReport::from_json(json).unwrap();
+        assert_eq!(r.silkscreen_collision_count(), 2);
+        assert!(r.silkscreen_collisions().all(|v| v.is_silkscreen_collision()));
+        // A real electrical error is still the only thing that makes it unclean.
+        assert_eq!(r.error_count(), 1);
+        assert!(!r.is_clean());
     }
 
     #[test]
