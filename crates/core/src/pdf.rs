@@ -36,6 +36,44 @@ impl Paint {
     }
 }
 
+/// A JPEG image, embeddable directly via PDF's `DCTDecode` filter.
+pub struct Image {
+    jpeg: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+impl Image {
+    /// Read a JPEG's pixel dimensions from its `SOFn` frame header.
+    pub fn from_jpeg(jpeg: Vec<u8>) -> Option<Image> {
+        let b = &jpeg;
+        if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
+            return None;
+        }
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = b[i + 1];
+            // Start-of-frame markers carry the dimensions (skip DHT 0xC4 etc.).
+            if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+                let h = ((b[i + 5] as u32) << 8) | b[i + 6] as u32;
+                let w = ((b[i + 7] as u32) << 8) | b[i + 8] as u32;
+                return Some(Image { jpeg, w, h });
+            }
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = ((b[i + 2] as usize) << 8) | b[i + 3] as usize;
+            i += 2 + len;
+        }
+        None
+    }
+}
+
 /// One page's content stream, built with drawing calls (PDF coords: origin at the
 /// bottom-left, Y up, units = points).
 #[derive(Default)]
@@ -102,6 +140,18 @@ impl Page {
         );
     }
 
+    /// Draw the document's shared image (`/Im0`) under a `cm` transform, clipped
+    /// to the rectangle `clip` (so an oversized image shows only there).
+    pub fn draw_image(&mut self, cm: [f64; 6], clip: (f64, f64, f64, f64)) {
+        let [a, b, c, d, e, ff] = cm;
+        let (cx, cy, cw, ch) = clip;
+        let _ = writeln!(
+            self.ops,
+            "q {cx:.2} {cy:.2} {cw:.2} {ch:.2} re W n \
+             {a:.5} {b:.5} {c:.5} {d:.5} {e:.3} {ff:.3} cm /Im0 Do Q"
+        );
+    }
+
     /// Left-anchored text at baseline `(x, y)`.
     pub fn text(&mut self, x: f64, y: f64, size: f64, font: Font, s: &str) {
         let f = match font {
@@ -133,13 +183,23 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Assemble `pages` into a complete PDF document (A4).
-pub fn document(pages: &[Page]) -> Vec<u8> {
+/// Assemble `pages` into a complete PDF document (A4). `image`, if present, is
+/// embedded once as the shared `/Im0` XObject and available to every page's
+/// [`draw_image`](Page::draw_image).
+pub fn document(pages: &[Page], image: Option<&Image>) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &str| {
         offsets.push(out.len());
-        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", offsets.len() + 1).as_bytes());
+        // Object N is the Nth offset pushed; xref maps entry N → offsets[N-1].
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", offsets.len()).as_bytes());
+    };
+    // The shared image XObject (if any) is appended after the page/content objects.
+    let img_obj = 5 + 2 * pages.len();
+    let xobject = if image.is_some() {
+        format!(" /XObject << /Im0 {img_obj} 0 R >>")
+    } else {
+        String::new()
     };
 
     out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
@@ -174,7 +234,8 @@ pub fn document(pages: &[Page]) -> Vec<u8> {
             &mut offsets,
             &format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {A4_W:.2} {A4_H:.2}] \
-                 /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {content_obj} 0 R >>"
+                 /Resources << /Font << /F1 3 0 R /F2 4 0 R >>{xobject} >> \
+                 /Contents {content_obj} 0 R >>"
             ),
         );
         // Content stream object.
@@ -183,11 +244,30 @@ pub fn document(pages: &[Page]) -> Vec<u8> {
         out.extend_from_slice(
             format!(
                 "{} 0 obj\n<< /Length {} >>\nstream\n{stream}endstream\nendobj\n",
-                offsets.len() + 1,
+                offsets.len(),
                 stream.len()
             )
             .as_bytes(),
         );
+    }
+
+    // Shared image XObject (raw JPEG via DCTDecode).
+    if let Some(img) = image {
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!(
+                "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} \
+                 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\n\
+                 stream\n",
+                offsets.len(),
+                img.w,
+                img.h,
+                img.jpeg.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&img.jpeg);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
     }
 
     // Cross-reference table.
@@ -219,12 +299,23 @@ mod tests {
         p.set_fill(1.0, 0.0, 0.0);
         p.rect(10.0, 10.0, 50.0, 20.0, Paint::Fill);
         p.text(10.0, 40.0, 12.0, Font::Bold, "Step 1");
-        let bytes = document(&[p]);
+        let bytes = document(&[p], None);
         assert!(bytes.starts_with(b"%PDF-1.7"));
         assert!(bytes.ends_with(b"%%EOF\n"));
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("/Type /Catalog"));
         assert!(s.contains("startxref"));
         assert!(s.contains("(Step 1) Tj"));
+        // Objects must be numbered 1..N with no gap — the catalog (`/Root 1 0 R`)
+        // must actually be object 1, and every xref entry must resolve.
+        assert!(s.contains("\n1 0 obj\n"), "catalog must be object 1");
+        let n_objs = s.matches(" 0 obj\n").count();
+        for k in 1..=n_objs {
+            assert!(
+                s.contains(&format!("\n{k} 0 obj\n")),
+                "object {k} missing (numbering gap)"
+            );
+        }
+        assert!(s.contains(&format!("/Size {}", n_objs + 1)));
     }
 }

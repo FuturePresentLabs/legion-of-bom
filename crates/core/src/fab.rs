@@ -93,6 +93,101 @@ pub fn export_board_svg(board: &Path, kicad_cli: &Path) -> Result<String, StageE
     Ok(std::fs::read_to_string(&out)?)
 }
 
+/// Render the real board to a JPEG (A4-landscape page, true mm coords) for the
+/// PDF build guide's diagram underlay ([`guide::guide_to_pdf`](crate::guide)).
+///
+/// KiCad plots the board to a PDF (copper/silk/fab/edge, board at its real page
+/// position); QuickLook rasterizes that at high resolution and `sips` converts to
+/// JPEG (the only raster our [`pdf`](crate::pdf) writer embeds). Falls back to a
+/// direct `sips` PDF→JPEG (lower resolution) if QuickLook is unavailable, and
+/// surfaces a [`StageError`] if neither tool works — so the caller drops to the
+/// schematic diagram rather than failing the guide.
+pub fn render_board_jpeg(board: &Path, kicad_cli: &Path) -> Result<Vec<u8>, StageError> {
+    let stem = board
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("board");
+    let tmp = std::env::temp_dir();
+    let plot = tmp.join(format!("lob-{stem}-plot.pdf"));
+    run_kicad(
+        kicad_cli,
+        &[
+            "pcb",
+            "export",
+            "pdf",
+            // Copper + silkscreen (outlines/refdes) + edge; F.Fab is dropped —
+            // its footprint-name text clutters the raster at guide scale.
+            "--layers",
+            "F.Cu,B.Cu,F.Silkscreen,Edge.Cuts",
+            "--mode-single",
+            "-o",
+            plot.to_str().unwrap_or_default(),
+        ],
+        board,
+    )?;
+    let jpg = tmp.join(format!("lob-{stem}-plot.jpg"));
+    if let Some(bytes) = rasterize_via_qlmanage(&plot, &tmp, &jpg) {
+        return Ok(bytes);
+    }
+    rasterize_via_sips(&plot, &jpg)
+}
+
+/// Rasterize `pdf` at high resolution via macOS QuickLook (`qlmanage`) then
+/// convert the PNG to JPEG with `sips`. Returns `None` if either step is missing
+/// or fails, so the caller can fall back.
+fn rasterize_via_qlmanage(pdf: &Path, outdir: &Path, jpg: &Path) -> Option<Vec<u8>> {
+    let name = pdf.file_name()?.to_str()?;
+    let png = outdir.join(format!("{name}.png"));
+    let _ = std::fs::remove_file(&png);
+    let ok = Command::new("qlmanage")
+        .args(["-t", "-s", "3000", "-o"])
+        .arg(outdir)
+        .arg(pdf)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok || !png.is_file() {
+        return None;
+    }
+    let ok = Command::new("sips")
+        .args(["-s", "format", "jpeg"])
+        .arg(&png)
+        .arg("--out")
+        .arg(jpg)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    std::fs::read(jpg).ok()
+}
+
+/// Rasterize `pdf` directly to JPEG with `sips` (72 DPI — lower resolution than
+/// the QuickLook path, but a dependency-light fallback).
+fn rasterize_via_sips(pdf: &Path, jpg: &Path) -> Result<Vec<u8>, StageError> {
+    let out = Command::new("sips")
+        .args(["-s", "format", "jpeg"])
+        .arg(pdf)
+        .arg("--out")
+        .arg(jpg)
+        .output()
+        .map_err(|e| StageError::ToolNotFound(format!("sips: {e}")))?;
+    if !out.status.success() {
+        return Err(StageError::ToolFailed {
+            tool: "sips".into(),
+            code: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+    }
+    Ok(std::fs::read(jpg)?)
+}
+
 /// Zip `dir`'s contents (flat, files at the archive root) into `zip_path` — the
 /// form JLCPCB accepts for PCB upload. Uses the system `zip`; returns `false`
 /// (rather than erroring) if it isn't available, so the caller can fall back to

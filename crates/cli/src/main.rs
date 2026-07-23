@@ -16,9 +16,10 @@ use legion_of_bom_core::{
     analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_board_svg,
     export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
     generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
-    parse_netlist_file, run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions, CircuitSource,
-    Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution,
-    PartsLibrary, PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    parse_netlist_file, render_board_jpeg, run_drc, simulate_ac, validate_erc, zip_dir,
+    BoardOptions, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus, Severity,
+    SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -467,7 +468,13 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     std::fs::create_dir_all(&work_dir)?;
     let board_file = work_dir.join(format!("{stem}.kicad_pcb"));
     std::fs::write(&board_file, &board)?;
-    let real_svg = kicad_cli_path().and_then(|k| export_board_svg(&board_file, &k).ok());
+    let kicad_cli = kicad_cli_path();
+    let real_svg = kicad_cli
+        .as_ref()
+        .and_then(|k| export_board_svg(&board_file, k).ok());
+    let real_jpeg = kicad_cli
+        .as_ref()
+        .and_then(|k| render_board_jpeg(&board_file, k).ok());
     if real_svg.is_some() {
         println!("  diagram: real KiCad layout (via kicad-cli)");
     } else {
@@ -487,8 +494,9 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     }
 
     // Native print-ready PDF, one step per page (self-contained, no browser).
+    // Embeds the real KiCad board raster when available, else a schematic diagram.
     let pdf_path = path.with_extension("pdf");
-    std::fs::write(&pdf_path, guide_to_pdf(&guide))
+    std::fs::write(&pdf_path, guide_to_pdf(&guide, real_jpeg.as_deref()))
         .with_context(|| format!("writing {}", pdf_path.display()))?;
     println!(
         "wrote {} (print-ready, one step per page)",

@@ -402,11 +402,75 @@ ul{margin:0;padding-left:1.1rem}li{margin:.15rem 0}.refs{color:#555}\
 .step:first-of-type{break-before:avoid}h1,.sub{break-after:avoid}\
 .diagram,.parts{break-inside:avoid}svg{max-height:150mm}}";
 
+/// Draw a highlight marker for one placed part on a PDF page: a red box (filled
+/// over the schematic fallback; outlined over the real-board image so the part
+/// shows through), its refdes, and any polarity marker. `mapx`/`mapy` map board
+/// mm to page points.
+fn pdf_marker(
+    pg: &mut Page,
+    p: &PlacedPart,
+    mapx: &dyn Fn(f64) -> f64,
+    mapy: &dyn Fn(f64) -> f64,
+    scale: f64,
+    filled: bool,
+) {
+    let (cx0, cy0, cx1, cy1) = p.bbox;
+    pg.set_line_width(if filled { 0.8 } else { 1.2 });
+    pg.set_stroke(0.63, 0.07, 0.07);
+    if filled {
+        pg.set_fill(0.89, 0.29, 0.29);
+        pg.rect(
+            mapx(cx0),
+            mapy(cy1),
+            ((cx1 - cx0) * scale).max(1.0),
+            ((cy1 - cy0) * scale).max(1.0),
+            Paint::FillStroke,
+        );
+    } else {
+        pg.rect(
+            mapx(cx0),
+            mapy(cy1),
+            ((cx1 - cx0) * scale).max(1.0),
+            ((cy1 - cy0) * scale).max(1.0),
+            Paint::Stroke,
+        );
+    }
+    let fs = (scale * 1.4).clamp(5.0, 11.0);
+    if filled {
+        pg.set_fill(1.0, 1.0, 1.0);
+    } else {
+        pg.set_fill(0.63, 0.07, 0.07);
+    }
+    pg.text(
+        mapx(p.cx) - p.refdes.len() as f64 * fs * 0.25,
+        mapy(p.cy) - fs * 0.35,
+        fs,
+        Font::Bold,
+        &p.refdes,
+    );
+    if let (Some(pol), Some((qx, qy))) = (p.polarity, p.pin1) {
+        let r = (scale * 1.3).clamp(4.0, 9.0);
+        pg.set_line_width(0.4);
+        pg.set_fill(0.06, 0.06, 0.06);
+        pg.set_stroke(1.0, 1.0, 1.0);
+        pg.circle(mapx(qx), mapy(qy), r, Paint::FillStroke);
+        pg.set_fill(1.0, 1.0, 1.0);
+        pg.text(
+            mapx(qx) - r * 0.3,
+            mapy(qy) - r * 0.5,
+            r * 1.2,
+            Font::Bold,
+            pol.label(),
+        );
+    }
+}
+
 /// Render the guide as a print-ready PDF — one build step per A4 page (clean page
-/// breaks). Self-contained (no browser), so it always works. Each page has the
-/// step's title, a top-down board diagram with the step's parts highlighted +
-/// polarity markers, the parts list, and any cautions.
-pub fn guide_to_pdf(guide: &BuildGuide) -> Vec<u8> {
+/// breaks). Self-contained (no browser). When `board_jpeg` is `Some` (KiCad's
+/// real board plot rasterized to JPEG, A4 landscape / true mm), it's embedded as
+/// the diagram with highlight overlays; otherwise a schematic top-down.
+pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
+    let image = board_jpeg.and_then(|b| pdf::Image::from_jpeg(b.to_vec()));
     let m = 36.0; // page margin (pt)
     let cw = pdf::A4_W - 2.0 * m; // content width
     let total = guide.steps.len();
@@ -424,7 +488,7 @@ pub fn guide_to_pdf(guide: &BuildGuide) -> Vec<u8> {
             top,
             13.0,
             Font::Regular,
-            &format!("{} — Step {} of {total}", guide.name, i + 1),
+            &format!("{} - Step {} of {total}", guide.name, i + 1),
         );
         pg.text(m, top - 24.0, 19.0, Font::Bold, &step.title);
 
@@ -435,63 +499,57 @@ pub fn guide_to_pdf(guide: &BuildGuide) -> Vec<u8> {
         let rx = m + (cw - dw) / 2.0;
         let mapx = |x: f64| rx + (x - bx0) * scale;
         let mapy = |y: f64| diag_top - (y - by0) * scale;
-
-        pg.set_line_width(0.8);
-        pg.set_fill(0.93, 0.95, 0.93);
-        pg.set_stroke(0.2, 0.6, 0.4);
-        pg.rect(
-            mapx(ox0),
-            mapy(oy1),
-            (ox1 - ox0) * scale,
-            (oy1 - oy0) * scale,
-            Paint::FillStroke,
-        );
-
         let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
-        for p in guide.steps.iter().flat_map(|s| &s.parts) {
-            let (cx0, cy0, cx1, cy1) = p.bbox;
-            let on = highlight.contains(p.refdes.as_str());
-            pg.set_line_width(if on { 0.8 } else { 0.4 });
-            if on {
-                pg.set_fill(0.89, 0.29, 0.29);
-                pg.set_stroke(0.63, 0.07, 0.07);
-            } else {
-                pg.set_fill(0.86, 0.86, 0.86);
-                pg.set_stroke(0.67, 0.67, 0.67);
+
+        if image.is_some() {
+            // Real KiCad board (A4-landscape JPEG in true mm) placed so board mm
+            // map via mapx/mapy, clipped to the board region; then overlay this
+            // step's parts as outlined markers so the real board shows through.
+            let cm = [
+                pdf::A4_H * scale / pdf::MM, // 297 mm × scale (pt/mm) in points
+                0.0,
+                0.0,
+                pdf::A4_W * scale / pdf::MM, // 210 mm × scale
+                mapx(0.0),
+                mapy(pdf::A4_W / pdf::MM),
+            ];
+            let clip = (
+                mapx(bx0),
+                mapy(by1),
+                (bx1 - bx0) * scale,
+                (by1 - by0) * scale,
+            );
+            pg.draw_image(cm, clip);
+            for p in &step.parts {
+                pdf_marker(&mut pg, p, &mapx, &mapy, scale, false);
             }
+        } else {
+            pg.set_line_width(0.8);
+            pg.set_fill(0.93, 0.95, 0.93);
+            pg.set_stroke(0.2, 0.6, 0.4);
             pg.rect(
-                mapx(cx0),
-                mapy(cy1),
-                ((cx1 - cx0) * scale).max(1.0),
-                ((cy1 - cy0) * scale).max(1.0),
+                mapx(ox0),
+                mapy(oy1),
+                (ox1 - ox0) * scale,
+                (oy1 - oy0) * scale,
                 Paint::FillStroke,
             );
-            if !on {
-                continue;
-            }
-            let fs = (scale * 1.4).clamp(5.0, 11.0);
-            pg.set_fill(1.0, 1.0, 1.0);
-            pg.text(
-                mapx(p.cx) - p.refdes.len() as f64 * fs * 0.25,
-                mapy(p.cy) - fs * 0.35,
-                fs,
-                Font::Bold,
-                &p.refdes,
-            );
-            if let (Some(pol), Some((qx, qy))) = (p.polarity, p.pin1) {
-                let r = (scale * 1.3).clamp(4.0, 9.0);
-                pg.set_line_width(0.4);
-                pg.set_fill(0.06, 0.06, 0.06);
-                pg.set_stroke(1.0, 1.0, 1.0);
-                pg.circle(mapx(qx), mapy(qy), r, Paint::FillStroke);
-                pg.set_fill(1.0, 1.0, 1.0);
-                pg.text(
-                    mapx(qx) - r * 0.3,
-                    mapy(qy) - r * 0.5,
-                    r * 1.2,
-                    Font::Bold,
-                    pol.label(),
-                );
+            for p in guide.steps.iter().flat_map(|s| &s.parts) {
+                let (cx0, cy0, cx1, cy1) = p.bbox;
+                if highlight.contains(p.refdes.as_str()) {
+                    pdf_marker(&mut pg, p, &mapx, &mapy, scale, true);
+                } else {
+                    pg.set_line_width(0.4);
+                    pg.set_fill(0.86, 0.86, 0.86);
+                    pg.set_stroke(0.67, 0.67, 0.67);
+                    pg.rect(
+                        mapx(cx0),
+                        mapy(cy1),
+                        ((cx1 - cx0) * scale).max(1.0),
+                        ((cy1 - cy0) * scale).max(1.0),
+                        Paint::FillStroke,
+                    );
+                }
             }
         }
 
@@ -529,7 +587,7 @@ pub fn guide_to_pdf(guide: &BuildGuide) -> Vec<u8> {
         }
         pages.push(pg);
     }
-    pdf::document(&pages)
+    pdf::document(&pages, image.as_ref())
 }
 
 /// The highlight overlay for one part (SVG, board-mm coords): a red box + white
