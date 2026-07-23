@@ -246,14 +246,70 @@ enum Cell {
 #[derive(Debug, Clone, Default)]
 pub struct GridRouter;
 
+/// Max routing passes: the first attempt plus rip-up-free retries that give
+/// previously-failed nets priority. The priority set only grows, so convergence
+/// is bounded; a handful of rounds resolves the common "one net boxed in" case.
+const ROUTE_MAX_ROUNDS: usize = 6;
+
 impl Router for GridRouter {
+    /// Route all nets, retrying failures: any net that fails gets first pick of
+    /// the grid on the next pass, so the nets that boxed it in reroute around it.
+    /// The priority set only grows (bounded convergence); the fewest-conflict pass
+    /// wins if none is perfect. A first pass with no failures returns unchanged.
     fn route(&self, nets: &[RouteNet], opts: &RouteOptions) -> RouteOutput {
-        let mut out = RouteOutput::default();
         let routable: Vec<&RouteNet> = nets.iter().filter(|n| n.pads.len() >= 2).collect();
         if routable.is_empty() {
-            return out;
+            return RouteOutput::default();
         }
+        // First-pass order: deterministic by net index.
+        let mut base: Vec<usize> = (0..routable.len()).collect();
+        base.sort_by_key(|&i| routable[i].net_idx);
 
+        let mut priority: Vec<usize> = Vec::new();
+        let mut best: Option<RouteOutput> = None;
+        for _ in 0..ROUTE_MAX_ROUNDS {
+            // Previously-failed nets first (in discovery order), then the rest.
+            let order: Vec<usize> = priority
+                .iter()
+                .copied()
+                .chain(base.iter().copied().filter(|i| !priority.contains(i)))
+                .collect();
+            let (out, failed) = self.route_pass(nets, &routable, &order, opts);
+            if failed.is_empty() {
+                return out;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|b| out.conflicts.len() < b.conflicts.len())
+            {
+                best = Some(out);
+            }
+            let newly: Vec<usize> = failed
+                .iter()
+                .copied()
+                .filter(|i| !priority.contains(i))
+                .collect();
+            if newly.is_empty() {
+                break; // no new information — stop and take the best pass
+            }
+            priority.extend(newly);
+        }
+        best.unwrap_or_default()
+    }
+}
+
+impl GridRouter {
+    /// One routing pass over `routable` in the given `order` (indices into
+    /// `routable`). Returns the routed output and the indices of nets that did
+    /// not fully route this pass.
+    fn route_pass(
+        &self,
+        nets: &[RouteNet],
+        routable: &[&RouteNet],
+        order: &[usize],
+        opts: &RouteOptions,
+    ) -> (RouteOutput, Vec<usize>) {
+        let mut out = RouteOutput::default();
         let res = opts.grid_mm.max(0.01);
         let (minx, miny, maxx, maxy) = opts.bounds.unwrap_or_else(|| bounds_of(nets, 2.0));
         let cols = (((maxx - minx) / res).ceil() as usize).max(1) + 1;
@@ -314,7 +370,7 @@ impl Router for GridRouter {
         // Record each routable net's pad cells (for source/target sets). A pad is
         // a connection point on every layer it touches — so a through-hole pad is
         // reachable on both, letting the router meet it without a via.
-        for net in &routable {
+        for net in routable {
             let mut cells = Vec::new();
             for pad in &net.pads {
                 let (c, r) = cell_of(pad.x_mm, pad.y_mm);
@@ -326,10 +382,9 @@ impl Router for GridRouter {
             pad_cells.push(cells);
         }
 
-        // Route each net (deterministic order), growing a tree from pad 0.
-        let mut order: Vec<usize> = (0..routable.len()).collect();
-        order.sort_by_key(|&i| routable[i].net_idx);
-        for &ni in &order {
+        // Route each net in the given order, growing a tree from pad 0.
+        let mut failed: Vec<usize> = Vec::new();
+        for &ni in order {
             let net = routable[ni];
             let step = (res * 1000.0) as i64;
             let via_cost = (opts.via_cost_mm * 1000.0) as i64;
@@ -370,14 +425,19 @@ impl Router for GridRouter {
                             }
                         }
                     }
-                    None => out.conflicts.push(format!(
-                        "net {} ({}): could not route to pad {}.{}",
-                        net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
-                    )),
+                    None => {
+                        out.conflicts.push(format!(
+                            "net {} ({}): could not route to pad {}.{}",
+                            net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
+                        ));
+                        if !failed.contains(&ni) {
+                            failed.push(ni);
+                        }
+                    }
                 }
             }
         }
-        out
+        (out, failed)
     }
 }
 
