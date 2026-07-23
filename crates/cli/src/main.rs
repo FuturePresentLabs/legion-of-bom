@@ -14,10 +14,10 @@ use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, default_panel_orders_dir, default_parts_dir, fetch_from_jlcpcb,
-    fetch_from_kicad, generate_board_report, generate_bom, panel_to_dxf, parse_netlist_file,
-    simulate_ac, validate_erc, BoardOptions, CircuitSource, Finding, JlcpcbClient, MouserClient,
-    PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
+    fetch_from_kicad, generate_board_report, generate_bom, kicad_cli_path, panel_to_dxf,
+    parse_netlist_file, run_drc, simulate_ac, validate_erc, BoardOptions, CircuitSource, Finding,
+    JlcpcbClient, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
+    PipelineReport, ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -65,6 +65,11 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run DRC on a .kicad_pcb and report violations (the layout loop's check step).
+    Drc {
+        /// Path to the board file to check.
+        board: PathBuf,
+    },
     /// Panel design: generate DXF, track orders.
     Panel {
         #[command(subcommand)]
@@ -76,7 +81,9 @@ enum Command {
 enum PartsCmd {
     List,
     /// Show a part (pins, ratings, verification status) by MPN.
-    Show { mpn: String },
+    Show {
+        mpn: String,
+    },
     /// Add or update a part's metadata (unverified; pins/ratings come from fetch).
     Add {
         mpn: String,
@@ -103,12 +110,16 @@ enum PartsCmd {
         by: String,
     },
     /// Resolve a circuit's parts against the library by MPN.
-    Resolve { circuit: PathBuf },
+    Resolve {
+        circuit: PathBuf,
+    },
     /// Verification gate: fail if any MPN-bearing part isn't human-verified.
     ///
     /// This is the check `layout` / real BOM ordering enforce (okm.4) — the
     /// structural block against unverified part data.
-    Gate { circuit: PathBuf },
+    Gate {
+        circuit: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -155,6 +166,7 @@ fn main() -> ExitCode {
             out,
         } => bom_cmd(circuit, price, out),
         Command::Board { circuit, out } => board_cmd(circuit, out),
+        Command::Drc { board } => drc_cmd(board),
         Command::Panel { action } => panel_cmd(action),
     };
 
@@ -288,9 +300,42 @@ fn board_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
             eprintln!("      - {c}");
         }
     }
-    println!("  validate: kicad-cli pcb drc {}", path.display());
+    println!("  validate: lob drc {}", path.display());
     println!("  export:   kicad-cli pcb export gerbers --check-zones (fills the pour) | export pos (CPL)");
     Ok(())
+}
+
+/// Handle `lob drc <board>` — run DRC and report violations (the layout loop's
+/// check step). Exits non-zero if any error-severity violation remains.
+fn drc_cmd(board: PathBuf) -> Result<()> {
+    let board = board
+        .canonicalize()
+        .with_context(|| format!("board not found: {}", board.display()))?;
+    let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
+
+    let report = run_drc(&board, &kicad)?;
+    println!(
+        "DRC {}: {} error(s), {} warning(s), {} unconnected",
+        board.display(),
+        report.error_count(),
+        report.warning_count(),
+        report.unconnected_count()
+    );
+    for v in report.errors() {
+        println!("  ✗ [{}] {}", v.kind, v.description);
+        for it in &v.items {
+            println!("      - {}", it.description);
+        }
+    }
+    for v in report.warnings() {
+        println!("  ⚠ [{}] {}", v.kind, v.description);
+    }
+    if report.is_clean() {
+        println!("  ✓ no errors");
+        Ok(())
+    } else {
+        anyhow::bail!("{} DRC error(s)", report.error_count());
+    }
 }
 
 /// Handle `lob bom <circuit> [--price] [--out]`.

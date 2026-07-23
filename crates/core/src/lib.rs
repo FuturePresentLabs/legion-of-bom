@@ -12,6 +12,7 @@
 
 pub mod board;
 pub mod bom;
+pub mod drc;
 pub mod fetch;
 pub mod jlcpcb;
 pub mod model;
@@ -36,6 +37,7 @@ pub use board::{
     Placement, Placer,
 };
 pub use bom::{generate_bom, Bom, BomLine};
+pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
@@ -57,7 +59,7 @@ pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
 pub use spice::{simulate_ac, AcPoint, AcResult, SimConfig};
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
-pub use tools::{find_on_path, phase0_tools, Tool, ToolStatus};
+pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
 pub use validate::validate_erc;
 pub use verify::{analytic_check, check_noninverting_gain, check_rc_cutoff};

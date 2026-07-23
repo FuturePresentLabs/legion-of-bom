@@ -100,6 +100,15 @@ pub fn phase0_tools() -> Vec<Tool> {
     ]
 }
 
+/// Resolve the `kicad-cli` executable (`PATH`, then the macOS app-bundle
+/// fallback), for the DRC-readback + export steps.
+pub fn kicad_cli_path() -> Option<PathBuf> {
+    phase0_tools()
+        .iter()
+        .find(|t| t.name == "kicad-cli")
+        .and_then(|t| t.probe().path)
+}
+
 /// Pick the most informative version line: the first non-empty line that
 /// contains a digit (skips banner lines like ngspice's `******`), falling back
 /// to the first non-empty line.
