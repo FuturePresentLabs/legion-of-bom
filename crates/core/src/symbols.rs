@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::model::SimModel;
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
 use crate::spice::SpiceModel;
@@ -31,6 +32,20 @@ pub fn resolve_models(
     let mut lib_cache: HashMap<String, Sexpr> = HashMap::new();
 
     for part in circuit.parts() {
+        let refdes = &part.refdes.0;
+
+        // 1. Prefer a model the part carries itself — from the circuit definition's
+        //    `Sim.*` fields today, the Dolt parts library later. A real device's
+        //    model travels with the device.
+        if let Some(sim) = &part.sim {
+            if let Some(model) = model_from_sim(sim, symbol_dir, refdes)? {
+                models.insert(refdes.clone(), model);
+            }
+            continue;
+        }
+
+        // 2. Otherwise recover it from the shipped symbol library — how KiCad's
+        //    ideal `Simulation_SPICE:*` parts declare their built-in models.
         let Some(library_part) = part.library_part.as_deref() else {
             continue;
         };
@@ -48,10 +63,29 @@ pub fn resolve_models(
         }
 
         if let Some(model) = model_from_symbol(&lib_cache[lib], name, symbol_dir)? {
-            models.insert(part.refdes.0.clone(), model);
+            models.insert(refdes.clone(), model);
         }
     }
     Ok(models)
+}
+
+/// Build a [`SpiceModel`] from a part-carried [`SimModel`] (its `Sim.*` fields).
+fn model_from_sim(
+    sim: &SimModel,
+    symbol_dir: &Path,
+    label: &str,
+) -> Result<Option<SpiceModel>, StageError> {
+    build_subckt_model(
+        |key| match key {
+            "Sim.Device" => Some(sim.device.clone()),
+            "Sim.Name" => Some(sim.name.clone()),
+            "Sim.Library" => sim.library.clone(),
+            "Sim.Pins" => sim.pins.clone(),
+            _ => None,
+        },
+        symbol_dir,
+        label,
+    )
 }
 
 /// Build a [`SpiceModel`] from a symbol's `Sim.*` properties, or `None` if the
@@ -70,27 +104,41 @@ fn model_from_symbol(
             "symbol '{part}' not found in library"
         )));
     };
-    let prop = |name: &str| {
-        sym.get_all("property")
-            .into_iter()
-            .find(|p| p.nth_atom(1) == Some(name))
-            .and_then(|p| p.nth_atom(2))
-    };
+    build_subckt_model(
+        |name| {
+            sym.get_all("property")
+                .into_iter()
+                .find(|p| p.nth_atom(1) == Some(name))
+                .and_then(|p| p.nth_atom(2))
+                .map(str::to_string)
+        },
+        symbol_dir,
+        part,
+    )
+}
 
+/// Shared: build a subckt [`SpiceModel`] from a `Sim.*` property getter, whatever
+/// the source (part-carried fields or a symbol's properties). `None` if the
+/// device isn't a SUBCKT (i.e. a SPICE primitive).
+fn build_subckt_model(
+    prop: impl Fn(&str) -> Option<String>,
+    symbol_dir: &Path,
+    label: &str,
+) -> Result<Option<SpiceModel>, StageError> {
     // Only subckt-modelled devices carry a model; anything else is a primitive.
-    if prop("Sim.Device") != Some("SUBCKT") {
+    if prop("Sim.Device").as_deref() != Some("SUBCKT") {
         return Ok(None);
     }
 
     let subckt = prop("Sim.Name")
-        .ok_or_else(|| StageError::Other(format!("{part}: Sim.Device=SUBCKT but no Sim.Name")))?
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| StageError::Other(format!("{label}: Sim.Device=SUBCKT but no Sim.Name")))?;
     let sim_library =
-        prop("Sim.Library").ok_or_else(|| StageError::Other(format!("{part}: no Sim.Library")))?;
+        prop("Sim.Library").ok_or_else(|| StageError::Other(format!("{label}: no Sim.Library")))?;
     let sim_pins =
-        prop("Sim.Pins").ok_or_else(|| StageError::Other(format!("{part}: no Sim.Pins")))?;
+        prop("Sim.Pins").ok_or_else(|| StageError::Other(format!("{label}: no Sim.Pins")))?;
 
-    let include = expand_symbol_dir(sim_library, symbol_dir);
+    let include = expand_symbol_dir(&sim_library, symbol_dir);
 
     // Sim.Pins: "1=in+ 2=in- 3=vcc 4=vee 5=out" → (pin, terminal) pairs.
     let pin_to_terminal: Vec<(&str, &str)> = sim_pins
@@ -108,7 +156,7 @@ fn model_from_symbol(
             .map(|(p, _)| p.to_string())
             .ok_or_else(|| {
                 StageError::Other(format!(
-                    "{part}: subckt terminal '{terminal}' missing from Sim.Pins"
+                    "{label}: subckt terminal '{terminal}' missing from Sim.Pins"
                 ))
             })?;
         pin_order.push(pin);

@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+use crate::model::{Circuit, Net, Part, PinRef, RefDes, SimModel};
 use crate::sexpr::Sexpr;
 use crate::stage::StageError;
 
@@ -60,12 +60,21 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 .get("libsource")
                 .and_then(|ls| Some(format!("{}:{}", ls.field("lib")?, ls.field("part")?)));
             let mpn = field_value(comp, "MPN");
+            // A part-carried SPICE model, if the circuit declares `Sim.*` fields
+            // (SKiDL passes manually-set fields through to the netlist).
+            let sim = field_value(comp, "Sim.Device").map(|device| SimModel {
+                device,
+                name: field_value(comp, "Sim.Name").unwrap_or_default(),
+                library: field_value(comp, "Sim.Library"),
+                pins: field_value(comp, "Sim.Pins"),
+            });
             parts.push(Part {
                 refdes: RefDes(refdes.to_string()),
                 value,
                 footprint,
                 library_part,
                 mpn,
+                sim,
             });
         }
     }
@@ -207,5 +216,35 @@ mod tests {
         // A generic part with no MPN field resolves to None.
         let r1 = c.parts.iter().find(|p| p.refdes.0 == "R1").unwrap();
         assert_eq!(r1.mpn, None);
+    }
+
+    #[test]
+    fn extracts_part_carried_spice_model() {
+        // A real device carries its SPICE model as Sim.* fields (SKiDL passes
+        // manually-set fields through). The parser lifts them onto Part.sim.
+        let nl = r#"
+        (export (version "E")
+          (components
+            (comp (ref "U1") (value "TL072")
+              (footprint "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm")
+              (fields
+                (field (name "Sim.Device") "SUBCKT")
+                (field (name "Sim.Name") "kicad_builtin_opamp")
+                (field (name "Sim.Library") "${KICAD9_SYMBOL_DIR}/Simulation_SPICE.sp")
+                (field (name "Sim.Pins") "3=in+ 2=in- 8=vcc 4=vee 1=out"))
+              (libsource (lib "Amplifier_Operational") (part "TL072")))
+            (comp (ref "R1") (value "1k")
+              (libsource (lib "Device") (part "R"))))
+          (nets))"#;
+        let c = parse_netlist_str(nl, "x").unwrap();
+        let u1 = c.parts.iter().find(|p| p.refdes.0 == "U1").unwrap();
+        let sim = u1.sim.as_ref().expect("U1 carries a SPICE model");
+        assert_eq!(sim.device, "SUBCKT");
+        assert_eq!(sim.name, "kicad_builtin_opamp");
+        assert_eq!(sim.pins.as_deref(), Some("3=in+ 2=in- 8=vcc 4=vee 1=out"));
+        assert!(sim.library.as_deref().unwrap().ends_with("Simulation_SPICE.sp"));
+        // A primitive (no Sim.*) carries no model.
+        let r1 = c.parts.iter().find(|p| p.refdes.0 == "R1").unwrap();
+        assert!(r1.sim.is_none());
     }
 }

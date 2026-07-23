@@ -49,16 +49,31 @@ pub struct Placement {
 
 /// Assigns a board position to each part — **the** extensibility seam. The
 /// iterative layout loop, PanelSpec-anchored connectors, and the manual escape
-/// hatch are all `Placer`s; board emission just consumes the result.
+/// hatch are all `Placer`s; board emission just consumes the result. `extents`
+/// gives each part's keep-out size (mm, keyed by refdes) so placement can space
+/// parts by their real footprint rather than colliding them.
 pub trait Placer {
-    fn place(&self, circuit: &dyn CircuitSource) -> HashMap<String, Placement>;
+    fn place(
+        &self,
+        circuit: &dyn CircuitSource,
+        extents: &HashMap<String, (f64, f64)>,
+    ) -> HashMap<String, Placement>;
 }
 
-/// Naive row/grid placement — a valid, non-optimising default. The layout loop
-/// (j54.6) supersedes this with real auto-placement.
+/// Extra gap (mm) left between adjacent grid cells, on top of each part's extent.
+const PLACE_GAP_MM: f64 = 1.0;
+
+/// Margin (mm) added around a part's pad bounding box to approximate its
+/// courtyard when sizing placement cells.
+const COURTYARD_MARGIN_MM: f64 = 1.0;
+
+/// Naive row/grid placement — a valid, non-optimising default. It is size-aware
+/// only enough to not overlap footprints: cells are sized to the largest part.
+/// The layout loop (j54.6) supersedes this with real auto-placement.
 #[derive(Debug, Clone)]
 pub struct GridPlacer {
     pub origin_mm: (f64, f64),
+    /// Minimum cell pitch (mm); the effective pitch grows to fit the largest part.
     pub pitch_mm: f64,
     pub per_row: usize,
 }
@@ -74,7 +89,14 @@ impl Default for GridPlacer {
 }
 
 impl Placer for GridPlacer {
-    fn place(&self, circuit: &dyn CircuitSource) -> HashMap<String, Placement> {
+    fn place(
+        &self,
+        circuit: &dyn CircuitSource,
+        extents: &HashMap<String, (f64, f64)>,
+    ) -> HashMap<String, Placement> {
+        // A uniform cell big enough for the largest part keeps courtyards apart.
+        let max_extent = extents.values().fold(0.0f64, |m, &(w, h)| m.max(w).max(h));
+        let pitch = self.pitch_mm.max(max_extent + PLACE_GAP_MM);
         circuit
             .parts()
             .iter()
@@ -84,8 +106,8 @@ impl Placer for GridPlacer {
                 (
                     part.refdes.0.clone(),
                     Placement {
-                        x_mm: self.origin_mm.0 + col as f64 * self.pitch_mm,
-                        y_mm: self.origin_mm.1 + row as f64 * self.pitch_mm,
+                        x_mm: self.origin_mm.0 + col as f64 * pitch,
+                        y_mm: self.origin_mm.1 + row as f64 * pitch,
                         rotation_deg: 0.0,
                         back: false,
                     },
@@ -162,29 +184,39 @@ pub fn generate_board_report(
         }
     }
 
-    let placements = options.placer.place(circuit);
-
-    // Transform each part's footprint into a placed, net-wired board footprint,
-    // and collect every connected pad's absolute position (for routing).
-    let mut footprints = Vec::new();
-    let mut net_pads: HashMap<usize, RouteNet> = HashMap::new();
+    // Pass 1: load each part's footprint and measure its keep-out extent, so the
+    // placer can space parts by their real size (not collide them).
+    let mut loaded: Vec<(&str, &str, Sexpr, Vec<FpPad>)> = Vec::new();
+    let mut extents: HashMap<String, (f64, f64)> = HashMap::new();
     for part in circuit.parts() {
-        let refdes = &part.refdes.0;
+        let refdes = part.refdes.0.as_str();
         let lib_part = part
             .footprint
             .as_deref()
             .ok_or_else(|| BoardError::NoFootprint {
-                refdes: refdes.clone(),
+                refdes: refdes.to_string(),
             })?;
+        let fp = load_footprint(&options.footprint_dir, lib_part)?;
+        let pads = footprint_pads(&fp);
+        extents.insert(refdes.to_string(), part_extent(&pads, COURTYARD_MARGIN_MM));
+        loaded.push((refdes, lib_part, fp, pads));
+    }
+
+    let placements = options.placer.place(circuit, &extents);
+
+    // Pass 2: transform each footprint into a placed, net-wired board footprint,
+    // and collect every connected pad's absolute position (for routing).
+    let mut footprints = Vec::new();
+    let mut net_pads: HashMap<usize, RouteNet> = HashMap::new();
+    for (refdes, lib_part, fp, pads) in loaded {
         let placement = placements.get(refdes).copied().unwrap_or(Placement {
             x_mm: 0.0,
             y_mm: 0.0,
             rotation_deg: 0.0,
             back: false,
         });
-        let fp = load_footprint(&options.footprint_dir, lib_part)?;
-        for pad in footprint_pads(&fp) {
-            if let Some(&name) = pin_net.get(&(refdes.clone(), pad.num.clone())) {
+        for pad in &pads {
+            if let Some(&name) = pin_net.get(&(refdes.to_string(), pad.num.clone())) {
                 let Some(&idx) = net_index.get(name) else {
                     continue;
                 };
@@ -200,8 +232,8 @@ pub fn generate_board_report(
                     })
                     .pads
                     .push(PadPoint {
-                        refdes: refdes.clone(),
-                        pad: pad.num,
+                        refdes: refdes.to_string(),
+                        pad: pad.num.clone(),
                         x_mm: x,
                         y_mm: y,
                         w_mm: pad.w,
@@ -328,6 +360,28 @@ fn footprint_pads(fp: &Sexpr) -> Vec<FpPad> {
         });
     }
     pads
+}
+
+/// A part's placement keep-out `(width, height)` in mm: the bounding box of its
+/// pads, expanded by `margin` to approximate the courtyard. Zero for a padless
+/// footprint.
+fn part_extent(pads: &[FpPad], margin: f64) -> (f64, f64) {
+    let mut bb = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in pads {
+        bb.0 = bb.0.min(p.px - p.w / 2.0);
+        bb.1 = bb.1.min(p.py - p.h / 2.0);
+        bb.2 = bb.2.max(p.px + p.w / 2.0);
+        bb.3 = bb.3.max(p.py + p.h / 2.0);
+    }
+    if !bb.0.is_finite() {
+        return (0.0, 0.0);
+    }
+    (bb.2 - bb.0 + 2.0 * margin, bb.3 - bb.1 + 2.0 * margin)
 }
 
 /// A footprint placed on the back mirrors its pads to the opposite copper.
@@ -625,9 +679,22 @@ mod tests {
 
     #[test]
     fn grid_places_all_parts() {
-        let placements = GridPlacer::default().place(&rc());
+        let placements = GridPlacer::default().place(&rc(), &HashMap::new());
         assert_eq!(placements.len(), 2);
         assert!(placements.contains_key("R1"));
+    }
+
+    #[test]
+    fn grid_spaces_by_largest_part() {
+        // A big part forces a wider pitch so footprints don't collide.
+        let extents = HashMap::from([
+            ("R1".to_string(), (2.0, 1.5)),
+            ("C1".to_string(), (8.0, 7.0)),
+        ]);
+        let p = GridPlacer::default().place(&rc(), &extents);
+        // Two parts in a row → their x separation must exceed the big part's width.
+        let dx = (p["R1"].x_mm - p["C1"].x_mm).abs();
+        assert!(dx >= 8.0, "pitch {dx} must fit the 8mm part");
     }
 
     #[test]

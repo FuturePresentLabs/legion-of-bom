@@ -36,7 +36,7 @@ pub use board::{
 pub use bom::{generate_bom, Bom, BomLine};
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
-pub use model::{Circuit, Net, Part, PinRef, RefDes};
+pub use model::{Circuit, Net, Part, PinRef, RefDes, SimModel};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use parts::{

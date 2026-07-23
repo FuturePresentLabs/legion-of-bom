@@ -21,6 +21,24 @@ impl<S: Into<String>> From<S> for RefDes {
     }
 }
 
+/// A SPICE model a part carries with it (from the circuit definition's `Sim.*`
+/// fields, or later the parts library) — DESIGN.md 3.5/5.1. Mirrors KiCad's
+/// `Sim.Device`/`Sim.Name`/`Sim.Library`/`Sim.Pins`. The resolver
+/// ([`crate::symbols`]) turns this into an emittable model. Keeping it *on the
+/// part* is the whole point: a real device's model travels with the device, so
+/// the SPICE generator never special-cases per-device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimModel {
+    /// `Sim.Device`, e.g. `"SUBCKT"`.
+    pub device: String,
+    /// `Sim.Name` — the subckt/model name, e.g. `"kicad_builtin_opamp"`.
+    pub name: String,
+    /// `Sim.Library` — where the model lives (may use `${KICAD9_SYMBOL_DIR}`).
+    pub library: Option<String>,
+    /// `Sim.Pins` — pin→terminal map, e.g. `"3=in+ 2=in- 8=vcc 4=vee 1=out"`.
+    pub pins: Option<String>,
+}
+
 /// A single component instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Part {
@@ -36,10 +54,14 @@ pub struct Part {
     /// The key that resolves against the global parts library. Generic passives
     /// usually have none.
     pub mpn: Option<String>,
+    /// SPICE model carried by the part, if it declares one (`Sim.*` fields). A
+    /// primitive (R/C/L) carries none. This is the seam the parts library fills.
+    pub sim: Option<SimModel>,
 }
 
 impl Part {
-    /// A part with just a refdes and value; no footprint, library part, or MPN.
+    /// A part with just a refdes and value; no footprint, library part, MPN, or
+    /// model.
     pub fn new(refdes: impl Into<RefDes>, value: impl Into<String>) -> Self {
         Part {
             refdes: refdes.into(),
@@ -47,6 +69,7 @@ impl Part {
             footprint: None,
             library_part: None,
             mpn: None,
+            sim: None,
         }
     }
 
@@ -62,12 +85,10 @@ impl Part {
         self
     }
 
-    /// Whether this is KiCad's ideal `Simulation_SPICE:OPAMP` symbol — an ideal
-    /// op-amp for simulation (modelled as a VCVS), not a real silicon device.
-    pub fn is_ideal_opamp(&self) -> bool {
-        self.library_part
-            .as_deref()
-            .is_some_and(|lp| lp == "OPAMP" || lp.ends_with(":OPAMP"))
+    /// Builder-style: attach a SPICE model.
+    pub fn with_sim(mut self, sim: SimModel) -> Self {
+        self.sim = Some(sim);
+        self
     }
 }
 
