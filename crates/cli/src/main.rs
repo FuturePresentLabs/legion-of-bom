@@ -343,12 +343,17 @@ fn board_options_with_panel(
                 anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
             }
         }
+        // Centre the board on KiCad's A4 sheet (297×210 landscape) rather than
+        // jamming it in the (0,0) corner.
+        let ox = ((297.0 - w) / 2.0).max(10.0);
+        let oy = ((210.0 - h) / 2.0).max(10.0);
         opts.placer = Box::new(EurorackPlacer {
             width_mm: w,
             height_mm: h,
+            origin_mm: (ox, oy),
             anchors,
         });
-        opts.fixed_outline = Some((0.0, 0.0, w, h));
+        opts.fixed_outline = Some((ox, oy, ox + w, oy + h));
     }
     Ok(opts)
 }

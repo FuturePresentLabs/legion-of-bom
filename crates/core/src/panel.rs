@@ -437,7 +437,11 @@ pub fn panel_to_dxf(panel: &dyn PanelSpec) -> String {
 pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
     use crate::board::{det_uuid, mm};
     let (w, h) = (panel.width_mm(), panel.height_mm());
-    let fy = |y: f64| h - y;
+    // Centre on KiCad's A4 sheet (297×210 landscape) instead of the (0,0) corner.
+    let ox = ((297.0 - w) / 2.0).max(10.0);
+    let oy = ((210.0 - h) / 2.0).max(10.0);
+    let fx = |x: f64| ox + x;
+    let fy = |y: f64| oy + (h - y);
     let edge_rect = |x1: f64, y1: f64, x2: f64, y2: f64, seed: &str| {
         format!(
             "  (gr_rect (start {} {}) (end {} {}) (stroke (width 0.15) (type solid)) \
@@ -471,11 +475,11 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
          \x20 (setup (pad_to_mask_clearance 0))\n  (net 0 \"\")\n",
     );
     // Panel outline.
-    s.push_str(&edge_rect(0.0, 0.0, w, h, "panel.outline"));
+    s.push_str(&edge_rect(ox, oy, ox + w, oy + h, "panel.outline"));
     // Mounting holes.
     for (i, hole) in panel.mounting_holes().iter().enumerate() {
         s.push_str(&edge_circle(
-            hole.x_mm,
+            fx(hole.x_mm),
             fy(hole.y_mm),
             hole.diameter_mm / 2.0,
             &format!("panel.hole.{i}"),
@@ -483,7 +487,7 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
     }
     // Cutouts (jack rects, pot/LED circles), as inner Edge.Cuts loops.
     for (i, c) in panel.cutouts().iter().enumerate() {
-        let (cx, cy) = (c.x_mm, fy(c.y_mm));
+        let (cx, cy) = (fx(c.x_mm), fy(c.y_mm));
         let seed = format!("panel.cut.{i}");
         match footprint_shape(&c.footprint) {
             Some(CutoutShape::Circle { diameter_mm }) => {
@@ -508,8 +512,8 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
         "  (gr_text \"{}\" (at {} {} 90) (layer \"F.SilkS\") (uuid \"{}\") \
          (effects (font (size 2.5 2.5) (thickness 0.35))))\n",
         title,
-        mm(w / 2.0),
-        mm(h / 2.0),
+        mm(ox + w / 2.0),
+        mm(oy + h / 2.0),
         det_uuid("panel.title")
     ));
     s.push_str(")\n");

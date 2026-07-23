@@ -139,8 +139,11 @@ impl Placer for GridPlacer {
 pub struct EurorackPlacer {
     pub width_mm: f64,
     pub height_mm: f64,
-    /// refdes → (x, y) in board coords (already Y-flipped from the panel's
-    /// bottom-up cutouts to KiCad top-down).
+    /// Board bottom-left on the KiCad sheet, so it sits centred rather than jammed
+    /// in the corner. Applied to every placement; the outline must use it too.
+    pub origin_mm: (f64, f64),
+    /// refdes → (x, y) in board-local coords (Y already flipped from the panel's
+    /// bottom-up cutouts to KiCad top-down; the origin is added on output).
     pub anchors: HashMap<String, (f64, f64)>,
 }
 
@@ -165,8 +168,8 @@ impl Placer for EurorackPlacer {
             out.insert(
                 refdes.clone(),
                 Placement {
-                    x_mm: x,
-                    y_mm: y,
+                    x_mm: self.origin_mm.0 + x,
+                    y_mm: self.origin_mm.1 + y,
                     rotation_deg: 0.0,
                     back: side_of(refdes),
                 },
@@ -229,8 +232,8 @@ impl Placer for EurorackPlacer {
             out.insert(
                 r.to_string(),
                 Placement {
-                    x_mm: cand.0 + w / 2.0,
-                    y_mm: cand.1 + h / 2.0,
+                    x_mm: self.origin_mm.0 + cand.0 + w / 2.0,
+                    y_mm: self.origin_mm.1 + cand.1 + h / 2.0,
                     rotation_deg: 0.0,
                     back: side_of(r),
                 },
@@ -1033,6 +1036,7 @@ mod tests {
         let placer = EurorackPlacer {
             width_mm: 40.0,
             height_mm: 128.5,
+            origin_mm: (0.0, 0.0),
             anchors,
         };
         let p = placer.place(&rc(), &f);
