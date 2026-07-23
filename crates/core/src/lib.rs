@@ -31,7 +31,8 @@ pub mod validate;
 pub mod verify;
 
 pub use board::{
-    generate_board, generate_board_report, BoardError, BoardOptions, GridPlacer, Placement, Placer,
+    generate_board, generate_board_report, BoardError, BoardOptions, GridPlacer, PartFacts,
+    Placement, Placer, Side,
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};

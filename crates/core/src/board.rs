@@ -47,16 +47,33 @@ pub struct Placement {
     pub back: bool,
 }
 
+/// Which physical side of the board a part mounts on (DESIGN 6.1). Eurorack is
+/// double-sided — SMD/PCBA components on one side, through-hole + silkscreen on
+/// the other; a single-sided board (e.g. the guitar pedal) is all `Front`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Front,
+    Back,
+}
+
+/// What the placer needs to know about a part beyond the netlist: its footprint
+/// keep-out size (mm) and which side it mounts on.
+#[derive(Debug, Clone, Copy)]
+pub struct PartFacts {
+    pub extent: (f64, f64),
+    pub side: Side,
+}
+
 /// Assigns a board position to each part — **the** extensibility seam. The
 /// iterative layout loop, PanelSpec-anchored connectors, and the manual escape
-/// hatch are all `Placer`s; board emission just consumes the result. `extents`
-/// gives each part's keep-out size (mm, keyed by refdes) so placement can space
-/// parts by their real footprint rather than colliding them.
+/// hatch are all `Placer`s; board emission just consumes the result. `facts`
+/// gives each part's keep-out size and side (keyed by refdes) so placement can
+/// space parts by their real footprint and put them on the right copper.
 pub trait Placer {
     fn place(
         &self,
         circuit: &dyn CircuitSource,
-        extents: &HashMap<String, (f64, f64)>,
+        facts: &HashMap<String, PartFacts>,
     ) -> HashMap<String, Placement>;
 }
 
@@ -92,10 +109,12 @@ impl Placer for GridPlacer {
     fn place(
         &self,
         circuit: &dyn CircuitSource,
-        extents: &HashMap<String, (f64, f64)>,
+        facts: &HashMap<String, PartFacts>,
     ) -> HashMap<String, Placement> {
         // A uniform cell big enough for the largest part keeps courtyards apart.
-        let max_extent = extents.values().fold(0.0f64, |m, &(w, h)| m.max(w).max(h));
+        let max_extent = facts
+            .values()
+            .fold(0.0f64, |m, f| m.max(f.extent.0).max(f.extent.1));
         let pitch = self.pitch_mm.max(max_extent + PLACE_GAP_MM);
         circuit
             .parts()
@@ -103,13 +122,17 @@ impl Placer for GridPlacer {
             .enumerate()
             .map(|(i, part)| {
                 let (col, row) = (i % self.per_row, i / self.per_row);
+                let side = facts
+                    .get(&part.refdes.0)
+                    .map(|f| f.side)
+                    .unwrap_or(Side::Front);
                 (
                     part.refdes.0.clone(),
                     Placement {
                         x_mm: self.origin_mm.0 + col as f64 * pitch,
                         y_mm: self.origin_mm.1 + row as f64 * pitch,
                         rotation_deg: 0.0,
-                        back: false,
+                        back: side == Side::Back,
                     },
                 )
             })
@@ -184,10 +207,10 @@ pub fn generate_board_report(
         }
     }
 
-    // Pass 1: load each part's footprint and measure its keep-out extent, so the
-    // placer can space parts by their real size (not collide them).
+    // Pass 1: load each part's footprint and measure its keep-out extent + side,
+    // so the placer can space parts by real size and mount them on the right copper.
     let mut loaded: Vec<(&str, &str, Sexpr, Vec<FpPad>)> = Vec::new();
-    let mut extents: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut facts: HashMap<String, PartFacts> = HashMap::new();
     for part in circuit.parts() {
         let refdes = part.refdes.0.as_str();
         let lib_part = part
@@ -198,16 +221,30 @@ pub fn generate_board_report(
             })?;
         let fp = load_footprint(&options.footprint_dir, lib_part)?;
         let pads = footprint_pads(&fp);
-        extents.insert(refdes.to_string(), part_extent(&pads, COURTYARD_MARGIN_MM));
+        facts.insert(
+            refdes.to_string(),
+            PartFacts {
+                extent: part_extent(&pads, COURTYARD_MARGIN_MM),
+                side: resolve_side(&pads),
+            },
+        );
         loaded.push((refdes, lib_part, fp, pads));
     }
 
-    let placements = options.placer.place(circuit, &extents);
+    let placements = options.placer.place(circuit, &facts);
 
     // Pass 2: transform each footprint into a placed, net-wired board footprint,
-    // and collect every connected pad's absolute position (for routing).
+    // collect every connected pad's absolute position (for routing), and track the
+    // real pad bounding box (for the outline — a big part's pads must not spill
+    // past the board edge).
     let mut footprints = Vec::new();
     let mut net_pads: HashMap<usize, RouteNet> = HashMap::new();
+    let mut pad_bb = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
     for (refdes, lib_part, fp, pads) in loaded {
         let placement = placements.get(refdes).copied().unwrap_or(Placement {
             x_mm: 0.0,
@@ -216,11 +253,15 @@ pub fn generate_board_report(
             back: false,
         });
         for pad in &pads {
+            let (x, y) = place_point(placement, pad.px, pad.py);
+            pad_bb.0 = pad_bb.0.min(x - pad.w / 2.0);
+            pad_bb.1 = pad_bb.1.min(y - pad.h / 2.0);
+            pad_bb.2 = pad_bb.2.max(x + pad.w / 2.0);
+            pad_bb.3 = pad_bb.3.max(y + pad.h / 2.0);
             if let Some(&name) = pin_net.get(&(refdes.to_string(), pad.num.clone())) {
                 let Some(&idx) = net_index.get(name) else {
                     continue;
                 };
-                let (x, y) = place_point(placement, pad.px, pad.py);
                 // A back-placed footprint mirrors its pads to the other side.
                 let layer = pad_layer_on_board(pad.layer, placement.back);
                 net_pads
@@ -268,10 +309,14 @@ pub fn generate_board_report(
     for name in &net_names {
         board.push(net(net_index[name.as_str()], name));
     }
-    // Board outline (bounding box of placed parts + margin) + bottom-layer
+    // Board outline (bounding box of the placed pads + margin) + bottom-layer
     // ground pour (DESIGN 6.2). A real panel-driven outline arrives with
     // PanelSpec (j54.10); this is a valid rectangular first cut.
-    if let Some(rect) = outline_rect(&placements, options.outline_margin_mm) {
+    let outline = pad_bb.0.is_finite().then(|| {
+        let m = options.outline_margin_mm;
+        (pad_bb.0 - m, pad_bb.1 - m, pad_bb.2 + m, pad_bb.3 + m)
+    });
+    if let Some(rect) = outline {
         board.push(edge_cuts_rect(rect));
         if let Some(gnd) = &options.ground_net {
             if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
@@ -362,6 +407,19 @@ fn footprint_pads(fp: &Sexpr) -> Vec<FpPad> {
     pads
 }
 
+/// Which side a part mounts on (DESIGN 6.1's Eurorack convention): a through-hole
+/// part goes on the THT+silkscreen side (back), an SMD part on the PCBA side
+/// (front). A part with any through-hole pad (on `*.Cu`, i.e. [`PadLayer::Both`])
+/// counts as through-hole. (The power-header exception — THT but on the PCBA side
+/// — is a per-part override left to follow-up work.)
+fn resolve_side(pads: &[FpPad]) -> Side {
+    if pads.iter().any(|p| p.layer == PadLayer::Both) {
+        Side::Back
+    } else {
+        Side::Front
+    }
+}
+
 /// A part's placement keep-out `(width, height)` in mm: the bounding box of its
 /// pads, expanded by `margin` to approximate the courtyard. Zero for a padless
 /// footprint.
@@ -399,6 +457,9 @@ fn pad_layer_on_board(local: PadLayer, back: bool) -> PadLayer {
 /// emits rotation 0 today, so that identity path is what ships — the formula is
 /// validated against KiCad ground truth when the layout loop introduces angles.
 fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
+    // A back-placed footprint mirrors local X (matching `flip_to_back`), then the
+    // whole footprint rotates about its origin.
+    let px = if placement.back { -px } else { px };
     let (s, c) = placement.rotation_deg.to_radians().sin_cos();
     let rx = px * c + py * s;
     let ry = py * c - px * s;
@@ -439,7 +500,18 @@ fn transform_footprint(
         items[1] = Sexpr::string(lib_part); // "R_0805" → "Resistor_SMD:R_0805…"
     }
 
-    // Insert (uuid) + (at x y rot) right after (layer …).
+    // A back-placed footprint is flipped to the bottom: swap every child item's
+    // F./B. layer and mirror its local X (KiCad's flip-to-back). Do it on the
+    // library-local geometry, before the board-level placement is inserted — and
+    // note `place_point` mirrors pad X the same way so routing matches the pads.
+    if placement.back {
+        for item in items.iter_mut().skip(2) {
+            flip_to_back(item);
+        }
+    }
+
+    // Insert (uuid) + (at x y rot) right after (layer …). The (layer) is now
+    // B.Cu for a back part (flipped above), F.Cu for a front one.
     let at = Sexpr::list(vec![
         Sexpr::sym("at"),
         Sexpr::sym(mm(placement.x_mm)),
@@ -456,15 +528,6 @@ fn transform_footprint(
         .unwrap_or(1);
     items.insert(layer_pos + 1, at);
     items.insert(layer_pos + 2, fp_uuid);
-    if placement.back {
-        if let Some(layer) = items.iter_mut().find(|c| c.head() == Some("layer")) {
-            if let Some(l) = layer.as_list_mut() {
-                if l.len() >= 2 {
-                    l[1] = Sexpr::string("B.Cu");
-                }
-            }
-        }
-    }
 
     for item in items.iter_mut() {
         match item.head() {
@@ -502,6 +565,71 @@ fn transform_footprint(
     fp
 }
 
+/// Flip a sided layer name between front and back (`F.SilkS` ↔ `B.SilkS`, …).
+/// Non-sided layers (`Edge.Cuts`, `*.Cu`, `User.*`) return `None` (unchanged).
+fn flip_layer(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("F.") {
+        Some(format!("B.{rest}"))
+    } else {
+        name.strip_prefix("B.").map(|rest| format!("F.{rest}"))
+    }
+}
+
+/// Recursively flip a footprint child item to the back: swap `F.`/`B.` layer
+/// names and mirror local X coordinates (KiCad's flip-to-back). Angles are left
+/// as-is — only rotation-0 placement ships today, and pad-shape angles are
+/// cosmetic for the rectangular/oval pads in use.
+fn flip_to_back(item: &mut Sexpr) {
+    let Some(list) = item.as_list_mut() else {
+        return;
+    };
+    let head = list.first().and_then(|x| x.as_atom()).map(str::to_string);
+    match head.as_deref() {
+        Some("layer") => {
+            if let Some(a) = list.get_mut(1) {
+                if let Some(flipped) = a.as_atom().and_then(flip_layer) {
+                    *a = Sexpr::string(flipped);
+                }
+            }
+        }
+        Some("layers") => {
+            for a in list.iter_mut().skip(1) {
+                if let Some(flipped) = a.as_atom().and_then(flip_layer) {
+                    *a = Sexpr::string(flipped);
+                }
+            }
+        }
+        // Coordinate lists: mirror the X component.
+        Some("at") | Some("start") | Some("end") | Some("center") | Some("mid") | Some("xy") => {
+            if let Some(x) = list.get_mut(1) {
+                if let Some(v) = x.as_atom().and_then(|s| s.parse::<f64>().ok()) {
+                    *x = Sexpr::sym(mm(-v));
+                }
+            }
+        }
+        // Text on the back must be mirrored so it reads correctly (KiCad requires
+        // `(justify mirror)` on back-layer text).
+        Some("effects") => match list.iter_mut().find(|c| c.head() == Some("justify")) {
+            Some(j) => {
+                if let Some(l) = j.as_list_mut() {
+                    if !l.iter().any(|x| x.as_atom() == Some("mirror")) {
+                        l.push(Sexpr::sym("mirror"));
+                    }
+                }
+            }
+            None => list.push(Sexpr::list(vec![
+                Sexpr::sym("justify"),
+                Sexpr::sym("mirror"),
+            ])),
+        },
+        _ => {
+            for child in list.iter_mut() {
+                flip_to_back(child);
+            }
+        }
+    }
+}
+
 // ---- small builders --------------------------------------------------
 
 fn kv(key: &str, value: Sexpr) -> Sexpr {
@@ -510,26 +638,6 @@ fn kv(key: &str, value: Sexpr) -> Sexpr {
 
 /// `(min_x, min_y, max_x, max_y)`.
 type Rect = (f64, f64, f64, f64);
-
-/// Bounding box of the placements, expanded by `margin`; `None` if no parts.
-fn outline_rect(placements: &HashMap<String, Placement>, margin: f64) -> Option<Rect> {
-    if placements.is_empty() {
-        return None;
-    }
-    let mut r = (
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    );
-    for p in placements.values() {
-        r.0 = r.0.min(p.x_mm);
-        r.1 = r.1.min(p.y_mm);
-        r.2 = r.2.max(p.x_mm);
-        r.3 = r.3.max(p.y_mm);
-    }
-    Some((r.0 - margin, r.1 - margin, r.2 + margin, r.3 + margin))
-}
 
 /// An `Edge.Cuts` rectangle — the board outline.
 fn edge_cuts_rect((x1, y1, x2, y2): Rect) -> Sexpr {
@@ -677,6 +785,21 @@ mod tests {
         }
     }
 
+    fn facts(entries: &[(&str, (f64, f64), Side)]) -> HashMap<String, PartFacts> {
+        entries
+            .iter()
+            .map(|(r, extent, side)| {
+                (
+                    r.to_string(),
+                    PartFacts {
+                        extent: *extent,
+                        side: *side,
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn grid_places_all_parts() {
         let placements = GridPlacer::default().place(&rc(), &HashMap::new());
@@ -687,14 +810,94 @@ mod tests {
     #[test]
     fn grid_spaces_by_largest_part() {
         // A big part forces a wider pitch so footprints don't collide.
-        let extents = HashMap::from([
-            ("R1".to_string(), (2.0, 1.5)),
-            ("C1".to_string(), (8.0, 7.0)),
+        let f = facts(&[
+            ("R1", (2.0, 1.5), Side::Front),
+            ("C1", (8.0, 7.0), Side::Front),
         ]);
-        let p = GridPlacer::default().place(&rc(), &extents);
+        let p = GridPlacer::default().place(&rc(), &f);
         // Two parts in a row → their x separation must exceed the big part's width.
         let dx = (p["R1"].x_mm - p["C1"].x_mm).abs();
         assert!(dx >= 8.0, "pitch {dx} must fit the 8mm part");
+    }
+
+    #[test]
+    fn grid_places_parts_on_assigned_side() {
+        let f = facts(&[
+            ("R1", (2.0, 1.5), Side::Front),
+            ("C1", (2.0, 1.5), Side::Back),
+        ]);
+        let p = GridPlacer::default().place(&rc(), &f);
+        assert!(!p["R1"].back, "SMD part stays front");
+        assert!(p["C1"].back, "through-hole part goes to back");
+    }
+
+    #[test]
+    fn resolve_side_by_pad_technology() {
+        let smd = |n: &str| FpPad {
+            num: n.into(),
+            px: 0.0,
+            py: 0.0,
+            w: 1.0,
+            h: 1.0,
+            layer: PadLayer::Front,
+        };
+        let tht = |n: &str| FpPad {
+            layer: PadLayer::Both,
+            ..smd(n)
+        };
+        assert_eq!(resolve_side(&[smd("1"), smd("2")]), Side::Front);
+        // Any through-hole pad makes the part through-hole → back.
+        assert_eq!(resolve_side(&[smd("1"), tht("2")]), Side::Back);
+    }
+
+    #[test]
+    fn flip_layer_swaps_front_and_back() {
+        assert_eq!(flip_layer("F.SilkS").as_deref(), Some("B.SilkS"));
+        assert_eq!(flip_layer("B.Cu").as_deref(), Some("F.Cu"));
+        assert_eq!(flip_layer("Edge.Cuts"), None); // non-sided, unchanged
+    }
+
+    #[test]
+    fn flip_to_back_mirrors_x_and_flips_layers_and_text() {
+        let mut e = crate::sexpr::Sexpr::parse(
+            r#"(fp_text user "R1" (at 1.5 2) (layer "F.SilkS") (effects (font (size 1 1))))"#,
+        )
+        .unwrap();
+        flip_to_back(&mut e);
+        let out = e.to_sexpr_string();
+        assert!(out.contains("(at -1.5 2)"), "x mirrored: {out}");
+        assert!(out.contains(r#"(layer "B.SilkS")"#), "layer flipped: {out}");
+        assert!(out.contains("mirror"), "back text mirrored: {out}");
+    }
+
+    /// A through-hole part must land flipped on the bottom copper + silk.
+    #[test]
+    fn through_hole_part_lands_on_bottom() {
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        let c = Circuit {
+            name: "ds".into(),
+            parts: vec![
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+                Part::new("J1", "Conn")
+                    .with_footprint("Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"),
+            ],
+            nets: vec![Net::new(
+                "IN",
+                vec![PinRef::new("R1", "1"), PinRef::new("J1", "1")],
+            )],
+        };
+        let board = match generate_board(&c, &BoardOptions::new(&dir)) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        // The SMD R1 stays on front; the through-hole J1 is flipped to the back.
+        assert!(board.contains(r#""Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical""#));
+        assert!(
+            board.contains(r#""B.SilkS""#),
+            "back part silk moved to B.SilkS"
+        );
     }
 
     #[test]

@@ -262,6 +262,10 @@ impl Router for GridRouter {
 
         // Clearance halo radius, in cells: keep other nets a trace-half + clearance away.
         let halo = ((opts.clearance_mm + opts.signal_width_mm / 2.0) / res).ceil() as isize;
+        // A via is bigger than a track, so it needs a wider keep-out.
+        let via_halo = ((opts.via_size_mm / 2.0 + opts.clearance_mm + opts.signal_width_mm / 2.0)
+            / res)
+            .ceil() as isize;
 
         // Paint every pad (and its clearance halo) as its net's territory. Do the
         // cores first so a halo never overwrites a real pad connection point.
@@ -334,13 +338,26 @@ impl Router for GridRouter {
                 } else {
                     BACK
                 };
-                match grid.route_one(net.net_idx, &connected, (tc, tr, tl), step, via_cost) {
+                match grid.route_one(
+                    net.net_idx,
+                    &connected,
+                    (tc, tr, tl),
+                    step,
+                    via_cost,
+                    via_halo,
+                ) {
                     Some(path) => {
                         emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
                         for &(c, r, l) in &path {
                             grid.commit(c, r, l, net.net_idx, halo);
                             if !connected.contains(&(c, r, l)) {
                                 connected.push((c, r, l));
+                            }
+                        }
+                        // Reserve each via's wider body so later nets keep clear.
+                        for w in path.windows(2) {
+                            if w[0].2 != w[1].2 {
+                                grid.commit_via(w[0].0, w[0].1, net.net_idx, via_halo);
                             }
                         }
                     }
@@ -418,6 +435,30 @@ impl Grid {
         self.set(c, r, layer, Cell::Owner(net));
         self.halo(c, r, layer, net, halo, halo);
     }
+    /// Reserve a via's body + clearance at `(c, r)` on both layers for `net`.
+    fn commit_via(&mut self, c: usize, r: usize, net: usize, via_halo: isize) {
+        for layer in [FRONT, BACK] {
+            self.set(c, r, layer, Cell::Owner(net));
+            self.halo(c, r, layer, net, via_halo, via_halo);
+        }
+    }
+    /// Is a via's whole body (`±via_halo` on both layers) free for `net`? Also
+    /// false if the via would sit too near the grid edge for its clearance.
+    fn via_area_clear(&self, c: usize, r: usize, net: usize, via_halo: isize) -> bool {
+        for dr in -via_halo..=via_halo {
+            for dc in -via_halo..=via_halo {
+                let (nc, nr) = (c as isize + dc, r as isize + dr);
+                if nc < 0 || nr < 0 || nc >= self.cols as isize || nr >= self.rows as isize {
+                    return false;
+                }
+                let (nc, nr) = (nc as usize, nr as usize);
+                if !self.passable(nc, nr, FRONT, net) || !self.passable(nc, nr, BACK, net) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 
     /// Dijkstra from any `sources` cell to the `target` cell for `net`. Moves are
     /// 4-connected on a layer (cost `step`) or a via to the other layer (cost
@@ -429,6 +470,7 @@ impl Grid {
         target: (usize, usize, usize),
         step: i64,
         via_cost: i64,
+        via_halo: isize,
     ) -> Option<Vec<(usize, usize, usize)>> {
         let n = self.cols * self.rows * 2;
         let mut dist = vec![i64::MAX; n];
@@ -482,9 +524,10 @@ impl Grid {
                     &mut heap,
                 );
             }
-            // Via to the other layer (same cell).
+            // Via to the other layer (same cell) — a via is bigger than a track,
+            // so its whole body must clear other nets on both layers.
             let other = layer ^ 1;
-            if self.passable(c, r, other, net) {
+            if self.via_area_clear(c, r, net, via_halo) {
                 relax(
                     self.idx(c, r, other),
                     d + via_cost,

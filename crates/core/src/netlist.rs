@@ -242,7 +242,11 @@ mod tests {
         assert_eq!(sim.device, "SUBCKT");
         assert_eq!(sim.name, "kicad_builtin_opamp");
         assert_eq!(sim.pins.as_deref(), Some("3=in+ 2=in- 8=vcc 4=vee 1=out"));
-        assert!(sim.library.as_deref().unwrap().ends_with("Simulation_SPICE.sp"));
+        assert!(sim
+            .library
+            .as_deref()
+            .unwrap()
+            .ends_with("Simulation_SPICE.sp"));
         // A primitive (no Sim.*) carries no model.
         let r1 = c.parts.iter().find(|p| p.refdes.0 == "R1").unwrap();
         assert!(r1.sim.is_none());
