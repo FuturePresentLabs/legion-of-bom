@@ -21,10 +21,72 @@ use crate::source::CircuitSource;
 pub struct PlacedPart {
     pub refdes: String,
     pub value: String,
+    pub footprint: String,
     pub cx: f64,
     pub cy: f64,
     pub bbox: (f64, f64, f64, f64),
     pub back: bool,
+    /// Position of the reference pad (pin 1) — where the polarity marker sits.
+    pub pin1: Option<(f64, f64)>,
+    /// Polarity/orientation reference, for polarised parts only.
+    pub polarity: Option<Polarity>,
+}
+
+/// A polarity/orientation reference: what to align to the board's silkscreen
+/// mark, resolved per part (a ceramic cap has none, an electrolytic has `Plus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polarity {
+    /// Diode/LED cathode — the banded / flat end.
+    Cathode,
+    /// Positive terminal of a polarised (electrolytic/tantalum) capacitor.
+    Plus,
+    /// Pin 1 of an IC / connector / transistor (notch / dot / flat).
+    Pin1,
+}
+
+impl Polarity {
+    /// Short marker drawn at the reference pad on the diagram.
+    fn label(self) -> &'static str {
+        match self {
+            Polarity::Cathode => "K",
+            Polarity::Plus => "+",
+            Polarity::Pin1 => "1",
+        }
+    }
+    /// The assembly caution, phrased against the board silkscreen.
+    fn caution(self) -> &'static str {
+        match self {
+            Polarity::Cathode => {
+                "Polarity: match each diode/LED cathode (K — banded/flat end) to the silkscreen band."
+            }
+            Polarity::Plus => {
+                "Polarity: match each capacitor's + terminal to the silkscreen + / stripe."
+            }
+            Polarity::Pin1 => "Orientation: align pin 1 (notch/dot) to the silkscreen pin-1 mark.",
+        }
+    }
+}
+
+/// Resolve a part's polarity from its reference designator and footprint. A
+/// ceramic/film cap is unpolarised; an electrolytic/tantalum one is `Plus`.
+fn detect_polarity(refdes: &str, footprint: &str) -> Option<Polarity> {
+    let name = footprint
+        .rsplit(':')
+        .next()
+        .unwrap_or(footprint)
+        .to_ascii_uppercase();
+    match prefix_of(refdes) {
+        "D" => Some(Polarity::Cathode),
+        "U" | "Q" | "J" => Some(Polarity::Pin1),
+        "C" if name.starts_with("CP")
+            || name.contains("ELEC")
+            || name.contains("TANTAL")
+            || name.contains("POLAR") =>
+        {
+            Some(Polarity::Plus)
+        }
+        _ => None,
+    }
 }
 
 /// One build step: a group of same-kind parts placed together.
@@ -44,11 +106,12 @@ pub struct BuildGuide {
     pub steps: Vec<BuildStep>,
 }
 
-/// A build-step kind, in low-profile-first assembly order (DESIGN 7.8).
+/// A build-step kind, in low-profile-first assembly order (DESIGN 7.8). Polarity
+/// cautions are derived per part (see [`detect_polarity`]), not fixed per kind —
+/// a ceramic-cap step shows no caution, an electrolytic one does.
 struct Kind {
     prefix: &'static str,
     title: &'static str,
-    caution: Option<&'static str>,
 }
 
 // Order matters — this *is* the build sequence.
@@ -56,39 +119,30 @@ const KINDS: &[Kind] = &[
     Kind {
         prefix: "R",
         title: "Resistors",
-        caution: None,
     },
     Kind {
         prefix: "D",
         title: "Diodes & LEDs",
-        caution: Some("Polarity: match the cathode band / LED flat to the silkscreen."),
     },
     Kind {
         prefix: "J",
         title: "Connectors, sockets & headers",
-        caution: Some("Orientation: pin 1 to the silkscreen mark."),
     },
     Kind {
         prefix: "SW",
         title: "Switches",
-        caution: None,
     },
     Kind {
         prefix: "C",
         title: "Capacitors",
-        caution: Some(
-            "Polarity: electrolytic/tantalum caps have a + / stripe — check before soldering.",
-        ),
     },
     Kind {
         prefix: "Q",
         title: "Transistors",
-        caution: Some("Orientation: match the flat/tab to the silkscreen."),
     },
     Kind {
         prefix: "U",
         title: "ICs",
-        caution: Some("Orientation: pin 1 (dot/notch) to the silkscreen mark."),
     },
 ];
 
@@ -102,13 +156,14 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         .map(|p| (p.refdes.0.as_str(), p.value.as_str()))
         .collect();
 
-    // Attach the circuit value to each placed part.
+    // Attach the circuit value + resolve polarity per part.
     let mut parts: Vec<PlacedPart> = placed
         .into_iter()
         .map(|mut p| {
             if let Some(v) = values.get(p.refdes.as_str()) {
                 p.value = v.to_string();
             }
+            p.polarity = detect_polarity(&p.refdes, &p.footprint);
             p
         })
         .collect();
@@ -128,17 +183,18 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         if idxs.is_empty() {
             continue;
         }
-        let group = idxs
+        let group: Vec<PlacedPart> = idxs
             .iter()
             .map(|&i| {
                 used[i] = true;
                 parts[i].clone()
             })
             .collect();
+        let caution = step_caution(&group);
         steps.push(BuildStep {
             title: kind.title.to_string(),
             parts: group,
-            caution: kind.caution.map(str::to_string),
+            caution,
         });
     }
     let remaining: Vec<PlacedPart> = parts
@@ -148,10 +204,11 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         .map(|(_, p)| p.clone())
         .collect();
     if !remaining.is_empty() {
+        let caution = step_caution(&remaining);
         steps.push(BuildStep {
             title: "Remaining parts".to_string(),
             parts: remaining,
-            caution: None,
+            caution,
         });
     }
 
@@ -160,6 +217,15 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         outline: board_outline(board_pcb).unwrap_or((0.0, 0.0, 10.0, 10.0)),
         steps,
     })
+}
+
+/// A step's polarity caution — from its first polarised part (parts in a
+/// kind-step share a polarity), or `None` if nothing in the step is polarised.
+fn step_caution(parts: &[PlacedPart]) -> Option<String> {
+    parts
+        .iter()
+        .find_map(|p| p.polarity)
+        .map(|pol| pol.caution().to_string())
 }
 
 /// The leading letters of a refdes (`R12` → `R`, `SW1` → `SW`).
@@ -198,14 +264,17 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
             continue;
         }
         let back = fp.get("layer").and_then(|l| l.nth_atom(1)) == Some("B.Cu");
+        let footprint = fp.nth_atom(1).unwrap_or_default().to_string();
 
-        // Pad bounding box, in board coordinates (rotation-0 grid placement).
+        // Pad bounding box, in board coordinates (rotation-0 grid placement), and
+        // the position of pad 1 (the polarity/pin-1 reference).
         let mut bb = (
             f64::INFINITY,
             f64::INFINITY,
             f64::NEG_INFINITY,
             f64::NEG_INFINITY,
         );
+        let mut pin1 = None;
         for pad in fp.get_all("pad") {
             let pat = pad.get("at");
             let (px, py) = (
@@ -222,6 +291,9 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
             bb.1 = bb.1.min(y - ph / 2.0);
             bb.2 = bb.2.max(x + pw / 2.0);
             bb.3 = bb.3.max(y + ph / 2.0);
+            if pad.nth_atom(1) == Some("1") {
+                pin1 = Some((x, y));
+            }
         }
         if !bb.0.is_finite() {
             bb = (fx - 0.5, fy - 0.5, fx + 0.5, fy + 0.5);
@@ -229,10 +301,13 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
         parts.push(PlacedPart {
             refdes,
             value: String::new(),
+            footprint,
             cx: fx,
             cy: fy,
             bbox: bb,
             back,
+            pin1,
+            polarity: None,
         });
     }
     Ok(parts)
@@ -361,6 +436,19 @@ fn board_svg(guide: &BuildGuide, highlight: &std::collections::HashSet<&str>) ->
                 p.cy,
                 esc(&p.refdes)
             ));
+            // Polarity marker at the reference pad (pin 1 / + / cathode), so the
+            // assembler can match it to the board's silkscreen mark.
+            if let (Some(pol), Some((mx, my))) = (p.polarity, p.pin1) {
+                let r = fs * 0.9;
+                svg.push_str(&format!(
+                    "<circle cx=\"{mx}\" cy=\"{my}\" r=\"{r}\" fill=\"#111\" \
+                     stroke=\"#fff\" stroke-width=\"0.15\"/>\
+                     <text x=\"{mx}\" y=\"{my}\" font-size=\"{}\" text-anchor=\"middle\" \
+                     dominant-baseline=\"central\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
+                    fs * 1.1,
+                    pol.label(),
+                ));
+            }
         }
     }
     svg.push_str("</svg>");
@@ -452,5 +540,32 @@ mod tests {
         assert_eq!(prefix_of("R12"), "R");
         assert_eq!(prefix_of("SW1"), "SW");
         assert!(refdes_key("R2") < refdes_key("R10"));
+    }
+
+    #[test]
+    fn polarity_is_per_part_footprint_aware() {
+        // Ceramic cap: not polarised. Electrolytic/tantalum: +.
+        assert_eq!(
+            detect_polarity("C1", "Capacitor_SMD:C_0805_2012Metric"),
+            None
+        );
+        assert_eq!(
+            detect_polarity("C2", "Capacitor_SMD:CP_Elec_5x5.4"),
+            Some(Polarity::Plus)
+        );
+        assert_eq!(
+            detect_polarity("C3", "Capacitor_THT:CP_Radial_Tantalum"),
+            Some(Polarity::Plus)
+        );
+        // Diodes/LEDs → cathode; ICs/transistors/connectors → pin 1.
+        assert_eq!(
+            detect_polarity("D1", "Diode_SMD:D_SOD-123"),
+            Some(Polarity::Cathode)
+        );
+        assert_eq!(
+            detect_polarity("U1", "Package_SO:SOIC-8"),
+            Some(Polarity::Pin1)
+        );
+        assert_eq!(detect_polarity("R1", "Resistor_SMD:R_0805"), None);
     }
 }
