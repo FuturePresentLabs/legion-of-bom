@@ -13,12 +13,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, default_panel_orders_dir, default_parts_dir, export_cpl, export_gerbers,
-    fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom, jlc_bom_csv,
-    kicad_cli_path, panel_to_dxf, parse_netlist_file, run_drc, simulate_ac, validate_erc, zip_dir,
-    BoardOptions, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus, Severity,
-    SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_cpl,
+    export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom,
+    guide_to_html, jlc_bom_csv, kicad_cli_path, panel_to_dxf, parse_netlist_file, run_drc,
+    simulate_ac, validate_erc, zip_dir, BoardOptions, CircuitSource, Finding, JlcpcbClient,
+    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -76,6 +76,14 @@ enum Command {
         /// Path to the circuit definition (e.g. a SKiDL script).
         circuit: PathBuf,
         /// Package directory (default: out/<name>/fab).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Generate a step-by-step visual assembly guide (HTML) from a circuit.
+    Guide {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Write the guide here (default: out/<name>/<name>-guide.html).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -177,6 +185,7 @@ fn main() -> ExitCode {
         Command::Board { circuit, out } => board_cmd(circuit, out),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab { circuit, out } => fab_cmd(circuit, out),
+        Command::Guide { circuit, out } => guide_cmd(circuit, out),
         Command::Panel { action } => panel_cmd(action),
     };
 
@@ -428,6 +437,42 @@ fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
         bom_path.display()
     );
     println!("  → JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly");
+    Ok(())
+}
+
+/// Handle `lob guide <circuit> [--out]` — generate a board and render a
+/// step-by-step visual assembly guide (HTML).
+fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let footprint_dir = kicad_footprint_dir()
+        .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    let (board, _) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
+
+    let guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
+    let html = guide_to_html(&guide);
+
+    let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}-guide.html")));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, html).with_context(|| format!("writing {}", path.display()))?;
+    println!("wrote {}", path.display());
+    println!("  {} build steps (low-profile first)", guide.steps.len());
+    for (i, step) in guide.steps.iter().enumerate() {
+        println!("    {}. {} ({} parts)", i + 1, step.title, step.parts.len());
+    }
     Ok(())
 }
 

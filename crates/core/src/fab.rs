@@ -52,7 +52,15 @@ pub fn export_gerbers(board: &Path, out_dir: &Path, kicad_cli: &Path) -> Result<
     )?;
     run_kicad(
         kicad_cli,
-        &["pcb", "export", "drill", "--drill-origin", "plot", "-o", &dir],
+        &[
+            "pcb",
+            "export",
+            "drill",
+            "--drill-origin",
+            "plot",
+            "-o",
+            &dir,
+        ],
         board,
     )?;
     Ok(())
