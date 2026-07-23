@@ -331,12 +331,17 @@ pub fn generate_board_report(
     for name in &net_names {
         board.push(net(net_index[name.as_str()], name));
     }
-    // Bottom-layer ground pour (DESIGN 6.2) over the outline.
+    // Ground pours (DESIGN 6.2): both copper layers, so the many through-hole GND
+    // pads bridge the two pours and reconnect any island a trace cuts out of one
+    // layer — and a two-sided ground is quieter for an analog signal path.
     if let Some(rect) = outline {
         board.push(edge_cuts_rect(rect));
         if let Some(gnd) = &options.ground_net {
             if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
-                board.push(ground_zone(net_index[name.as_str()], name, rect));
+                let idx = net_index[name.as_str()];
+                for layer in ["F.Cu", "B.Cu"] {
+                    board.push(ground_zone(idx, name, rect, layer));
+                }
             }
         }
     }
@@ -682,15 +687,15 @@ fn edge_cuts_rect((x1, y1, x2, y2): Rect) -> Sexpr {
 }
 
 /// A bottom-layer (`B.Cu`) ground pour over `rect`, flooded to `net`.
-fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect) -> Sexpr {
+fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &str) -> Sexpr {
     let xy =
         |x: f64, y: f64| Sexpr::list(vec![Sexpr::sym("xy"), Sexpr::sym(mm(x)), Sexpr::sym(mm(y))]);
     Sexpr::list(vec![
         Sexpr::sym("zone"),
         kv("net", Sexpr::sym(net_idx.to_string())),
         kv("net_name", Sexpr::string(net_name)),
-        kv("layer", Sexpr::string("B.Cu")),
-        kv("uuid", Sexpr::string(det_uuid("gnd.zone"))),
+        kv("layer", Sexpr::string(layer)),
+        kv("uuid", Sexpr::string(det_uuid(&format!("gnd.zone.{layer}")))),
         Sexpr::list(vec![
             Sexpr::sym("hatch"),
             Sexpr::sym("edge"),
@@ -707,6 +712,8 @@ fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect) -> Sexpr 
             Sexpr::sym("yes"),
             kv("thermal_gap", Sexpr::sym("0.5")),
             kv("thermal_bridge_width", Sexpr::sym("0.5")),
+            // Drop filled scraps that don't connect to the net (floating islands).
+            kv("island_removal_mode", Sexpr::sym("0")),
         ]),
         Sexpr::list(vec![
             Sexpr::sym("polygon"),

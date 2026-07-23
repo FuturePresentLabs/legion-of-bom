@@ -124,6 +124,10 @@ pub struct RouteOptions {
     pub grid_mm: f64,
     /// Cost (mm-equivalent) charged for a layer change, to discourage vias.
     pub via_cost_mm: f64,
+    /// Extra cost (mm-equivalent) per grid step routed on the **back** layer, so
+    /// signals prefer the front and the back stays a mostly-intact ground plane
+    /// (short crossings still dip to the back; long runs get pushed to the front).
+    pub back_penalty_mm: f64,
     /// Routable rectangle `(min_x, min_y, max_x, max_y)`; defaults to the pads'
     /// bounding box (plus a margin) when `None`.
     pub bounds: Option<(f64, f64, f64, f64)>,
@@ -141,6 +145,11 @@ impl Default for RouteOptions {
             clearance_mm: 0.2,
             grid_mm: 0.2,
             via_cost_mm: 2.0,
+            // Small per-cell surcharge on the back layer: it accumulates so a long
+            // back run loses to a front detour (keeping the ground plane intact),
+            // but stays under one via's cost so a short same-layer hop still beats
+            // crossing over. Crossover vs a via is ~via_cost/penalty ≈ 20 cells.
+            back_penalty_mm: 0.1,
             bounds: None,
             front: "F.Cu".into(),
             back: "B.Cu".into(),
@@ -229,6 +238,15 @@ fn mst_edges(pads: &[PadPoint]) -> Vec<(usize, usize)> {
 
 const FRONT: usize = 0;
 const BACK: usize = 1;
+
+/// Per-move maze-search costs (mm × 1000, integer for a total ordering): one grid
+/// step, a layer change (via), and the surcharge for a step on the back layer.
+#[derive(Clone, Copy)]
+struct Costs {
+    step: i64,
+    via: i64,
+    back: i64,
+}
 
 /// Per-cell, per-layer ownership on the routing grid.
 #[derive(Clone, Copy, PartialEq)]
@@ -386,8 +404,11 @@ impl GridRouter {
         let mut failed: Vec<usize> = Vec::new();
         for &ni in order {
             let net = routable[ni];
-            let step = (res * 1000.0) as i64;
-            let via_cost = (opts.via_cost_mm * 1000.0) as i64;
+            let costs = Costs {
+                step: (res * 1000.0) as i64,
+                via: (opts.via_cost_mm * 1000.0) as i64,
+                back: (opts.back_penalty_mm * 1000.0) as i64,
+            };
 
             // Connected component: cells already part of this net's routed tree.
             // A through-hole pad seeds both layers (it bridges them).
@@ -403,7 +424,7 @@ impl GridRouter {
                 // Reach the pad on any layer it touches (cheapest wins).
                 let targets: Vec<(usize, usize, usize)> =
                     tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
-                match grid.route_one(net.net_idx, &connected, &targets, step, via_cost, via_halo) {
+                match grid.route_one(net.net_idx, &connected, &targets, costs, via_halo) {
                     Some(path) => {
                         emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
                         for &(c, r, l) in &path {
@@ -537,10 +558,14 @@ impl Grid {
         net: usize,
         sources: &[(usize, usize, usize)],
         targets: &[(usize, usize, usize)],
-        step: i64,
-        via_cost: i64,
+        costs: Costs,
         via_halo: isize,
     ) -> Option<Vec<(usize, usize, usize)>> {
+        let Costs {
+            step,
+            via: via_cost,
+            back: back_penalty,
+        } = costs;
         let n = self.cols * self.rows * 2;
         let mut dist = vec![i64::MAX; n];
         let mut prev = vec![usize::MAX; n];
@@ -584,9 +609,12 @@ impl Grid {
                 if !self.passable(nc, nr, layer, net) {
                     continue;
                 }
+                // Bias signals to the front: routing on the back (pour layer)
+                // costs extra, so the back stays a mostly-intact ground plane.
+                let move_cost = step + if layer == BACK { back_penalty } else { 0 };
                 relax(
                     self.idx(nc, nr, layer),
-                    d + step,
+                    d + move_cost,
                     i,
                     &mut dist,
                     &mut prev,
@@ -917,6 +945,27 @@ mod tests {
         assert!(
             out.tracks.iter().all(|t| t.net_idx != 0),
             "a no-net obstacle pad is not routed"
+        );
+    }
+
+    #[test]
+    fn signals_prefer_the_front_layer() {
+        // Two through-hole pads reachable on either layer. The back-layer surcharge
+        // keeps the run on the front, leaving the back as an intact ground plane
+        // (fixes the pour-fragmentation / starved_thermal class from the slew limiter).
+        let net = RouteNet {
+            net_idx: 1,
+            name: "N".into(),
+            pads: vec![
+                pad_on("U1", "1", 100.0, 100.0, PadLayer::Both),
+                pad_on("U2", "1", 106.0, 100.0, PadLayer::Both),
+            ],
+        };
+        let out = GridRouter.route(&[net], &RouteOptions::default());
+        assert!(out.conflicts.is_empty() && !out.tracks.is_empty());
+        assert!(
+            out.tracks.iter().all(|t| t.layer == "F.Cu"),
+            "front-biased routing keeps signals off the back ground plane"
         );
     }
 
