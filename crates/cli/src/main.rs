@@ -13,9 +13,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, default_parts_dir, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
-    generate_bom, parse_netlist_file, simulate_ac, validate_erc, BoardOptions, CircuitSource,
-    Finding, JlcpcbClient, MouserClient, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    analytic_check, default_panel_orders_dir, default_parts_dir, fetch_from_jlcpcb,
+    fetch_from_kicad, generate_board_report, generate_bom, panel_to_dxf, parse_netlist_file,
+    simulate_ac, validate_erc, BoardOptions, CircuitSource, Finding, JlcpcbClient, MouserClient,
+    PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
     ResolutionStatus, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
@@ -64,11 +65,15 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Panel design: generate DXF, track orders.
+    Panel {
+        #[command(subcommand)]
+        action: PanelCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum PartsCmd {
-    /// List all MPNs in the library.
     List,
     /// Show a part (pins, ratings, verification status) by MPN.
     Show { mpn: String },
@@ -106,6 +111,34 @@ enum PartsCmd {
     Gate { circuit: PathBuf },
 }
 
+#[derive(Debug, Subcommand)]
+enum PanelCmd {
+    /// Generate a DXF from a panel spec TOML file.
+    Dxf {
+        /// Path to the panel spec TOML.
+        spec: PathBuf,
+        /// Output DXF path (default: same name with .dxf extension).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Show the current order status for a module.
+    Status {
+        /// Module name (e.g. "crossfader-v1").
+        module: String,
+    },
+    /// Mark a panel as manually ordered.
+    MarkOrdered {
+        /// Module name.
+        module: String,
+        /// Vendor (e.g. "sendcutsend", "oshcut").
+        #[arg(long)]
+        vendor: String,
+        /// Vendor tracking / order reference.
+        #[arg(long)]
+        tracking: Option<String>,
+    },
+}
+
 fn main() -> ExitCode {
     // Load .env (API keys) before anything reads the environment.
     let _ = dotenvy::dotenv();
@@ -122,6 +155,7 @@ fn main() -> ExitCode {
             out,
         } => bom_cmd(circuit, price, out),
         Command::Board { circuit, out } => board_cmd(circuit, out),
+        Command::Panel { action } => panel_cmd(action),
     };
 
     match result {
@@ -408,6 +442,67 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             println!("fetched {mpn} from {source}:");
             print_part(&part);
             println!("\n(unverified — run `lob parts verify {mpn}` after confirming)");
+        }
+    }
+    Ok(())
+}
+
+/// Handle `lob panel ...` commands.
+fn panel_cmd(action: PanelCmd) -> Result<()> {
+    match action {
+        PanelCmd::Dxf { spec, out } => {
+            let toml = std::fs::read_to_string(&spec)
+                .with_context(|| format!("reading {}", spec.display()))?;
+            let file = PanelFile::from_toml(&toml)
+                .with_context(|| format!("parsing {}", spec.display()))?;
+            let panel = file
+                .to_spec()
+                .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
+            let dxf = panel_to_dxf(panel.as_ref());
+            let out_path = out.unwrap_or_else(|| spec.with_extension("dxf"));
+            std::fs::write(&out_path, dxf)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("wrote {}", out_path.display());
+            println!(
+                "  panel: {:.2} mm × {:.2} mm, {} hole(s), {} cutout(s)",
+                panel.width_mm(),
+                panel.height_mm(),
+                panel.mounting_holes().len(),
+                panel.cutouts().len(),
+            );
+        }
+        PanelCmd::Status { module } => {
+            let store = PanelOrders::open(default_panel_orders_dir())
+                .with_context(|| "opening panel orders (is `dolt` installed?)")?;
+            match store.latest(&module)? {
+                Some(order) => {
+                    println!("{}: {}", order.module, order.status.as_str());
+                    println!("  dxf:   {}", order.dxf_path);
+                    if let Some(v) = order.vendor {
+                        println!("  vendor: {v}");
+                    }
+                    if let Some(t) = order.tracking_ref {
+                        println!("  tracking: {t}");
+                    }
+                    if let Some(n) = order.notes {
+                        println!("  notes: {n}");
+                    }
+                }
+                None => println!("{module}: no orders on record"),
+            }
+        }
+        PanelCmd::MarkOrdered {
+            module,
+            vendor,
+            tracking,
+        } => {
+            let store = PanelOrders::open(default_panel_orders_dir())
+                .with_context(|| "opening panel orders (is `dolt` installed?)")?;
+            store.mark_ordered(&module, &vendor, tracking.as_deref())?;
+            println!("marked {module} as ordered via {vendor}");
+            if let Some(t) = tracking {
+                println!("  tracking: {t}");
+            }
         }
     }
     Ok(())

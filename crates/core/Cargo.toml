@@ -9,6 +9,8 @@ description = "Core pipeline library for legion-of-bom: circuit model, stage tra
 [dependencies]
 thiserror.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
 ureq.workspace = true
 hmac.workspace = true
 sha2.workspace = true
