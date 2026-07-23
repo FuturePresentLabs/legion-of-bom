@@ -487,10 +487,7 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     let board_file = work_dir.join(format!("{stem}.kicad_pcb"));
     std::fs::write(&board_file, &board)?;
     let kicad_cli = kicad_cli_path();
-    let any_back = guide
-        .steps
-        .iter()
-        .any(|s| s.parts.iter().any(|p| p.back));
+    let any_back = guide.steps.iter().any(|s| s.parts.iter().any(|p| p.back));
     let top = kicad_cli
         .as_ref()
         .and_then(|k| render_board_png(&board_file, k, true, false).ok());
@@ -504,7 +501,11 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     match &top {
         Some((_, w, h)) => println!(
             "  diagram: photoreal bare-board render ({w}×{h}){}",
-            if bottom.is_some() { " + bottom side" } else { "" }
+            if bottom.is_some() {
+                " + bottom side"
+            } else {
+                ""
+            }
         ),
         None => println!("  diagram: schematic top-down (kicad-cli not found)"),
     }

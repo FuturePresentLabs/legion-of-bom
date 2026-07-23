@@ -819,6 +819,48 @@ mod tests {
     }
 
     #[test]
+    fn no_net_pad_forces_traces_to_route_around_it() {
+        // board.rs seeds each no-net pad (unused IC pin, jack switch contact, …)
+        // as a single-pad net so it's an obstacle, not a connection. Prove it: a
+        // signal net whose straight path crosses a through-hole no-net pad must
+        // detour around it (fixes the shorting_items class from the slew limiter).
+        let opts = RouteOptions::default();
+        let sig = || RouteNet {
+            net_idx: 1,
+            name: "SIG".into(),
+            pads: vec![pad("U1", "1", 100.0, 100.0), pad("U2", "1", 108.0, 100.0)],
+        };
+        // Baseline (no obstacle): the router runs straight along y = 100.
+        let base = GridRouter.route(&[sig()], &opts);
+        assert!(base.conflicts.is_empty() && !base.tracks.is_empty());
+        assert!(
+            base.tracks
+                .iter()
+                .all(|t| (t.start.1 - 100.0).abs() < 0.11 && (t.end.1 - 100.0).abs() < 0.11),
+            "baseline route is a straight line"
+        );
+        // A lone through-hole no-net pad on that line (blocks both layers).
+        let obstacle = RouteNet {
+            net_idx: 0,
+            name: String::new(),
+            pads: vec![pad_on("U3", "2", 104.0, 100.0, PadLayer::Both)],
+        };
+        let out = GridRouter.route(&[sig(), obstacle], &opts);
+        assert!(!out.tracks.is_empty(), "signal still routes");
+        assert!(
+            out.tracks
+                .iter()
+                .any(|t| (t.start.1 - 100.0).abs() > 0.3 || (t.end.1 - 100.0).abs() > 0.3),
+            "trace must route around the no-net pad, not through it"
+        );
+        // The lone obstacle pad is never itself connected.
+        assert!(
+            out.tracks.iter().all(|t| t.net_idx != 0),
+            "a no-net obstacle pad is not routed"
+        );
+    }
+
+    #[test]
     fn mst_two_pad_net_makes_one_track() {
         let net = RouteNet {
             net_idx: 3,

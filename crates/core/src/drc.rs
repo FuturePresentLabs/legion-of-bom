@@ -214,7 +214,9 @@ mod tests {
         ]}"#;
         let r = DrcReport::from_json(json).unwrap();
         assert_eq!(r.silkscreen_collision_count(), 2);
-        assert!(r.silkscreen_collisions().all(|v| v.is_silkscreen_collision()));
+        assert!(r
+            .silkscreen_collisions()
+            .all(|v| v.is_silkscreen_collision()));
         // A real electrical error is still the only thing that makes it unclean.
         assert_eq!(r.error_count(), 1);
         assert!(!r.is_clean());

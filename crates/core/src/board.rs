@@ -233,6 +233,10 @@ pub fn generate_board_report(
     // past the board edge).
     let mut footprints = Vec::new();
     let mut net_pads: HashMap<usize, RouteNet> = HashMap::new();
+    // Pads carrying no net (unused IC pins, jack switch contacts, spare header
+    // pins) are still physical copper — the router must route *around* them or it
+    // shorts a passing trace to them. Collected here and seeded as obstacles.
+    let mut obstacle_pads: Vec<PadPoint> = Vec::new();
     let mut pad_bb = (
         f64::INFINITY,
         f64::INFINITY,
@@ -252,13 +256,22 @@ pub fn generate_board_report(
             pad_bb.1 = pad_bb.1.min(y - pad.h / 2.0);
             pad_bb.2 = pad_bb.2.max(x + pad.w / 2.0);
             pad_bb.3 = pad_bb.3.max(y + pad.h / 2.0);
-            if let Some(&name) = pin_net.get(&(refdes.to_string(), pad.num.clone())) {
-                let Some(&idx) = net_index.get(name) else {
-                    continue;
-                };
-                // A back-placed footprint mirrors its pads to the other side.
-                let layer = pad_layer_on_board(pad.layer, placement.back);
-                net_pads
+            // A back-placed footprint mirrors its pads to the other side.
+            let layer = pad_layer_on_board(pad.layer, placement.back);
+            let point = PadPoint {
+                refdes: refdes.to_string(),
+                pad: pad.num.clone(),
+                x_mm: x,
+                y_mm: y,
+                w_mm: pad.w,
+                h_mm: pad.h,
+                layer,
+            };
+            match pin_net
+                .get(&(refdes.to_string(), pad.num.clone()))
+                .and_then(|name| net_index.get(name).map(|&idx| (idx, *name)))
+            {
+                Some((idx, name)) => net_pads
                     .entry(idx)
                     .or_insert_with(|| RouteNet {
                         net_idx: idx,
@@ -266,15 +279,9 @@ pub fn generate_board_report(
                         pads: Vec::new(),
                     })
                     .pads
-                    .push(PadPoint {
-                        refdes: refdes.to_string(),
-                        pad: pad.num.clone(),
-                        x_mm: x,
-                        y_mm: y,
-                        w_mm: pad.w,
-                        h_mm: pad.h,
-                        layer,
-                    });
+                    .push(point),
+                // No net: keep it as a route-around obstacle, not a connection.
+                None => obstacle_pads.push(point),
             }
         }
         footprints.push(transform_footprint(
@@ -339,7 +346,17 @@ pub fn generate_board_report(
     // routing traces the rest (and any multi-pad ground net) on the copper layers.
     let mut conflicts = Vec::new();
     if let Some(router) = &options.router {
-        let nets: Vec<RouteNet> = net_pads.into_values().collect();
+        let mut nets: Vec<RouteNet> = net_pads.into_values().collect();
+        // Each no-net pad as its own single-pad net: painted as an obstacle (with
+        // clearance halo) so traces route around it, but never itself routed
+        // (the router only connects nets with ≥2 pads).
+        for point in obstacle_pads {
+            nets.push(RouteNet {
+                net_idx: 0,
+                name: String::new(),
+                pads: vec![point],
+            });
+        }
         let routed = router.route(&nets, &options.route_options);
         for track in &routed.tracks {
             board.push(track_sexpr(track));
@@ -921,7 +938,10 @@ mod tests {
         )
         .to_sexpr_string();
         assert!(out.contains(r#"(layer "B.SilkS")"#), "silk on back: {out}");
-        assert!(!out.contains(r#"(layer "F.SilkS")"#), "no front silk: {out}");
+        assert!(
+            !out.contains(r#"(layer "F.SilkS")"#),
+            "no front silk: {out}"
+        );
         assert!(out.contains("mirror"), "back refdes mirrored: {out}");
     }
 

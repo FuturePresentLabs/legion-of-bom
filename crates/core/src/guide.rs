@@ -827,7 +827,12 @@ pub fn guide_to_pdf(
 fn highlight_svg(p: &PlacedPart, fs: f64, fill_opacity: f64) -> String {
     let (bx0, by0, bx1, by1) = p.bbox;
     let m = 0.35; // frame just outside the pads
-    let (x, y, w, h) = (bx0 - m, by0 - m, (bx1 - bx0) + 2.0 * m, (by1 - by0) + 2.0 * m);
+    let (x, y, w, h) = (
+        bx0 - m,
+        by0 - m,
+        (bx1 - bx0) + 2.0 * m,
+        (by1 - by0) + 2.0 * m,
+    );
     let halo = fs * 0.16;
     // Refdes just above the box so it never crowds the pads.
     let label_y = y - fs * 0.3;
@@ -1041,7 +1046,10 @@ mod tests {
         assert_eq!(g.steps[0].title, "Capacitors");
         assert!(g.steps[0].parts.iter().all(|p| p.back), "cap step is back");
         assert_eq!(g.steps[1].title, "Resistors");
-        assert!(g.steps[1].parts.iter().all(|p| !p.back), "resistor is front");
+        assert!(
+            g.steps[1].parts.iter().all(|p| !p.back),
+            "resistor is front"
+        );
     }
 
     #[test]
