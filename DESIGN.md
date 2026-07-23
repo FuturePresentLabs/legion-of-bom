@@ -44,6 +44,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    6.7 DFM checks (JLCDFM + mechanical/3D collision checks)
    6.8 Manual layout escape hatch — where the human loop stays in
    6.9 PanelSpec trait — the format-agnostic seam (filled — see body)
+   6.10 Silkscreen generation & validation (filled — see body)
 
 7. **Panel Design**
    7.1 DXF output (filled — see body)
@@ -54,6 +55,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    7.6 Visual BOM / component sorting sheet (filled — see body)
    7.7 Drilling jigs + Lightburn SVG (filled — see body)
    7.8 Build-guide rendering (filled — see body)
+   7.9 Parametric brand identity — curated, not generated (filled — see body)
 
 8. **Manufacturing Outputs**
    8.1 Gerbers via KiCad (v1 path)
@@ -104,7 +106,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
 
 ---
 
-## 1. Vision & [118;1:3uScope
+## 1. Vision & Scope
 
 ### 1.1 Problem statement
 Small electronics hardware businesses (starting with Puget Audio) currently manage
@@ -449,6 +451,36 @@ same anchored-jack-pot cutout model used for the other three would be wrong,
 not just incomplete, so its `PanelSpec` implementation waits until it's
 actually being built rather than being guessed at now.
 
+### 6.10 Silkscreen generation & validation
+Not previously covered — the sexp-generation and DRC-readback work (6.6)
+solved copper/routing/electrical-rule checking, but silkscreen (reference
+designators, polarity marks, pin-1 indicators) is a distinct KiCad layer
+untouched by any of that.
+
+**v0 scope**: accept KiCad's default reference-designator auto-placement
+rather than building custom placement logic — real auto-arrangement of
+silkscreen text to avoid overlaps is its own hard layout-adjacent problem
+(similar in spirit to general label-placement optimization), and not worth
+solving before a single real board has shipped. What *is* worth adding: a
+`silkscreen_collision` violation type in the DRC-readback check step (6.5),
+since silkscreen-over-pad or silkscreen-over-silkscreen isn't an electrical
+DRC violation and would otherwise pass the existing check silently.
+
+**Why this matters more given the THT pedal direction specifically**:
+reference designators and polarity marks are directly useful to someone
+hand-assembling a board from a BOM — not cosmetic. Polarity marks in
+particular need to be correct and visible, since wrong-polarity assembly
+(diodes, electrolytic caps, ICs) is a common real failure mode in DIY-style
+builds. This ties directly into 7.8's build-guide rendering — the "populated
+board" reference render needs accurate silkscreen to be useful as a guide,
+not just accurate copper.
+
+**Low risk from board density for the near-term targets**: THT's low part
+count and 0.1" grid spacing (per the THT-vs-SMD discussion) makes silkscreen
+collisions rare in practice — another reason THT is a forgiving first real
+target, this time for a layer nothing has touched yet rather than for
+routing.
+
 ---
 
 ## 4. Validation Layer
@@ -572,6 +604,48 @@ Needs two things that don't exist elsewhere in the pipeline yet:
 Scope note for all of 7.6–7.8: layered on top of the Guitar Pedal `PanelSpec`
 implementation, not before it exists — same gating already applied to
 500-series and the rest of the layout epic.
+
+### 7.9 Parametric brand identity — curated, not generated
+The goal: boards and panels should read as designed products, not raw
+pipeline output — including the ones that came out of the pipeline entirely
+automatically. Same automatable/manual split already used for 7.8's labels,
+applied to brand identity as a whole:
+
+- **Automatable, parametric layer**: a small, fixed set of house-style rules
+  — consistent silkscreen typography, a logo placement rule expressed as a
+  function of panel dimensions (e.g. "bottom-center, scaled to N% of panel
+  width, M mm from the bottom edge") rather than a fixed pixel position, a
+  consistent border/frame treatment, a defined finish/color palette per
+  product line. Applied programmatically to every board via the same
+  `PanelSpec`/silkscreen (6.10) generation path — not hand-laid-out per
+  board, but not generic defaults either.
+- **Stays manual/curated**: actual illustration, one-off artwork, anything
+  that's a genuine creative choice rather than a systematic rule. Same
+  reasoning as everywhere else in this doc that draws this line (6.8's
+  layout escape hatch, 7.8's labels) — automate what's mechanically
+  derivable from a rule, surface what needs a human's eye.
+
+**The actual risk this section exists to name**: a parametric system that
+*invents* its own placement/spacing heuristics on the fly will read as
+generated, no matter how technically correct it is — the "curated, not
+generated" feel comes from the rules themselves being designed once, by a
+human, and applied consistently, not from the automation being clever. This
+matches the pipeline's consistent posture elsewhere (verification gates,
+`research_topology`'s citation requirement, critical-net tagging) — the tool
+executes and applies judgment that's been made deliberately, it doesn't
+originate it.
+
+**Practical shape**: a small "brand kit" — logo as a scalable vector (not a
+fixed-resolution raster, so it holds up across HP widths and pedal enclosure
+sizes), a typography choice for legends, and the placement-rule set above —
+stored once as a shared asset referenced by every `PanelSpec` implementation
+(Eurorack, Guitar Pedal, and beyond), not duplicated per product line. Given
+it's genuinely cross-project brand identity rather than per-circuit content,
+this likely belongs alongside the other shared/global concerns (parts
+library, panel-order tracking) rather than living inside any one circuit
+repo — exact storage mechanism (Dolt vs. a dedicated `brand/` directory in
+the `legion-of-bom` repo itself) is an open implementation detail, not
+resolved here.
 
 ---
 
