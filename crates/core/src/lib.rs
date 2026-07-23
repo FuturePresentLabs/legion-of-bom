@@ -36,8 +36,8 @@ pub mod validate;
 pub mod verify;
 
 pub use board::{
-    generate_board, generate_board_report, BoardError, BoardOptions, GridPlacer, PartFacts,
-    Placement, Placer,
+    generate_board, generate_board_report, BoardError, BoardOptions, EurorackPlacer, GridPlacer,
+    PartFacts, Placement, Placer,
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};

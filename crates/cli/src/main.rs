@@ -18,9 +18,9 @@ use legion_of_bom_core::{
     guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, panel_to_kicad_pcb,
     parse_netlist_file,
     png_to_jpeg, render_board_png, run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions,
-    BoardPng, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus, Severity,
-    SimConfig, SkidlRunner, StageOutcome,
+    BoardPng, CircuitSource, EurorackPlacer, Finding, JlcpcbClient, MouserClient, PanelFile,
+    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus,
+    Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -67,6 +67,10 @@ enum Command {
         /// Write the board here (default: out/<name>/<name>.kicad_pcb).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Eurorack panel spec (TOML): anchor jacks/pots to its cutouts and size
+        /// the board to the panel (vertical 3U) instead of a bounding-box strip.
+        #[arg(long)]
+        panel: Option<PathBuf>,
     },
     /// Run DRC on a .kicad_pcb and report violations (the layout loop's check step).
     Drc {
@@ -193,7 +197,11 @@ fn main() -> ExitCode {
             price,
             out,
         } => bom_cmd(circuit, price, out),
-        Command::Board { circuit, out } => board_cmd(circuit, out),
+        Command::Board {
+            circuit,
+            out,
+            panel,
+        } => board_cmd(circuit, out, panel),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab { circuit, out } => fab_cmd(circuit, out),
         Command::Guide { circuit, out } => guide_cmd(circuit, out),
@@ -297,7 +305,41 @@ fn run(circuit: PathBuf) -> Result<()> {
 }
 
 /// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
-fn board_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+/// Build board options, using panel-anchored Eurorack placement when a panel
+/// spec is given: jacks/pots are anchored to the panel's cutouts (Y flipped from
+/// the panel's bottom-up frame to KiCad top-down) and the board outline becomes
+/// the panel size (vertical 3U). Otherwise the default grid placement.
+fn board_options_with_panel(
+    footprint_dir: PathBuf,
+    panel: &Option<PathBuf>,
+) -> Result<BoardOptions> {
+    let mut opts = BoardOptions::new(footprint_dir);
+    if let Some(spec_path) = panel {
+        let toml = std::fs::read_to_string(spec_path)
+            .with_context(|| format!("reading {}", spec_path.display()))?;
+        let file = PanelFile::from_toml(&toml)
+            .with_context(|| format!("parsing {}", spec_path.display()))?;
+        let spec = file
+            .to_spec()
+            .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
+        let (w, h) = (spec.width_mm(), spec.height_mm());
+        let mut anchors = std::collections::HashMap::new();
+        for c in spec.cutouts() {
+            if let Some(refdes) = &c.refdes {
+                anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
+            }
+        }
+        opts.placer = Box::new(EurorackPlacer {
+            width_mm: w,
+            height_mm: h,
+            anchors,
+        });
+        opts.fixed_outline = Some((0.0, 0.0, w, h));
+    }
+    Ok(opts)
+}
+
+fn board_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Result<()> {
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -313,7 +355,8 @@ fn board_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
 
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    let (board, conflicts) = generate_board_report(&model, &BoardOptions::new(footprint_dir))?;
+    let options = board_options_with_panel(footprint_dir, &panel)?;
+    let (board, conflicts) = generate_board_report(&model, &options)?;
 
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;

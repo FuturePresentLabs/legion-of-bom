@@ -132,6 +132,120 @@ impl Placer for GridPlacer {
     }
 }
 
+/// Vertical Eurorack placement: panel-facing parts (jacks, pots, switches) are
+/// **anchored** at their panel-cutout positions so the board mates the panel PCB;
+/// the remaining parts are shelf-packed into the free bands between them. All
+/// coordinates are KiCad top-down, in the panel's frame (`0..width × 0..height`).
+pub struct EurorackPlacer {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    /// refdes → (x, y) in board coords (already Y-flipped from the panel's
+    /// bottom-up cutouts to KiCad top-down).
+    pub anchors: HashMap<String, (f64, f64)>,
+}
+
+impl Placer for EurorackPlacer {
+    fn place(
+        &self,
+        circuit: &dyn CircuitSource,
+        facts: &HashMap<String, PartFacts>,
+    ) -> HashMap<String, Placement> {
+        let side_of = |refdes: &str| {
+            facts
+                .get(refdes)
+                .map(|f| f.side == Side::Back)
+                .unwrap_or(false)
+        };
+        let mut out = HashMap::new();
+
+        // Keep-out boxes to avoid: the anchored parts first (at their cutouts).
+        let mut boxes: Vec<Rect> = Vec::new();
+        let box_of = |x: f64, y: f64, (w, h): (f64, f64)| (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0);
+        for (refdes, &(x, y)) in &self.anchors {
+            out.insert(
+                refdes.clone(),
+                Placement {
+                    x_mm: x,
+                    y_mm: y,
+                    rotation_deg: 0.0,
+                    back: side_of(refdes),
+                },
+            );
+            let ext = facts.get(refdes).map(|f| f.extent).unwrap_or((8.0, 8.0));
+            boxes.push(box_of(x, y, ext));
+        }
+
+        // Free parts: first-fit into the interior, top→bottom then left→right,
+        // taking the first spot whose courtyard box clears everything placed so
+        // far (anchors + earlier free parts). Robust against extent quirks — no
+        // overlap can slip through, unlike shelf math.
+        let margin = 3.0;
+        // Extra clearance beyond the measured courtyard — footprints occasionally
+        // under-declare it, and it leaves the router room between neighbours.
+        let clearance = 2.5;
+        let step = 0.5;
+        let (x0, x1) = (margin, self.width_mm - margin);
+        let (y0, y1) = (margin, self.height_mm - margin);
+        let mut free: Vec<&str> = circuit
+            .parts()
+            .iter()
+            .map(|p| p.refdes.0.as_str())
+            .filter(|r| !self.anchors.contains_key(*r))
+            .collect();
+        free.sort();
+
+        let n = free.len().max(1) as f64;
+        for (i, r) in free.iter().enumerate() {
+            let (w, h) = facts.get(*r).map(|f| f.extent).unwrap_or((3.0, 3.0));
+            // Spread the parts down the (tall) board rather than packing them at
+            // the top: aim each at an evenly-spaced row, then take the nearest
+            // free spot searching outward from there.
+            let target = (y0 + (i as f64 + 0.5) / n * (y1 - y0) - h / 2.0).clamp(y0, y1 - h);
+            let free_at = |cy: f64, boxes: &[Rect]| -> Option<Rect> {
+                if cy < y0 || cy + h > y1 {
+                    return None;
+                }
+                let mut cx = x0;
+                while cx + w <= x1 {
+                    let cand = (cx, cy, cx + w, cy + h);
+                    if !boxes.iter().any(|b| rects_overlap(b, &cand, clearance)) {
+                        return Some(cand);
+                    }
+                    cx += step;
+                }
+                None
+            };
+            let mut spot = None;
+            let mut d = 0.0;
+            while d <= (y1 - y0) {
+                if let Some(c) = free_at(target + d, &boxes).or_else(|| free_at(target - d, &boxes)) {
+                    spot = Some(c);
+                    break;
+                }
+                d += step;
+            }
+            // No room found → drop it just below the board (visible, DRC flags it).
+            let cand = spot.unwrap_or((x0, y1 + 2.0, x0 + w, y1 + 2.0 + h));
+            out.insert(
+                r.to_string(),
+                Placement {
+                    x_mm: cand.0 + w / 2.0,
+                    y_mm: cand.1 + h / 2.0,
+                    rotation_deg: 0.0,
+                    back: side_of(r),
+                },
+            );
+            boxes.push(cand);
+        }
+        out
+    }
+}
+
+/// Whether two rectangles `(min_x, min_y, max_x, max_y)` overlap within `c` mm.
+fn rects_overlap(a: &Rect, b: &Rect, c: f64) -> bool {
+    a.0 - c < b.2 && b.0 - c < a.2 && a.1 - c < b.3 && b.1 - c < a.3
+}
+
 /// Options for [`generate_board`].
 pub struct BoardOptions {
     pub footprint_dir: PathBuf,
@@ -146,6 +260,10 @@ pub struct BoardOptions {
     pub ground_net: Option<String>,
     /// Margin (mm) added around the placed parts for the board outline.
     pub outline_margin_mm: f64,
+    /// A fixed board outline `(min_x, min_y, max_x, max_y)` — set for a Eurorack
+    /// board so the outline is the panel size, not the parts' bounding box. When
+    /// `None`, the outline is the pad bounding box + [`outline_margin_mm`].
+    pub fixed_outline: Option<(f64, f64, f64, f64)>,
 }
 
 impl BoardOptions {
@@ -159,6 +277,7 @@ impl BoardOptions {
             route_options: RouteOptions::default(),
             ground_net: Some("GND".into()),
             outline_margin_mm: 5.0,
+            fixed_outline: None,
         }
     }
 }
@@ -215,10 +334,16 @@ pub fn generate_board_report(
             })?;
         let fp = load_footprint(&options.footprint_dir, lib_part)?;
         let pads = footprint_pads(&fp);
+        // Keep-out = the larger of the pad bbox (+margin) and the real courtyard.
+        let pad_ext = part_extent(&pads, COURTYARD_MARGIN_MM);
+        let extent = match courtyard_extent(&fp) {
+            Some((cw, ch)) => (pad_ext.0.max(cw), pad_ext.1.max(ch)),
+            None => pad_ext,
+        };
         facts.insert(
             refdes.to_string(),
             PartFacts {
-                extent: part_extent(&pads, COURTYARD_MARGIN_MM),
+                extent,
                 side: part.side.unwrap_or(Side::Front),
             },
         );
@@ -289,13 +414,14 @@ pub fn generate_board_report(
         ));
     }
 
-    // Board outline (bounding box of the placed pads + margin). Computed before
-    // the setup block so the drill/place-file origin can anchor to it. A real
-    // panel-driven outline arrives with PanelSpec (j54.10); this is a valid
-    // rectangular first cut.
-    let outline = pad_bb.0.is_finite().then(|| {
-        let m = options.outline_margin_mm;
-        (pad_bb.0 - m, pad_bb.1 - m, pad_bb.2 + m, pad_bb.3 + m)
+    // Board outline: a fixed panel-driven rectangle (Eurorack — see
+    // `fixed_outline`), else the pad bounding box + margin. Computed before the
+    // setup block so the drill/place-file origin can anchor to it.
+    let outline = options.fixed_outline.or_else(|| {
+        pad_bb.0.is_finite().then(|| {
+            let m = options.outline_margin_mm;
+            (pad_bb.0 - m, pad_bb.1 - m, pad_bb.2 + m, pad_bb.3 + m)
+        })
     });
 
     // Setup: anchor the drill/place-file origin at the board's bottom-left, so
@@ -441,6 +567,45 @@ fn footprint_pads(fp: &Sexpr) -> Vec<FpPad> {
 /// A part's placement keep-out `(width, height)` in mm: the bounding box of its
 /// pads, expanded by `margin` to approximate the courtyard. Zero for a padless
 /// footprint.
+/// The footprint's courtyard (`*.CrtYd`) bounding-box size, if it declares one.
+/// The courtyard is the real keep-out — usually larger than the pad bbox — so
+/// placers must space parts by it or KiCad flags `courtyards_overlap`.
+fn courtyard_extent(fp: &Sexpr) -> Option<(f64, f64)> {
+    let parse2 = |p: &Sexpr| -> Option<(f64, f64)> {
+        Some((p.nth_atom(1)?.parse().ok()?, p.nth_atom(2)?.parse().ok()?))
+    };
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for it in fp.as_list()? {
+        let on_crtyd = it
+            .get("layer")
+            .and_then(|l| l.nth_atom(1))
+            .is_some_and(|l| l.ends_with(".CrtYd"));
+        if !on_crtyd {
+            continue;
+        }
+        for key in ["start", "end", "center", "mid"] {
+            if let Some(v) = it.get(key).and_then(parse2) {
+                pts.push(v);
+            }
+        }
+        if let Some(node) = it.get("pts") {
+            pts.extend(node.get_all("xy").into_iter().filter_map(parse2));
+        }
+    }
+    if pts.is_empty() {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (x, y) in pts {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    Some((x1 - x0, y1 - y0))
+}
+
 fn part_extent(pads: &[FpPad], margin: f64) -> (f64, f64) {
     let mut bb = (
         f64::INFINITY,
@@ -853,6 +1018,32 @@ mod tests {
         let p = GridPlacer::default().place(&rc(), &f);
         assert!(!p["R1"].back, "SMD part stays front");
         assert!(p["C1"].back, "through-hole part goes to back");
+    }
+
+    #[test]
+    fn eurorack_placer_anchors_parts_and_clears_the_rest() {
+        // R1 is anchored to a panel cutout; C1 is free and must land elsewhere on
+        // the board without overlapping the anchor.
+        let f = facts(&[
+            ("R1", (2.0, 1.5), Side::Front),
+            ("C1", (2.0, 1.5), Side::Front),
+        ]);
+        let mut anchors = HashMap::new();
+        anchors.insert("R1".to_string(), (10.0, 100.0));
+        let placer = EurorackPlacer {
+            width_mm: 40.0,
+            height_mm: 128.5,
+            anchors,
+        };
+        let p = placer.place(&rc(), &f);
+        // Anchored part sits exactly on its cutout.
+        assert_eq!((p["R1"].x_mm, p["R1"].y_mm), (10.0, 100.0));
+        // Free part is inside the board and clear of the anchor.
+        assert!(p["C1"].x_mm > 0.0 && p["C1"].x_mm < 40.0);
+        assert!(p["C1"].y_mm > 0.0 && p["C1"].y_mm < 128.5);
+        let dx = p["C1"].x_mm - 10.0;
+        let dy = p["C1"].y_mm - 100.0;
+        assert!((dx * dx + dy * dy).sqrt() > 2.0, "free part clears the anchor");
     }
 
     #[test]

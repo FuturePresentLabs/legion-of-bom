@@ -35,6 +35,9 @@ pub struct Cutout {
     pub rotation_deg: f64,
     /// Footprint name, e.g. `"Thonkiconn"`, `"Alpha9mm"`, `"LED_3mm"`.
     pub footprint: String,
+    /// The board part this cutout is for (e.g. `"J1"`). When set, the board
+    /// placer anchors that part at this position so the board mates the panel.
+    pub refdes: Option<String>,
 }
 
 /// The shape of a cutout, derived from its footprint name.
@@ -143,23 +146,26 @@ impl EurorackPanel {
             y_mm,
             rotation_deg: 0.0,
             footprint: footprint.into(),
+            refdes: None,
         });
         self
     }
 
-    /// Add a cutout with explicit rotation.
+    /// Add a cutout with explicit rotation and an optional anchored refdes.
     pub fn with_cutout_rotated(
         mut self,
         x_mm: f64,
         y_mm: f64,
         rotation_deg: f64,
         footprint: impl Into<String>,
+        refdes: Option<String>,
     ) -> Self {
         self.cutouts.push(Cutout {
             x_mm,
             y_mm,
             rotation_deg,
             footprint: footprint.into(),
+            refdes,
         });
         self
     }
@@ -265,6 +271,9 @@ pub struct CutoutFile {
     #[serde(default)]
     pub rotation_deg: f64,
     pub footprint: String,
+    /// Board part anchored here (e.g. `"J1"`) — the board placer mates to it.
+    #[serde(default)]
+    pub refdes: Option<String>,
 }
 
 impl PanelFile {
@@ -287,6 +296,7 @@ impl PanelFile {
                         c.y_mm,
                         c.rotation_deg,
                         c.footprint.clone(),
+                        c.refdes.clone(),
                     );
                 }
                 Ok(Box::new(panel))
