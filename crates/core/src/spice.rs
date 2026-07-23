@@ -159,33 +159,30 @@ fn fmt_num(x: f64) -> String {
     }
 }
 
-/// Generate an ngspice AC deck for `circuit`, writing results to `data_path`.
-///
-/// `models` maps a reference designator to the SPICE model resolved for that
-/// component (see [`crate::symbols::resolve_models`]). Parts with a model are
-/// instantiated as subcircuits; parts without one are emitted as SPICE
-/// primitives (R/C/L). The generator contains no per-device knowledge.
-pub fn generate_ac_deck(
+/// Error if a net the harness needs (input/output) isn't in the circuit.
+fn require_net(circuit: &dyn CircuitSource, net_names: &HashSet<&str>, required: &str) -> Result<(), StageError> {
+    if net_names.contains(required) {
+        return Ok(());
+    }
+    Err(StageError::Other(format!(
+        "simulation needs a net named '{required}' (have: {})",
+        circuit
+            .nets()
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// Emit the circuit body — `.include`s and component cards — from each part's
+/// resolved SPICE model (subckt instance) or, for R/C/L, a primitive. Shared by
+/// the AC and transient decks; the generator has no per-device knowledge.
+fn netlist_body(
     circuit: &dyn CircuitSource,
     config: &SimConfig,
     models: &HashMap<String, SpiceModel>,
-    data_path: &Path,
-) -> Result<String, StageError> {
-    let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
-    for required in [&config.input_net, &config.output_net] {
-        if !net_names.contains(required.as_str()) {
-            return Err(StageError::Other(format!(
-                "simulation needs a net named '{required}' (have: {})",
-                circuit
-                    .nets()
-                    .iter()
-                    .map(|n| n.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-    }
-
+) -> Result<(BTreeSet<PathBuf>, Vec<String>), StageError> {
     let pinmap = pin_net_map(circuit);
     let node_at = |refdes: &str, pin: &str| -> Option<String> {
         pinmap
@@ -244,6 +241,36 @@ pub fn generate_ac_deck(
             unsupported.join(", ")
         )));
     }
+    Ok((includes, components))
+}
+
+/// Supply-rail sources for each supply net the circuit actually uses.
+fn supply_lines(config: &SimConfig, net_names: &HashSet<&str>) -> Vec<String> {
+    config
+        .supplies
+        .iter()
+        .filter(|(net, _)| net_names.contains(net.as_str()))
+        .map(|(net, volts)| format!("V{net}_supply {} 0 {}", config.node(net), fmt_num(*volts)))
+        .collect()
+}
+
+/// Generate an ngspice AC deck for `circuit`, writing results to `data_path`.
+///
+/// `models` maps a reference designator to the SPICE model resolved for that
+/// component (see [`crate::symbols::resolve_models`]). Parts with a model are
+/// instantiated as subcircuits; parts without one are emitted as SPICE
+/// primitives (R/C/L). The generator contains no per-device knowledge.
+pub fn generate_ac_deck(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    models: &HashMap<String, SpiceModel>,
+    data_path: &Path,
+) -> Result<String, StageError> {
+    let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    require_net(circuit, &net_names, &config.input_net)?;
+    require_net(circuit, &net_names, &config.output_net)?;
+
+    let (includes, components) = netlist_body(circuit, config, models)?;
 
     let in_node = config.node(&config.input_net);
     if in_node == "0" {
@@ -257,16 +284,7 @@ pub fn generate_ac_deck(
     for include in &includes {
         lines.push(format!(".include {}", include.display()));
     }
-    // Supply rails for any supply net the circuit actually uses.
-    for (net, volts) in &config.supplies {
-        if net_names.contains(net.as_str()) {
-            lines.push(format!(
-                "V{net}_supply {} 0 {}",
-                config.node(net),
-                fmt_num(*volts)
-            ));
-        }
-    }
+    lines.extend(supply_lines(config, &net_names));
     lines.extend(components);
     // 1 V AC source driving the input against ground.
     lines.push(format!("Vlob_src {in_node} 0 DC 0 AC 1"));
@@ -284,6 +302,200 @@ pub fn generate_ac_deck(
     lines.push(".end".into());
 
     Ok(lines.join("\n") + "\n")
+}
+
+/// A transient (time-domain) analysis: a voltage step on the input net, run for
+/// `stop_s` at `step_s` resolution, probing the output waveform. The basis for
+/// slew-rate / step-response checks on time-domain circuits (DESIGN 5, tus.7) —
+/// where an AC sweep says nothing (a slew limiter's behaviour *is* the transient).
+#[derive(Debug, Clone)]
+pub struct TranAnalysis {
+    /// `.tran` time step (s).
+    pub step_s: f64,
+    /// `.tran` stop time (s).
+    pub stop_s: f64,
+    /// When the input steps (s).
+    pub step_at_s: f64,
+    /// Input voltage before / after the step.
+    pub from_v: f64,
+    pub to_v: f64,
+}
+
+impl Default for TranAnalysis {
+    fn default() -> Self {
+        TranAnalysis {
+            step_s: 1e-5,
+            stop_s: 1e-2,
+            step_at_s: 1e-4,
+            from_v: 0.0,
+            to_v: 5.0,
+        }
+    }
+}
+
+/// One point of a transient waveform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TranPoint {
+    pub t_s: f64,
+    pub v: f64,
+}
+
+/// A parsed transient waveform of the probed output net.
+#[derive(Debug, Clone)]
+pub struct TranResult {
+    pub points: Vec<TranPoint>,
+}
+
+impl TranResult {
+    /// Peak slew rate |dV/dt| over the waveform (V/s).
+    pub fn max_slew_v_per_s(&self) -> Option<f64> {
+        self.points
+            .windows(2)
+            .filter_map(|w| {
+                let dt = w[1].t_s - w[0].t_s;
+                (dt > 0.0).then(|| ((w[1].v - w[0].v) / dt).abs())
+            })
+            .fold(None, |m, s| Some(m.map_or(s, |mx: f64| mx.max(s))))
+    }
+
+    /// 10%→90% rise time between the initial and final output levels (s), for a
+    /// monotonic step response.
+    pub fn rise_time_s(&self) -> Option<f64> {
+        let v0 = self.points.first()?.v;
+        let v1 = self.points.last()?.v;
+        let (lo, hi) = (v0 + 0.1 * (v1 - v0), v0 + 0.9 * (v1 - v0));
+        let cross = |thr: f64| {
+            self.points.windows(2).find_map(|w| {
+                let (a, b) = (w[0], w[1]);
+                ((a.v - thr) * (b.v - thr) <= 0.0 && (b.v - a.v).abs() > f64::EPSILON).then(|| {
+                    let f = (thr - a.v) / (b.v - a.v);
+                    a.t_s + f * (b.t_s - a.t_s)
+                })
+            })
+        };
+        Some(cross(hi)? - cross(lo)?)
+    }
+}
+
+/// Generate an ngspice transient deck: the same circuit body, a voltage **step**
+/// on the input net, a `.tran` run probing the output waveform.
+pub fn generate_tran_deck(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    tran: &TranAnalysis,
+    models: &HashMap<String, SpiceModel>,
+    data_path: &Path,
+) -> Result<String, StageError> {
+    let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    require_net(circuit, &net_names, &config.input_net)?;
+    require_net(circuit, &net_names, &config.output_net)?;
+
+    let (includes, components) = netlist_body(circuit, config, models)?;
+
+    let in_node = config.node(&config.input_net);
+    if in_node == "0" {
+        return Err(StageError::Other(format!(
+            "input net '{}' maps to ground",
+            config.input_net
+        )));
+    }
+    let out_node = config.node(&config.output_net);
+
+    let mut lines = vec![format!("* legion-of-bom transient deck for {}", circuit.name())];
+    for include in &includes {
+        lines.push(format!(".include {}", include.display()));
+    }
+    lines.extend(supply_lines(config, &net_names));
+    lines.extend(components);
+    // Input step as a sharp PWL ramp at step_at_s.
+    let edge = tran.step_s.clamp(1e-9, 1e-6);
+    lines.push(format!(
+        "Vlob_src {in_node} 0 PWL(0 {} {} {} {} {} {} {})",
+        fmt_num(tran.from_v),
+        fmt_num(tran.step_at_s),
+        fmt_num(tran.from_v),
+        fmt_num(tran.step_at_s + edge),
+        fmt_num(tran.to_v),
+        fmt_num(tran.stop_s),
+        fmt_num(tran.to_v),
+    ));
+    lines.push(".control".into());
+    lines.push(format!(
+        "tran {} {}",
+        fmt_num(tran.step_s),
+        fmt_num(tran.stop_s)
+    ));
+    lines.push(format!("wrdata {} v({out_node})", data_path.display()));
+    lines.push(".endc".into());
+    lines.push(".end".into());
+    Ok(lines.join("\n") + "\n")
+}
+
+/// Parse `wrdata` transient output: whitespace-separated `time voltage` per line.
+fn parse_tran_data(text: &str) -> Vec<TranPoint> {
+    text.lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let t = it.next()?.parse::<f64>().ok()?;
+            let v = it.next()?.parse::<f64>().ok()?;
+            Some(TranPoint { t_s: t, v })
+        })
+        .collect()
+}
+
+/// Run a transient simulation: generate a step-response deck, run `ngspice -b`,
+/// parse the output waveform. Artifacts are written under `work_dir`.
+pub fn simulate_tran(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    tran: &TranAnalysis,
+    work_dir: &Path,
+) -> Result<TranResult, StageError> {
+    let ngspice =
+        find_on_path("ngspice").ok_or_else(|| StageError::ToolNotFound("ngspice".into()))?;
+
+    std::fs::create_dir_all(work_dir)?;
+    let work_dir = work_dir.canonicalize()?;
+    let name = sanitize(circuit.name());
+    let data_path = work_dir.join(format!("{name}_tran.dat"));
+    let deck_path = work_dir.join(format!("{name}_tran.cir"));
+
+    let models = match crate::skidl::kicad_symbol_dir() {
+        Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
+        None => HashMap::new(),
+    };
+
+    let deck = generate_tran_deck(circuit, config, tran, &models, &data_path)?;
+    std::fs::write(&deck_path, &deck)?;
+
+    let output = Command::new(&ngspice)
+        .arg("-b")
+        .arg(&deck_path)
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|e| StageError::ToolNotFound(format!("ngspice {}: {e}", ngspice.display())))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StageError::ToolFailed {
+            tool: "ngspice".into(),
+            code: output.status.code().unwrap_or(-1),
+            stderr: tail(&stderr, 20),
+        });
+    }
+
+    let data = std::fs::read_to_string(&data_path).map_err(|e| {
+        StageError::Other(format!(
+            "ngspice produced no data at {}: {e}",
+            data_path.display()
+        ))
+    })?;
+    let points = parse_tran_data(&data);
+    if points.is_empty() {
+        return Err(StageError::Other(
+            "ngspice produced no transient data points".into(),
+        ));
+    }
+    Ok(TranResult { points })
 }
 
 /// Run an AC simulation: generate a deck, run `ngspice -b`, parse the response.
@@ -534,5 +746,77 @@ mod tests {
         let points = parse_ac_data(data);
         assert_eq!(points.len(), 2);
         assert_eq!(points[1].freq_hz, 1000.0);
+    }
+
+    #[test]
+    fn tran_deck_has_step_source_and_tran_analysis() {
+        let c = rc_lowpass();
+        let tran = TranAnalysis {
+            step_s: 1e-5,
+            stop_s: 1e-2,
+            step_at_s: 1e-4,
+            from_v: 0.0,
+            to_v: 5.0,
+        };
+        let deck = generate_tran_deck(
+            &c,
+            &SimConfig::default(),
+            &tran,
+            &HashMap::new(),
+            Path::new("/tmp/x.dat"),
+        )
+        .unwrap();
+        assert!(deck.contains("R1 IN OUT 1k"), "deck:\n{deck}");
+        assert!(deck.contains("Vlob_src IN 0 PWL("), "step source:\n{deck}");
+        assert!(deck.contains("\ntran "), "tran analysis:\n{deck}");
+        assert!(deck.contains("wrdata /tmp/x.dat v(OUT)"), "probe:\n{deck}");
+    }
+
+    #[test]
+    fn tran_metrics_slew_and_rise() {
+        // A 0→10 V ramp over 1 ms, then flat: slew ≈ 1e4 V/s, 10–90% rise ≈ 0.8 ms.
+        let mut points: Vec<TranPoint> = (0..=10)
+            .map(|i| TranPoint {
+                t_s: i as f64 * 1e-4,
+                v: i as f64,
+            })
+            .collect();
+        points.push(TranPoint { t_s: 2e-3, v: 10.0 });
+        let r = TranResult { points };
+        assert!((r.max_slew_v_per_s().unwrap() - 1e4).abs() < 1.0);
+        assert!((r.rise_time_s().unwrap() - 0.8e-3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tran_data_parsing_reads_time_voltage() {
+        let data = " 0.000e+00 0.0 \n 1.000e-04 1.0 \nhdr\n 2.000e-04 2.0 \n";
+        let pts = parse_tran_data(data);
+        assert_eq!(pts.len(), 3);
+        assert_eq!(pts[1].t_s, 1e-4);
+        assert_eq!(pts[2].v, 2.0);
+    }
+
+    #[test]
+    fn tran_step_response_of_rc_when_ngspice_available() {
+        // End-to-end pipeline transient run (needs ngspice). An RC low-pass (R=1k,
+        // C=159n, τ≈159µs) fed a 0→1 V step charges toward 1 V, steepest right
+        // after the step at ≈ Vstep/τ ≈ 6289 V/s.
+        if crate::tools::find_on_path("ngspice").is_none() {
+            return;
+        }
+        let c = rc_lowpass();
+        let tran = TranAnalysis {
+            step_s: 1e-6,
+            stop_s: 2e-3,
+            step_at_s: 1e-4,
+            from_v: 0.0,
+            to_v: 1.0,
+        };
+        let dir = std::env::temp_dir().join("lob-tran-test");
+        let r = simulate_tran(&c, &SimConfig::default(), &tran, &dir).unwrap();
+        assert!(r.points.first().unwrap().v.abs() < 0.05, "starts near 0");
+        assert!(r.points.last().unwrap().v > 0.9, "charges toward 1V");
+        let sr = r.max_slew_v_per_s().unwrap();
+        assert!((3000.0..12000.0).contains(&sr), "RC step slew {sr} V/s");
     }
 }

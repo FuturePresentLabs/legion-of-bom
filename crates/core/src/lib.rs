@@ -67,7 +67,9 @@ pub use route::{
 };
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
-pub use spice::{simulate_ac, AcPoint, AcResult, SimConfig};
+pub use spice::{
+    simulate_ac, simulate_tran, AcPoint, AcResult, SimConfig, TranAnalysis, TranPoint, TranResult,
+};
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
