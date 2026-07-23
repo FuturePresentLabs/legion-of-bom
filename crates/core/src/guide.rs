@@ -13,6 +13,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use base64::Engine;
+
 use crate::pdf::{self, Font, Page, Paint};
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
@@ -106,6 +108,21 @@ pub struct BuildGuide {
     pub outline: (f64, f64, f64, f64),
     pub steps: Vec<BuildStep>,
 }
+
+/// A photorealistic board render (PNG bytes + pixel size) for the guide diagram —
+/// produced by [`fab::render_board_png`](crate::fab::render_board_png) (an
+/// unpopulated top-down `pcb render`). The guide maps board-mm into it
+/// analytically, so no pixels are decoded.
+pub struct BoardPng<'a> {
+    pub png: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Fraction of the render frame KiCad's `pcb render` fits the board bbox to
+/// (orthographic top, centred) — calibrated against real renders. Board-mm →
+/// image-px scale is `PHOTOREAL_FIT · min(W/w_mm, H/h_mm)`.
+const PHOTOREAL_FIT: f64 = 0.70;
 
 /// A build-step kind, in low-profile-first assembly order (DESIGN 7.8). Polarity
 /// cautions are derived per part (see [`detect_polarity`]), not fixed per kind —
@@ -339,18 +356,18 @@ fn f(s: &str) -> Option<f64> {
 /// per step, the step's parts highlighted). When `board_svg` is `Some`, it is
 /// KiCad's real board plot (from [`fab::export_board_svg`](crate::fab)) used as
 /// the underlay with highlight boxes overlaid; otherwise a schematic top-down.
-pub fn guide_to_html(guide: &BuildGuide, board_svg: Option<&str>) -> String {
+pub fn guide_to_html(guide: &BuildGuide, board: Option<BoardPng>) -> String {
     let total = guide.steps.len();
     let mut body = String::new();
     body.push_str(&format!(
         "<h1>Build guide — {}</h1><p class=\"sub\">{total} steps, low-profile first. \
-         Highlighted parts are for the current step.</p>",
+         Highlighted parts are for the current step; place them on the bare board shown.</p>",
         esc(&guide.name)
     ));
     for (i, step) in guide.steps.iter().enumerate() {
         let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
-        let svg = match board_svg {
-            Some(kicad) => real_board_svg(kicad, guide.outline, &step.parts),
+        let svg = match &board {
+            Some(bp) => photoreal_board_svg(bp, guide.outline, &step.parts),
             None => schematic_board_svg(guide, &highlight),
         };
         let mut list = String::new();
@@ -435,19 +452,21 @@ fn pdf_marker(
             Paint::Stroke,
         );
     }
-    let fs = (scale * 1.4).clamp(5.0, 11.0);
-    if filled {
-        pg.set_fill(1.0, 1.0, 1.0);
-    } else {
-        pg.set_fill(0.63, 0.07, 0.07);
-    }
-    pg.text(
-        mapx(p.cx) - p.refdes.len() as f64 * fs * 0.25,
-        mapy(p.cy) - fs * 0.35,
-        fs,
-        Font::Bold,
-        &p.refdes,
+    // Refdes on a dark chip just above the box, so it stays legible over the busy
+    // photoreal board without crowding the pads.
+    let fs = (scale * 1.4).clamp(6.0, 12.0);
+    let tw = p.refdes.len() as f64 * fs * 0.62;
+    let (lx, ly) = (mapx(p.cx), mapy(cy0) + fs * 0.85);
+    pg.set_fill(0.1, 0.12, 0.14);
+    pg.rect(
+        lx - tw / 2.0 - 1.5,
+        ly - fs * 0.5,
+        tw + 3.0,
+        fs * 1.2,
+        Paint::Fill,
     );
+    pg.set_fill(1.0, 1.0, 1.0);
+    pg.text(lx - tw / 2.0, ly - fs * 0.32, fs, Font::Bold, &p.refdes);
     if let (Some(pol), Some((qx, qy))) = (p.polarity, p.pin1) {
         let r = (scale * 1.3).clamp(4.0, 9.0);
         pg.set_line_width(0.4);
@@ -492,38 +511,36 @@ pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
         );
         pg.text(m, top - 24.0, 19.0, Font::Bold, &step.title);
 
-        // Board diagram, scaled to fit the region under the title.
-        let diag_top = top - 46.0; // page y of the board's top edge
-        let scale = (cw / bw).min(360.0 / bh);
-        let dw = bw * scale;
-        let rx = m + (cw - dw) / 2.0;
-        let mapx = |x: f64| rx + (x - bx0) * scale;
-        let mapy = |y: f64| diag_top - (y - by0) * scale;
+        // Board diagram under the title.
+        let diag_top = top - 46.0; // page y of the diagram's top edge
         let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
+        let diag_bottom;
 
-        if image.is_some() {
-            // Real KiCad board (A4-landscape JPEG in true mm) placed so board mm
-            // map via mapx/mapy, clipped to the board region; then overlay this
-            // step's parts as outlined markers so the real board shows through.
-            let cm = [
-                pdf::A4_H * scale / pdf::MM, // 297 mm × scale (pt/mm) in points
-                0.0,
-                0.0,
-                pdf::A4_W * scale / pdf::MM, // 210 mm × scale
-                mapx(0.0),
-                mapy(pdf::A4_W / pdf::MM),
-            ];
-            let clip = (
-                mapx(bx0),
-                mapy(by1),
-                (bx1 - bx0) * scale,
-                (by1 - by0) * scale,
+        if let Some(img) = &image {
+            // Photoreal render (W×H px, board centred, orthographic top). Fit it
+            // into the diagram region; map board-mm → image-px → page point so this
+            // step's outlined markers land on the bare pads.
+            let (iw, ih) = img.size();
+            let ds = (cw / iw).min(360.0 / ih); // page pt per image px
+            let (dw, dh) = (iw * ds, ih * ds);
+            let ix = m + (cw - dw) / 2.0;
+            let sc = PHOTOREAL_FIT * (iw / (ox1 - ox0)).min(ih / (oy1 - oy0)); // px/mm
+            let (cxmm, cymm) = ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0);
+            let mapx = |x: f64| ix + (iw / 2.0 + (x - cxmm) * sc) * ds;
+            let mapy = |y: f64| diag_top - (ih / 2.0 + (y - cymm) * sc) * ds;
+            pg.draw_image(
+                [dw, 0.0, 0.0, dh, ix, diag_top - dh],
+                (ix, diag_top - dh, dw, dh),
             );
-            pg.draw_image(cm, clip);
             for p in &step.parts {
-                pdf_marker(&mut pg, p, &mapx, &mapy, scale, false);
+                pdf_marker(&mut pg, p, &mapx, &mapy, sc * ds, false);
             }
+            diag_bottom = diag_top - dh;
         } else {
+            let scale = (cw / bw).min(360.0 / bh);
+            let rx = m + (cw - bw * scale) / 2.0;
+            let mapx = |x: f64| rx + (x - bx0) * scale;
+            let mapy = |y: f64| diag_top - (y - by0) * scale;
             pg.set_line_width(0.8);
             pg.set_fill(0.93, 0.95, 0.93);
             pg.set_stroke(0.2, 0.6, 0.4);
@@ -551,10 +568,11 @@ pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
                     );
                 }
             }
+            diag_bottom = diag_top - bh * scale;
         }
 
         // Parts list + cautions below the diagram.
-        let mut ly = (diag_top - bh * scale) - 30.0;
+        let mut ly = diag_bottom - 30.0;
         pg.set_fill(0.13, 0.13, 0.13);
         pg.text(m, ly, 12.0, Font::Bold, "Parts for this step:");
         ly -= 18.0;
@@ -590,32 +608,36 @@ pub fn guide_to_pdf(guide: &BuildGuide, board_jpeg: Option<&[u8]>) -> Vec<u8> {
     pdf::document(&pages, image.as_ref())
 }
 
-/// The highlight overlay for one part (SVG, board-mm coords): a red box + white
-/// refdes + a polarity marker (K/+/1) at the reference pad, so the assembler can
-/// match it to the board's silkscreen mark. `fill_opacity` lets the real board
-/// show through when overlaid.
+/// The highlight overlay for one part (SVG, board-mm coords): a rounded amber
+/// box (framing the pads, edged red so it reads over green soldermask) + a
+/// halo'd white refdes + a polarity marker (K/+/1) at the reference pad, so the
+/// assembler can match it to the board's silkscreen mark. `fill_opacity` lets the
+/// bare pads show through so the builder still sees where the pins land.
 fn highlight_svg(p: &PlacedPart, fs: f64, fill_opacity: f64) -> String {
     let (bx0, by0, bx1, by1) = p.bbox;
+    let m = 0.35; // frame just outside the pads
+    let (x, y, w, h) = (bx0 - m, by0 - m, (bx1 - bx0) + 2.0 * m, (by1 - by0) + 2.0 * m);
+    let halo = fs * 0.16;
+    // Refdes just above the box so it never crowds the pads.
+    let label_y = y - fs * 0.3;
     let mut s = format!(
-        "<rect x=\"{bx0}\" y=\"{by0}\" width=\"{}\" height=\"{}\" rx=\"0.2\" fill=\"#e34a4a\" \
-         fill-opacity=\"{fill_opacity}\" stroke=\"#a11\" stroke-width=\"0.35\"/>\
-         <text x=\"{}\" y=\"{}\" font-size=\"{fs}\" text-anchor=\"middle\" \
-         dominant-baseline=\"middle\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
-        bx1 - bx0,
-        by1 - by0,
-        p.cx,
-        p.cy,
-        esc(&p.refdes)
+        "<rect x=\"{x:.3}\" y=\"{y:.3}\" width=\"{w:.3}\" height=\"{h:.3}\" rx=\"0.4\" \
+         fill=\"#ffd21f\" fill-opacity=\"{fill_opacity}\" stroke=\"#ff3b30\" stroke-width=\"0.4\"/>\
+         <text x=\"{cx:.3}\" y=\"{label_y:.3}\" font-size=\"{fs:.3}\" text-anchor=\"middle\" \
+         dominant-baseline=\"baseline\" fill=\"#fff\" stroke=\"#111\" stroke-width=\"{halo:.3}\" \
+         paint-order=\"stroke\" font-weight=\"bold\">{refdes}</text>",
+        cx = p.cx,
+        refdes = esc(&p.refdes)
     );
     if let (Some(pol), Some((mx, my))) = (p.polarity, p.pin1) {
-        let r = fs * 0.9;
+        let r = fs * 0.95;
         s.push_str(&format!(
-            "<circle cx=\"{mx}\" cy=\"{my}\" r=\"{r}\" fill=\"#111\" stroke=\"#fff\" \
-             stroke-width=\"0.15\"/>\
-             <text x=\"{mx}\" y=\"{my}\" font-size=\"{}\" text-anchor=\"middle\" \
-             dominant-baseline=\"central\" fill=\"#fff\" font-weight=\"bold\">{}</text>",
-            fs * 1.1,
-            pol.label(),
+            "<circle cx=\"{mx:.3}\" cy=\"{my:.3}\" r=\"{r:.3}\" fill=\"#111\" stroke=\"#fff\" \
+             stroke-width=\"0.2\"/>\
+             <text x=\"{mx:.3}\" y=\"{my:.3}\" font-size=\"{fss:.3}\" text-anchor=\"middle\" \
+             dominant-baseline=\"central\" fill=\"#fff\" font-weight=\"bold\">{lbl}</text>",
+            fss = fs * 1.15,
+            lbl = pol.label(),
         ));
     }
     s
@@ -660,35 +682,34 @@ fn schematic_board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String 
     svg
 }
 
-/// KiCad's real board plot with the current step's parts highlighted on top. The
-/// KiCad SVG is in true board mm, so retargeting its viewBox to the board outline
-/// crops/zooms to the board and the highlight overlays (also board-mm) align.
-fn real_board_svg(kicad_svg: &str, outline: (f64, f64, f64, f64), parts: &[PlacedPart]) -> String {
+/// The photorealistic board render (PNG, base64-embedded) with the current step's
+/// parts highlighted. `pcb render` is orthographic top-down with the board
+/// centred, so board-mm map into the image via `scale = FIT·min(W/w_mm, H/h_mm)`
+/// about the image centre (FIT calibrated to KiCad's framing). Overlays are drawn
+/// in mm inside an SVG transform group, so [`highlight_svg`] is reused unchanged.
+fn photoreal_board_svg(
+    board: &BoardPng,
+    outline: (f64, f64, f64, f64),
+    parts: &[PlacedPart],
+) -> String {
     let (x0, y0, x1, y1) = outline;
-    let pad = 2.0;
-    let vb = format!(
-        "{:.3} {:.3} {:.3} {:.3}",
-        x0 - pad,
-        y0 - pad,
-        (x1 - x0) + 2.0 * pad,
-        (y1 - y0) + 2.0 * pad
-    );
-    let base = retarget_viewbox(kicad_svg, &vb);
+    let (w, h) = (board.width as f64, board.height as f64);
+    let scale = PHOTOREAL_FIT * (w / (x1 - x0)).min(h / (y1 - y0));
+    let (cxmm, cymm) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let png = base64::engine::general_purpose::STANDARD.encode(board.png);
     let fs = label_size(outline);
-    let overlay: String = parts.iter().map(|p| highlight_svg(p, fs, 0.42)).collect();
-    base.replacen("</svg>", &format!("{overlay}</svg>"), 1)
-}
-
-/// Replace an SVG document's `viewBox` value (crop/zoom without moving content).
-fn retarget_viewbox(svg: &str, viewbox: &str) -> String {
-    let key = "viewBox=\"";
-    if let Some(i) = svg.find(key) {
-        let start = i + key.len();
-        if let Some(len) = svg[start..].find('"') {
-            return format!("{}{viewbox}{}", &svg[..start], &svg[start + len..]);
-        }
-    }
-    svg.to_string()
+    let overlay: String = parts.iter().map(|p| highlight_svg(p, fs, 0.30)).collect();
+    format!(
+        "<svg viewBox=\"0 0 {w:.0} {h:.0}\" xmlns=\"http://www.w3.org/2000/svg\">\
+         <image x=\"0\" y=\"0\" width=\"{w:.0}\" height=\"{h:.0}\" \
+         href=\"data:image/png;base64,{png}\"/>\
+         <g transform=\"translate({tx:.3} {ty:.3}) scale({scale:.5}) translate({ntx:.3} {nty:.3})\">\
+         {overlay}</g></svg>",
+        tx = w / 2.0,
+        ty = h / 2.0,
+        ntx = -cxmm,
+        nty = -cymm,
+    )
 }
 
 /// Group a step's parts by value, preserving refdes order.
@@ -769,6 +790,25 @@ mod tests {
         assert!(html.contains("Step 1 of 2: Resistors"));
         // The IC step cautions about pin 1.
         assert!(html.contains("pin 1"));
+    }
+
+    #[test]
+    fn photoreal_step_highlights_every_grouped_part_on_one_render() {
+        let g = build_guide(&amp(), BOARD).unwrap();
+        let png = b"PNGBYTES"; // opaque to photoreal_board_svg (it just base64s it)
+        let board = BoardPng {
+            png,
+            width: 800,
+            height: 600,
+        };
+        // Step 0 groups R1 + R2 — both must be marked on the single embedded render.
+        let svg = photoreal_board_svg(&board, g.outline, &g.steps[0].parts);
+        assert_eq!(svg.matches("<image").count(), 1, "one shared render");
+        assert!(svg.contains("data:image/png;base64,"));
+        assert!(svg.contains("viewBox=\"0 0 800 600\""));
+        assert!(svg.contains(">R1</text>") && svg.contains(">R2</text>"));
+        // Overlays sit in an mm→px transform group (so highlight_svg is reused).
+        assert!(svg.contains("<g transform=\"translate("));
     }
 
     #[test]

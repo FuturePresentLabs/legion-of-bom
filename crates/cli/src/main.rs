@@ -13,11 +13,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_board_svg,
-    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
-    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
-    parse_netlist_file, render_board_jpeg, run_drc, simulate_ac, validate_erc, zip_dir,
-    BoardOptions, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
+    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_cpl,
+    export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom,
+    guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, parse_netlist_file,
+    png_to_jpeg, render_board_png, run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions,
+    BoardPng, CircuitSource, Finding, JlcpcbClient, MouserClient, PanelFile, PanelOrders,
     PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus, Severity,
     SimConfig, SkidlRunner, StageOutcome,
 };
@@ -480,24 +480,25 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
 
     let guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Use KiCad's real board plot as the diagram underlay when kicad-cli is
-    // available; fall back to the schematic top-down otherwise.
+    // Diagram: a photorealistic UNPOPULATED board render (bare pads a builder
+    // populates) when kicad-cli is available; fall back to the schematic top-down.
     std::fs::create_dir_all(&work_dir)?;
     let board_file = work_dir.join(format!("{stem}.kicad_pcb"));
     std::fs::write(&board_file, &board)?;
     let kicad_cli = kicad_cli_path();
-    let real_svg = kicad_cli
+    let render = kicad_cli
         .as_ref()
-        .and_then(|k| export_board_svg(&board_file, k).ok());
-    let real_jpeg = kicad_cli
-        .as_ref()
-        .and_then(|k| render_board_jpeg(&board_file, k).ok());
-    if real_svg.is_some() {
-        println!("  diagram: real KiCad layout (via kicad-cli)");
-    } else {
-        println!("  diagram: schematic top-down (kicad-cli not found)");
+        .and_then(|k| render_board_png(&board_file, k, true).ok());
+    match &render {
+        Some((_, w, h)) => println!("  diagram: photoreal bare-board render ({w}×{h})"),
+        None => println!("  diagram: schematic top-down (kicad-cli not found)"),
     }
-    let html = guide_to_html(&guide, real_svg.as_deref());
+    let board_png = render.as_ref().map(|(png, w, h)| BoardPng {
+        png,
+        width: *w,
+        height: *h,
+    });
+    let html = guide_to_html(&guide, board_png);
 
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}-guide.html")));
     if let Some(parent) = path.parent() {
@@ -511,9 +512,10 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     }
 
     // Native print-ready PDF, one step per page (self-contained, no browser).
-    // Embeds the real KiCad board raster when available, else a schematic diagram.
+    // Embeds the same photoreal render (PNG→JPEG for DCTDecode), else schematic.
+    let board_jpeg = render.as_ref().and_then(|(png, _, _)| png_to_jpeg(png));
     let pdf_path = path.with_extension("pdf");
-    std::fs::write(&pdf_path, guide_to_pdf(&guide, real_jpeg.as_deref()))
+    std::fs::write(&pdf_path, guide_to_pdf(&guide, board_jpeg.as_deref()))
         .with_context(|| format!("writing {}", pdf_path.display()))?;
     println!(
         "wrote {} (print-ready, one step per page)",

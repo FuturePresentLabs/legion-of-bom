@@ -44,6 +44,11 @@ pub struct Image {
 }
 
 impl Image {
+    /// Pixel dimensions `(width, height)` as floats.
+    pub fn size(&self) -> (f64, f64) {
+        (self.w as f64, self.h as f64)
+    }
+
     /// Read a JPEG's pixel dimensions from its `SOFn` frame header.
     pub fn from_jpeg(jpeg: Vec<u8>) -> Option<Image> {
         let b = &jpeg;
