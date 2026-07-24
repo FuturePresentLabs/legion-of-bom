@@ -511,6 +511,9 @@ mod tests {
             extent: (w, h),
             origin_offset: (0.0, 0.0),
             side: crate::model::Side::Front,
+            height_mm: 2.0,
+            standoff_mm: None,
+            tht_pads: Vec::new(),
         };
         facts.insert("C1".to_string(), f(5.0, 5.0));
         facts.insert("U1".to_string(), f(8.0, 8.0));

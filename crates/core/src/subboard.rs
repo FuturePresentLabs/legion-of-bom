@@ -139,11 +139,19 @@ impl SubboardSpec {
             self.name,
             mm(hh + 1.5)
         ));
-        // Courtyard = the sub-board body → the placement keep-out.
-        s.push_str(&format!(
-            "  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\"))\n",
-            mm(-hw), mm(-hh), mm(hw), mm(hh)
-        ));
+        // Courtyard: only the header rows are hard keep-out — that copper is what
+        // contacts the board. The body floats on its standoff, so the space
+        // between the rows is left open for short parts underneath (DESIGN 6.7,
+        // 25z.5); a full-body courtyard would false-trip courtyards_overlap on
+        // them. One courtyard rect per pin row, sized to its pads.
+        for row in &self.rows {
+            let span = row.count.saturating_sub(1) as f64 * row.pitch_mm;
+            let r = self.pad_dia_mm / 2.0 + 0.25;
+            s.push_str(&format!(
+                "  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.05) (type solid)) (fill none) (layer \"F.CrtYd\"))\n",
+                mm(row.x_mm - r), mm(-span / 2.0 - r), mm(row.x_mm + r), mm(span / 2.0 + r)
+            ));
+        }
         // Silk body outline (sits at the body edge, clear of the pads).
         s.push_str(&format!(
             "  (fp_rect (start {} {}) (end {} {}) (stroke (width 0.12) (type solid)) (fill none) (layer \"F.SilkS\"))\n",

@@ -53,7 +53,7 @@ pub struct Placement {
 /// What the placer needs to know about a part beyond the netlist: its footprint
 /// keep-out size (mm), where that keep-out sits relative to the footprint origin,
 /// and which side it mounts on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PartFacts {
     /// Keep-out size `(width, height)` — the courtyard (or pad box + margin).
     pub extent: (f64, f64),
@@ -64,6 +64,16 @@ pub struct PartFacts {
     /// look clear. Defaults to `(0, 0)` (centred).
     pub origin_offset: (f64, f64),
     pub side: Side,
+    /// Component height (mm). A part shorter than a sub-board's standoff may sit in
+    /// the gap under its body (DESIGN 6.7).
+    pub height_mm: f64,
+    /// `Some(standoff)` if this part is itself a stacked sub-board.
+    pub standoff_mm: Option<f64>,
+    /// Through-hole pad keep-outs (mm rects, relative to the footprint origin,
+    /// already clearance-expanded). Pins occupy *both* copper layers, so these are
+    /// hard keep-outs every body avoids regardless of side — while the part's body
+    /// itself is only on its own side.
+    pub tht_pads: Vec<Rect>,
 }
 
 impl PartFacts {
@@ -80,6 +90,18 @@ impl PartFacts {
             x + ox + w / 2.0,
             y + oy + h / 2.0,
         )
+    }
+
+    /// This part's through-hole pad keep-outs in absolute board coordinates for a
+    /// placement with origin at `(x, y)` (X mirrored on the back, like the pads).
+    fn tht_pads_at(&self, x: f64, y: f64, back: bool) -> Vec<Rect> {
+        self.tht_pads
+            .iter()
+            .map(|&(a, b, c, d)| {
+                let (x0, x1) = if back { (-c, -a) } else { (a, c) };
+                (x + x0, y + b, x + x1, y + d)
+            })
+            .collect()
     }
 }
 
@@ -102,6 +124,10 @@ const PLACE_GAP_MM: f64 = 1.0;
 /// Margin (mm) added around a part's pad bounding box to approximate its
 /// courtyard when sizing placement cells.
 const COURTYARD_MARGIN_MM: f64 = 1.0;
+
+/// Clearance (mm) around a through-hole pad's keep-out — enough that a neighbour's
+/// copper clears the pin (copper-to-copper clearance is 0.2 mm).
+const THT_PAD_CLEAR_MM: f64 = 0.4;
 
 /// Naive row/grid placement — a valid, non-optimising default. It is size-aware
 /// only enough to not overlap footprints: cells are sized to the largest part.
@@ -336,10 +362,13 @@ impl Placer for SeededPlacer {
         // A part's facts (keep-out size + origin offset), defaulting to a small
         // centred box for a part with no footprint measured.
         let facts_of = |refdes: &str| {
-            facts.get(refdes).copied().unwrap_or(PartFacts {
+            facts.get(refdes).cloned().unwrap_or(PartFacts {
                 extent: (3.0, 3.0),
                 origin_offset: (0.0, 0.0),
                 side: Side::Front,
+                height_mm: 2.0,
+                standoff_mm: None,
+                tht_pads: Vec::new(),
             })
         };
         let side_of = |refdes: &str| facts_of(refdes).side == Side::Back;
@@ -367,7 +396,7 @@ impl Placer for SeededPlacer {
         let (x0, x1, y0, y1) = bounds;
 
         let mut out = HashMap::new();
-        let mut boxes: Vec<Rect> = Vec::new();
+        let mut boxes: Vec<Placed> = Vec::new();
         // Board-local centres of everything placed so far (anchors + free), for
         // centroid seeding. Kept separate from `out` (which is origin-shifted).
         let mut pos: HashMap<String, (f64, f64)> = HashMap::new();
@@ -387,7 +416,13 @@ impl Placer for SeededPlacer {
                     back,
                 },
             );
-            boxes.push(f.keepout_at(x, y, back));
+            boxes.push(Placed {
+                body: f.keepout_at(x, y, back),
+                back,
+                height_mm: f.height_mm,
+                standoff_mm: f.standoff_mm,
+                tht_pads: f.tht_pads_at(x, y, back),
+            });
             let (ox, oy) = offset_of(&f, back);
             pos.insert(refdes.clone(), (x + ox, y + oy));
             placed.insert(refdes.clone());
@@ -511,11 +546,37 @@ impl Placer for SeededPlacer {
             let nudge = self.nudges.get(&r).copied().unwrap_or((0.0, 0.0));
             let target = (target.0 + nudge.0, target.1 + nudge.1);
 
-            // Nearest collision-free spot for the keep-out box; if the board is
-            // full, drop it just below the outline where DRC flags it (never
-            // overlap). `cx,cy` is the keep-out centre; the footprint origin is
-            // that minus the offset.
-            let cand = nearest_clear_spot(target, ext, &boxes, bounds, clearance, step)
+            // Through-hole pins at a candidate keep-out centre (cx,cy): the origin
+            // sits at (cx-ox, cy-oy). Only computed for the un-rotated case (a
+            // rotated part is a wide SMD one with no through-holes).
+            let cand_tht = |cx: f64, cy: f64| -> Vec<Rect> {
+                if rot == 0.0 {
+                    f.tht_pads_at(cx - ox, cy - oy, back)
+                } else {
+                    Vec::new()
+                }
+            };
+            // Nearest spot whose body + pins clash with nothing already placed
+            // (side- and height-aware — 25z.5); if the board is full, drop it just
+            // below the outline where DRC flags it (never overlap).
+            let clear = |cx: f64, cy: f64| {
+                let body = (
+                    cx - ext.0 / 2.0,
+                    cy - ext.1 / 2.0,
+                    cx + ext.0 / 2.0,
+                    cy + ext.1 / 2.0,
+                );
+                placement_clear(
+                    &body,
+                    back,
+                    f.height_mm,
+                    f.standoff_mm,
+                    &cand_tht(cx, cy),
+                    &boxes,
+                    clearance,
+                )
+            };
+            let cand = nearest_clear_spot(target, ext, bounds, step, clear)
                 .unwrap_or_else(|| overflow_drop(x0, ext, &mut overflow_top));
             let (cx, cy) = ((cand.0 + cand.2) / 2.0, (cand.1 + cand.3) / 2.0);
             out.insert(
@@ -527,7 +588,13 @@ impl Placer for SeededPlacer {
                     back,
                 },
             );
-            boxes.push(cand);
+            boxes.push(Placed {
+                body: cand,
+                back,
+                height_mm: f.height_mm,
+                standoff_mm: f.standoff_mm,
+                tht_pads: cand_tht(cx, cy),
+            });
             pos.insert(r.clone(), (cx, cy));
             placed.insert(r);
         }
@@ -535,18 +602,74 @@ impl Placer for SeededPlacer {
     }
 }
 
+/// One placed part's keep-out for placement: its body (on its own side), plus its
+/// through-hole pins (both sides), height, and — if a sub-board — standoff.
+struct Placed {
+    body: Rect,
+    back: bool,
+    height_mm: f64,
+    standoff_mm: Option<f64>,
+    tht_pads: Vec<Rect>,
+}
+
+/// Whether two parts may occupy the same board area vertically: one is a sub-board
+/// tall enough (its standoff) to clear the other beneath it (DESIGN 6.7). A pin
+/// counts as height 0, so it always clears a standoff.
+fn fits_under(a_h: f64, a_standoff: Option<f64>, b_h: f64, b_standoff: Option<f64>) -> bool {
+    a_standoff.is_some_and(|s| b_h < s) || b_standoff.is_some_and(|s| a_h < s)
+}
+
+/// Whether a candidate part (body + through-hole pins, on side `back`) fits at a
+/// spot without clashing with anything already `placed`. The rules (25z.5):
+/// bodies clash only on the *same side* and only when neither passes under the
+/// other; through-hole pins are both-side hard keep-outs every body avoids; a
+/// candidate's own pins may pass over a sub-board's standoff but not into a
+/// surface part.
+fn placement_clear(
+    cand_body: &Rect,
+    cand_back: bool,
+    cand_h: f64,
+    cand_standoff: Option<f64>,
+    cand_tht: &[Rect],
+    placed: &[Placed],
+    clr: f64,
+) -> bool {
+    for p in placed {
+        if p.back == cand_back
+            && !fits_under(cand_h, cand_standoff, p.height_mm, p.standoff_mm)
+            && rects_overlap(cand_body, &p.body, clr)
+        {
+            return false;
+        }
+        if p.tht_pads.iter().any(|q| rects_overlap(cand_body, q, clr)) {
+            return false;
+        }
+        for c in cand_tht {
+            // A pin (height 0) may pass over a sub-board's standoff, but not into a
+            // surface part's body, nor onto another pin.
+            if !fits_under(0.0, None, p.height_mm, p.standoff_mm) && rects_overlap(c, &p.body, clr)
+            {
+                return false;
+            }
+            if p.tht_pads.iter().any(|q| rects_overlap(c, q, clr)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The collision-free `w×h` spot whose centre is nearest `(tx, ty)`, searched in
 /// expanding rings so an occupied target spills to the closest free space rather
-/// than jumping across the board. Returns the rect `(min_x, min_y, max_x, max_y)`,
-/// or `None` if the part cannot fit inside `bounds` at all. Deterministic: rings
-/// are sampled in a fixed order.
+/// than jumping across the board. `clear(cx, cy)` decides whether the part fits
+/// with its centre there. Returns the rect `(min_x, min_y, max_x, max_y)`, or
+/// `None` if it fits nowhere. Deterministic: rings are sampled in a fixed order.
 fn nearest_clear_spot(
     (tx, ty): (f64, f64),
     (w, h): (f64, f64),
-    boxes: &[Rect],
     (x0, x1, y0, y1): (f64, f64, f64, f64),
-    clearance: f64,
     step: f64,
+    clear: impl Fn(f64, f64) -> bool,
 ) -> Option<Rect> {
     if x1 - x0 < w || y1 - y0 < h {
         return None;
@@ -559,25 +682,22 @@ fn nearest_clear_spot(
         )
     };
     let rect_at = |cx: f64, cy: f64| (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0);
-    let is_clear = |r: &Rect| !boxes.iter().any(|b| rects_overlap(b, r, clearance));
 
     let max_r = (x1 - x0).hypot(y1 - y0);
     let mut d = 0.0;
     while d <= max_r {
         if d == 0.0 {
             let (cx, cy) = clamp_center(tx, ty);
-            let r = rect_at(cx, cy);
-            if is_clear(&r) {
-                return Some(r);
+            if clear(cx, cy) {
+                return Some(rect_at(cx, cy));
             }
         } else {
             let mut t = -d;
             while t <= d + 1e-9 {
                 for (dx, dy) in [(t, -d), (t, d), (-d, t), (d, t)] {
                     let (cx, cy) = clamp_center(tx + dx, ty + dy);
-                    let r = rect_at(cx, cy);
-                    if is_clear(&r) {
-                        return Some(r);
+                    if clear(cx, cy) {
+                        return Some(rect_at(cx, cy));
                     }
                 }
                 t += step;
@@ -768,12 +888,25 @@ pub fn generate_board_artifacts(
             (Some(b), None) | (None, Some(b)) => b,
             (None, None) => (0.0, 0.0, 0.0, 0.0),
         };
+        // Through-hole pads (both copper layers) become hard both-side keep-outs,
+        // each clearance-expanded, relative to the footprint origin.
+        let tht_pads: Vec<Rect> = pads
+            .iter()
+            .filter(|p| matches!(p.layer, PadLayer::Both))
+            .map(|p| {
+                let m = THT_PAD_CLEAR_MM + p.w.max(p.h) / 2.0;
+                (p.px - m, p.py - m, p.px + m, p.py + m)
+            })
+            .collect();
         facts.insert(
             refdes.to_string(),
             PartFacts {
                 extent: (keepout.2 - keepout.0, keepout.3 - keepout.1),
                 origin_offset: ((keepout.0 + keepout.2) / 2.0, (keepout.1 + keepout.3) / 2.0),
                 side: part.side.unwrap_or(Side::Front),
+                height_mm: part_height_mm(lib_part),
+                standoff_mm: subboard_standoff(lib_part),
+                tht_pads,
             },
         );
         loaded.push((refdes, lib_part, part.value.as_str(), fp, pads));
@@ -1798,6 +1931,9 @@ mod tests {
                         extent: *extent,
                         origin_offset: (0.0, 0.0),
                         side: *side,
+                        height_mm: 2.0,
+                        standoff_mm: None,
+                        tht_pads: Vec::new(),
                     },
                 )
             })
@@ -1913,6 +2049,108 @@ mod tests {
         let hits = detect_collisions(&parts);
         assert_eq!(hits.len(), 1, "only J1 collides: {hits:?}");
         assert!(hits[0].contains("J1") && hits[0].contains("A1"));
+    }
+
+    #[test]
+    fn placement_clear_enforces_side_height_and_pin_rules() {
+        let clr = 0.2;
+        // A back-side sub-board with an 11mm standoff and one pin at (2..4, 2..4).
+        let sub = Placed {
+            body: (0.0, 0.0, 18.0, 51.0),
+            back: true,
+            height_mm: 8.5,
+            standoff_mm: Some(11.0),
+            tht_pads: vec![(2.0, 2.0, 4.0, 4.0)],
+        };
+        let placed = [sub];
+        let body = (8.0, 8.0, 10.0, 10.0); // same-side, clear of the pin
+        let on_pin = (2.5, 2.5, 3.5, 3.5);
+        // Short same-side body tucks under the sub-board.
+        assert!(placement_clear(&body, true, 1.0, None, &[], &placed, clr));
+        // A tall same-side body can't fit under it.
+        assert!(!placement_clear(&body, true, 12.0, None, &[], &placed, clr));
+        // Any body over a through-hole pin is blocked, regardless of side/height.
+        assert!(!placement_clear(
+            &on_pin,
+            true,
+            1.0,
+            None,
+            &[],
+            &placed,
+            clr
+        ));
+        assert!(!placement_clear(
+            &on_pin,
+            false,
+            1.0,
+            None,
+            &[],
+            &placed,
+            clr
+        ));
+        // An opposite-side body (over the floating body, not a pin) is independent
+        // — even a tall one.
+        assert!(placement_clear(&body, false, 20.0, None, &[], &placed, clr));
+        // A candidate's own pin may pass over the standoff gap, not into a pin.
+        assert!(placement_clear(
+            &body,
+            false,
+            1.0,
+            None,
+            &[(8.0, 8.0, 10.0, 10.0)],
+            &placed,
+            clr
+        ));
+        assert!(!placement_clear(
+            &body,
+            false,
+            1.0,
+            None,
+            &[(2.5, 2.5, 3.5, 3.5)],
+            &placed,
+            clr
+        ));
+    }
+
+    #[test]
+    fn short_parts_pack_under_a_subboard_tall_ones_do_not() {
+        // A1 is a sub-board (18×51, 11mm standoff); C1 (short) and U1 (tall) are
+        // both netted to it. The placer tucks C1 under A1's body and keeps U1 clear.
+        let c = Circuit {
+            name: "stack".into(),
+            parts: vec![
+                Part::new("A1", "Daisy"),
+                Part::new("C1", "100n"),
+                Part::new("U1", "reg"),
+            ],
+            nets: vec![
+                Net::new("N1", vec![PinRef::new("A1", "1"), PinRef::new("C1", "1")]),
+                Net::new("N2", vec![PinRef::new("A1", "2"), PinRef::new("U1", "1")]),
+            ],
+        };
+        let mk = |w: f64, h: f64, height: f64, standoff: Option<f64>| PartFacts {
+            extent: (w, h),
+            origin_offset: (0.0, 0.0),
+            side: Side::Front,
+            height_mm: height,
+            standoff_mm: standoff,
+            tht_pads: Vec::new(), // no pins → the whole body is packable space
+        };
+        let mut facts = HashMap::new();
+        facts.insert("A1".to_string(), mk(18.0, 51.0, 8.5, Some(11.0)));
+        facts.insert("C1".to_string(), mk(3.0, 3.0, 1.0, None));
+        facts.insert("U1".to_string(), mk(3.0, 3.0, 12.0, None));
+        let placer = SeededPlacer::new(40.0, 100.0, (0.0, 0.0), HashMap::new());
+        let p = placer.place(&c, &facts);
+        let ko = |r: &str| facts[r].keepout_at(p[r].x_mm, p[r].y_mm, p[r].back);
+        assert!(
+            rects_overlap(&ko("A1"), &ko("C1"), 0.0),
+            "short C1 packs under the sub-board"
+        );
+        assert!(
+            !rects_overlap(&ko("A1"), &ko("U1"), 0.0),
+            "tall U1 stays clear of the sub-board"
+        );
     }
 
     #[test]
