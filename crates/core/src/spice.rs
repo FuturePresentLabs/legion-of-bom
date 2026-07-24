@@ -80,6 +80,75 @@ impl Default for SimConfig {
     }
 }
 
+/// Candidate signal-input / signal-output net names, most-specific first.
+const INPUT_NETS: &[&str] = &["IN", "SIG_IN", "INPUT", "IN_L", "AUDIO_IN", "AUDIO_IN_L"];
+const OUTPUT_NETS: &[&str] = &[
+    "OUT",
+    "SIG_OUT",
+    "OUTPUT",
+    "OUT_L",
+    "AUDIO_OUT",
+    "AUDIO_OUT_L",
+];
+
+/// The DC voltage a net name implies if it's a supply rail — `+12V`→+12, `-12V`→
+/// −12, `+5V`→5, `+3V3`→3.3, or the named rails VCC/VDD (+12) / VEE/VSS (−12).
+/// `None` for anything that isn't rail-shaped (signals, ground, IABC, …).
+fn rail_voltage(name: &str) -> Option<f64> {
+    let up = name.trim().to_ascii_uppercase();
+    match up.as_str() {
+        "VCC" | "VDD" => return Some(12.0),
+        "VEE" | "VSS" => return Some(-12.0),
+        _ => {}
+    }
+    // Explicit rails start with a sign and carry a voltage: +12V, -12V, +3V3.
+    let sign = match up.as_bytes().first() {
+        Some(b'+') => 1.0,
+        Some(b'-') => -1.0,
+        _ => return None,
+    };
+    let body = &up[1..];
+    if !body.contains('V') {
+        return None;
+    }
+    // `12V`→`12`, `3V3`→`3.3`, `3.3V`→`3.3`.
+    let num = body.trim_end_matches('V').replace('V', ".");
+    num.parse::<f64>().ok().map(|v| sign * v)
+}
+
+impl SimConfig {
+    /// Infer the I/O and supply nets from the circuit's own net names, so the
+    /// harness adapts to a real board (`SIG_IN`/`SIG_OUT`, `+12V`/`-12V`) instead
+    /// of assuming `IN`/`OUT`/`±15 V`. Falls back to [`default`](Self::default)
+    /// names/supplies when nothing matches. (tus.9)
+    pub fn infer(circuit: &dyn CircuitSource) -> SimConfig {
+        let names: Vec<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+        let first = |cands: &[&str], fallback: &str| -> String {
+            for c in cands {
+                if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(c)) {
+                    return n.to_string();
+                }
+            }
+            fallback.to_string()
+        };
+        let supplies: Vec<(String, f64)> = names
+            .iter()
+            .filter_map(|n| rail_voltage(n).map(|v| (n.to_string(), v)))
+            .collect();
+        SimConfig {
+            input_net: first(INPUT_NETS, "IN"),
+            output_net: first(OUTPUT_NETS, "OUT"),
+            ground_nets: vec!["GND".into(), "0".into()],
+            supplies: if supplies.is_empty() {
+                SimConfig::default().supplies
+            } else {
+                supplies
+            },
+            ac: AcSweep::default(),
+        }
+    }
+}
+
 impl SimConfig {
     fn is_ground(&self, net: &str) -> bool {
         self.ground_nets.iter().any(|g| g.eq_ignore_ascii_case(net))
@@ -612,6 +681,49 @@ mod tests {
                 Net::new("GND", vec![PinRef::new("C1", "2")]),
             ],
         }
+    }
+
+    #[test]
+    fn rail_voltage_parses_supply_names() {
+        assert_eq!(rail_voltage("+12V"), Some(12.0));
+        assert_eq!(rail_voltage("-12V"), Some(-12.0));
+        assert_eq!(rail_voltage("+5V"), Some(5.0));
+        assert_eq!(rail_voltage("+3V3"), Some(3.3));
+        assert_eq!(rail_voltage("VCC"), Some(12.0));
+        assert_eq!(rail_voltage("VEE"), Some(-12.0));
+        // Signals / ground / bias nodes are not rails.
+        for n in ["GND", "0", "SIG_IN", "IABC", "+CV", "SLEW_NODE"] {
+            assert_eq!(rail_voltage(n), None, "{n} must not read as a rail");
+        }
+    }
+
+    #[test]
+    fn infer_adapts_io_and_supplies_to_the_circuit() {
+        // A slew-limiter-shaped circuit: SIG_IN/SIG_OUT + ±12V rails.
+        let c = Circuit {
+            name: "sl".into(),
+            parts: vec![Part::new("U1", "op")],
+            nets: vec![
+                Net::new("SIG_IN", vec![PinRef::new("U1", "3")]),
+                Net::new("SIG_OUT", vec![PinRef::new("U1", "1")]),
+                Net::new("+12V", vec![PinRef::new("U1", "8")]),
+                Net::new("-12V", vec![PinRef::new("U1", "4")]),
+                Net::new("GND", vec![PinRef::new("U1", "5")]),
+            ],
+        };
+        let cfg = SimConfig::infer(&c);
+        assert_eq!(cfg.input_net, "SIG_IN");
+        assert_eq!(cfg.output_net, "SIG_OUT");
+        let mut sup = cfg.supplies.clone();
+        sup.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(sup, vec![("+12V".into(), 12.0), ("-12V".into(), -12.0)]);
+        // A plain RC (IN/OUT, no rails) falls back cleanly.
+        let rc = SimConfig::infer(&rc_lowpass());
+        assert_eq!(
+            (rc.input_net.as_str(), rc.output_net.as_str()),
+            ("IN", "OUT")
+        );
+        assert_eq!(rc.supplies, SimConfig::default().supplies);
     }
 
     #[test]

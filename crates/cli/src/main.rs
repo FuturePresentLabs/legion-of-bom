@@ -321,8 +321,10 @@ fn run(circuit: PathBuf) -> Result<()> {
     // Stage: validate — surface ERC results as structured findings.
     report.push(validate_erc(skidl_run.erc_report.as_deref()));
 
-    // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep.
-    let ac = simulate_ac(&model, &SimConfig::default(), &work_dir)
+    // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep. Infer
+    // the I/O and supply nets from the circuit (SIG_IN/SIG_OUT, +12V/-12V) rather
+    // than assuming IN/OUT/±15 V (tus.9).
+    let ac = simulate_ac(&model, &SimConfig::infer(&model), &work_dir)
         .with_context(|| "simulate stage failed (try `lob doctor`)")?;
     report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
         "AC sweep: {} points, passband {:.2} dB",
