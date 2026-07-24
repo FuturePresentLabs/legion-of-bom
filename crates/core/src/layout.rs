@@ -210,6 +210,9 @@ pub struct LayoutReport {
     pub metrics: PlacementMetrics,
     /// Connections surfaced for manual routing (§6.8) — the router's conflicts.
     pub unresolved: Vec<String>,
+    /// Mechanical clearance problems: parts under a stacked sub-board taller than
+    /// its standoff (DESIGN 6.7). Surfaced, not auto-fixed.
+    pub collisions: Vec<String>,
     /// Final-gate DRC report, when `kicad_cli` was provided.
     pub drc: Option<DrcReport>,
     /// Human-facing observations (info/warning/error), incl. unresolved criticals.
@@ -232,6 +235,7 @@ pub fn run_layout_loop(
         board: String,
         metrics: PlacementMetrics,
         unresolved: Vec<String>,
+        collisions: Vec<String>,
         drc: Option<DrcReport>,
     }
 
@@ -279,6 +283,7 @@ pub fn run_layout_loop(
                 board: art.pcb,
                 metrics,
                 unresolved: art.route.conflicts.clone(),
+                collisions: art.collisions.clone(),
                 drc,
             });
         }
@@ -302,6 +307,7 @@ pub fn run_layout_loop(
         board,
         metrics,
         unresolved,
+        collisions,
         mut drc,
     } = best.expect("loop runs at least once");
 
@@ -337,6 +343,9 @@ pub fn run_layout_loop(
             }
         }
     }
+    for c in &collisions {
+        findings.push(Finding::warning(format!("mechanical clearance: {c}")));
+    }
     if let Some(report) = &drc {
         if report.error_count() > 0 {
             findings.push(Finding::error(format!(
@@ -354,6 +363,7 @@ pub fn run_layout_loop(
         score,
         metrics,
         unresolved,
+        collisions,
         drc,
         findings,
     })

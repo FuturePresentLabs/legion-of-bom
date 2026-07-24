@@ -670,6 +670,10 @@ pub struct BoardArtifacts {
     /// What the router produced — tracks, vias, and unrouted `conflicts`. Empty
     /// when `options.router` is `None`.
     pub route: RouteOutput,
+    /// Mechanical clearance problems (DESIGN 6.7): a part standing under a
+    /// stacked sub-board that is taller than the sub-board's standoff. Surfaced,
+    /// not auto-fixed. Empty when nothing collides.
+    pub collisions: Vec<String>,
 }
 
 /// Generate a `.kicad_pcb` for a circuit: footprints assigned + placed + net-wired,
@@ -776,6 +780,26 @@ pub fn generate_board_artifacts(
     }
 
     let placements = options.placer.place(circuit, &facts);
+
+    // Height/collision check (DESIGN 6.7): a sub-board stands off the main board on
+    // its headers; a taller part directly under it on the same side would hit it.
+    // Surfaced (never silently moved) — the author raises the standoff, moves the
+    // part, or flips it to the other side.
+    let placed_parts: Vec<PlacedPart> = loaded
+        .iter()
+        .filter_map(|(refdes, lib_part, ..)| {
+            let f = facts.get(*refdes)?;
+            let p = placements.get(*refdes)?;
+            Some(PlacedPart {
+                refdes: refdes.to_string(),
+                keepout: f.keepout_at(p.x_mm, p.y_mm, p.back),
+                back: p.back,
+                height_mm: part_height_mm(lib_part),
+                standoff_mm: subboard_standoff(lib_part),
+            })
+        })
+        .collect();
+    let collisions = detect_collisions(&placed_parts);
 
     // Pass 2: transform each footprint into a placed, net-wired board footprint,
     // collect every connected pad's absolute position (for routing), and track the
@@ -1019,6 +1043,7 @@ pub fn generate_board_artifacts(
         pcb: Sexpr::list(board).to_sexpr_string() + "\n",
         placements,
         route,
+        collisions,
     })
 }
 
@@ -1191,6 +1216,84 @@ fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
 }
 
 /// Load and parse a footprint `.kicad_mod` by `lib:name`.
+/// A placed part reduced to what the mechanical-clearance check needs.
+struct PlacedPart {
+    refdes: String,
+    keepout: Rect,
+    back: bool,
+    height_mm: f64,
+    /// `Some(standoff)` if this part is itself a stacked sub-board.
+    standoff_mm: Option<f64>,
+}
+
+/// Mechanical clearance findings (DESIGN 6.7): for each stacked sub-board, any
+/// same-side part whose keep-out overlaps the sub-board body and is taller than
+/// the sub-board's standoff would physically collide. Sub-boards are not checked
+/// against each other. Deterministic (sorted); empty when nothing collides.
+fn detect_collisions(parts: &[PlacedPart]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in parts.iter().filter(|p| p.standoff_mm.is_some()) {
+        let standoff = s.standoff_mm.unwrap();
+        for p in parts {
+            if p.refdes == s.refdes || p.standoff_mm.is_some() || p.back != s.back {
+                continue;
+            }
+            if p.height_mm > standoff && rects_overlap(&p.keepout, &s.keepout, 0.0) {
+                out.push(format!(
+                    "{} (~{:.1}mm) sits under {} but is taller than its {:.1}mm standoff",
+                    p.refdes, p.height_mm, s.refdes, standoff
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The standoff (mm) a sub-board mounts at, if `lib_part` is a synthesized
+/// sub-board; `None` for an ordinary footprint.
+fn subboard_standoff(lib_part: &str) -> Option<f64> {
+    let (lib, name) = lib_part.split_once(':')?;
+    (lib == crate::subboard::SUBBOARD_LIB)
+        .then(|| crate::subboard::from_name(name).map(|s| s.standoff_mm))
+        .flatten()
+}
+
+/// Rough component height (mm) by footprint family — enough to tell a low-profile
+/// SMD part (fine under a stacked sub-board) from a tall through-hole /
+/// electrolytic / connector one that would hit it. A heuristic pending real
+/// 3D-model heights (DESIGN 6.7); deliberately errs toward flagging.
+fn part_height_mm(lib_part: &str) -> f64 {
+    let f = lib_part.to_ascii_lowercase();
+    let has = |s: &str| f.contains(s);
+    if has("pinheader")
+        || has("pinsocket")
+        || has("idc")
+        || has("connector")
+        || has("jack")
+        || has("terminal")
+        || has("lobmodule")
+    {
+        8.5
+    } else if has("potentiometer") || has("trimmer") || has("rotaryencoder") {
+        10.0
+    } else if has("cp_") || has("electrolytic") || has("radial") {
+        6.0
+    } else if has("to-92") || has("to92") || has("to-220") || has("to220") {
+        9.0
+    } else if has("crystal") || has("oscillator") || has("hc49") {
+        3.5
+    } else if has("soic") || has("sop") || has("tssop") || has("qfp") || has("qfn") || has("dfn") {
+        1.8
+    } else if has("0402") || has("0201") {
+        0.5
+    } else if has("0603") || has("0805") || has("1206") || has("1210") {
+        1.0
+    } else {
+        2.0 // unknown → assume a modest low profile
+    }
+}
+
 fn load_footprint(dir: &Path, lib_part: &str) -> Result<Sexpr, BoardError> {
     let (lib, name) = lib_part.split_once(':').ok_or_else(|| {
         BoardError::Other(format!("bad footprint id '{lib_part}' (want lib:name)"))
@@ -1772,6 +1875,44 @@ mod tests {
             art.pcb.contains("(segment"),
             "the function-named net becomes copper — resolution worked"
         );
+    }
+
+    #[test]
+    fn part_height_and_standoff_heuristics() {
+        assert!(part_height_mm("Connector_PinHeader_2.54mm:PinHeader_2x05") > 5.0);
+        assert!(part_height_mm("Capacitor_THT:CP_Radial_D6.3mm") > 5.0);
+        assert!(part_height_mm("Package_SO:SOIC-8_3.9x4.9mm") < 3.0);
+        assert!(part_height_mm("Resistor_SMD:R_0603_1608Metric") < 1.5);
+        assert_eq!(subboard_standoff("LobModule:Daisy_Seed"), Some(11.0));
+        assert_eq!(subboard_standoff("Resistor_SMD:R_0603_1608Metric"), None);
+    }
+
+    #[test]
+    fn collision_flags_only_tall_same_side_parts_under_a_subboard() {
+        let sub = |refdes: &str| PlacedPart {
+            refdes: refdes.into(),
+            keepout: (10.0, 10.0, 28.0, 61.0), // 18×51 Daisy body
+            back: false,
+            height_mm: 8.5,
+            standoff_mm: Some(11.0),
+        };
+        let part = |refdes: &str, x: f64, h: f64, back: bool| PlacedPart {
+            refdes: refdes.into(),
+            keepout: (x, 20.0, x + 4.0, 24.0),
+            back,
+            height_mm: h,
+            standoff_mm: None,
+        };
+        let parts = vec![
+            sub("A1"),
+            part("C1", 15.0, 3.0, false),  // under it, short → fine
+            part("J1", 15.0, 12.0, false), // under it, tall → collides
+            part("J2", 15.0, 12.0, true),  // under it but on the back → fine
+            part("J3", 40.0, 12.0, false), // tall but not under it → fine
+        ];
+        let hits = detect_collisions(&parts);
+        assert_eq!(hits.len(), 1, "only J1 collides: {hits:?}");
+        assert!(hits[0].contains("J1") && hits[0].contains("A1"));
     }
 
     #[test]

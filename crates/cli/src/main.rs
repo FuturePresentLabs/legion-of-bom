@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, derive_panel,
-    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
-    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, render_board_png, run_drc,
+    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
+    generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
+    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, render_board_png, run_drc,
     run_layout_loop, simulate_ac, validate_erc, zip_dir, BoardOptions, BoardPng, BuiltinCutouts,
     CircuitSource, EurorackPlacer, Finding, JlcpcbClient, LayoutLoop, LayoutMode, Logo,
     MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
@@ -501,7 +501,7 @@ fn board_cmd(
 
     // Iterative, connectivity-aware layout when a panel is given (needs anchors);
     // otherwise the one-shot placement path.
-    let (board, conflicts) = match (seeded_template(&panel)?, iterations) {
+    let (board, conflicts, collisions) = match (seeded_template(&panel)?, iterations) {
         (Some(template), iters) if iters > 0 => {
             let cfg = LayoutLoop {
                 mode: parse_mode(&mode)?,
@@ -517,9 +517,12 @@ fn board_cmd(
                 report.metrics.critical_hpwl_mm,
                 report.metrics.via_count,
             );
-            (report.board, report.unresolved)
+            (report.board, report.unresolved, report.collisions)
         }
-        _ => generate_board_report(&model, &options)?,
+        _ => {
+            let art = generate_board_artifacts(&model, &options)?;
+            (art.pcb, art.route.conflicts, art.collisions)
+        }
     };
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
@@ -533,6 +536,15 @@ fn board_cmd(
             conflicts.len()
         );
         for c in &conflicts {
+            eprintln!("      - {c}");
+        }
+    }
+    if !collisions.is_empty() {
+        eprintln!(
+            "  ⚠ {} mechanical clearance issue(s) under a stacked sub-board:",
+            collisions.len()
+        );
+        for c in &collisions {
             eprintln!("      - {c}");
         }
     }

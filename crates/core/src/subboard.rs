@@ -87,6 +87,10 @@ pub struct SubboardSpec {
     pub pad_dia_mm: f64,
     /// Function name per pad (empty for a generic unnamed header).
     pub pins: Vec<PinLabel>,
+    /// Standoff (mm): how high the sub-board body sits above the main board on its
+    /// headers. Components under it on the same side must be shorter than this or
+    /// they collide (DESIGN 6.7).
+    pub standoff_mm: f64,
 }
 
 impl SubboardSpec {
@@ -210,6 +214,8 @@ pub fn daisy_seed() -> SubboardSpec {
             .iter()
             .map(|&(pad, name, aliases)| PinLabel { pad, name, aliases })
             .collect(),
+        // A Daisy Seed typically stacks on ~11 mm 2×20 headers.
+        standoff_mm: 11.0,
     }
 }
 
