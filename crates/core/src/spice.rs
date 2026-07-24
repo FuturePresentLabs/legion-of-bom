@@ -270,6 +270,13 @@ fn netlist_body(
     for part in circuit.parts() {
         let refdes = &part.refdes.0;
 
+        // Connectors and mechanical parts (jacks, headers, mounting holes, test
+        // points) carry no SPICE device — their pins are just net junctions. Skip
+        // them rather than demanding a model.
+        if is_electrical_noop(part) {
+            continue;
+        }
+
         // A part that carries a SPICE model is instantiated from that model.
         if let Some(SpiceModel::Subckt {
             subckt,
@@ -295,6 +302,24 @@ fn netlist_body(
             continue;
         }
 
+        // A potentiometer (`RV…`, 3 pins: 1–wiper(2)–3) → two resistors split at a
+        // nominal 50% wiper. Without this the wiper net floats and the DC operating
+        // point can't be found.
+        if refdes.to_ascii_uppercase().starts_with("RV") {
+            if let (Some(n1), Some(nw), Some(n3)) = (
+                node_at(refdes, "1"),
+                node_at(refdes, "2"),
+                node_at(refdes, "3"),
+            ) {
+                let half = crate::units::parse_eng_value(&part.value)
+                    .map(|v| fmt_num(v / 2.0))
+                    .unwrap_or_else(|| part.value.clone());
+                components.push(format!("R{refdes}A {n1} {nw} {half}"));
+                components.push(format!("R{refdes}B {nw} {n3} {half}"));
+                continue;
+            }
+        }
+
         // Otherwise a SPICE primitive, by reference-designator letter.
         match refdes.chars().next().unwrap_or('?').to_ascii_uppercase() {
             'R' | 'C' | 'L' => {
@@ -315,6 +340,29 @@ fn netlist_body(
         )));
     }
     Ok((includes, components))
+}
+
+/// Whether a part is an electrical no-op for simulation — a connector or
+/// mechanical part (jack, header, mounting hole, test point) that contributes no
+/// SPICE device, only net junctions. Recognised by the `J` reference prefix or a
+/// connector/mechanical footprint.
+fn is_electrical_noop(part: &crate::model::Part) -> bool {
+    if part.refdes.0.starts_with('J') {
+        return true;
+    }
+    part.footprint.as_deref().is_some_and(|f| {
+        let f = f.to_ascii_lowercase();
+        [
+            "jack",
+            "connector",
+            "mountinghole",
+            "testpoint",
+            "fiducial",
+            "socket",
+        ]
+        .iter()
+        .any(|k| f.contains(k))
+    })
 }
 
 /// Supply-rail sources for each supply net the circuit actually uses.
@@ -354,6 +402,9 @@ pub fn generate_ac_deck(
     }
 
     let mut lines = vec![format!("* legion-of-bom AC deck for {}", circuit.name())];
+    // A tiny shunt to ground on every node keeps a floating/high-Z node (an op-amp
+    // input, an unpatched jack) from making the operating-point matrix singular.
+    lines.push(".options rshunt=1e12 gmin=1e-10 itl1=1000".into());
     for include in &includes {
         lines.push(format!(".include {}", include.display()));
     }
@@ -478,6 +529,8 @@ pub fn generate_tran_deck(
         "* legion-of-bom transient deck for {}",
         circuit.name()
     )];
+    // See the AC deck: keep floating/high-Z nodes from making the matrix singular.
+    lines.push(".options rshunt=1e12 gmin=1e-10 itl1=1000".into());
     for include in &includes {
         lines.push(format!(".include {}", include.display()));
     }
@@ -543,6 +596,7 @@ pub fn simulate_tran(
 
     let deck = generate_tran_deck(circuit, config, tran, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
+    crate::symbols::write_builtin_lib(&work_dir)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")
@@ -600,6 +654,7 @@ pub fn simulate_ac(
 
     let deck = generate_ac_deck(circuit, config, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
+    crate::symbols::write_builtin_lib(&work_dir)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")

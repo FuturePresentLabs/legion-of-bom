@@ -45,25 +45,29 @@ pub fn resolve_models(
         }
 
         // 2. Otherwise recover it from the shipped symbol library — how KiCad's
-        //    ideal `Simulation_SPICE:*` parts declare their built-in models.
-        let Some(library_part) = part.library_part.as_deref() else {
-            continue;
-        };
-        let Some((lib, name)) = library_part.split_once(':') else {
-            continue;
-        };
-
-        if !lib_cache.contains_key(lib) {
-            let path = symbol_dir.join(format!("{lib}.kicad_sym"));
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| StageError::Other(format!("reading {}: {e}", path.display())))?;
-            let root = Sexpr::parse(&text)
-                .map_err(|e| StageError::Other(format!("parsing {}: {e}", path.display())))?;
-            lib_cache.insert(lib.to_string(), root);
+        //    ideal `Simulation_SPICE:*` parts declare their built-in models. A
+        //    missing/unparsable library is not fatal; we fall through to (3).
+        let mut model = None;
+        if let Some((lib, name)) = part.library_part.as_deref().and_then(|p| p.split_once(':')) {
+            if !lib_cache.contains_key(lib) {
+                let path = symbol_dir.join(format!("{lib}.kicad_sym"));
+                if let Some(root) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| Sexpr::parse(&t).ok())
+                {
+                    lib_cache.insert(lib.to_string(), root);
+                }
+            }
+            if let Some(root) = lib_cache.get(lib) {
+                model = model_from_symbol(root, name, symbol_dir)?;
+            }
         }
 
-        if let Some(model) = model_from_symbol(&lib_cache[lib], name, symbol_dir)? {
-            models.insert(refdes.clone(), model);
+        // 3. Fall back to the built-in behavioural catalog — the parts-library
+        //    stand-in for common active parts (op-amps, the LM13700 OTA) whose
+        //    KiCad symbols ship no `Sim.*` model.
+        if let Some(m) = model.or_else(|| builtin_model(part)) {
+            models.insert(refdes.clone(), m);
         }
     }
     Ok(models)
@@ -301,9 +305,71 @@ fn subckt_terminals(sp_path: &Path, name: &str) -> Result<Vec<String>, StageErro
     )))
 }
 
+/// Filename of the bundled behavioural model library, written next to the SPICE
+/// deck (ngspice `.include`s it by this relative name).
+pub const BUILTIN_LIB_NAME: &str = "lob_builtin.lib";
+
+/// The bundled behavioural model library text (op-amp + LM13700 OTA).
+const BUILTIN_LIB_TEXT: &str = include_str!("spice/lob_builtin.lib");
+
+/// Write the bundled behavioural model library into `dir` so a deck that
+/// `.include`s [`BUILTIN_LIB_NAME`] can find it. Idempotent.
+pub fn write_builtin_lib(dir: &Path) -> std::io::Result<()> {
+    std::fs::write(dir.join(BUILTIN_LIB_NAME), BUILTIN_LIB_TEXT)
+}
+
+/// The built-in behavioural [`SpiceModel`] for a common active part whose KiCad
+/// symbol carries no `Sim.*` model — the parts-library stand-in. Matched on the
+/// part's library id / value. `None` for anything not in the catalogue.
+fn builtin_model(part: &crate::model::Part) -> Option<SpiceModel> {
+    let hay = format!(
+        "{} {}",
+        part.library_part.as_deref().unwrap_or(""),
+        part.value
+    )
+    .to_ascii_uppercase();
+    // (subckt name, part pin numbers in the subckt's terminal order).
+    let (subckt, pins): (&str, &[&str]) = if hay.contains("LM13700") || hay.contains("LM13600") {
+        ("LM13700", &["1", "3", "4", "5", "6", "7", "8", "11"])
+    } else if hay.contains("TL072") || hay.contains("TL082") || hay.contains("NE5532") {
+        ("TL072", &["1", "2", "3", "4", "5", "6", "7", "8"])
+    } else {
+        return None;
+    };
+    Some(SpiceModel::Subckt {
+        subckt: subckt.into(),
+        include: PathBuf::from(BUILTIN_LIB_NAME),
+        pin_order: pins.iter().map(|s| s.to_string()).collect(),
+        params: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_catalog_models_active_parts_without_a_symbol_model() {
+        // An LM13700 OTA + TL072 op-amp whose KiCad symbols carry no Sim.* model
+        // resolve to the built-in behavioural subckts; primitives resolve to none.
+        let c = crate::model::Circuit {
+            name: "ota".into(),
+            parts: vec![
+                crate::model::Part::new("U1", "LM13700"),
+                crate::model::Part::new("U2", "TL072"),
+                crate::model::Part::new("R1", "1k"),
+            ],
+            nets: vec![],
+        };
+        let models = resolve_models(&c, Path::new("/nonexistent")).unwrap();
+        let subckt = |r: &str| match models.get(r) {
+            Some(SpiceModel::Subckt { subckt, .. }) => Some(subckt.as_str()),
+            _ => None,
+        };
+        assert_eq!(subckt("U1"), Some("LM13700"));
+        assert_eq!(subckt("U2"), Some("TL072"));
+        assert!(!models.contains_key("R1"), "a resistor carries no model");
+    }
 
     #[test]
     fn expands_symbol_dir_variable() {

@@ -1,0 +1,31 @@
+* legion-of-bom built-in behavioural SPICE models.
+* The parts-library stand-in until real device models travel with each part
+* (DESIGN 2.3 / okm). Behavioural, not vendor macro-models — enough to validate
+* topology + slew behaviour, not datasheet-exact.
+
+* --- Ideal op-amp: high-gain VCVS with a finite output resistance so a unity-
+*     feedback follower has a well-conditioned operating point (a stiff 0-ohm
+*     source in a 1e5 loop does not converge). Signals stay within the rails.
+.subckt OPAMP_IDEAL out inm inp vminus vplus
+Eg ng 0 inp inm 1e5
+Rout ng out 100
+.ends
+
+* --- Dual op-amp (TL072/TL082/…): pins 1..8 = out1 in1- in1+ V- in2+ in2- out2 V+.
+.subckt TL072 o1 i1m i1p vm i2p i2m o2 vp
+Xa o1 i1m i1p vm vp OPAMP_IDEAL
+Xb o2 i2m i2p vm vp OPAMP_IDEAL
+.ends
+
+* --- LM13700 OTA + Darlington buffer (channel A terminals). --------------------
+* Pin order: iabc(1) in+(3) in-(4) Iout(5) V-(6) bufin(7) bufout(8) V+(11).
+* OTA: I_out = IABC * tanh((V+ - V-)/(2*Vt)), Vt = 26 mV. IABC is the bias current
+* pushed into the iabc pin (which sits ~2 diode drops above V-).
+.subckt LM13700 iabc inp inn iout vm bufin bufout vp
+Vsense iabc na 0
+Dbias1 na nb DLM
+Dbias2 nb vm DLM
+Bota vm iout I = I(Vsense) * tanh( (V(inp) - V(inn)) / 0.052 )
+Ebuf bufout 0 bufin 0 1
+.model DLM D(Is=1e-14)
+.ends
