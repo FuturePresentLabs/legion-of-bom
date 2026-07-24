@@ -87,8 +87,8 @@ export function ScopeSection({ name, version }: { name: string; version: number 
   const [shape, setShape] = useState<Shape>("tri");
   const [lfoRate, setLfoRate] = useState(200); // Hz
   const [lfoAmp, setLfoAmp] = useState(2.5); // V
-  const [rate, setRate] = useState(0.7); // RATE knob 0=fast .. 1=slow
-  const [winMs, setWinMs] = useState(80); // scope timebase (ms)
+  const [rate, setRate] = useState(0.5); // RATE knob 0=fast .. 1=slow
+  const [winMs, setWinMs] = useState(600); // scope timebase (ms)
 
   const winS = winMs / 1000;
   const drive: Pt[] = useMemo(
@@ -164,7 +164,7 @@ export function ScopeSection({ name, version }: { name: string; version: number 
             <input
               type="range"
               min={5}
-              max={500}
+              max={2000}
               step={5}
               value={winMs}
               onInput={(e) => setWinMs(+(e.target as HTMLInputElement).value)}
