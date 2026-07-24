@@ -1130,6 +1130,20 @@ fn load_footprint(dir: &Path, lib_part: &str) -> Result<Sexpr, BoardError> {
     let (lib, name) = lib_part.split_once(':').ok_or_else(|| {
         BoardError::Other(format!("bad footprint id '{lib_part}' (want lib:name)"))
     })?;
+    // Sub-board / header footprints (Daisy Seed, board-to-board headers) are
+    // synthesized in-memory, not read from a `.pretty` dir — a part with footprint
+    // `LobModule:Daisy_Seed` places + routes through the normal pipeline (25z).
+    if lib == crate::subboard::SUBBOARD_LIB {
+        let spec =
+            crate::subboard::from_name(name).ok_or_else(|| BoardError::FootprintNotFound {
+                lib_part: lib_part.to_string(),
+                path: format!("{}:<synthesized>", crate::subboard::SUBBOARD_LIB),
+            })?;
+        return Sexpr::parse(&spec.kicad_mod()).map_err(|msg| BoardError::FootprintParse {
+            lib_part: lib_part.to_string(),
+            msg,
+        });
+    }
     let path = dir
         .join(format!("{lib}.pretty"))
         .join(format!("{name}.kicad_mod"));
@@ -1531,6 +1545,43 @@ mod tests {
         let placements = GridPlacer::default().place(&rc(), &HashMap::new());
         assert_eq!(placements.len(), 2);
         assert!(placements.contains_key("R1"));
+    }
+
+    #[test]
+    fn subboard_places_and_routes_via_synthesized_footprint() {
+        // A sub-board (Daisy Seed) is a part whose footprint is synthesized from
+        // `LobModule:` — no `.pretty` file, so this needs no KiCad install. It must
+        // place (courtyard → keep-out) and route to its header pins (25z.1).
+        let daisy = Circuit {
+            name: "daisy".into(),
+            parts: vec![Part::new("A1", "Daisy_Seed").with_footprint("LobModule:Daisy_Seed")],
+            // A 2-pin net across the header rows must become copper; a lone GND pin
+            // is exercised by the pour.
+            nets: vec![
+                Net::new(
+                    "AUDIO",
+                    vec![PinRef::new("A1", "1"), PinRef::new("A1", "40")],
+                ),
+                Net::new("GND", vec![PinRef::new("A1", "20")]),
+            ],
+        };
+        // The footprint dir is never read (the module is synthesized), so any path
+        // works — proving the sub-board path is self-contained.
+        let art = generate_board_artifacts(&daisy, &BoardOptions::new("/nonexistent"))
+            .expect("sub-board board generates");
+        assert!(Sexpr::parse(&art.pcb).is_ok(), "board must parse");
+        assert!(
+            art.pcb.contains(r#""LobModule:Daisy_Seed""#),
+            "the Daisy footprint is placed on the board"
+        );
+        let pads = art.pcb.matches("(pad \"").count();
+        assert!(pads >= 40, "all 40 header pads emitted (got {pads})");
+        assert!(
+            art.route.conflicts.is_empty(),
+            "the AUDIO net routes to the header pins: {:?}",
+            art.route.conflicts
+        );
+        assert!(art.pcb.contains("(segment"), "AUDIO net becomes a track");
     }
 
     #[test]
