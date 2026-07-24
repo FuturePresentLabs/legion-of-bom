@@ -1,0 +1,6 @@
+node_modules/
+# The built SPA is a release artifact, but keep the dir present so the
+# `embed-assets` feature (rust-embed) compiles on a fresh checkout before any
+# `npm run build`. Only `.gitkeep` is tracked.
+dist/*
+!dist/.gitkeep
