@@ -693,12 +693,13 @@ fn generate_tran_deck_drive(
     lines.extend(supply_lines(config, &net_names));
     lines.extend(components);
     lines.push(pwl_source_line(&in_node, &drive.pwl));
-    // Extra forced control nets (e.g. RATE_CV), each its own PWL source.
+    // Extra forced control nets (e.g. RATE_CV), each its own PWL source. A net the
+    // circuit doesn't have is skipped (not an error) so a generic control — a RATE
+    // knob — is harmless on a circuit without it.
     for (i, (net, pwl)) in drive.cv.iter().enumerate() {
-        require_net(circuit, &net_names, net)?;
         let node = config.node(net);
-        if node == "0" {
-            continue; // a grounded control net can't be forced
+        if node == "0" || !net_names.contains(net.as_str()) {
+            continue; // grounded or absent — can't force it
         }
         let body = pwl
             .iter()

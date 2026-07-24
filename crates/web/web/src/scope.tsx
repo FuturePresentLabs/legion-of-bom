@@ -36,6 +36,11 @@ type Pt = [number, number]; // [t_s, volts]
 type Source = "seq" | "lfo";
 type Shape = "sine" | "tri" | "square";
 
+// RATE knob → OTA bias voltage. Near the negative rail (~V(IABC)) the bias current
+// starves to nA and the slew stretches out; above it the slew is near-instant.
+const RAIL = -10.8;
+const BIAS_FAST = 5;
+
 const SEMI = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
 const noteName = (s: number) => SEMI[((s % 12) + 12) % 12] + (4 + Math.floor(s / 12));
 const semiToVolt = (s: number) => s / 12; // 1V/octave
@@ -82,7 +87,8 @@ export function ScopeSection({ name, version }: { name: string; version: number 
   const [shape, setShape] = useState<Shape>("tri");
   const [lfoRate, setLfoRate] = useState(200); // Hz
   const [lfoAmp, setLfoAmp] = useState(2.5); // V
-  const [winMs, setWinMs] = useState(20); // scope timebase (ms) — tight so the slew pops
+  const [rate, setRate] = useState(0.7); // RATE knob 0=fast .. 1=slow
+  const [winMs, setWinMs] = useState(80); // scope timebase (ms)
 
   const winS = winMs / 1000;
   const drive: Pt[] = useMemo(
@@ -90,9 +96,23 @@ export function ScopeSection({ name, version }: { name: string; version: number 
     [source, steps, shape, lfoRate, lfoAmp, winS],
   );
 
-  const payload: SimPayload = { pwl: drive, step_s: winS / 2000, stop_s: winS };
-  // Re-run whenever the drive, timebase, or a rebuild (version) changes.
-  const sim = useSim(name, payload, [name, drive, winS, version]);
+  // The RATE knob starves the OTA bias (RATE_CV + CV_AMT toward the neg rail):
+  // slew = IABC/C, and IABC shrinks toward the rail. The musical range is squeezed
+  // near the rail, so map the knob with a cubic so the slow end gets most travel.
+  // Floor the curve just shy of the rail so max RATE glides (~20ms) instead of
+  // starving IABC to zero and freezing the integrator.
+  const bias = RAIL + (BIAS_FAST - RAIL) * Math.max(Math.pow(1 - rate, 3.5), 0.0008);
+  const payload: SimPayload = {
+    pwl: drive,
+    step_s: winS / 2000,
+    stop_s: winS,
+    cv: [
+      { net: "RATE_CV", pwl: [[0, bias], [winS, bias]] },
+      { net: "CV_AMT", pwl: [[0, bias], [winS, bias]] },
+    ],
+  };
+  // Re-run whenever the drive, RATE, timebase, or a rebuild (version) changes.
+  const sim = useSim(name, payload, [name, drive, bias, winS, version]);
 
   return (
     <section class="scope-section">
@@ -128,11 +148,23 @@ export function ScopeSection({ name, version }: { name: string; version: number 
         )}
         <div class="timebase">
           <label>
+            rate
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={rate}
+              onInput={(e) => setRate(+(e.target as HTMLInputElement).value)}
+            />
+            <span class="mono">{rate < 0.5 ? "fast" : rate < 0.85 ? "slew" : "slow"}</span>
+          </label>
+          <label>
             timebase
             <input
               type="range"
               min={5}
-              max={400}
+              max={500}
               step={5}
               value={winMs}
               onInput={(e) => setWinMs(+(e.target as HTMLInputElement).value)}
