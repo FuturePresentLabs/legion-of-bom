@@ -32,6 +32,18 @@ pub enum Numbering {
     Up,
 }
 
+/// A header pin's function name and any aliases — so nets can be mapped to a
+/// sub-board by function (`AUDIO_OUT_L`, `D15`) rather than pad number, and the
+/// footprint can label each pad on its fab layer.
+#[derive(Debug, Clone)]
+pub struct PinLabel {
+    pub pad: usize,
+    /// Canonical name (emitted on the footprint's fab layer).
+    pub name: &'static str,
+    /// Other accepted names (e.g. an ADC pin's `A0` alias).
+    pub aliases: &'static [&'static str],
+}
+
 /// One straight row of header pins, parallel to the Y axis at a fixed X offset
 /// from the footprint origin (the body centre).
 #[derive(Debug, Clone)]
@@ -73,12 +85,31 @@ pub struct SubboardSpec {
     pub rows: Vec<PinRow>,
     pub pad_drill_mm: f64,
     pub pad_dia_mm: f64,
+    /// Function name per pad (empty for a generic unnamed header).
+    pub pins: Vec<PinLabel>,
 }
 
 impl SubboardSpec {
     /// Every header pad as `(pad_number, x_mm, y_mm)`, in row-then-pin order.
     pub fn pads(&self) -> Vec<(usize, f64, f64)> {
         self.rows.iter().flat_map(|r| r.pads()).collect()
+    }
+
+    /// The pad number for a function name (case-insensitive; matches the canonical
+    /// name or any alias). Lets a net be mapped to `"AUDIO_OUT_L"` not `"18"`.
+    pub fn pad_for(&self, name: &str) -> Option<usize> {
+        self.pins
+            .iter()
+            .find(|p| {
+                p.name.eq_ignore_ascii_case(name)
+                    || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
+            })
+            .map(|p| p.pad)
+    }
+
+    /// The canonical function name of a pad, if named.
+    pub fn pin_name(&self, pad: usize) -> Option<&'static str> {
+        self.pins.iter().find(|p| p.pad == pad).map(|p| p.name)
     }
 
     /// KiCad `.kicad_mod` text: through-hole header pads (reachable from either
@@ -127,6 +158,19 @@ impl SubboardSpec {
                 mm(self.pad_drill_mm),
             ));
         }
+        // Function-name labels on the fab layer (documentation): placed just
+        // inboard of each pad so the board reads which pad is which pin.
+        for (num, x, y) in self.pads() {
+            if let Some(name) = self.pin_name(num) {
+                let inward = if x < 0.0 { 1.0 } else { -1.0 };
+                let ax = x + inward * (self.pad_dia_mm / 2.0 + 0.4);
+                let justify = if x < 0.0 { "left" } else { "right" };
+                s.push_str(&format!(
+                    "  (fp_text user \"{}\" (at {} {}) (layer \"F.Fab\") (effects (font (size 0.5 0.5) (thickness 0.08)) (justify {})))\n",
+                    name, mm(ax), mm(y), justify
+                ));
+            }
+        }
         s.push_str(")\n");
         s
     }
@@ -162,8 +206,32 @@ pub fn daisy_seed() -> SubboardSpec {
         ],
         pad_drill_mm: 1.0,
         pad_dia_mm: 1.7,
+        pins: DAISY_SEED_PINS
+            .iter()
+            .map(|&(pad, name, aliases)| PinLabel { pad, name, aliases })
+            .collect(),
     }
 }
+
+/// Daisy Seed physical pinout (pad number → function name + aliases), from the
+/// official Electrosmith libDaisy `Daisy_Seed_Rev4_Pinout.csv`. Pad numbers match
+/// the DIP layout above (1 top-left → 20 bottom-left, 21 bottom-right → 40
+/// top-right). ADC-capable GPIOs carry their `A#` alias.
+#[rustfmt::skip]
+const DAISY_SEED_PINS: &[(usize, &str, &[&str])] = &[
+    (1, "D0", &[]),  (2, "D1", &[]),  (3, "D2", &[]),  (4, "D3", &[]),  (5, "D4", &[]),
+    (6, "D5", &[]),  (7, "D6", &[]),  (8, "D7", &[]),  (9, "D8", &[]),  (10, "D9", &[]),
+    (11, "D10", &[]), (12, "D11", &[]), (13, "D12", &[]), (14, "D13", &[]), (15, "D14", &[]),
+    (16, "AUDIO_IN_L", &[]), (17, "AUDIO_IN_R", &[]),
+    (18, "AUDIO_OUT_L", &[]), (19, "AUDIO_OUT_R", &[]),
+    (20, "AGND", &[]),
+    (21, "3V3_ANA", &["3V3A"]),
+    (22, "D15", &["A0"]), (23, "D16", &["A1"]), (24, "D17", &["A2"]), (25, "D18", &["A3"]),
+    (26, "D19", &["A4"]), (27, "D20", &["A5"]), (28, "D21", &["A6"]), (29, "D22", &["A7"]),
+    (30, "D23", &["A8"]), (31, "D24", &["A9"]), (32, "D25", &["A10"]), (33, "D26", &[]),
+    (34, "D27", &[]), (35, "D28", &["A11"]), (36, "D29", &[]), (37, "D30", &[]),
+    (38, "3V3_DIG", &["3V3D"]), (39, "VIN", &[]), (40, "GND", &["DGND"]),
+];
 
 /// Resolve a synthesized sub-board footprint by name (the part after
 /// `LobModule:`). `None` for an unknown name.
@@ -221,5 +289,32 @@ mod tests {
             "pin 1 is marked"
         );
         assert!(text.contains("*.Cu"), "header pads reach both layers");
+    }
+
+    #[test]
+    fn named_pins_resolve_by_function_and_alias() {
+        let d = daisy_seed();
+        // All 40 pads are named exactly once.
+        assert_eq!(d.pins.len(), 40);
+        // Canonical names map to the right physical pad.
+        assert_eq!(d.pad_for("AUDIO_OUT_L"), Some(18));
+        assert_eq!(d.pad_for("D0"), Some(1));
+        assert_eq!(d.pad_for("GND"), Some(40));
+        assert_eq!(d.pad_for("D15"), Some(22));
+        // Case-insensitive + ADC aliases.
+        assert_eq!(d.pad_for("audio_out_l"), Some(18));
+        assert_eq!(d.pad_for("A0"), Some(22), "ADC alias resolves");
+        assert_eq!(d.pad_for("DGND"), Some(40));
+        assert_eq!(d.pad_for("nope"), None);
+        // Reverse lookup.
+        assert_eq!(d.pin_name(18), Some("AUDIO_OUT_L"));
+    }
+
+    #[test]
+    fn kicad_mod_labels_pads_on_the_fab_layer() {
+        let text = daisy_seed().kicad_mod();
+        assert!(text.contains("F.Fab"), "pin names documented on fab");
+        assert!(text.contains(r#"(fp_text user "AUDIO_OUT_L""#));
+        assert!(text.contains(r#"(fp_text user "VIN""#));
     }
 }

@@ -725,6 +725,9 @@ pub fn generate_board_artifacts(
     // from SMD-vs-through-hole. A double-sided board declares its back parts.
     let mut loaded: Vec<(&str, &str, &str, Sexpr, Vec<FpPad>)> = Vec::new();
     let mut facts: HashMap<String, PartFacts> = HashMap::new();
+    // For sub-boards: refdes → (pad number → its function names), so a net can be
+    // wired to a pad by function (`AUDIO_OUT_L`) as well as by number (25z.3).
+    let mut pin_labels: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for part in circuit.parts() {
         let refdes = part.refdes.0.as_str();
         let lib_part = part
@@ -733,6 +736,20 @@ pub fn generate_board_artifacts(
             .ok_or_else(|| BoardError::NoFootprint {
                 refdes: refdes.to_string(),
             })?;
+        if let Some((crate::subboard::SUBBOARD_LIB, name)) = lib_part.split_once(':') {
+            if let Some(spec) = crate::subboard::from_name(name) {
+                let map: HashMap<String, Vec<String>> = spec
+                    .pins
+                    .iter()
+                    .map(|p| {
+                        let mut names = vec![p.name.to_string()];
+                        names.extend(p.aliases.iter().map(|a| a.to_string()));
+                        (p.pad.to_string(), names)
+                    })
+                    .collect();
+                pin_labels.insert(refdes.to_string(), map);
+            }
+        }
         let fp = load_footprint(&options.footprint_dir, lib_part)?;
         let pads = footprint_pads(&fp);
         // Keep-out = the union of the pad bbox (+margin) and the real courtyard,
@@ -800,10 +817,22 @@ pub fn generate_board_artifacts(
                 h_mm: pad.h,
                 layer,
             };
-            match pin_net
+            // Resolve the pad's net by pad number, then (for a sub-board) by any of
+            // the pad's function names — so `AUDIO_OUT_L` wires to pad 18.
+            let net_name: Option<&str> = pin_net
                 .get(&(refdes.to_string(), pad.num.clone()))
-                .and_then(|name| net_index.get(name).map(|&idx| (idx, *name)))
-            {
+                .copied()
+                .or_else(|| {
+                    pin_labels
+                        .get(refdes)
+                        .and_then(|m| m.get(&pad.num))
+                        .and_then(|names| {
+                            names.iter().find_map(|n| {
+                                pin_net.get(&(refdes.to_string(), n.clone())).copied()
+                            })
+                        })
+                });
+            match net_name.and_then(|name| net_index.get(name).map(|&idx| (idx, name))) {
                 Some((idx, name)) => net_pads
                     .entry(idx)
                     .or_insert_with(|| RouteNet {
@@ -1714,6 +1743,35 @@ mod tests {
             art.route.conflicts
         );
         assert!(art.pcb.contains("(segment"), "AUDIO net becomes a track");
+    }
+
+    #[test]
+    fn subboard_net_wires_to_a_pad_by_function_name() {
+        // A net references the Daisy pin by function name, not pad number; it must
+        // resolve to the right pad and route (25z.3).
+        let daisy = Circuit {
+            name: "daisy".into(),
+            parts: vec![Part::new("A1", "Daisy_Seed").with_footprint("LobModule:Daisy_Seed")],
+            nets: vec![Net::new(
+                "SIG",
+                vec![
+                    PinRef::new("A1", "AUDIO_OUT_L"), // pad 18, by name
+                    PinRef::new("A1", "A0"),          // pad 22, by ADC alias
+                ],
+            )],
+        };
+        let art = generate_board_artifacts(&daisy, &BoardOptions::new("/nonexistent"))
+            .expect("generates");
+        // If name resolution failed, both pads would be obstacles → no SIG track.
+        assert!(
+            art.route.conflicts.is_empty(),
+            "SIG routes: {:?}",
+            art.route.conflicts
+        );
+        assert!(
+            art.pcb.contains("(segment"),
+            "the function-named net becomes copper — resolution worked"
+        );
     }
 
     #[test]
