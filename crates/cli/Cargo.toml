@@ -10,8 +10,14 @@ description = "lob: command-line interface for the legion-of-bom pipeline."
 name = "lob"
 path = "src/main.rs"
 
+[features]
+# Bake the dashboard SPA into the `lob` binary so `lob serve` is self-contained
+# (release/packaged builds). Dev builds serve crates/web/web/dist from disk.
+embed-assets = ["legion-of-bom-web/embed-assets"]
+
 [dependencies]
 legion-of-bom-core.workspace = true
+legion-of-bom-web.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

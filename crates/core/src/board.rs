@@ -57,6 +57,12 @@ pub struct Placement {
 pub struct PartFacts {
     /// Keep-out size `(width, height)` — the courtyard (or pad box + margin).
     pub extent: (f64, f64),
+    /// Physical **body** span `(width, height)` — the courtyard alone (or raw pad
+    /// box), *without* the clearance margins and pin/lug inflation baked into
+    /// `extent`. Those margins can distort a part's aspect (an Alpha pot's solder
+    /// lugs stretch its keep-out taller than wide even though its body is
+    /// landscape), so orientation decisions read this, not `extent`.
+    pub body_extent: (f64, f64),
     /// Keep-out centre offset from the footprint origin. Not every footprint is
     /// centred on its origin — a DIP places the origin at pin 1, so its courtyard
     /// sits ~half the body away. Placers must offset the keep-out by this or a
@@ -89,6 +95,26 @@ impl PartFacts {
             y + oy - h / 2.0,
             x + ox + w / 2.0,
             y + oy + h / 2.0,
+        )
+    }
+
+    /// [`keepout_at`](Self::keepout_at) for a footprint rotated `rot_deg`. Only
+    /// quarter turns change the box: 90°/270° swap width and height (the pad-offset
+    /// rotation is negligible for the near-centred controls this is used on).
+    fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
+        let (ox, oy) = self.origin_offset;
+        let ox = if back { -ox } else { ox };
+        let (w, h) = self.extent;
+        let (ew, eh) = if (rot_deg / 90.0).round() as i64 % 2 != 0 {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        (
+            x + ox - ew / 2.0,
+            y + oy - eh / 2.0,
+            x + ox + ew / 2.0,
+            y + oy + eh / 2.0,
         )
     }
 
@@ -128,6 +154,16 @@ const COURTYARD_MARGIN_MM: f64 = 1.0;
 /// Clearance (mm) around a through-hole pad's keep-out — enough that a neighbour's
 /// copper clears the pin (copper-to-copper clearance is 0.2 mm).
 const THT_PAD_CLEAR_MM: f64 = 0.4;
+
+/// Placement clearance (mm) left between part courtyards — a routing/soldermask
+/// allowance on top of the courtyard the placers space by. This is the knob that
+/// trades board density against how much room the (still-crude) router needs to
+/// connect neighbours without shorting: 3 mm wasted enormous space; ~1.2 mm is the
+/// tightest the current router routes DRC-clean. Lower it as the router improves.
+const PLACE_CLEARANCE_MM: f64 = 1.5;
+
+/// Board-edge margin (mm) — keep parts off the outline.
+const EDGE_MARGIN_MM: f64 = 1.5;
 
 /// Naive row/grid placement — a valid, non-optimising default. It is size-aware
 /// only enough to not overlap footprints: cells are sized to the largest part.
@@ -185,7 +221,89 @@ impl Placer for GridPlacer {
     }
 }
 
-/// Vertical Eurorack placement: panel-facing parts (jacks, pots, switches) are
+/// Orient a panel-facing control to sit *narrow* on the board's width axis (the
+/// HP-limited one), returning 0 or 90 degrees.
+///
+/// The primary signal is the courtyard: a part whose body is wider than it is
+/// tall (an Alpha pot — round body plus solder-lug shoulders spans ~14 mm wide,
+/// ~13 mm tall) is turned a quarter-turn so it stands on end, which also lays its
+/// pin column into a horizontal row (the ideal, user-directed pot orientation).
+/// A jack, taller than wide, is left upright. As a fallback, a square-bodied part
+/// whose *pins* form a wide horizontal row is rotated so the pins face into the
+/// board.
+fn control_rotation(f: &PartFacts) -> f64 {
+    // Stand a control on end when its through-hole pins sit in a horizontal row so
+    // they face into the board rather than splaying sideways. Keys off the pin span
+    // (the courtyard is often square even when the pins are a wide row); falls back
+    // to the courtyard for parts with no through-hole pads.
+    //
+    // NOTE: [`PartFacts::body_extent`] shows a pot's *body* is landscape (wider than
+    // tall), so the ideal orientation is a quarter-turn (pins horizontal). But
+    // rotating an anchored control 90° currently makes the placer collide with
+    // neighbours/edges and the router can't recover (DRC errors + unstable
+    // placement) — so that stays gated behind the deeper placer/router work rather
+    // than a rotation heuristic. See the pot-rotation bead.
+    let (w, h) = pad_span(f).unwrap_or(f.extent);
+    if w > h * 1.2 {
+        90.0
+    } else {
+        0.0
+    }
+}
+
+/// Physical body span `(w, h)` for orientation decisions — the courtyard if the
+/// footprint has one, else its raw pad box. Feeds [`PartFacts::body_extent`], the
+/// groundwork for orienting a control by its body rather than its keep-out.
+fn body_span(courtyard: Option<Rect>, pad_box: Option<Rect>) -> (f64, f64) {
+    match courtyard.or(pad_box) {
+        Some((x0, y0, x1, y1)) => (x1 - x0, y1 - y0),
+        None => (0.0, 0.0),
+    }
+}
+
+/// Rotate an `(x, y)` offset by a footprint rotation of `deg` (quarter turns).
+fn rotate_offset((x, y): (f64, f64), deg: f64) -> (f64, f64) {
+    match (((deg / 90.0).round() as i64) % 4 + 4) % 4 {
+        1 => (-y, x),
+        2 => (-x, -y),
+        3 => (y, -x),
+        _ => (x, y),
+    }
+}
+
+/// Bounding span `(width, height)` of a part's through-hole pads, or `None` when
+/// it has none (SMD).
+fn pad_span(f: &PartFacts) -> Option<(f64, f64)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for &(a, b, c, d) in &f.tht_pads {
+        x0 = x0.min(a);
+        y0 = y0.min(b);
+        x1 = x1.max(c);
+        y1 = y1.max(d);
+    }
+    (x1 > x0).then_some((x1 - x0, y1 - y0))
+}
+
+/// Refdes of the free (non-anchored) Eurorack power headers — a 2×N pin header
+/// that exits the board (not the panel), which both placers lay horizontal
+/// against the top edge, clear of the control field.
+fn power_header_refdes(
+    circuit: &dyn CircuitSource,
+    anchors: &HashMap<String, (f64, f64)>,
+) -> Vec<String> {
+    circuit
+        .parts()
+        .iter()
+        .filter(|p| !anchors.contains_key(&p.refdes.0))
+        .filter(|p| {
+            p.footprint
+                .as_deref()
+                .is_some_and(|f| f.contains("PinHeader_2x"))
+        })
+        .map(|p| p.refdes.0.clone())
+        .collect()
+}
+
 /// **anchored** at their panel-cutout positions so the board mates the panel PCB;
 /// the remaining parts are shelf-packed into the free bands between them. All
 /// coordinates are KiCad top-down, in the panel's frame (`0..width × 0..height`).
@@ -219,28 +337,86 @@ impl Placer for EurorackPlacer {
         let box_of = |x: f64, y: f64, (w, h): (f64, f64)| {
             (x - w / 2.0, y - h / 2.0, x + w / 2.0, y + h / 2.0)
         };
+        // A landscape footprint (clearly wider than tall) is stood on end so panel
+        // controls — pots especially — sit portrait with their pins facing into the
+        // board, not splayed sideways. The keep-out swaps with it.
+        let oriented = |refdes: &str| -> (f64, (f64, f64)) {
+            let ext = facts.get(refdes).map(|f| f.extent).unwrap_or((8.0, 8.0));
+            let rot = facts.get(refdes).map(control_rotation).unwrap_or(0.0);
+            if rot != 0.0 {
+                (rot, (ext.1, ext.0))
+            } else {
+                (0.0, ext)
+            }
+        };
         for (refdes, &(x, y)) in &self.anchors {
+            let (rotation_deg, ext) = oriented(refdes);
+            let back = side_of(refdes);
+            // Align the control's mount point (courtyard centre ≈ shaft/barrel) to
+            // the cutout by placing the footprint origin at `cutout - offset`.
+            let (ox, oy) = facts
+                .get(refdes)
+                .map(|f| f.origin_offset)
+                .unwrap_or((0.0, 0.0));
+            let (ox, oy) = if back { (-ox, oy) } else { (ox, oy) };
+            let (rox, roy) = rotate_offset((ox, oy), rotation_deg);
             out.insert(
                 refdes.clone(),
                 Placement {
-                    x_mm: self.origin_mm.0 + x,
-                    y_mm: self.origin_mm.1 + y,
-                    rotation_deg: 0.0,
-                    back: side_of(refdes),
+                    x_mm: self.origin_mm.0 + x - rox,
+                    y_mm: self.origin_mm.1 + y - roy,
+                    rotation_deg,
+                    back,
                 },
             );
-            let ext = facts.get(refdes).map(|f| f.extent).unwrap_or((8.0, 8.0));
+            // Keep-out sits at the mount point (the cutout), where the body now is.
             boxes.push(box_of(x, y, ext));
+        }
+
+        let margin = EDGE_MARGIN_MM;
+
+        // The Eurorack power header exits the board (not the panel), so lay it
+        // horizontal and tuck it against the top edge, clear of the control field.
+        let power_headers: Vec<&str> = circuit
+            .parts()
+            .iter()
+            .filter(|p| !self.anchors.contains_key(&p.refdes.0))
+            .filter(|p| {
+                p.footprint
+                    .as_deref()
+                    .is_some_and(|f| f.contains("PinHeader_2x"))
+            })
+            .map(|p| p.refdes.0.as_str())
+            .collect();
+        let mut header_x = margin;
+        for r in &power_headers {
+            let (ew, eh) = facts.get(*r).map(|f| f.extent).unwrap_or((12.0, 5.0));
+            // Horizontal = long axis along X; rotate a portrait header 90°.
+            let (rotation_deg, (w, h)) = if eh > ew {
+                (90.0, (eh, ew))
+            } else {
+                (0.0, (ew, eh))
+            };
+            let cx = (header_x + w / 2.0).min(self.width_mm - margin - w / 2.0);
+            let cy = margin + h / 2.0;
+            out.insert(
+                r.to_string(),
+                Placement {
+                    x_mm: self.origin_mm.0 + cx,
+                    y_mm: self.origin_mm.1 + cy,
+                    rotation_deg,
+                    back: side_of(r),
+                },
+            );
+            boxes.push(box_of(cx, cy, (w, h)));
+            header_x += w + 2.0;
         }
 
         // Free parts: first-fit into the interior, top→bottom then left→right,
         // taking the first spot whose courtyard box clears everything placed so
-        // far (anchors + earlier free parts). Robust against extent quirks — no
-        // overlap can slip through, unlike shelf math.
-        let margin = 3.0;
-        // Extra clearance beyond the measured courtyard — footprints occasionally
-        // under-declare it, and it leaves the router room between neighbours.
-        let clearance = 2.5;
+        // far (anchors + header + earlier free parts). Robust against extent
+        // quirks — no overlap can slip through, unlike shelf math.
+        let clearance = PLACE_CLEARANCE_MM;
         let step = 0.5;
         let (x0, x1) = (margin, self.width_mm - margin);
         let (y0, y1) = (margin, self.height_mm - margin);
@@ -249,6 +425,7 @@ impl Placer for EurorackPlacer {
             .iter()
             .map(|p| p.refdes.0.as_str())
             .filter(|r| !self.anchors.contains_key(*r))
+            .filter(|r| !power_headers.contains(r))
             .collect();
         free.sort();
 
@@ -335,6 +512,77 @@ pub struct SeededPlacer {
 /// ordinary 2-pin net, in the seeded placer's centroid weighting.
 const CRITICAL_PULL: f64 = 6.0;
 
+/// How hard a decoupling cap is bonded to the IC it decouples — well above any
+/// net pull, so it lands hard against the chip (the shortest power loop, w95).
+const DECOUPLE_PULL: f64 = 12.0;
+
+/// Strong placement-attractor edges pairing each **decoupling cap** — a capacitor
+/// tied between a power rail and GND — to an IC on that rail, so it seeds hard
+/// against the chip's power pin (the shortest decoupling loop, and the single
+/// biggest routing win). Returns `(cap, ic, weight)` edges to fold into the
+/// seeded placer's adjacency; when a rail has several ICs, caps are spread across
+/// them fewest-first. Roles come from topology, so this needs no SKiDL tags.
+fn decoupling_bonus(circuit: &dyn CircuitSource) -> Vec<(String, String, f64)> {
+    let is_gnd = |n: &str| {
+        let u = n.trim().to_ascii_uppercase();
+        matches!(u.as_str(), "GND" | "GNDA" | "AGND" | "DGND" | "VSS" | "0") || u.ends_with("GND")
+    };
+    let is_power = |n: &str| {
+        let u = n.trim().to_ascii_uppercase();
+        !is_gnd(n)
+            && (u.starts_with('+')
+                || u.starts_with('-')
+                || matches!(u.as_str(), "VCC" | "VDD" | "VEE" | "V+" | "V-"))
+    };
+    let fp: HashMap<&str, &str> = circuit
+        .parts()
+        .iter()
+        .map(|p| (p.refdes.0.as_str(), p.footprint.as_deref().unwrap_or("")))
+        .collect();
+    let is_cap = |r: &str| fp.get(r).is_some_and(|f| f.contains("Capacitor"));
+    let is_ic = |r: &str| fp.get(r).is_some_and(|f| f.contains("Package_"));
+
+    let mut net_refs: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut part_nets: HashMap<&str, Vec<&str>> = HashMap::new();
+    for net in circuit.nets() {
+        for pin in &net.pins {
+            let (rd, nm) = (pin.refdes.0.as_str(), net.name.as_str());
+            net_refs.entry(nm).or_default().push(rd);
+            part_nets.entry(rd).or_default().push(nm);
+        }
+    }
+
+    let mut bonuses = Vec::new();
+    let mut cap_count: HashMap<String, usize> = HashMap::new();
+    for part in circuit.parts() {
+        let r = part.refdes.0.as_str();
+        if !is_cap(r) {
+            continue;
+        }
+        let nets = part_nets.get(r).cloned().unwrap_or_default();
+        // A decoupling cap bridges a power rail and GND.
+        if !nets.iter().any(|n| is_gnd(n)) {
+            continue;
+        }
+        let Some(pnet) = nets.iter().copied().find(|n| is_power(n)) else {
+            continue;
+        };
+        let mut ics: Vec<&str> = net_refs
+            .get(pnet)
+            .map(|v| v.iter().copied().filter(|x| is_ic(x)).collect())
+            .unwrap_or_default();
+        ics.sort_unstable();
+        ics.dedup();
+        ics.sort_by_key(|ic| *cap_count.get(*ic).unwrap_or(&0));
+        let Some(&ic) = ics.first() else {
+            continue;
+        };
+        *cap_count.entry(ic.to_string()).or_default() += 1;
+        bonuses.push((r.to_string(), ic.to_string(), DECOUPLE_PULL));
+    }
+    bonuses
+}
+
 impl SeededPlacer {
     /// A seeded placer with no repair nudges (the loop's first pass).
     pub fn new(
@@ -364,6 +612,7 @@ impl Placer for SeededPlacer {
         let facts_of = |refdes: &str| {
             facts.get(refdes).cloned().unwrap_or(PartFacts {
                 extent: (3.0, 3.0),
+                body_extent: (3.0, 3.0),
                 origin_offset: (0.0, 0.0),
                 side: Side::Front,
                 height_mm: 2.0,
@@ -380,12 +629,10 @@ impl Placer for SeededPlacer {
             (if back { -ox } else { ox }, oy)
         };
 
-        let margin = 3.0;
-        // The seeded placer clusters connected parts, so unlike the spread-out
-        // EurorackPlacer it packs parts to this limit. `extent` is the real
-        // courtyard (circles included), so a modest gap over it clears KiCad's
-        // courtyard/clearance rules with room for the router between neighbours.
-        let clearance = 3.0;
+        let margin = EDGE_MARGIN_MM;
+        // `extent` is already the real courtyard (KiCad's keep-out); the clearance
+        // is only a routing/soldermask allowance on top.
+        let clearance = PLACE_CLEARANCE_MM;
         let step = 0.5;
         let bounds = (
             margin,
@@ -407,25 +654,69 @@ impl Placer for SeededPlacer {
         for (refdes, &(x, y)) in &self.anchors {
             let back = side_of(refdes);
             let f = facts_of(refdes);
+            // Stand landscape controls (pots) on end; pins face into the board.
+            let rotation_deg = control_rotation(&f);
+            // Align the mount point (courtyard centre ≈ shaft/barrel) to the
+            // cutout: put the footprint origin at `cutout - offset`.
+            let (ox, oy) = offset_of(&f, back);
+            let (rox, roy) = rotate_offset((ox, oy), rotation_deg);
+            let (px, py) = (x - rox, y - roy);
             out.insert(
                 refdes.clone(),
                 Placement {
-                    x_mm: self.origin_mm.0 + x,
-                    y_mm: self.origin_mm.1 + y,
-                    rotation_deg: 0.0,
+                    x_mm: self.origin_mm.0 + px,
+                    y_mm: self.origin_mm.1 + py,
+                    rotation_deg,
                     back,
                 },
             );
             boxes.push(Placed {
-                body: f.keepout_at(x, y, back),
+                body: f.keepout_at_rot(px, py, back, rotation_deg),
                 back,
                 height_mm: f.height_mm,
                 standoff_mm: f.standoff_mm,
-                tht_pads: f.tht_pads_at(x, y, back),
+                tht_pads: f.tht_pads_at(px, py, back),
             });
-            let (ox, oy) = offset_of(&f, back);
-            pos.insert(refdes.clone(), (x + ox, y + oy));
+            // Centroid seed = the mount point (cutout), where the body sits.
+            pos.insert(refdes.clone(), (x, y));
             placed.insert(refdes.clone());
+        }
+
+        // Power header(s): laid horizontal against the top edge, out of the
+        // control field (the cable exits the board, not the panel).
+        let power_headers = power_header_refdes(circuit, &self.anchors);
+        let mut header_x = margin;
+        for refdes in &power_headers {
+            let back = side_of(refdes);
+            let f = facts_of(refdes);
+            let (ew, eh) = f.extent;
+            // Horizontal = long axis along X; rotate a portrait header 90°.
+            let (rotation_deg, (w, h)) = if eh > ew {
+                (90.0, (eh, ew))
+            } else {
+                (0.0, (ew, eh))
+            };
+            let cx = (header_x + w / 2.0).min(self.width_mm - margin - w / 2.0);
+            let cy = margin + h / 2.0;
+            out.insert(
+                refdes.clone(),
+                Placement {
+                    x_mm: self.origin_mm.0 + cx,
+                    y_mm: self.origin_mm.1 + cy,
+                    rotation_deg,
+                    back,
+                },
+            );
+            boxes.push(Placed {
+                body: f.keepout_at_rot(cx, cy, back, rotation_deg),
+                back,
+                height_mm: f.height_mm,
+                standoff_mm: f.standoff_mm,
+                tht_pads: f.tht_pads_at(cx, cy, back),
+            });
+            pos.insert(refdes.clone(), (cx, cy));
+            placed.insert(refdes.clone());
+            header_x += w + 2.0;
         }
 
         // Free parts, in a deterministic base order (also the even-spread fallback
@@ -435,6 +726,7 @@ impl Placer for SeededPlacer {
             .iter()
             .map(|p| p.refdes.0.clone())
             .filter(|r| !self.anchors.contains_key(r))
+            .filter(|r| !power_headers.contains(r))
             .collect();
         free.sort();
         let free_index: HashMap<String, usize> = free
@@ -470,6 +762,14 @@ impl Placer for SeededPlacer {
                     }
                 }
             }
+        }
+
+        // Design rule (w95): bond each decoupling cap hard to its IC so it seeds
+        // against the chip's power pin — the shortest loop, and short traces the
+        // router can actually finish. Codified in placement, not fixed up later.
+        for (cap, ic, w) in decoupling_bonus(circuit) {
+            adj.entry(cap.clone()).or_default().push((ic.clone(), w));
+            adj.entry(ic).or_default().push((cap, w));
         }
 
         // Greedy: repeatedly place the unplaced free part most tied to what's down.
@@ -508,11 +808,16 @@ impl Placer for SeededPlacer {
             // KiCad's convention (a point (px,py) → (py,−px)): the keep-out extent
             // swaps and its origin offset rotates with it.
             let usable_w = (self.width_mm - 2.0 * margin).max(1.0);
-            let rot = if f.extent.0 > f.extent.1 && f.extent.0 > usable_w * 0.5 {
-                90.0
-            } else {
-                0.0
-            };
+            // Only turn THROUGH-HOLE parts portrait. Rotating a fine-pitch SMD IC
+            // (a SOIC) hurts pin fanout AND — the j54.25 bug — its rotated pads
+            // trip shorting/soldermask DRC on the back layer; leave SMD unrotated.
+            let rot =
+                if !f.tht_pads.is_empty() && f.extent.0 > f.extent.1 && f.extent.0 > usable_w * 0.5
+                {
+                    90.0
+                } else {
+                    0.0
+                };
             let (ext, base_off) = if rot == 90.0 {
                 (
                     (f.extent.1, f.extent.0),
@@ -796,6 +1101,93 @@ pub struct BoardArtifacts {
     pub collisions: Vec<String>,
 }
 
+/// Load every part's footprint and measure its placement facts (keep-out extent,
+/// origin offset, through-hole pads, side) — the same measurement
+/// [`generate_board_artifacts`] does in its first pass, exposed so sizing tools
+/// (e.g. [`minimum_hp`]) can reason about a board without generating it.
+pub fn build_facts(
+    circuit: &dyn CircuitSource,
+    footprint_dir: &Path,
+) -> Result<HashMap<String, PartFacts>, BoardError> {
+    let mut facts = HashMap::new();
+    for part in circuit.parts() {
+        let refdes = part.refdes.0.as_str();
+        let lib_part = part
+            .footprint
+            .as_deref()
+            .ok_or_else(|| BoardError::NoFootprint {
+                refdes: refdes.to_string(),
+            })?;
+        let fp = load_footprint(footprint_dir, lib_part)?;
+        let pads = footprint_pads(&fp);
+        let courtyard = courtyard_extent(&fp);
+        let keepout = match (part_extent(&pads, COURTYARD_MARGIN_MM), courtyard) {
+            (Some(p), Some(c)) => (p.0.min(c.0), p.1.min(c.1), p.2.max(c.2), p.3.max(c.3)),
+            (Some(b), None) | (None, Some(b)) => b,
+            (None, None) => (0.0, 0.0, 0.0, 0.0),
+        };
+        let tht_pads: Vec<Rect> = pads
+            .iter()
+            .filter(|p| matches!(p.layer, PadLayer::Both))
+            .map(|p| {
+                let m = THT_PAD_CLEAR_MM + p.w.max(p.h) / 2.0;
+                (p.px - m, p.py - m, p.px + m, p.py + m)
+            })
+            .collect();
+        facts.insert(
+            refdes.to_string(),
+            PartFacts {
+                extent: (keepout.2 - keepout.0, keepout.3 - keepout.1),
+                body_extent: body_span(courtyard, part_extent(&pads, 0.0)),
+                origin_offset: ((keepout.0 + keepout.2) / 2.0, (keepout.1 + keepout.3) / 2.0),
+                side: part.side.unwrap_or(Side::Front),
+                height_mm: part_height_mm(lib_part),
+                standoff_mm: subboard_standoff(lib_part),
+                tht_pads,
+            },
+        );
+    }
+    Ok(facts)
+}
+
+/// The **minimum Eurorack HP** that fits a circuit — the "PCB drives the panel"
+/// primitive (DESIGN 6.1). Auto-arranges the panel controls (via
+/// [`crate::panel::derive_panel`]), then, for each candidate width smallest-first,
+/// runs [`EurorackPlacer`] and takes the first HP where no part is pushed into the
+/// off-board overflow lane. Height is fixed (3U), so this optimizes width only.
+pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts>) -> u16 {
+    use crate::panel::PanelSpec;
+    const MAX_HP: u16 = 42;
+    for hp in 2u16..=MAX_HP {
+        let dims = crate::panel::EurorackPanel::new(hp);
+        let (w, h) = (dims.width_mm(), dims.height_mm());
+        // Auto-arranged controls become the anchors (cutout y is bottom-up).
+        let panel = crate::panel::derive_panel(circuit, hp, &crate::panel::BuiltinCutouts);
+        let anchors: HashMap<String, (f64, f64)> = panel
+            .cutouts
+            .iter()
+            .filter_map(|c| c.refdes.clone().map(|r| (r, (c.x_mm, h - c.y_mm))))
+            .collect();
+        // Measure with the SAME placer the build uses (SeededPlacer): it packs
+        // back-side SMD *under* front-side THT controls, so the min HP reflects
+        // the real, tight layout — not the looser side-unaware EurorackPlacer.
+        let placer = SeededPlacer {
+            width_mm: w,
+            height_mm: h,
+            origin_mm: (0.0, 0.0),
+            anchors,
+            nudges: HashMap::new(),
+        };
+        let placements = placer.place(circuit, facts);
+        // A part in the overflow lane sits below the board bottom (y > height).
+        let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
+        if !overflowed {
+            return hp;
+        }
+    }
+    MAX_HP
+}
+
 /// Generate a `.kicad_pcb` for a circuit: footprints assigned + placed + net-wired,
 /// then routed into copper tracks (unless `options.router` is `None`). Downstream
 /// (gerbers, CPL, DXF, DRC) is `kicad-cli` on the result.
@@ -880,10 +1272,8 @@ pub fn generate_board_artifacts(
         // both relative to the footprint origin. The union (not a max of sizes)
         // preserves *where* the keep-out sits — a DIP's courtyard is offset from
         // its pin-1 origin, and that offset must survive into placement.
-        let keepout = match (
-            part_extent(&pads, COURTYARD_MARGIN_MM),
-            courtyard_extent(&fp),
-        ) {
+        let courtyard = courtyard_extent(&fp);
+        let keepout = match (part_extent(&pads, COURTYARD_MARGIN_MM), courtyard) {
             (Some(p), Some(c)) => (p.0.min(c.0), p.1.min(c.1), p.2.max(c.2), p.3.max(c.3)),
             (Some(b), None) | (None, Some(b)) => b,
             (None, None) => (0.0, 0.0, 0.0, 0.0),
@@ -902,6 +1292,7 @@ pub fn generate_board_artifacts(
             refdes.to_string(),
             PartFacts {
                 extent: (keepout.2 - keepout.0, keepout.3 - keepout.1),
+                body_extent: body_span(courtyard, part_extent(&pads, 0.0)),
                 origin_offset: ((keepout.0 + keepout.2) / 2.0, (keepout.1 + keepout.3) / 2.0),
                 side: part.side.unwrap_or(Side::Front),
                 height_mm: part_height_mm(lib_part),
@@ -1934,6 +2325,109 @@ mod tests {
         }
     }
 
+    fn a_fact(extent: (f64, f64), origin_offset: (f64, f64), tht: Vec<Rect>) -> PartFacts {
+        PartFacts {
+            extent,
+            body_extent: extent,
+            origin_offset,
+            side: Side::Front,
+            height_mm: 5.0,
+            standoff_mm: None,
+            tht_pads: tht,
+        }
+    }
+
+    #[test]
+    fn rotate_offset_quarter_turns() {
+        assert_eq!(rotate_offset((3.0, 1.0), 0.0), (3.0, 1.0));
+        assert_eq!(rotate_offset((3.0, 1.0), 90.0), (-1.0, 3.0));
+        assert_eq!(rotate_offset((3.0, 1.0), 180.0), (-3.0, -1.0));
+        assert_eq!(rotate_offset((3.0, 1.0), 270.0), (1.0, -3.0));
+    }
+
+    #[test]
+    fn control_rotation_stands_up_a_horizontal_pin_row() {
+        // Pins in a horizontal row (like a badly-oriented pot) → stand it up.
+        let wide = a_fact((10.0, 10.0), (0.0, 0.0), vec![(-3.0, -0.5, 3.0, 0.5)]);
+        assert_eq!(control_rotation(&wide), 90.0);
+        // Pins in a vertical column (the Alpha pot's real layout) → leave it.
+        let tall = a_fact((10.0, 10.0), (0.0, 0.0), vec![(-0.5, -3.0, 0.5, 3.0)]);
+        assert_eq!(control_rotation(&tall), 0.0);
+        // No through-hole pads → fall back to the courtyard extent.
+        let smd = a_fact((4.0, 1.0), (0.0, 0.0), vec![]);
+        assert_eq!(control_rotation(&smd), 90.0);
+    }
+
+    #[test]
+    fn decoupling_bonus_pairs_bypass_caps_to_their_ic() {
+        use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+        let part = |r: &str, fp: &str| Part {
+            refdes: RefDes(r.into()),
+            value: String::new(),
+            footprint: Some(fp.into()),
+            library_part: None,
+            mpn: None,
+            sim: None,
+            side: None,
+        };
+        let node = |r: &str, p: &str| PinRef {
+            refdes: RefDes(r.into()),
+            pin: p.into(),
+        };
+        let net = |name: &str, pins: Vec<PinRef>| Net {
+            name: name.into(),
+            pins,
+            net_class: None,
+        };
+        let c = Circuit {
+            name: "t".into(),
+            parts: vec![
+                part("U1", "Package_SO:SOIC-8"),
+                part("C2", "Capacitor_SMD:C_0603_1608Metric"), // decoupling +12V↔GND
+                part("C1", "Capacitor_SMD:C_0603_1608Metric"), // signal SIG↔GND
+            ],
+            nets: vec![
+                net("+12V", vec![node("U1", "8"), node("C2", "1")]),
+                net(
+                    "GND",
+                    vec![node("U1", "4"), node("C2", "2"), node("C1", "2")],
+                ),
+                net("SIG", vec![node("U1", "1"), node("C1", "1")]),
+            ],
+        };
+        let bonus = decoupling_bonus(&c);
+        // C2 bridges +12V↔GND → bonded to U1; C1 is a signal cap → no bond.
+        assert!(bonus.iter().any(|(cap, ic, _)| cap == "C2" && ic == "U1"));
+        assert!(!bonus.iter().any(|(cap, _, _)| cap == "C1"));
+    }
+
+    #[test]
+    fn power_header_is_identified_and_only_when_free() {
+        use crate::model::{Circuit, Part, RefDes};
+        let part = |refdes: &str, fp: &str| Part {
+            refdes: RefDes(refdes.into()),
+            value: String::new(),
+            footprint: Some(fp.into()),
+            library_part: None,
+            mpn: None,
+            sim: None,
+            side: None,
+        };
+        let c = Circuit {
+            name: "t".into(),
+            parts: vec![
+                part("J3", "Connector_PinHeader_2.54mm:PinHeader_2x05"),
+                part("J1", "Connector_Audio:Jack_3.5mm"),
+            ],
+            nets: vec![],
+        };
+        let none = HashMap::new();
+        assert_eq!(power_header_refdes(&c, &none), vec!["J3".to_string()]);
+        // An anchored header is not a free power header.
+        let anchored: HashMap<String, (f64, f64)> = [("J3".to_string(), (0.0, 0.0))].into();
+        assert!(power_header_refdes(&c, &anchored).is_empty());
+    }
+
     fn facts(entries: &[(&str, (f64, f64), Side)]) -> HashMap<String, PartFacts> {
         entries
             .iter()
@@ -1942,6 +2436,7 @@ mod tests {
                     r.to_string(),
                     PartFacts {
                         extent: *extent,
+                        body_extent: *extent,
                         origin_offset: (0.0, 0.0),
                         side: *side,
                         height_mm: 2.0,
@@ -2197,6 +2692,7 @@ mod tests {
         };
         let mk = |w: f64, h: f64, height: f64, standoff: Option<f64>| PartFacts {
             extent: (w, h),
+            body_extent: (w, h),
             origin_offset: (0.0, 0.0),
             side: Side::Front,
             height_mm: height,

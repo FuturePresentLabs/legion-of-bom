@@ -13,16 +13,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_guide, default_image_cache_dir, default_panel_orders_dir,
+    analytic_check, build_facts, build_guide, default_image_cache_dir, default_panel_orders_dir,
     default_parts_dir, derive_panel, embed_source, export_cpl, export_gerbers, fetch_data_uri,
     fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts, generate_board_report,
-    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, product_image_url, render_board_png,
-    run_drc, run_layout_loop, simulate_ac, simulate_tran, validate_erc, zip_dir, BoardOptions,
-    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding,
-    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
-    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus,
-    SeededPlacer, Severity, SimConfig, SkidlRunner, StageOutcome, TranAnalysis,
+    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, minimum_hp,
+    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, product_image_url,
+    render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_mpns,
+    validate_erc, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine,
+    BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, JlcpcbClient, KitType,
+    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelOrders, PartRecord,
+    PartResolution, PartsLibrary, PipelineReport, ProjectView, ResolutionStatus, SeededPlacer,
+    Severity, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -55,6 +56,13 @@ enum Command {
     /// Show each circuit's build state — which artifacts exist and whether they
     /// are stale relative to the source + manifest. No network.
     Status,
+    /// Serve the local web dashboard (localhost, no auth) for this repo — the
+    /// read-only Forestry-style viewer over the same core.
+    Serve {
+        /// Address to bind (host:port).
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+    },
     /// Check that the external toolchain (ngspice, kicad-cli, SKiDL) is available.
     Doctor,
     /// Inspect and edit the global, Dolt-backed parts library.
@@ -204,6 +212,19 @@ enum PartsCmd {
     Resolve {
         circuit: PathBuf,
     },
+    /// Suggest real MPNs for a circuit's *generic* parts (no MPN yet), using
+    /// Mouser keyword search + the LCSC/EasyEDA catalog. SUGGEST-ONLY — it prints
+    /// ranked candidates for a human to confirm (`lob parts fetch` + `verify`);
+    /// it never assigns or orders. Degrades gracefully when a distributor key is
+    /// absent (LCSC is keyless; Mouser needs MOUSER_API_KEY).
+    Suggest {
+        /// Path to the circuit definition (e.g. a SKiDL script), or a circuit name
+        /// from lob.toml.
+        circuit: PathBuf,
+        /// Max candidates to show per part.
+        #[arg(long, default_value_t = 3)]
+        limit: usize,
+    },
     /// Verification gate: fail if any MPN-bearing part isn't human-verified.
     ///
     /// This is the check `layout` / real BOM ordering enforce (okm.4) — the
@@ -240,12 +261,19 @@ enum PanelCmd {
     Derive {
         /// Path to the circuit definition (e.g. a SKiDL script).
         circuit: PathBuf,
-        /// Panel width in HP.
-        #[arg(long, default_value_t = 8)]
-        hp: u16,
+        /// Panel width in HP. Omit to size to the minimum HP the PCB fits in —
+        /// the PCB drives the panel (DESIGN 6.1), which is the default.
+        #[arg(long)]
+        hp: Option<u16>,
         /// Output TOML path (default: <circuit>_panel.toml next to the circuit).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Compute the minimum Eurorack HP that fits a circuit — the PCB drives the
+    /// panel width (DESIGN 6.1).
+    Fit {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
     },
     /// Show the current order status for a module.
     Status {
@@ -266,8 +294,8 @@ enum PanelCmd {
 }
 
 fn main() -> ExitCode {
-    // Load .env (API keys) before anything reads the environment.
-    let _ = dotenvy::dotenv();
+    // Load API keys before anything reads the environment.
+    load_credentials();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
@@ -276,6 +304,7 @@ fn main() -> ExitCode {
         Command::Circuits => circuits_cmd(),
         Command::Build { circuit } => build_cmd(circuit),
         Command::Status => status_cmd(),
+        Command::Serve { bind } => serve_cmd(bind),
         Command::Doctor => doctor::run(),
         Command::Parts { action } => parts_cmd(action),
         Command::Bom {
@@ -469,6 +498,106 @@ fn panel_geometry(spec_path: &std::path::Path) -> Result<PanelGeometry> {
 
 /// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
 /// Build board options, using panel-anchored Eurorack placement when a panel
+/// The panel spec to build against: the one explicitly given (a `--panel` flag or
+/// the manifest's `panel` field), otherwise a panel **auto-derived from the
+/// circuit at the minimum HP the PCB fits in** (DESIGN 6.1 — the PCB drives the
+/// panel). The derived spec is written into the work dir as `<stem>_auto_panel.toml`
+/// so downstream reads it like any other. `None` only when the circuit has no
+/// panel-facing controls (a plain board).
+fn effective_panel(
+    explicit: Option<PathBuf>,
+    model: &legion_of_bom_core::Circuit,
+    footprint_dir: &Path,
+    work_dir: &Path,
+    stem: &str,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        // A declared panel is authoritative — EXCEPT when it's stale (missing
+        // controls the circuit now has). The board can't mate a jack/pot with no
+        // cutout, so a stale spec silently produces the wrong board ("panel doesn't
+        // match the board / no holes for the pots / 8 HP keeps coming back"). Rather
+        // than faithfully rebuild a wrong panel, self-heal it: regenerate in place
+        // from the circuit at minimum HP, keeping the builder's finish/thickness.
+        refresh_declared_panel_if_stale(&path, model, footprint_dir)?;
+        return Ok(Some(path));
+    }
+    let facts = build_facts(model, footprint_dir)?;
+    let hp = minimum_hp(model, &facts);
+    let panel = derive_panel(model, hp, &BuiltinCutouts);
+    if panel.cutouts.is_empty() {
+        return Ok(None); // no controls — build a plain board, no panel
+    }
+    std::fs::create_dir_all(work_dir)?;
+    let path = work_dir.join(format!("{stem}_auto_panel.toml"));
+    let toml = panel
+        .to_toml()
+        .map_err(|e| anyhow::anyhow!("serialising panel: {e}"))?;
+    std::fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "  auto panel: {hp} HP, {} control(s) → {}",
+        panel.cutouts.len(),
+        path.display()
+    );
+    Ok(Some(path))
+}
+
+/// Self-heal a declared panel that has gone stale — missing controls the circuit
+/// now has (compared by refdes: what `derive_panel` would place vs what the spec
+/// declares). When stale, regenerate the spec in place from the circuit at minimum
+/// HP, preserving the builder-owned finish/thickness. A fresh panel is left
+/// untouched. Best-effort: an unreadable/unparseable spec is left alone.
+fn refresh_declared_panel_if_stale(
+    path: &Path,
+    model: &legion_of_bom_core::Circuit,
+    footprint_dir: &Path,
+) -> Result<()> {
+    let Some(declared) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| PanelFile::from_toml(&t).ok())
+    else {
+        return Ok(());
+    };
+    let facts = build_facts(model, footprint_dir)?;
+    let min_hp = minimum_hp(model, &facts);
+    let expected = derive_panel(model, declared.hp.unwrap_or(min_hp), &BuiltinCutouts);
+    let have: std::collections::HashSet<&str> = declared
+        .cutouts
+        .iter()
+        .filter_map(|c| c.refdes.as_deref())
+        .collect();
+    let missing: Vec<&str> = expected
+        .cutouts
+        .iter()
+        .filter_map(|c| c.refdes.as_deref())
+        .filter(|r| !have.contains(r))
+        .collect();
+    // Stale two ways: missing a control the circuit now has (no cutout to mate), or
+    // declared narrower than the PCB actually fits in (parts won't lay out → DRC).
+    let too_small = declared.hp.is_some_and(|h| h < min_hp);
+    if missing.is_empty() && !too_small {
+        return Ok(()); // fresh — the declared panel is authoritative, use as-is
+    }
+    // Rebuild it from the circuit at the minimum HP the PCB fits in.
+    let mut fresh = derive_panel(model, min_hp, &BuiltinCutouts);
+    fresh.finish = declared.finish;
+    fresh.thickness_mm = declared.thickness_mm;
+    let toml = fresh
+        .to_toml()
+        .map_err(|e| anyhow::anyhow!("serialising regenerated panel: {e}"))?;
+    std::fs::write(path, &toml).with_context(|| format!("writing {}", path.display()))?;
+    let reason = if !missing.is_empty() {
+        format!("missing {}", missing.join(", "))
+    } else {
+        format!("{} HP too small for the PCB", declared.hp.unwrap_or(0))
+    };
+    println!(
+        "  ⚠ declared panel {} was stale ({reason}) → regenerated: {min_hp} HP, {} control(s)",
+        path.display(),
+        fresh.cutouts.len()
+    );
+    Ok(())
+}
+
 /// spec is given: jacks/pots are anchored to the panel's cutouts and the board
 /// outline becomes the panel size (vertical 3U). Otherwise the default grid
 /// placement. The placer here is the one-shot [`EurorackPlacer`]; the iterative
@@ -561,6 +690,8 @@ fn board_cmd(
 
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    // Default: the PCB drives the panel — auto-derive one at minimum HP.
+    let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let mut options = board_options_with_panel(footprint_dir, &panel)?;
     options.title = Some(pretty_title(stem));
     options.logo = load_logo(&logo)?;
@@ -697,6 +828,8 @@ fn fab_cmd(
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    // Default: the PCB drives the panel — auto-derive one at minimum HP.
+    let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let mut options = board_options_with_panel(footprint_dir, &panel)?;
     options.title = Some(pretty_title(stem));
     options.logo = load_logo(&logo)?;
@@ -851,27 +984,27 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
 /// Handle `lob circuits` — list the circuits declared in the nearest `lob.toml`.
 fn circuits_cmd() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let (root, manifest) = Manifest::discover(&cwd)
+    let view = ProjectView::discover(&cwd)
         .with_context(|| "no lob.toml found (run inside a circuits repo)")?;
-    let repo = manifest.repo.name.as_deref().unwrap_or("(unnamed)");
-    let brand = manifest
+    let repo = view.repo.name.as_deref().unwrap_or("(unnamed)");
+    let brand = view
         .repo
         .brand
         .as_deref()
         .map(|b| format!(" · {b}"))
         .unwrap_or_default();
-    println!("{repo}{brand}  [{}]", root.display());
-    if manifest.circuits.is_empty() {
+    println!("{repo}{brand}  [{}]", view.root.display());
+    if view.circuits.is_empty() {
         println!("  (no circuits declared)");
     }
-    for c in &manifest.circuits {
-        let kit = c.effective_kit(&manifest.defaults).unwrap_or("auto");
+    for c in &view.circuits {
+        let kit = c.kit.as_deref().unwrap_or("auto");
         let panel = c
             .panel
             .as_deref()
             .map(|p| format!(" · panel {p}"))
             .unwrap_or_default();
-        let copy = if c.build.is_some() {
+        let copy = if c.has_build_copy {
             " · build-copy"
         } else {
             ""
@@ -943,51 +1076,51 @@ fn build_cmd(name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Modification time of `path`, or `None` if it doesn't exist / isn't statable.
-fn mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
 /// Handle `lob status` — per-circuit build freshness, no network. An artifact is
 /// "stale" when the source (or panel, or the manifest) changed after it was
-/// written; "—" when it was never built.
+/// written; "—" when it was never built. Reads the shared [`ProjectView`] model
+/// so the dashboard reports identical state (DESIGN 2.2).
 fn status_cmd() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let (root, manifest) = Manifest::discover(&cwd)
+    let view = ProjectView::discover(&cwd)
         .with_context(|| "no lob.toml found (run inside a circuits repo)")?;
     println!(
         "{}  [{}]",
-        manifest.repo.name.as_deref().unwrap_or("(unnamed)"),
-        root.display()
+        view.repo.name.as_deref().unwrap_or("(unnamed)"),
+        view.root.display()
     );
-    let manifest_mtime = mtime(&root.join("lob.toml"));
 
-    for c in &manifest.circuits {
-        // Newest input: the source, its panel, and the manifest itself.
-        let mut input = mtime(&c.source_path(&root)).max(manifest_mtime);
-        if let Some(panel) = c.panel_path(&root) {
-            input = input.max(mtime(&panel));
-        }
-        let out = root.join("out").join(&c.name);
-        let artifacts = [
-            ("guide", out.join(format!("{}-guide.html", c.name))),
-            ("vbom", out.join(format!("{}-vbom.html", c.name))),
-            (
-                "fab",
-                out.join("fab").join(format!("{}-gerbers.zip", c.name)),
-            ),
-        ];
-        let cols: Vec<String> = artifacts
+    // The three artifacts `lob status` has always reported, in column order.
+    let columns = [ArtifactKind::Guide, ArtifactKind::Vbom, ArtifactKind::Fab];
+    for c in &view.circuits {
+        let cols: Vec<String> = columns
             .iter()
-            .map(|(label, path)| match mtime(path) {
-                None => format!("{label} —"),
-                Some(m) if input.is_none() || m >= input.unwrap() => format!("{label} ✓"),
-                Some(_) => format!("{label} stale"),
+            .map(|&kind| {
+                let mark = match c.artifact(kind).map(|a| a.status) {
+                    Some(ArtifactStatus::Fresh) => "✓",
+                    Some(ArtifactStatus::Stale) => "stale",
+                    _ => "—",
+                };
+                format!("{} {mark}", kind.label())
             })
             .collect();
         println!("  {:<18} {}", c.name, cols.join("   "));
     }
     Ok(())
+}
+
+/// Handle `lob serve [--bind]` — start the localhost dashboard backend over the
+/// nearest circuits repo. The third head (DESIGN 2.2), no auth (DESIGN 2.5).
+fn serve_cmd(bind: String) -> Result<()> {
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .with_context(|| format!("invalid --bind address '{bind}' (expected host:port)"))?;
+    let cwd = std::env::current_dir()?;
+    let root = Manifest::find_repo_root(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("no lob.toml found (run inside a circuits repo)"))?;
+    println!("serving {} at http://{addr}", root.display());
+    println!("  (Ctrl-C to stop)");
+    legion_of_bom_web::serve_blocking(root, addr)
 }
 
 /// Handle `lob guide <circuit> [--out]` — generate a board and render a
@@ -1028,6 +1161,8 @@ fn guide_cmd(
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    // Default: the PCB drives the panel — auto-derive one at minimum HP.
+    let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let options = board_options_with_panel(footprint_dir, &panel)?;
     let (board, _) = generate_board_report(&model, &options)?;
 
@@ -1289,6 +1424,11 @@ fn has_letter_run(s: &str, n: usize) -> bool {
 
 /// Handle `lob parts …` against the global parts library.
 fn parts_cmd(action: PartsCmd) -> Result<()> {
+    // `suggest` is about parts NOT yet in the library (generic, no MPN), so it
+    // doesn't need Dolt — handle it before opening the library.
+    if let PartsCmd::Suggest { circuit, limit } = action {
+        return suggest_cmd(circuit, limit);
+    }
     let lib = PartsLibrary::open(default_parts_dir())
         .with_context(|| "opening the parts library (is `dolt` installed?)")?;
     match action {
@@ -1355,6 +1495,8 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         PartsCmd::Resolve { circuit } => {
             print_resolutions(&resolve_circuit_file(&lib, circuit)?);
         }
+        // Handled before the library is opened (it needs no Dolt).
+        PartsCmd::Suggest { .. } => unreachable!("suggest is dispatched before lib open"),
         PartsCmd::Gate { circuit } => {
             let resolutions = resolve_circuit_file(&lib, circuit)?;
             let blockers: Vec<_> = resolutions
@@ -1495,14 +1637,35 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 .run(&circuit)
                 .with_context(|| "SKiDL failed (try `lob doctor`)")?;
             let model = parse_netlist_file(&run.netlist_path)?;
+            // Default: let the PCB drive the width (minimum HP it fits in).
+            let hp = match hp {
+                Some(h) => h,
+                None => {
+                    let footprint_dir = kicad_footprint_dir()
+                        .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+                    let facts = build_facts(&model, &footprint_dir)?;
+                    let min = minimum_hp(&model, &facts);
+                    println!("auto width: minimum {min} HP");
+                    min
+                }
+            };
             // Cutout dims resolve through the CutoutSource seam; BuiltinCutouts is
             // the fallback until the parts library carries verified mechanical data.
-            let panel = derive_panel(&model, hp, &BuiltinCutouts);
+            let mut panel = derive_panel(&model, hp, &BuiltinCutouts);
+            let out_path =
+                out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_panel.toml")));
+            // Re-deriving must not wipe the builder-owned finish / thickness they set
+            // on the existing spec (cutout topology is what we're regenerating).
+            if let Some(prev) = std::fs::read_to_string(&out_path)
+                .ok()
+                .and_then(|t| PanelFile::from_toml(&t).ok())
+            {
+                panel.finish = prev.finish;
+                panel.thickness_mm = prev.thickness_mm;
+            }
             let toml = panel
                 .to_toml()
                 .map_err(|e| anyhow::anyhow!("serialising panel: {e}"))?;
-            let out_path =
-                out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_panel.toml")));
             std::fs::write(&out_path, &toml)
                 .with_context(|| format!("writing {}", out_path.display()))?;
             println!(
@@ -1521,6 +1684,31 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                     c.label.as_deref().unwrap_or("")
                 );
             }
+        }
+        PanelCmd::Fit { circuit } => {
+            let circuit = circuit
+                .canonicalize()
+                .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+            let stem = circuit
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("circuit");
+            let work_dir = PathBuf::from("out").join(stem);
+            let run = SkidlRunner::discover(&work_dir)
+                .run(&circuit)
+                .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+            let model = parse_netlist_file(&run.netlist_path)?;
+            let footprint_dir = kicad_footprint_dir()
+                .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+            let facts = build_facts(&model, &footprint_dir)?;
+            let hp = minimum_hp(&model, &facts);
+            let mm = f64::from(hp) * 5.08;
+            println!("minimum panel width: {hp} HP ({mm:.1} mm) for {stem}");
+            println!(
+                "  {} panel-facing control(s), {} part(s) total",
+                derive_panel(&model, hp, &BuiltinCutouts).cutouts.len(),
+                model.parts().len()
+            );
         }
         PanelCmd::Status { module } => {
             let store = PanelOrders::open(default_panel_orders_dir())
@@ -1577,6 +1765,139 @@ fn resolve_circuit_file(
         .with_context(|| "SKiDL failed (try `lob doctor`)")?;
     let model = parse_netlist_file(&run.netlist_path)?;
     Ok(lib.resolve_circuit(&model)?)
+}
+
+/// Handle `lob parts suggest <circuit> [--limit N]` — run SKiDL → netlist → model,
+/// then for each part with NO MPN, print ranked real-MPN candidates from the
+/// distributors we have access to. SUGGEST-ONLY: prints only; a human confirms one
+/// via `lob parts fetch`/`verify` (the okm gate stays intact). Degrades gracefully
+/// when a distributor key is absent.
+fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
+    let resolved = resolve_circuit(&circuit)?;
+    let stem = resolved.name.clone();
+    let circuit = resolved
+        .source
+        .canonicalize()
+        .with_context(|| "circuit not found")?;
+    let work_dir = PathBuf::from("out").join(&stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+
+    let clients = SourcingClients::from_env();
+    // Tell the user what's active — never panic on a missing key.
+    let mut sources = Vec::new();
+    if clients.mouser.is_some() {
+        sources.push("Mouser");
+    } else {
+        eprintln!("  note: set MOUSER_API_KEY to enable Mouser keyword search");
+    }
+    if clients.use_lcsc {
+        sources.push("LCSC/EasyEDA (keyless)");
+    }
+    if !clients.any() {
+        anyhow::bail!("no distributor sources available (set MOUSER_API_KEY, or enable LCSC)");
+    }
+    println!("suggesting MPNs via: {}\n", sources.join(" + "));
+
+    // Only parts with no MPN need a suggestion; group by (value, footprint) so we
+    // search each distinct generic part once, not per reference designator.
+    use std::collections::BTreeMap;
+    let mut generics: BTreeMap<(String, Option<String>), (legion_of_bom_core::Part, Vec<String>)> =
+        BTreeMap::new();
+    let mut resolved_count = 0usize;
+    for part in model.parts() {
+        if part.mpn.is_some() {
+            resolved_count += 1;
+            continue;
+        }
+        let key = (part.value.clone(), part.footprint.clone());
+        generics
+            .entry(key)
+            .or_insert_with(|| (part.clone(), Vec::new()))
+            .1
+            .push(part.refdes.0.clone());
+    }
+
+    if generics.is_empty() {
+        println!(
+            "every part already declares an MPN ({resolved_count} part(s)) — nothing to suggest"
+        );
+        return Ok(());
+    }
+
+    for ((value, footprint), (part, mut refdes)) in generics {
+        refdes.sort();
+        let fp = footprint.as_deref().unwrap_or("(no footprint)");
+        println!("● {}  {value}  [{fp}]", refdes.join(", "));
+        let query = legion_of_bom_core::build_query(&part);
+        if let Some(q) = &query {
+            println!("    query: \"{q}\"");
+        }
+        let candidates = suggest_mpns(&part, &clients, limit);
+        if candidates.is_empty() {
+            println!("    (no candidates — try a more specific value/footprint, or add by hand)");
+        }
+        for (i, c) in candidates.iter().enumerate() {
+            let mfr = c.manufacturer.as_deref().unwrap_or("?");
+            let stock = c
+                .in_stock
+                .map(|s| format!("{s} in stock"))
+                .unwrap_or_else(|| "stock ?".into());
+            let price = c
+                .unit_price
+                .map(|p| format!("${p:.4}"))
+                .unwrap_or_else(|| "$ ?".into());
+            let pkg = c
+                .package
+                .as_deref()
+                .map(|p| format!(" · {p}"))
+                .unwrap_or_default();
+            let lcsc = c
+                .lcsc_code
+                .as_deref()
+                .map(|l| format!(" · {l}"))
+                .unwrap_or_default();
+            println!(
+                "    {}. {:<22} {mfr:<16} {stock:<16} {price:<9}{pkg}{lcsc}  [{}]",
+                i + 1,
+                c.mpn,
+                c.source,
+            );
+            if let Some(ds) = &c.datasheet_url {
+                println!("       datasheet: {ds}");
+            }
+        }
+        // The confirm path — never silent-assign (okm gate).
+        if let Some(top) = candidates.first() {
+            let fetch_hint = match top.lcsc_code.as_deref() {
+                Some(code) => format!("lob parts fetch {code} --source jlcpcb"),
+                None => format!("lob parts add {} --manufacturer '{}'", top.mpn, {
+                    top.manufacturer.as_deref().unwrap_or("")
+                }),
+            };
+            println!(
+                "    → confirm: {fetch_hint}  then  lob parts verify {}",
+                top.mpn
+            );
+        }
+        println!();
+    }
+
+    println!(
+        "{} generic part group(s) need an MPN; {resolved_count} part(s) already resolved.\n\
+         Suggestions are NOT auto-assigned — confirm one, then `lob parts verify` (okm gate).",
+        // recompute count of groups printed
+        model
+            .parts()
+            .iter()
+            .filter(|p| p.mpn.is_none())
+            .map(|p| (p.value.clone(), p.footprint.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+    Ok(())
 }
 
 /// Merge a freshly-fetched part into any existing record: overlay non-empty
@@ -1734,4 +2055,23 @@ fn init_tracing(verbose: u8) {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+/// Load API credentials into the process environment before anything reads it.
+///
+/// Precedence, highest first: variables already set in the real environment,
+/// then a repo-local `.env` (a dev convenience, searched from the cwd upward),
+/// then the user-global `~/.lob/credentials`. `dotenvy` never overrides an
+/// already-set variable, so loading local before global gives local precedence
+/// while the global file supplies the keys from *any* working directory — so
+/// `lob bom --price` and `lob serve` find `MOUSER_API_KEY` when run from inside
+/// a circuits repo, not only from this checkout.
+fn load_credentials() {
+    // Repo-local .env (dev override).
+    let _ = dotenvy::dotenv();
+    // User-global credentials — the durable home for API keys.
+    if let Some(home) = std::env::var_os("HOME") {
+        let global = Path::new(&home).join(".lob").join("credentials");
+        let _ = dotenvy::from_path(&global);
+    }
 }

@@ -170,18 +170,21 @@ impl CutoutSource for BuiltinCutouts {
 /// House silkscreen-layout rules (DESIGN §7.9 — designed once, applied
 /// consistently, not invented per-panel). Millimetres.
 mod silk {
-    /// Title text height and its distance below the top edge.
-    pub const TITLE_FONT_MM: f64 = 2.0;
-    pub const TITLE_TOP_MARGIN_MM: f64 = 7.0;
+    /// Title text height and its distance below the top edge. Sized like a real
+    /// Eurorack faceplate — the module name reads across the room, not a 2 mm
+    /// whisper.
+    pub const TITLE_FONT_MM: f64 = 3.6;
+    pub const TITLE_TOP_MARGIN_MM: f64 = 8.0;
     /// Control-label text height and its offset above the cutout centre (clears a
     /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
-    pub const LABEL_FONT_MM: f64 = 1.8;
+    pub const LABEL_FONT_MM: f64 = 2.4;
     pub const LABEL_OFFSET_MM: f64 = 6.5;
     /// Brand logo: fraction of panel width, the minimum width worth drawing, and
     /// the clearances keeping it off the lowest cutout and the bottom edge/holes.
-    pub const LOGO_WIDTH_FRAC: f64 = 0.4;
+    /// The logo is the maker's mark — give it real presence in the bottom band.
+    pub const LOGO_WIDTH_FRAC: f64 = 0.66;
     pub const LOGO_MIN_WIDTH_MM: f64 = 4.0;
-    pub const LOGO_CUTOUT_GAP_MM: f64 = 2.0;
+    pub const LOGO_CUTOUT_GAP_MM: f64 = 2.5;
     pub const BOTTOM_MARGIN_MM: f64 = 6.0;
 }
 
@@ -376,6 +379,11 @@ pub struct PanelFile {
     pub hp: Option<u16>,
     #[serde(default = "default_thickness")]
     pub thickness_mm: f64,
+    /// Panel finish — a named material (`black`/`silver`/`white`/`green`) or a
+    /// `#rrggbb` face color. Drives the 2D panel render's color (DESIGN §7.9).
+    /// Absent → black.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
     #[serde(default)]
     pub cutouts: Vec<CutoutFile>,
 }
@@ -433,6 +441,111 @@ impl PanelFile {
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    /// The resolved visual finish (defaults to black).
+    pub fn resolved_finish(&self) -> PanelFinish {
+        self.finish
+            .as_deref()
+            .map(PanelFinish::named)
+            .unwrap_or_default()
+    }
+}
+
+/// The named finishes the panel editor offers as swatches; each resolves via
+/// [`PanelFinish::named`]. A `#rrggbb` custom color is also accepted.
+pub const NAMED_FINISHES: &[&str] = &["black", "silver", "white", "green", "blue", "red"];
+
+/// A panel's visual finish: the face color plus the color of its engraved /
+/// printed legends (labels, title, logo). A panel is a flat front face in a real
+/// material — not a green PCB — so it renders in this color (DESIGN §7.9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelFinish {
+    /// A human name for the finish (for UIs).
+    pub name: String,
+    /// Panel face color (CSS hex).
+    pub face: String,
+    /// Legend / logo color (CSS hex).
+    pub legend: String,
+}
+
+impl PanelFinish {
+    /// Whether `spec` is a *recognized* finish token — a known material name or a
+    /// valid `#rgb`/`#rrggbb` color. Unknown names render as black; the editor
+    /// rejects them via this check so a typo isn't silently swallowed.
+    pub fn is_recognized(spec: &str) -> bool {
+        let s = spec.trim().to_ascii_lowercase();
+        normalize_hex(spec.trim()).is_some()
+            || NAMED_FINISHES.contains(&s.as_str())
+            || matches!(s.as_str(), "aluminum" | "aluminium" | "raw" | "pcb")
+    }
+
+    /// Resolve a finish from a named material (`black`/`silver`/`white`/`green`/
+    /// `blue`/`red`) or a `#rgb`/`#rrggbb` face color (legend auto-picked for
+    /// contrast). Anything unknown falls back to black.
+    pub fn named(spec: &str) -> PanelFinish {
+        let s = spec.trim();
+        if let Some(face) = normalize_hex(s) {
+            let legend = if relative_luminance(&face) > 0.5 {
+                "#1b1c1e"
+            } else {
+                "#f2f2ef"
+            };
+            return PanelFinish {
+                name: spec.to_string(),
+                face,
+                legend: legend.to_string(),
+            };
+        }
+        let (face, legend) = match s.to_ascii_lowercase().as_str() {
+            "silver" | "aluminum" | "aluminium" | "raw" => ("#c9ccce", "#1b1c1e"),
+            "white" => ("#f4f4f0", "#1b1c1e"),
+            "green" | "pcb" => ("#0f5c3f", "#f2f2ef"),
+            "blue" => ("#1c3f8f", "#f2f2ef"),
+            "red" => ("#8f1c22", "#f2f2ef"),
+            _ => ("#1c1d1f", "#f2f2ef"), // black — the default
+        };
+        PanelFinish {
+            name: s.to_ascii_lowercase(),
+            face: face.to_string(),
+            legend: legend.to_string(),
+        }
+    }
+}
+
+impl Default for PanelFinish {
+    fn default() -> Self {
+        PanelFinish::named("black")
+    }
+}
+
+/// Normalize `#rgb` / `#rrggbb` to lowercase `#rrggbb`; `None` if not a hex color.
+fn normalize_hex(s: &str) -> Option<String> {
+    let h = s.strip_prefix('#')?;
+    if !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match h.len() {
+        6 => Some(format!("#{}", h.to_ascii_lowercase())),
+        3 => {
+            let mut out = String::from("#");
+            for c in h.chars() {
+                out.push(c.to_ascii_lowercase());
+                out.push(c.to_ascii_lowercase());
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Rough relative luminance (0..1) of a `#rrggbb` color, for legend contrast.
+fn relative_luminance(hex: &str) -> f64 {
+    let h = hex.trim_start_matches('#');
+    if h.len() != 6 {
+        return 0.0;
+    }
+    let ch = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0) as f64 / 255.0;
+    0.2126 * ch(0) + 0.7152 * ch(2) + 0.0722 * ch(4)
 }
 
 /// House rules for the derived layout (DESIGN §7.9), designed once. The pitches
@@ -520,6 +633,7 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
         format: "eurorack".into(),
         hp: Some(hp),
         thickness_mm: derive_rules::THICKNESS_MM,
+        finish: None,
         cutouts: out,
     }
 }
@@ -683,6 +797,174 @@ pub fn panel_to_dxf(panel: &dyn PanelSpec) -> String {
 ///
 /// Panel coordinates are measured from the bottom-left; KiCad's are top-down, so
 /// Y is flipped here.
+/// Render the panel as a flat 2D SVG in its real finish color — the front face a
+/// builder sees, not a green PCB. Cutouts are drawn as holes; labels, title, and
+/// the brand logo go in the legend color, placed by the same house rules as the
+/// KiCad panel. No external tools, so it's cheap to generate per request.
+pub fn panel_to_svg(
+    panel: &dyn PanelSpec,
+    title: &str,
+    finish: &PanelFinish,
+    logo: Option<&Logo>,
+) -> String {
+    let w = panel.width_mm();
+    let h = panel.height_mm();
+    let pad = 3.0;
+    // Panel y is measured up from the bottom; SVG y runs down from the top.
+    let sy = |y: f64| h - y;
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{:.2} {:.2} {:.2} {:.2}\" \
+         width=\"{:.0}\" height=\"{:.0}\" role=\"img\" aria-label=\"{} panel\">",
+        -pad,
+        -pad,
+        w + 2.0 * pad,
+        h + 2.0 * pad,
+        (w + 2.0 * pad) * 4.0,
+        (h + 2.0 * pad) * 4.0,
+        xml_escape(title),
+    ));
+    // Panel face.
+    s.push_str(&format!(
+        "<rect x=\"0\" y=\"0\" width=\"{:.2}\" height=\"{:.2}\" rx=\"1.2\" fill=\"{}\" \
+         stroke=\"rgba(0,0,0,0.28)\" stroke-width=\"0.2\"/>",
+        w, h, finish.face
+    ));
+    // Mounting holes.
+    for mh in panel.mounting_holes() {
+        s.push_str(&svg_hole_circle(mh.x_mm, sy(mh.y_mm), mh.diameter_mm / 2.0));
+    }
+    // Control cutouts + their labels.
+    for c in panel.cutouts() {
+        let (cx, cy) = (c.x_mm, sy(c.y_mm));
+        match footprint_shape(&c.footprint) {
+            Some(CutoutShape::Circle { diameter_mm }) => {
+                s.push_str(&svg_hole_circle(cx, cy, diameter_mm / 2.0));
+            }
+            Some(CutoutShape::RoundedRect {
+                width_mm,
+                height_mm,
+                corner_radius_mm,
+            }) => {
+                s.push_str(&svg_hole_rect(
+                    cx,
+                    cy,
+                    width_mm,
+                    height_mm,
+                    corner_radius_mm,
+                ));
+            }
+            None => s.push_str(&svg_hole_circle(cx, cy, 1.5)),
+        }
+        if let Some(label) = &c.label {
+            s.push_str(&svg_text(
+                cx,
+                cy - silk::LABEL_OFFSET_MM,
+                silk::LABEL_FONT_MM,
+                &finish.legend,
+                label,
+            ));
+        }
+    }
+    // Title, top-centre.
+    if !title.is_empty() {
+        s.push_str(&svg_text(
+            w / 2.0,
+            silk::TITLE_TOP_MARGIN_MM,
+            silk::TITLE_FONT_MM,
+            &finish.legend,
+            title,
+        ));
+    }
+    // Brand logo in the clear band below the lowest cutout (ported house rule).
+    if let Some(logo) = logo {
+        let lowest = panel
+            .cutouts()
+            .iter()
+            .map(|c| {
+                let r = match footprint_shape(&c.footprint) {
+                    Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
+                    Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
+                    None => 1.5,
+                };
+                sy(c.y_mm) + r
+            })
+            .fold(10.0, f64::max);
+        let bottom_limit = h - silk::BOTTOM_MARGIN_MM;
+        let gap = bottom_limit - lowest;
+        let (lx0, ly0, lx1, ly1) = logo.bbox();
+        let aspect = (ly1 - ly0) / (lx1 - lx0).max(1e-6);
+        let target_w = (w * silk::LOGO_WIDTH_FRAC)
+            .min((gap - silk::LOGO_CUTOUT_GAP_MM).max(0.0) / aspect.max(1e-6));
+        if target_w >= silk::LOGO_MIN_WIDTH_MM {
+            let logo_h = target_w * aspect;
+            let center = (w / 2.0, lowest + silk::LOGO_CUTOUT_GAP_MM + logo_h / 2.0);
+            let placed = logo.place(target_w, center, false);
+            let mut d = String::new();
+            for sp in &placed {
+                for (i, (x, y)) in sp.iter().enumerate() {
+                    d.push_str(&format!(
+                        "{}{:.2} {:.2} ",
+                        if i == 0 { 'M' } else { 'L' },
+                        x,
+                        y
+                    ));
+                }
+                d.push('Z');
+            }
+            if !d.is_empty() {
+                s.push_str(&format!(
+                    "<path d=\"{}\" fill=\"{}\" fill-rule=\"evenodd\"/>",
+                    d, finish.legend
+                ));
+            }
+        }
+    }
+    s.push_str("</svg>");
+    s
+}
+
+fn svg_hole_circle(cx: f64, cy: f64, r: f64) -> String {
+    format!(
+        "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"rgba(0,0,0,0.55)\" \
+         stroke=\"rgba(255,255,255,0.18)\" stroke-width=\"0.25\"/>",
+        cx, cy, r
+    )
+}
+
+fn svg_hole_rect(cx: f64, cy: f64, w: f64, h: f64, r: f64) -> String {
+    format!(
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{:.2}\" \
+         fill=\"rgba(0,0,0,0.55)\" stroke=\"rgba(255,255,255,0.18)\" stroke-width=\"0.25\"/>",
+        cx - w / 2.0,
+        cy - h / 2.0,
+        w,
+        h,
+        r
+    )
+}
+
+fn svg_text(x: f64, y: f64, size: f64, color: &str, text: &str) -> String {
+    format!(
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-family=\"'Helvetica Neue',Arial,sans-serif\" \
+         font-size=\"{:.2}\" font-weight=\"600\" fill=\"{}\" text-anchor=\"middle\" \
+         dominant-baseline=\"central\">{}</text>",
+        x,
+        y,
+        size,
+        color,
+        xml_escape(text)
+    )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo>) -> String {
     use crate::board::{det_uuid, mm};
     let (w, h) = (panel.width_mm(), panel.height_mm());
@@ -1120,6 +1402,55 @@ mod tests {
         assert_eq!(panel.width_mm(), 6.0 * 5.08);
         assert_eq!(panel.height_mm(), 128.5);
         assert_eq!(panel.thickness_mm(), 2.0);
+    }
+
+    #[test]
+    fn finish_resolves_materials_and_hex() {
+        assert_eq!(PanelFinish::default().face, "#1c1d1f"); // black default
+        assert_eq!(PanelFinish::named("silver").face, "#c9ccce");
+        assert_eq!(PanelFinish::named("white").legend, "#1b1c1e"); // dark legend, light face
+        assert_eq!(PanelFinish::named("green").face, "#0f5c3f");
+        assert_eq!(PanelFinish::named("bogus").face, "#1c1d1f"); // unknown → black
+                                                                 // Hex passthrough with auto-contrast legend; #rgb expands to #rrggbb.
+        let white = PanelFinish::named("#ffffff");
+        assert_eq!(white.face, "#ffffff");
+        assert_eq!(white.legend, "#1b1c1e");
+        assert_eq!(PanelFinish::named("#000").face, "#000000");
+        assert_eq!(PanelFinish::named("#000").legend, "#f2f2ef");
+    }
+
+    #[test]
+    fn panel_svg_uses_finish_color_labels_and_cutouts() {
+        let panel = EurorackPanel::new(8)
+            .with_cutout_rotated(
+                20.32,
+                100.0,
+                0.0,
+                "Alpha9mm",
+                None,
+                Some("RATE".to_string()),
+            )
+            .with_cutout_rotated(
+                20.32,
+                14.0,
+                0.0,
+                "Thonkiconn",
+                None,
+                Some("OUT".to_string()),
+            );
+        let svg = panel_to_svg(&panel, "Slew Limiter", &PanelFinish::named("black"), None);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.ends_with("</svg>"));
+        assert!(svg.contains("#1c1d1f"), "black face color present");
+        assert!(svg.contains(">Slew Limiter</text>"), "title");
+        assert!(
+            svg.contains(">RATE</text>") && svg.contains(">OUT</text>"),
+            "labels"
+        );
+        assert!(
+            svg.matches("<circle").count() >= 2,
+            "control holes as circles"
+        );
     }
 
     #[test]

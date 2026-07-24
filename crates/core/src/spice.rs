@@ -458,7 +458,7 @@ impl Default for TranAnalysis {
 }
 
 /// One point of a transient waveform.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct TranPoint {
     pub t_s: f64,
     pub v: f64,
@@ -595,6 +595,153 @@ pub fn simulate_tran(
     };
 
     let deck = generate_tran_deck(circuit, config, tran, &models, &data_path)?;
+    std::fs::write(&deck_path, &deck)?;
+    crate::symbols::write_builtin_lib(&work_dir)?;
+
+    let output = Command::new(&ngspice)
+        .arg("-b")
+        .arg(&deck_path)
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|e| StageError::ToolNotFound(format!("ngspice {}: {e}", ngspice.display())))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StageError::ToolFailed {
+            tool: "ngspice".into(),
+            code: output.status.code().unwrap_or(-1),
+            stderr: tail(&stderr, 20),
+        });
+    }
+
+    let data = std::fs::read_to_string(&data_path).map_err(|e| {
+        StageError::Other(format!(
+            "ngspice produced no data at {}: {e}",
+            data_path.display()
+        ))
+    })?;
+    let points = parse_tran_data(&data);
+    if points.is_empty() {
+        return Err(StageError::Other(
+            "ngspice produced no transient data points".into(),
+        ));
+    }
+    Ok(TranResult { points })
+}
+
+/// A **driven** transient: an arbitrary piecewise-linear stimulus played into the
+/// input net (instead of [`TranAnalysis`]'s single step), so a caller can drive a
+/// sequence / LFO into the circuit and scope the response — the basis of the
+/// dashboard scope (5hr).
+#[derive(Debug, Clone)]
+pub struct TranDrive {
+    /// `.tran` time step (s).
+    pub step_s: f64,
+    /// `.tran` stop time (s).
+    pub stop_s: f64,
+    /// Input-source breakpoints `(t_s, volts)`, ascending in time — emitted as one
+    /// PWL source on the input net.
+    pub pwl: Vec<(f64, f64)>,
+    /// Extra forced nets: `(net, breakpoints)` each emitted as its own PWL source.
+    /// Drive a control net (e.g. `RATE_CV`) here to sweep a parameter — turning the
+    /// slew rate down into the musical range, or modulating it with an LFO.
+    pub cv: Vec<(String, Vec<(f64, f64)>)>,
+    /// Net to probe; defaults to `config.output_net` when `None`.
+    pub probe_net: Option<String>,
+}
+
+/// A `Vlob_src … PWL(t0 v0 t1 v1 …)` line from breakpoints.
+fn pwl_source_line(in_node: &str, pwl: &[(f64, f64)]) -> String {
+    let body = pwl
+        .iter()
+        .map(|(t, v)| format!("{} {}", fmt_num(*t), fmt_num(*v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("Vlob_src {in_node} 0 PWL({body})")
+}
+
+/// Like [`generate_tran_deck`] but with an arbitrary PWL stimulus + chosen probe.
+fn generate_tran_deck_drive(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    drive: &TranDrive,
+    models: &HashMap<String, SpiceModel>,
+    data_path: &Path,
+) -> Result<String, StageError> {
+    let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    require_net(circuit, &net_names, &config.input_net)?;
+    let probe = drive.probe_net.as_deref().unwrap_or(&config.output_net);
+    require_net(circuit, &net_names, probe)?;
+
+    let (includes, components) = netlist_body(circuit, config, models)?;
+    let in_node = config.node(&config.input_net);
+    if in_node == "0" {
+        return Err(StageError::Other(format!(
+            "input net '{}' maps to ground",
+            config.input_net
+        )));
+    }
+    let probe_node = config.node(probe);
+
+    let mut lines = vec![format!(
+        "* legion-of-bom driven transient deck for {}",
+        circuit.name()
+    )];
+    lines.push(".options rshunt=1e12 gmin=1e-10 itl1=1000".into());
+    for include in &includes {
+        lines.push(format!(".include {}", include.display()));
+    }
+    lines.extend(supply_lines(config, &net_names));
+    lines.extend(components);
+    lines.push(pwl_source_line(&in_node, &drive.pwl));
+    // Extra forced control nets (e.g. RATE_CV), each its own PWL source.
+    for (i, (net, pwl)) in drive.cv.iter().enumerate() {
+        require_net(circuit, &net_names, net)?;
+        let node = config.node(net);
+        if node == "0" {
+            continue; // a grounded control net can't be forced
+        }
+        let body = pwl
+            .iter()
+            .map(|(t, v)| format!("{} {}", fmt_num(*t), fmt_num(*v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(format!("Vlob_cv{i} {node} 0 PWL({body})"));
+    }
+    lines.push(".control".into());
+    lines.push(format!(
+        "tran {} {}",
+        fmt_num(drive.step_s),
+        fmt_num(drive.stop_s)
+    ));
+    lines.push(format!("wrdata {} v({probe_node})", data_path.display()));
+    lines.push(".endc".into());
+    lines.push(".end".into());
+    Ok(lines.join("\n") + "\n")
+}
+
+/// Run a **driven** transient (arbitrary PWL stimulus) and parse the probed
+/// waveform. Same ngspice invocation as [`simulate_tran`]; artifacts go under
+/// `work_dir` as `<name>_scope.{cir,dat}`.
+pub fn simulate_tran_drive(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    drive: &TranDrive,
+    work_dir: &Path,
+) -> Result<TranResult, StageError> {
+    let ngspice =
+        find_on_path("ngspice").ok_or_else(|| StageError::ToolNotFound("ngspice".into()))?;
+    std::fs::create_dir_all(work_dir)?;
+    let work_dir = work_dir.canonicalize()?;
+    let name = sanitize(circuit.name());
+    let data_path = work_dir.join(format!("{name}_scope.dat"));
+    let deck_path = work_dir.join(format!("{name}_scope.cir"));
+
+    let models = match crate::skidl::kicad_symbol_dir() {
+        Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
+        None => HashMap::new(),
+    };
+
+    let deck = generate_tran_deck_drive(circuit, config, drive, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
     crate::symbols::write_builtin_lib(&work_dir)?;
 

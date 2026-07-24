@@ -14,8 +14,10 @@ pub mod board;
 pub mod bom;
 pub mod drc;
 pub mod easyeda;
+pub mod edit;
 pub mod fab;
 pub mod fetch;
+pub mod git;
 pub mod guide;
 pub mod images;
 pub mod jlcpcb;
@@ -26,13 +28,16 @@ pub mod model;
 pub mod mouser;
 pub mod netlist;
 pub mod panel;
+pub mod panel_edit;
 pub mod parts;
 pub mod pdf;
+pub mod project;
 pub mod resistor;
 pub mod route;
 mod sexpr;
 pub mod skidl;
 pub mod source;
+pub mod sourcing;
 pub mod spice;
 pub mod stage;
 pub mod subboard;
@@ -44,17 +49,20 @@ pub mod validate;
 pub mod verify;
 
 pub use board::{
-    generate_board, generate_board_artifacts, generate_board_report, BoardArtifacts, BoardError,
-    BoardOptions, EurorackPlacer, GridPlacer, PartFacts, Placement, Placer, SeededPlacer,
+    build_facts, generate_board, generate_board_artifacts, generate_board_report, minimum_hp,
+    BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts, Placement,
+    Placer, SeededPlacer,
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
-pub use easyeda::product_image_url;
+pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCandidate};
+pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
 pub use fab::{
     export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos, png_to_jpeg,
     render_board_jpeg, render_board_png, zip_dir,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
+pub use git::{stage as git_stage, staged_paths, GitError};
 pub use guide::{
     build_guide, guide_to_html, guide_to_pdf, BoardPng, BuildGuide, BuildStep, KitType, PartNote,
     PlacedPart,
@@ -72,13 +80,16 @@ pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use panel::{
     default_panel_orders_dir, derive_panel, footprint_shape, panel_to_dxf, panel_to_kicad_pcb,
-    BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec, EurorackPanel,
-    MountingHole, PanelFile, PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
+    panel_to_svg, BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec,
+    EurorackPanel, MountingHole, PanelFile, PanelFinish, PanelOrder, PanelOrderStatus, PanelOrders,
+    PanelSpec,
 };
+pub use panel_edit::{apply_panel_edit_str, edit_panel, PanelEdit, PanelEditError};
 pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
 };
+pub use project::{ArtifactKind, ArtifactStatus, ArtifactView, CircuitView, ProjectView, RepoView};
 pub use resistor::{color_code, parse_ohms, Band, ColorCode};
 pub use route::{
     GridRouter, MstRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput, Router, Track,
@@ -86,8 +97,10 @@ pub use route::{
 };
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
+pub use sourcing::{build_query, part_kind, suggest_mpns, MpnCandidate, PartKind, SourcingClients};
 pub use spice::{
-    simulate_ac, simulate_tran, AcPoint, AcResult, SimConfig, TranAnalysis, TranPoint, TranResult,
+    simulate_ac, simulate_tran, simulate_tran_drive, AcPoint, AcResult, SimConfig, TranAnalysis,
+    TranDrive, TranPoint, TranResult,
 };
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
