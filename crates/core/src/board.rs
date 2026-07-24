@@ -227,6 +227,8 @@ impl Placer for EurorackPlacer {
         free.sort();
 
         let n = free.len().max(1) as f64;
+        // Running top of the off-board overflow lane (board-local, below the edge).
+        let mut overflow_top = self.height_mm + OVERFLOW_GAP_MM;
         for (i, r) in free.iter().enumerate() {
             let (w, h) = facts.get(*r).map(|f| f.extent).unwrap_or((3.0, 3.0));
             // Spread the parts down the (tall) board rather than packing them at
@@ -257,8 +259,9 @@ impl Placer for EurorackPlacer {
                 }
                 d += step;
             }
-            // No room found → drop it just below the board (visible, DRC flags it).
-            let cand = spot.unwrap_or((x0, y1 + 2.0, x0 + w, y1 + 2.0 + h));
+            // No room found → drop it into the off-board overflow lane (clear of
+            // the edge; surfaces downstream as its nets left unrouted).
+            let cand = spot.unwrap_or_else(|| overflow_drop(x0, (w, h), &mut overflow_top));
             out.insert(
                 r.to_string(),
                 Placement {
@@ -436,6 +439,8 @@ impl Placer for SeededPlacer {
 
         // Greedy: repeatedly place the unplaced free part most tied to what's down.
         let mut remaining = free.clone();
+        // Running top of the off-board overflow lane (board-local, below the edge).
+        let mut overflow_top = self.height_mm + OVERFLOW_GAP_MM;
         while !remaining.is_empty() {
             let pull_to_placed = |r: &str| -> f64 {
                 adj.get(r)
@@ -511,7 +516,7 @@ impl Placer for SeededPlacer {
             // overlap). `cx,cy` is the keep-out centre; the footprint origin is
             // that minus the offset.
             let cand = nearest_clear_spot(target, ext, &boxes, bounds, clearance, step)
-                .unwrap_or((x0, y1 + 2.0, x0 + ext.0, y1 + 2.0 + ext.1));
+                .unwrap_or_else(|| overflow_drop(x0, ext, &mut overflow_top));
             let (cx, cy) = ((cand.0 + cand.2) / 2.0, (cand.1 + cand.3) / 2.0);
             out.insert(
                 r.clone(),
@@ -581,6 +586,24 @@ fn nearest_clear_spot(
         d += step;
     }
     None
+}
+
+/// Gap (mm) around an overflow part: below the board edge and between stacked
+/// overflow parts. > the usual edge clearance so a dropped part never trips
+/// `copper_edge_clearance`.
+const OVERFLOW_GAP_MM: f64 = 2.0;
+
+/// Board-local drop rect (keep-out box) for a free part that fits nowhere on the
+/// board. It goes into an off-board lane a clear gap *below* the bottom edge —
+/// never straddling the edge (a drop within edge clearance manufactures a
+/// misleading `copper_edge_clearance` DRC error instead of the honest "this part
+/// could not be placed", which surfaces downstream as its nets left unrouted).
+/// `lane_top` is the running top of the lane, advanced past this part so
+/// successive overflow parts stack instead of overlapping.
+fn overflow_drop(x0: f64, (w, h): (f64, f64), lane_top: &mut f64) -> Rect {
+    let top = *lane_top;
+    *lane_top = top + h + OVERFLOW_GAP_MM;
+    (x0, top, x0 + w, top + h)
 }
 
 /// Whether two rectangles `(min_x, min_y, max_x, max_y)` overlap within `c` mm.
@@ -1569,6 +1592,31 @@ mod tests {
         // No declared side → front (single-sided default).
         let placements = GridPlacer::default().place(&rc(), &HashMap::new());
         assert!(placements.values().all(|p| !p.back));
+    }
+
+    #[test]
+    fn overflow_parts_drop_clear_below_the_board_edge() {
+        // A free part that fits nowhere must land in the off-board lane below the
+        // bottom edge — never straddling it (that would fake a copper_edge_clearance
+        // DRC error instead of surfacing as an unrouted net). j54.24.
+        let board_h = 128.5;
+        let mut lane = board_h + OVERFLOW_GAP_MM;
+        let a = overflow_drop(3.0, (9.0, 9.0), &mut lane);
+        let b = overflow_drop(3.0, (5.0, 5.0), &mut lane);
+        // Both start below the board edge with clearance to spare.
+        assert!(
+            a.1 >= board_h + OVERFLOW_GAP_MM,
+            "first overflow clears the edge"
+        );
+        assert!(
+            b.1 >= board_h + OVERFLOW_GAP_MM,
+            "second overflow clears the edge"
+        );
+        // Stacked, never overlapping the previous overflow part.
+        assert!(
+            b.1 >= a.3,
+            "overflow parts stack instead of overlapping: {a:?} {b:?}"
+        );
     }
 
     #[test]
