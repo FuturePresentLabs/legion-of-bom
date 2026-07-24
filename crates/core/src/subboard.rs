@@ -248,10 +248,36 @@ const DAISY_SEED_PINS: &[(usize, &str, &[&str])] = &[
 ];
 
 /// Resolve a synthesized sub-board footprint by name (the part after
-/// `LobModule:`). `None` for an unknown name.
+/// `LobModule:`). `None` for an unknown name. Only modules we synthesize (with a
+/// standoff + named pins) have a spec; vendored real footprints do not.
 pub fn from_name(name: &str) -> Option<SubboardSpec> {
     match name {
         "Daisy_Seed" => Some(daisy_seed()),
+        _ => None,
+    }
+}
+
+/// The `.kicad_mod` text for a `LobModule:<name>` footprint — either synthesized
+/// (the Daisy Seed) or a **real, vendored** footprint embedded from Electrosmith's
+/// MIT-licensed DaisyKiCad library (Patch SM, Seed2 DFM). Vendored footprints name
+/// their pads by the physical Daisy pin (`A1`…`D10` / `A1`…`E10`), so a net wired
+/// to pin `B2` connects straight through. `None` for an unknown name.
+pub fn footprint_text(name: &str) -> Option<String> {
+    let vendored = |s: &str| Some(s.to_string());
+    match name {
+        "Daisy_Seed" => Some(daisy_seed().kicad_mod()),
+        "DAISY_PATCH_SM" => vendored(include_str!(
+            "../footprints/Daisy-Boards.pretty/DAISY_PATCH_SM.kicad_mod"
+        )),
+        "DAISY_PATCH_SM_SMT" => vendored(include_str!(
+            "../footprints/Daisy-Boards.pretty/DAISY_PATCH_SM_SMT.kicad_mod"
+        )),
+        "DAISY_SEED2_DFM" => vendored(include_str!(
+            "../footprints/Daisy-Boards.pretty/DAISY_SEED2_DFM.kicad_mod"
+        )),
+        "DAISY_SEED2_DFM_PTH" => vendored(include_str!(
+            "../footprints/Daisy-Boards.pretty/DAISY_SEED2_DFM_PTH.kicad_mod"
+        )),
         _ => None,
     }
 }

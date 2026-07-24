@@ -1435,12 +1435,12 @@ fn load_footprint(dir: &Path, lib_part: &str) -> Result<Sexpr, BoardError> {
     // synthesized in-memory, not read from a `.pretty` dir — a part with footprint
     // `LobModule:Daisy_Seed` places + routes through the normal pipeline (25z).
     if lib == crate::subboard::SUBBOARD_LIB {
-        let spec =
-            crate::subboard::from_name(name).ok_or_else(|| BoardError::FootprintNotFound {
+        let text =
+            crate::subboard::footprint_text(name).ok_or_else(|| BoardError::FootprintNotFound {
                 lib_part: lib_part.to_string(),
-                path: format!("{}:<synthesized>", crate::subboard::SUBBOARD_LIB),
+                path: format!("{}:<synthesized/vendored>", crate::subboard::SUBBOARD_LIB),
             })?;
-        return Sexpr::parse(&spec.kicad_mod()).map_err(|msg| BoardError::FootprintParse {
+        return Sexpr::parse(&text).map_err(|msg| BoardError::FootprintParse {
             lib_part: lib_part.to_string(),
             msg,
         });
@@ -1982,6 +1982,37 @@ mod tests {
             art.route.conflicts
         );
         assert!(art.pcb.contains("(segment"), "AUDIO net becomes a track");
+    }
+
+    #[test]
+    fn vendored_daisy_footprints_place_and_route() {
+        // Real Electrosmith footprints (Patch SM = 40 THT pads, Seed2 DFM = 50 SMD
+        // pads), embedded and named by physical pin — a net wired to pin "B2"/"B4"
+        // connects straight through and routes. No KiCad install needed.
+        for (fp, pads_min, a, b) in [
+            ("LobModule:DAISY_PATCH_SM", 40, "B2", "B4"),
+            ("LobModule:DAISY_SEED2_DFM", 50, "D5", "D4"),
+        ] {
+            let c = Circuit {
+                name: "mod".into(),
+                parts: vec![Part::new("M1", "mod").with_footprint(fp)],
+                nets: vec![Net::new(
+                    "SIG",
+                    vec![PinRef::new("M1", a), PinRef::new("M1", b)],
+                )],
+            };
+            let art = generate_board_artifacts(&c, &BoardOptions::new("/nonexistent"))
+                .unwrap_or_else(|e| panic!("{fp} generates: {e:?}"));
+            assert!(Sexpr::parse(&art.pcb).is_ok(), "{fp} parses");
+            assert!(art.pcb.contains(&format!("{fp:?}")), "{fp} placed");
+            let pads = art.pcb.matches("(pad \"").count();
+            assert!(pads >= pads_min, "{fp}: {pads_min} pads (got {pads})");
+            assert!(
+                art.route.conflicts.is_empty(),
+                "{fp} SIG routes: {:?}",
+                art.route.conflicts
+            );
+        }
     }
 
     #[test]
