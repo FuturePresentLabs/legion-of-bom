@@ -6,22 +6,23 @@
 
 mod doctor;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, derive_panel,
-    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
-    generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
-    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, render_board_png, run_drc,
-    run_layout_loop, simulate_ac, simulate_tran, validate_erc, zip_dir, BoardOptions, BoardPng,
-    BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, JlcpcbClient, LayoutLoop, LayoutMode,
-    Logo, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
-    PipelineReport, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, StageOutcome,
-    TranAnalysis,
+    analytic_check, build_guide, default_image_cache_dir, default_panel_orders_dir,
+    default_parts_dir, derive_panel, embed_source, export_cpl, export_gerbers, fetch_data_uri,
+    fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts, generate_board_report,
+    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, product_image_url, render_board_png,
+    run_drc, run_layout_loop, simulate_ac, simulate_tran, validate_erc, zip_dir, BoardOptions,
+    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding,
+    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
+    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus,
+    SeededPlacer, Severity, SimConfig, SkidlRunner, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -43,6 +44,17 @@ enum Command {
         /// Path to the circuit definition (e.g. a SKiDL script).
         circuit: PathBuf,
     },
+    /// List the circuits declared in this repo's lob.toml.
+    Circuits,
+    /// Build a circuit's full artifact set (guide + Visual BOM + fab package), or
+    /// every circuit in the repo when no name is given.
+    Build {
+        /// Circuit name from lob.toml; omit to build all circuits.
+        circuit: Option<String>,
+    },
+    /// Show each circuit's build state — which artifacts exist and whether they
+    /// are stale relative to the source + manifest. No network.
+    Status,
     /// Check that the external toolchain (ngspice, kicad-cli, SKiDL) is available.
     Doctor,
     /// Inspect and edit the global, Dolt-backed parts library.
@@ -60,6 +72,10 @@ enum Command {
         /// Also write the BOM CSV to this path.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Also write a Visual BOM (HTML): a part photo per line (EasyEDA/LCSC,
+        /// keyless), with through-hole resistors shown as their color code.
+        #[arg(long)]
+        visual: bool,
     },
     /// Generate a .kicad_pcb board file (footprints placed + routed) from a circuit.
     Board {
@@ -122,6 +138,10 @@ enum Command {
         /// Eurorack panel spec (TOML): build the vertical panel-anchored board.
         #[arg(long)]
         panel: Option<PathBuf>,
+        /// Assembly kit type: auto (default; detects from pad types) | tht | smd |
+        /// mixed. THT-first framing + copy — most DIY kits are through-hole.
+        #[arg(long, default_value = "auto")]
+        kit: String,
     },
     /// Panel design: generate DXF, track orders.
     Panel {
@@ -161,6 +181,24 @@ enum PartsCmd {
         mpn: String,
         #[arg(long, default_value = "cli-user")]
         by: String,
+    },
+    /// Set a part's Visual-BOM photo by MPN — a URL or a local image file. For
+    /// boutique parts a distributor lookup can't cover (Thonkiconn jacks, pots);
+    /// `scripts/pull_part_image.py` populates these from Thonk/Tayda/EasyEDA.
+    SetImage {
+        /// Manufacturer part number to attach the photo to.
+        mpn: String,
+        /// Image URL (http/https) or a path to a local image file.
+        source: String,
+    },
+    /// Set a part's build-guide assembly notes by MPN — ordered part-specific tips
+    /// (e.g. "snap off the locating tab if unused") that augment the generic
+    /// per-kind copy. Pass no notes to clear them.
+    SetAssembly {
+        /// Manufacturer part number to attach the notes to.
+        mpn: String,
+        /// Ordered note lines; each argument is one step.
+        notes: Vec<String>,
     },
     /// Resolve a circuit's parts against the library by MPN.
     Resolve {
@@ -235,13 +273,17 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Run { circuit } => run(circuit),
+        Command::Circuits => circuits_cmd(),
+        Command::Build { circuit } => build_cmd(circuit),
+        Command::Status => status_cmd(),
         Command::Doctor => doctor::run(),
         Command::Parts { action } => parts_cmd(action),
         Command::Bom {
             circuit,
             price,
             out,
-        } => bom_cmd(circuit, price, out),
+            visual,
+        } => bom_cmd(circuit, price, out, visual),
         Command::Board {
             circuit,
             out,
@@ -264,7 +306,8 @@ fn main() -> ExitCode {
             circuit,
             out,
             panel,
-        } => guide_cmd(circuit, out, panel),
+            kit,
+        } => guide_cmd(circuit, out, panel, kit),
         Command::Panel { action } => panel_cmd(action),
     };
 
@@ -638,13 +681,13 @@ fn fab_cmd(
     drc_every_iter: bool,
     logo: Option<PathBuf>,
 ) -> Result<()> {
-    let circuit = circuit
+    let resolved = resolve_circuit(&circuit)?;
+    let panel = panel.or_else(|| resolved.panel.clone());
+    let circuit = resolved
+        .source
         .canonicalize()
-        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
-    let stem = circuit
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("circuit");
+        .with_context(|| format!("circuit not found: {}", resolved.source.display()))?;
+    let stem = resolved.name.as_str();
     let work_dir = PathBuf::from("out").join(stem);
 
     // Generate the board.
@@ -743,16 +786,240 @@ fn fab_cmd(
     Ok(())
 }
 
+/// A circuit input resolved from either a direct file path or a manifest circuit.
+struct ResolvedCircuit {
+    /// Circuit id — the manifest name, or the source file stem for a path arg.
+    /// Drives the `out/<name>/` output tree.
+    name: String,
+    source: PathBuf,
+    panel: Option<PathBuf>,
+    kit: Option<String>,
+    build: Option<BuildCopy>,
+    brand: Option<String>,
+}
+
+/// Resolve a `lob <cmd> <arg>` circuit argument. An existing file is used
+/// directly (flags supply panel/kit as before). Otherwise `arg` is treated as a
+/// circuit **name** in the nearest `lob.toml` (walking up from the working dir),
+/// pulling its source/panel/kit/build + the repo brand — so `lob guide
+/// slew_limiter` works by name from inside a circuits repo.
+fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
+    if arg.is_file() {
+        return Ok(ResolvedCircuit {
+            name: arg
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("circuit")
+                .to_string(),
+            source: arg.to_path_buf(),
+            panel: None,
+            kit: None,
+            build: None,
+            brand: None,
+        });
+    }
+    let cwd = std::env::current_dir()?;
+    let (root, manifest) = Manifest::discover(&cwd).map_err(|e| {
+        anyhow::anyhow!(
+            "'{}' is not a file, and no circuits repo was found: {e}",
+            arg.display()
+        )
+    })?;
+    let name = arg.to_str().unwrap_or_default();
+    let entry = manifest.circuit(name).ok_or_else(|| {
+        let have: Vec<&str> = manifest.circuits.iter().map(|c| c.name.as_str()).collect();
+        anyhow::anyhow!(
+            "no circuit '{name}' in {}/lob.toml (have: {})",
+            root.display(),
+            if have.is_empty() {
+                "none".into()
+            } else {
+                have.join(", ")
+            }
+        )
+    })?;
+    Ok(ResolvedCircuit {
+        name: entry.name.clone(),
+        source: entry.source_path(&root),
+        panel: entry.panel_path(&root),
+        kit: entry.effective_kit(&manifest.defaults).map(str::to_string),
+        build: entry.build.clone(),
+        brand: manifest.repo.brand.clone(),
+    })
+}
+
+/// Handle `lob circuits` — list the circuits declared in the nearest `lob.toml`.
+fn circuits_cmd() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let (root, manifest) = Manifest::discover(&cwd)
+        .with_context(|| "no lob.toml found (run inside a circuits repo)")?;
+    let repo = manifest.repo.name.as_deref().unwrap_or("(unnamed)");
+    let brand = manifest
+        .repo
+        .brand
+        .as_deref()
+        .map(|b| format!(" · {b}"))
+        .unwrap_or_default();
+    println!("{repo}{brand}  [{}]", root.display());
+    if manifest.circuits.is_empty() {
+        println!("  (no circuits declared)");
+    }
+    for c in &manifest.circuits {
+        let kit = c.effective_kit(&manifest.defaults).unwrap_or("auto");
+        let panel = c
+            .panel
+            .as_deref()
+            .map(|p| format!(" · panel {p}"))
+            .unwrap_or_default();
+        let copy = if c.build.is_some() {
+            " · build-copy"
+        } else {
+            ""
+        };
+        println!("  {:<20} {}  ({kit}{panel}{copy})", c.name, c.source);
+    }
+    Ok(())
+}
+
+/// Handle `lob build [circuit]` — produce a circuit's full artifact set (guide +
+/// Visual BOM + fab package), or every circuit in the repo. Each artifact is
+/// independent, so one failing (e.g. a DRC-blocked fab) still leaves the others.
+fn build_cmd(name: Option<String>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let (_root, manifest) = Manifest::discover(&cwd)
+        .with_context(|| "no lob.toml found (run inside a circuits repo)")?;
+    let targets: Vec<String> = match name {
+        Some(n) => {
+            manifest
+                .circuit(&n)
+                .ok_or_else(|| anyhow::anyhow!("no circuit '{n}' in lob.toml"))?;
+            vec![n]
+        }
+        None => manifest.circuits.iter().map(|c| c.name.clone()).collect(),
+    };
+    if targets.is_empty() {
+        println!("no circuits declared in lob.toml");
+        return Ok(());
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for name in &targets {
+        println!("\n━━━━━━━━━━  build {name}  ━━━━━━━━━━");
+        let arg = || PathBuf::from(name);
+        let steps: [(&str, Result<()>); 3] = [
+            ("guide", guide_cmd(arg(), None, None, "auto".into())),
+            ("bom", bom_cmd(arg(), false, None, true)),
+            (
+                "fab",
+                fab_cmd(arg(), None, None, "analog".into(), 6, false, None),
+            ),
+        ];
+        let mut done = Vec::new();
+        let mut circuit_ok = true;
+        for (label, res) in steps {
+            match res {
+                Ok(()) => done.push(label),
+                Err(e) => {
+                    eprintln!("  ✗ {label}: {e:#}");
+                    circuit_ok = false;
+                }
+            }
+        }
+        if circuit_ok {
+            println!("✓ {name}: {}", done.join(" + "));
+        } else {
+            failures.push(name.clone());
+        }
+    }
+
+    println!(
+        "\nbuilt {}/{} circuit(s)",
+        targets.len() - failures.len(),
+        targets.len()
+    );
+    if !failures.is_empty() {
+        anyhow::bail!("incomplete: {}", failures.join(", "));
+    }
+    Ok(())
+}
+
+/// Modification time of `path`, or `None` if it doesn't exist / isn't statable.
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Handle `lob status` — per-circuit build freshness, no network. An artifact is
+/// "stale" when the source (or panel, or the manifest) changed after it was
+/// written; "—" when it was never built.
+fn status_cmd() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let (root, manifest) = Manifest::discover(&cwd)
+        .with_context(|| "no lob.toml found (run inside a circuits repo)")?;
+    println!(
+        "{}  [{}]",
+        manifest.repo.name.as_deref().unwrap_or("(unnamed)"),
+        root.display()
+    );
+    let manifest_mtime = mtime(&root.join("lob.toml"));
+
+    for c in &manifest.circuits {
+        // Newest input: the source, its panel, and the manifest itself.
+        let mut input = mtime(&c.source_path(&root)).max(manifest_mtime);
+        if let Some(panel) = c.panel_path(&root) {
+            input = input.max(mtime(&panel));
+        }
+        let out = root.join("out").join(&c.name);
+        let artifacts = [
+            ("guide", out.join(format!("{}-guide.html", c.name))),
+            ("vbom", out.join(format!("{}-vbom.html", c.name))),
+            (
+                "fab",
+                out.join("fab").join(format!("{}-gerbers.zip", c.name)),
+            ),
+        ];
+        let cols: Vec<String> = artifacts
+            .iter()
+            .map(|(label, path)| match mtime(path) {
+                None => format!("{label} —"),
+                Some(m) if input.is_none() || m >= input.unwrap() => format!("{label} ✓"),
+                Some(_) => format!("{label} stale"),
+            })
+            .collect();
+        println!("  {:<18} {}", c.name, cols.join("   "));
+    }
+    Ok(())
+}
+
 /// Handle `lob guide <circuit> [--out]` — generate a board and render a
 /// step-by-step visual assembly guide (HTML).
-fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Result<()> {
-    let circuit = circuit
+fn guide_cmd(
+    circuit: PathBuf,
+    out: Option<PathBuf>,
+    panel: Option<PathBuf>,
+    kit: String,
+) -> Result<()> {
+    // A path is used directly; a bare name resolves via the repo's lob.toml
+    // (source + panel + kit + build copy + brand). Explicit flags still win.
+    let resolved = resolve_circuit(&circuit)?;
+    let panel = panel.or_else(|| resolved.panel.clone());
+    // Effective kit: an explicit --kit wins; else the manifest's; else auto.
+    let kit = if kit != "auto" {
+        kit
+    } else {
+        resolved.kit.clone().unwrap_or_else(|| "auto".into())
+    };
+    // Resolve the kit override up front so a bad value fails before the SKiDL run.
+    let kit_override = match kit.as_str() {
+        "auto" => None,
+        other => Some(KitType::parse(other).ok_or_else(|| {
+            anyhow::anyhow!("unknown kit '{other}' (expected auto | tht | smd | mixed)")
+        })?),
+    };
+    let circuit = resolved
+        .source
         .canonicalize()
-        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
-    let stem = circuit
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("circuit");
+        .with_context(|| format!("circuit not found: {}", resolved.source.display()))?;
+    let stem = resolved.name.as_str();
     let work_dir = PathBuf::from("out").join(stem);
 
     let run = SkidlRunner::discover(&work_dir)
@@ -764,7 +1031,36 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> 
     let options = board_options_with_panel(footprint_dir, &panel)?;
     let (board, _) = generate_board_report(&model, &options)?;
 
-    let guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
+    let mut guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(kit) = kit_override {
+        guide.kit = kit;
+    }
+    println!("  kit: {:?} (assembly copy + framing)", guide.kit);
+
+    // Per-part assembly notes from the parts library (best-effort; keyed by MPN
+    // via resolve_circuit). Skips silently when the library (dolt) is unavailable.
+    if let Ok(lib) = PartsLibrary::open(default_parts_dir()) {
+        if let Ok(resolutions) = lib.resolve_circuit(&model) {
+            let notes: std::collections::BTreeMap<String, Vec<String>> = resolutions
+                .into_iter()
+                .filter_map(|r| {
+                    let steps = r.record?.assembly_steps;
+                    (!steps.is_empty()).then_some((r.refdes, steps))
+                })
+                .collect();
+            if !notes.is_empty() {
+                println!("  part notes: {} part(s) from the library", notes.len());
+                guide.attach_part_notes(&notes);
+            }
+        }
+    }
+
+    // Per-circuit build copy + brand from the manifest (5uj.5).
+    if resolved.build.is_some() || resolved.brand.is_some() {
+        let b = resolved.build.clone().unwrap_or_default();
+        guide.set_build_copy(resolved.brand.clone(), b.intro, b.tools, b.cautions);
+        println!("  build copy: from lob.toml");
+    }
 
     // Diagram: photorealistic UNPOPULATED board renders (bare pads a builder
     // populates) when kicad-cli is available — top always, plus the bottom side
@@ -835,15 +1131,15 @@ fn guide_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> 
     Ok(())
 }
 
-/// Handle `lob bom <circuit> [--price] [--out]`.
-fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>) -> Result<()> {
-    let circuit = circuit
+/// Handle `lob bom <circuit> [--price] [--out] [--visual]`.
+fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) -> Result<()> {
+    let resolved = resolve_circuit(&circuit)?;
+    let stem = resolved.name.clone();
+    let circuit = resolved
+        .source
         .canonicalize()
-        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
-    let stem = circuit
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("circuit");
+        .with_context(|| "circuit not found")?;
+    let stem = stem.as_str();
     let work_dir = PathBuf::from("out").join(stem);
     let run = SkidlRunner::discover(&work_dir)
         .run(&circuit)
@@ -859,21 +1155,25 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>) -> Result<()> {
                 continue;
             };
             match client.search_mpn(&mpn) {
-                Ok(Some(pp)) => match pp.unit_price_at(line.qty() as u64) {
-                    Some(unit) => {
-                        line.set_unit_price(unit);
-                        priced += 1;
-                        let stock = pp
-                            .in_stock
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "?".into());
-                        eprintln!(
-                            "  priced {mpn} → {} @ ${unit:.4} ({stock} in stock)",
-                            pp.mpn
-                        );
+                Ok(Some(pp)) => {
+                    // Keep the product photo for the Visual BOM, even if no price break.
+                    line.image_url = pp.image_url.clone();
+                    match pp.unit_price_at(line.qty() as u64) {
+                        Some(unit) => {
+                            line.set_unit_price(unit);
+                            priced += 1;
+                            let stock = pp
+                                .in_stock
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "?".into());
+                            eprintln!(
+                                "  priced {mpn} → {} @ ${unit:.4} ({stock} in stock)",
+                                pp.mpn
+                            );
+                        }
+                        None => eprintln!("  {mpn}: matched {} but no price breaks", pp.mpn),
                     }
-                    None => eprintln!("  {mpn}: matched {} but no price breaks", pp.mpn),
-                },
+                }
                 Ok(None) => eprintln!("  no Mouser match: {mpn}"),
                 Err(e) => eprintln!("  pricing {mpn}: {e}"),
             }
@@ -889,7 +1189,102 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>) -> Result<()> {
         std::fs::write(&out, bom.to_csv()).with_context(|| format!("writing {}", out.display()))?;
         println!("wrote {}", out.display());
     }
+
+    if visual {
+        // Hydrate line photos from the parts library first (curated/scripted
+        // per-MPN images — the durable source for boutique parts). Best-effort:
+        // skip silently if the library (dolt) isn't available.
+        if let Ok(lib) = PartsLibrary::open(default_parts_dir()) {
+            for line in &mut bom.lines {
+                if line.image_url.is_some() {
+                    continue;
+                }
+                if let Some(mpn) = &line.mpn {
+                    if let Ok(Some(rec)) = lib.get_part(mpn) {
+                        line.image_url = rec.image_url;
+                    }
+                }
+            }
+        }
+
+        // Resolve + cache + embed a photo per line: the library/curated image
+        // first, else an EasyEDA/LCSC auto-lookup; lines with none fall back to a
+        // color swatch (THT resistors) or a blank cell.
+        let cache = default_image_cache_dir();
+        let mut fetched = 0usize;
+        let thumbs: Vec<Option<String>> = bom
+            .lines
+            .iter()
+            .map(|l| {
+                let t = resolve_photo(l, &cache);
+                fetched += t.is_some() as usize;
+                t
+            })
+            .collect();
+        std::fs::create_dir_all(&work_dir)?;
+        let vpath = work_dir.join(format!("{stem}-vbom.html"));
+        std::fs::write(&vpath, bom.to_visual_html(stem, &thumbs))
+            .with_context(|| format!("writing {}", vpath.display()))?;
+        println!(
+            "wrote {} (Visual BOM, {fetched}/{} photo(s))",
+            vpath.display(),
+            bom.lines.len()
+        );
+    }
     Ok(())
+}
+
+/// Resolve an embeddable thumbnail (`data:` URI) for a BOM line: a curated or
+/// priced `image_url` first, else an EasyEDA/LCSC product photo looked up by MPN
+/// or distinctive value. `None` → the Visual BOM falls back to a swatch / blank.
+fn resolve_photo(line: &BomLine, cache: &Path) -> Option<String> {
+    // A curated/library image (may be a `file://` local photo) wins.
+    if let Some(src) = &line.image_url {
+        if let Some(thumb) = embed_source(src, cache) {
+            return Some(thumb);
+        }
+    }
+    let keyword = photo_keyword(line)?;
+    let url = product_image_url(&keyword)?;
+    fetch_data_uri(&url, cache)
+}
+
+/// The photo-search keyword for a line, or `None` when a photo isn't wanted:
+/// passives (R/C) get a swatch/blank, and a generic value with no MPN (e.g.
+/// `"100k"`) would only return noise — so require a part-number-like token.
+fn photo_keyword(line: &BomLine) -> Option<String> {
+    let prefix: String = line
+        .refdes
+        .first()?
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    if matches!(prefix.as_str(), "R" | "C") {
+        return None;
+    }
+    let keyword = line
+        .mpn
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(line.value.as_str());
+    if keyword.is_empty() || (line.mpn.is_none() && !has_letter_run(keyword, 2)) {
+        return None;
+    }
+    Some(keyword.to_string())
+}
+
+/// Whether `s` contains a run of at least `n` consecutive ASCII letters — a cheap
+/// "looks like a part number, not a bare value" test (`"LM13700"`/`"TL072"` yes,
+/// `"100k"`/`"4.7k"` no — a passive's unit suffix is a lone letter).
+fn has_letter_run(s: &str, n: usize) -> bool {
+    let mut run = 0usize;
+    for c in s.chars() {
+        run = if c.is_ascii_alphabetic() { run + 1 } else { 0 };
+        if run >= n {
+            return true;
+        }
+    }
+    false
 }
 
 /// Handle `lob parts …` against the global parts library.
@@ -930,6 +1325,32 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             lib.mark_verified(&mpn, &by)?;
             lib.commit(&format!("parts: verify {mpn}"))?;
             println!("verified {mpn} (by {by})");
+        }
+        PartsCmd::SetImage { mpn, source } => {
+            // A local file is stored as an absolute `file://` URL (durable across
+            // working directories); anything else is taken as an http(s) URL.
+            let stored = if Path::new(&source).is_file() {
+                let abs = std::fs::canonicalize(&source)
+                    .with_context(|| format!("resolving image path {source}"))?;
+                format!("file://{}", abs.display())
+            } else {
+                source.clone()
+            };
+            lib.set_image_url(&mpn, Some(&stored))?;
+            lib.commit(&format!("parts: set image {mpn}"))?;
+            println!("set image for {mpn}: {stored}");
+        }
+        PartsCmd::SetAssembly { mpn, notes } => {
+            lib.set_assembly_steps(&mpn, &notes)?;
+            lib.commit(&format!("parts: set assembly {mpn}"))?;
+            if notes.is_empty() {
+                println!("cleared assembly notes for {mpn}");
+            } else {
+                println!("set {} assembly note(s) for {mpn}:", notes.len());
+                for (i, n) in notes.iter().enumerate() {
+                    println!("  {}. {n}", i + 1);
+                }
+            }
         }
         PartsCmd::Resolve { circuit } => {
             print_resolutions(&resolve_circuit_file(&lib, circuit)?);
@@ -1190,6 +1611,13 @@ fn print_part(part: &PartRecord) {
         "datasheet:    {}",
         part.datasheet_url.as_deref().unwrap_or("-")
     );
+    println!("image:        {}", part.image_url.as_deref().unwrap_or("-"));
+    if !part.assembly_steps.is_empty() {
+        println!("assembly:");
+        for (i, step) in part.assembly_steps.iter().enumerate() {
+            println!("  {}. {step}", i + 1);
+        }
+    }
     let verified = if part.verified_by_human {
         format!(
             "yes{}",

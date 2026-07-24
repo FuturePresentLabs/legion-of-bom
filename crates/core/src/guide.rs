@@ -18,6 +18,7 @@ use base64::Engine;
 use crate::pdf::{self, Font, Page, Paint};
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
+use crate::theme;
 
 /// A placed component: board-space centre + pad bounding box (mm).
 #[derive(Debug, Clone)]
@@ -29,6 +30,10 @@ pub struct PlacedPart {
     pub cy: f64,
     pub bbox: (f64, f64, f64, f64),
     pub back: bool,
+    /// Whether this part mounts through the board (has ≥1 through-hole pad) — a
+    /// hand-soldered THT part — versus surface-mount. Drives kit-type detection
+    /// and which per-kind assembly-copy variant a step shows.
+    pub through_hole: bool,
     /// Position of the reference pad (pin 1) — where the polarity marker sits.
     pub pin1: Option<(f64, f64)>,
     /// Polarity/orientation reference, for polarised parts only.
@@ -92,11 +97,82 @@ fn detect_polarity(refdes: &str, footprint: &str) -> Option<Polarity> {
     }
 }
 
+/// Whether a build targets through-hole (hand assembly — the default for DIY
+/// kits), surface-mount, or a mix of both. Drives the guide's framing and which
+/// per-kind assembly-copy variant a step shows. Auto-detected from the board's
+/// pad types, overridable via `lob guide --kit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KitType {
+    /// Through-hole — leaded parts, hand-soldered. The DIY-kit default.
+    Tht,
+    /// Surface-mount — usually machine-assembled, but hand-solderable.
+    Smd,
+    /// A mix of through-hole and surface-mount parts.
+    Mixed,
+}
+
+impl KitType {
+    /// Parse a `--kit` argument (`tht`/`smd`/`mixed`, with common synonyms).
+    pub fn parse(s: &str) -> Option<KitType> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tht" | "through-hole" | "thru" | "th" => Some(KitType::Tht),
+            "smd" | "smt" | "surface" => Some(KitType::Smd),
+            "mixed" | "both" => Some(KitType::Mixed),
+            _ => None,
+        }
+    }
+
+    /// The framing label shown at the top of the guide.
+    fn label(self) -> &'static str {
+        match self {
+            KitType::Tht => "Through-hole kit",
+            KitType::Smd => "Surface-mount board",
+            KitType::Mixed => "Mixed through-hole + SMD build",
+        }
+    }
+}
+
+/// Auto-detect the kit type from placed parts' pad types: any through-hole *and*
+/// any surface-mount part → `Mixed`; otherwise whichever is present; an
+/// unclassifiable / empty board defaults to `Tht` (the DIY-kit assumption).
+fn detect_kit(parts: &[PlacedPart]) -> KitType {
+    let (mut tht, mut smd) = (false, false);
+    for p in parts {
+        if p.through_hole {
+            tht = true;
+        } else {
+            smd = true;
+        }
+    }
+    match (tht, smd) {
+        (true, true) => KitType::Mixed,
+        (false, true) => KitType::Smd,
+        _ => KitType::Tht,
+    }
+}
+
+/// A part-specific assembly callout, sourced from the parts library and attached
+/// to a step: the reference designators it applies to (grouped when they share the
+/// same steps) plus the ordered note text — e.g. `RV1, RV2` → "snap off the
+/// locating tab if unused". Augments the generic per-kind copy.
+#[derive(Debug, Clone)]
+pub struct PartNote {
+    pub refs: Vec<String>,
+    pub steps: Vec<String>,
+}
+
 /// One build step: a group of same-kind parts placed together.
 #[derive(Debug, Clone)]
 pub struct BuildStep {
     pub title: String,
     pub parts: Vec<PlacedPart>,
+    /// How to physically place this kind of part — the per-kind assembly copy
+    /// (THT or SMD variant, chosen from the step's parts). This is the *default*;
+    /// a per-part note from the parts library (`part_notes`) augments it.
+    pub assembly: Option<String>,
+    /// Part-specific notes for this step, resolved from the parts library by MPN
+    /// via [`BuildGuide::attach_part_notes`]. Empty until attached.
+    pub part_notes: Vec<PartNote>,
     /// A polarity / orientation warning to show, if the parts are polarised.
     pub caution: Option<String>,
 }
@@ -107,6 +183,33 @@ pub struct BuildGuide {
     pub name: String,
     pub outline: (f64, f64, f64, f64),
     pub steps: Vec<BuildStep>,
+    /// Through-hole / SMD / mixed — auto-detected, overridable. Frames the guide.
+    pub kit: KitType,
+    /// Per-circuit build copy from the repo manifest (5uj.5), set by the CLI via
+    /// [`BuildGuide::set_build_copy`]. `brand` fronts the masthead; `intro`/`tools`/
+    /// `kit_cautions` render a "Before you build" section above the steps.
+    pub brand: Option<String>,
+    pub intro: Option<String>,
+    pub tools: Vec<String>,
+    pub kit_cautions: Vec<String>,
+}
+
+impl BuildGuide {
+    /// Attach the per-circuit build copy (from the circuits-repo manifest). Kept
+    /// off [`build_guide`] so the core stays free of the project model — the CLI
+    /// resolves the manifest and calls this, mirroring [`Self::attach_part_notes`].
+    pub fn set_build_copy(
+        &mut self,
+        brand: Option<String>,
+        intro: Option<String>,
+        tools: Vec<String>,
+        cautions: Vec<String>,
+    ) {
+        self.brand = brand;
+        self.intro = intro;
+        self.tools = tools;
+        self.kit_cautions = cautions;
+    }
 }
 
 /// A photorealistic board render (PNG bytes + pixel size) for the guide diagram —
@@ -130,6 +233,11 @@ const PHOTOREAL_FIT: f64 = 0.70;
 struct Kind {
     prefix: &'static str,
     title: &'static str,
+    /// How to place this kind, through-hole (the default) — the per-kind copy.
+    note_tht: &'static str,
+    /// The surface-mount variant, when the technique genuinely differs; `None`
+    /// falls back to `note_tht` (parts that are rarely SMD, e.g. panel hardware).
+    note_smd: Option<&'static str>,
 }
 
 // Order matters — this *is* the build sequence: low-profile → tall, so a part
@@ -137,41 +245,89 @@ struct Kind {
 // (pots, jacks) goes last since it mates to the front panel. Within this order,
 // build_guide does the BACK side first (SMD + power header) then the front.
 // `prefix_of` yields the whole letter prefix, so `RV`/`SW` never collide with
-// `R`/`S`.
+// `R`/`S`. Each kind carries its own assembly copy — THT-first, since few DIY
+// kits are surface-mount; a per-part note from the parts library overrides it.
 const KINDS: &[Kind] = &[
     Kind {
         prefix: "R",
         title: "Resistors",
+        note_tht: "Bend each resistor's leads to the pad spacing, seat it flat against the board, \
+                   and splay the leads on the back to hold it. Solder both pads, then flush-cut the \
+                   excess lead. Match each value by its color bands (shown in the sort list).",
+        note_smd: Some(
+            "Tack one pad, set the body square, solder the opposite pad, then reflow the first.",
+        ),
     },
     Kind {
         prefix: "D",
         title: "Diodes & LEDs",
+        note_tht: "Match the cathode (banded / flat) end to the silkscreen before soldering. Bend \
+                   the leads, seat, splay to hold, solder, then clip.",
+        note_smd: Some(
+            "Match the cathode mark to the silkscreen; tack one end, align, solder the other.",
+        ),
     },
     Kind {
         prefix: "Q",
         title: "Transistors",
+        note_tht: "Match the flat / pin-1 to the outline. Leave the body a few mm proud of the \
+                   board, and solder each lead briefly so the part doesn't overheat.",
+        note_smd: None,
     },
     Kind {
         prefix: "U",
         title: "ICs & sockets",
+        note_tht: "Fit a socket first — don't solder the IC directly. Match the notch / pin-1 to \
+                   the silkscreen, solder two diagonal corner pins, check it sits flat, then solder \
+                   the rest. Insert the IC last, notch matched.",
+        note_smd: Some(
+            "Match pin-1 to the mark. Tack one corner, align, solder the diagonal corner, then run \
+             the rows and check for solder bridges.",
+        ),
     },
     Kind {
         prefix: "C",
         title: "Capacitors",
+        note_tht: "Ceramic and film caps go in either way. Electrolytics are polarised — match the \
+                   + terminal to the silkscreen (the longer lead is +). Seat flat, solder, clip.",
+        note_smd: Some(
+            "Ceramics are unpolarised; match a tantalum's + to the mark. Tack, align, solder the \
+             far pad.",
+        ),
     },
     Kind {
         prefix: "SW",
         title: "Switches",
+        note_tht: "Seat the switch fully flush against the board before soldering so it lines up \
+                   with the panel cut-out.",
+        note_smd: None,
     },
     Kind {
         prefix: "RV",
         title: "Potentiometers & trimmers",
+        note_tht: "Mount the pot through the panel and tighten its nut before soldering, so it \
+                   self-aligns. Some pots have a small locating tab — snap it off if your panel has \
+                   no matching hole.",
+        note_smd: None,
     },
     Kind {
         prefix: "J",
         title: "Connectors, jacks & headers",
+        note_tht: "Fit these last. Mount panel jacks through the panel and tighten before soldering \
+                   so everything lines up; seat headers square to the board.",
+        note_smd: None,
     },
 ];
+
+/// The per-kind assembly note for a step, choosing the SMD variant only when the
+/// whole group is surface-mount (else the THT default).
+fn kind_note(kind: &Kind, parts: &[PlacedPart]) -> String {
+    let all_smd = !parts.is_empty() && parts.iter().all(|p| !p.through_hole);
+    match (all_smd, kind.note_smd) {
+        (true, Some(smd)) => smd.to_string(),
+        _ => kind.note_tht.to_string(),
+    }
+}
 
 /// Build the guide from a circuit (values, types) and its generated board
 /// (positions). Parts default to the front; back parts are noted per step.
@@ -215,6 +371,8 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
                 continue;
             }
             steps.push(BuildStep {
+                assembly: Some(kind_note(kind, &group)),
+                part_notes: Vec::new(),
                 caution: step_caution(&group),
                 title: kind.title.to_string(),
                 parts: group,
@@ -223,6 +381,8 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         let remaining = take_group(&parts, &mut used, |p| p.back == back);
         if !remaining.is_empty() {
             steps.push(BuildStep {
+                assembly: None,
+                part_notes: Vec::new(),
                 caution: step_caution(&remaining),
                 title: "Remaining parts".to_string(),
                 parts: remaining,
@@ -233,8 +393,39 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
     Ok(BuildGuide {
         name: circuit.name().to_string(),
         outline: board_outline(board_pcb).unwrap_or((0.0, 0.0, 10.0, 10.0)),
+        kit: detect_kit(&parts),
+        brand: None,
+        intro: None,
+        tools: Vec::new(),
+        kit_cautions: Vec::new(),
         steps,
     })
+}
+
+impl BuildGuide {
+    /// Attach part-specific assembly notes to the steps they belong to. `notes`
+    /// maps a reference designator to its ordered note text — the CLI builds it
+    /// from [`PartsLibrary::resolve_circuit`](crate::parts::PartsLibrary::resolve_circuit)
+    /// (per-MPN library records) so [`build_guide`] itself stays free of the parts
+    /// library. Parts in a step that share the same note collapse into one callout.
+    pub fn attach_part_notes(&mut self, notes: &BTreeMap<String, Vec<String>>) {
+        for step in &mut self.steps {
+            let mut grouped: Vec<PartNote> = Vec::new();
+            for p in &step.parts {
+                let Some(steps) = notes.get(&p.refdes).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                match grouped.iter_mut().find(|g| &g.steps == steps) {
+                    Some(g) => g.refs.push(p.refdes.clone()),
+                    None => grouped.push(PartNote {
+                        refs: vec![p.refdes.clone()],
+                        steps: steps.clone(),
+                    }),
+                }
+            }
+            step.part_notes = grouped;
+        }
+    }
 }
 
 /// Collect — and mark used — every not-yet-used part matching `pred`, preserving
@@ -331,7 +522,15 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
             f64::NEG_INFINITY,
         );
         let mut pin1 = None;
+        let mut through_hole = false;
         for pad in fp.get_all("pad") {
+            // Pad type is the atom after the pad number: `(pad "1" thru_hole …)`.
+            if pad
+                .nth_atom(2)
+                .is_some_and(|t| t == "thru_hole" || t == "np_thru_hole")
+            {
+                through_hole = true;
+            }
             let pat = pad.get("at");
             let (px, py) = (
                 pat.and_then(|a| a.nth_atom(1)).and_then(f).unwrap_or(0.0),
@@ -362,6 +561,7 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
             cy: fy,
             bbox: bb,
             back,
+            through_hole,
             pin1,
             polarity: None,
         });
@@ -405,13 +605,46 @@ pub fn guide_to_html(
     let any_back = guide.steps.iter().any(step_is_back);
     let cxmm = (guide.outline.0 + guide.outline.2) / 2.0;
     let mut body = String::new();
-    body.push_str(&format!(
-        "<h1>Build guide — {}</h1><p class=\"sub\">{total} steps, {total_parts} parts. \
-         Work low-profile → tall{}. Match every polarity / pin-1 marker to the board \
-         silkscreen.</p>",
-        esc(&guide.name),
+    let sub = format!(
+        "Work low-profile → tall{}. Match every polarity / pin-1 marker to the board silkscreen.",
         if any_back { ", back side first" } else { "" },
+    );
+    let eyebrow = match &guide.brand {
+        Some(b) => format!("{b} · Build guide"),
+        None => "Build guide".to_string(),
+    };
+    body.push_str(&theme::masthead(
+        &eyebrow,
+        &guide.name,
+        &sub,
+        &[
+            guide.kit.label().to_string(),
+            format!("{total} steps"),
+            format!("{total_parts} parts"),
+        ],
     ));
+
+    // Per-circuit build copy (5uj.5): kit intro, tools, kit-level cautions.
+    if guide.intro.is_some() || !guide.tools.is_empty() || !guide.kit_cautions.is_empty() {
+        body.push_str("<section class=\"kit-copy\">");
+        if let Some(intro) = &guide.intro {
+            body.push_str(&format!("<p class=\"intro\">{}</p>", esc(intro)));
+        }
+        for c in &guide.kit_cautions {
+            body.push_str(&format!("<p class=\"caution\">⚠ {}</p>", esc(c)));
+        }
+        if !guide.tools.is_empty() {
+            let tools = guide
+                .tools
+                .iter()
+                .map(|t| format!("<li>{}</li>", esc(t)))
+                .collect::<String>();
+            body.push_str(&format!(
+                "<h2>Tools you'll need</h2><ul class=\"tools\">{tools}</ul>"
+            ));
+        }
+        body.push_str("</section>");
+    }
 
     // Prep / sort sheet — pull and sort every part up front, in build order.
     body.push_str(
@@ -428,9 +661,10 @@ pub fn guide_to_html(
             .into_iter()
             .map(|(v, refs)| {
                 format!(
-                    "{}× {} <span class=\"refs\">({})</span>",
+                    "{}× {} {}<span class=\"refs\">({})</span>",
                     refs.len(),
                     esc(&v),
+                    resistor_swatch_html(&step.parts, &refs, &v),
                     esc(&refs.join(", "))
                 )
             })
@@ -464,12 +698,34 @@ pub fn guide_to_html(
         let mut list = String::new();
         for (value, refs) in group_by_value(&step.parts) {
             list.push_str(&format!(
-                "<li><b>{}×</b> {} — <span class=\"refs\">{}</span></li>",
+                "<li><b>{}×</b> {} {}— <span class=\"refs\">{}</span></li>",
                 refs.len(),
                 esc(&value),
+                resistor_swatch_html(&step.parts, &refs, &value),
                 esc(&refs.join(", "))
             ));
         }
+        let howto = step
+            .assembly
+            .as_deref()
+            .map(|a| format!("<p class=\"howto\">{}</p>", esc(a)))
+            .unwrap_or_default();
+        let partnotes: String = step
+            .part_notes
+            .iter()
+            .map(|pn| {
+                let text = pn
+                    .steps
+                    .iter()
+                    .map(|s| esc(s))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    "<p class=\"partnote\"><b class=\"pn-ref\">{}</b> {text}</p>",
+                    esc(&pn.refs.join(", ")),
+                )
+            })
+            .collect();
         let caution = step
             .caution
             .as_deref()
@@ -481,44 +737,76 @@ pub fn guide_to_html(
             ""
         };
         body.push_str(&format!(
-            "<section class=\"step\"><h2>Step {} of {total}: {} {badge}</h2>\
-             <p class=\"prog\">Place {n} part{} — {placed} of {total_parts} placed when done.</p>\
+            "<section class=\"step\"><header class=\"step-head\">\
+             <span class=\"step-no mono\">{stepno}<span class=\"of\"> / {total}</span></span>\
+             <div class=\"step-meta\"><h2 class=\"step-title\">{title}{badge}</h2>\
+             <p class=\"prog mono\">Place {n} part{s} · {placed} / {total_parts} placed when done</p>\
+             </div></header>\
              <div class=\"cols\"><div class=\"diagram\">{svg}</div>\
-             <div class=\"parts\"><ul>{list}</ul>{caution}</div></div></section>",
-            i + 1,
-            esc(&step.title),
-            if n == 1 { "" } else { "s" },
+             <div class=\"parts\"><ul>{list}</ul>{howto}{partnotes}{caution}</div></div></section>",
+            stepno = i + 1,
+            title = esc(&step.title),
+            s = if n == 1 { "" } else { "s" },
         ));
     }
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Build guide — {}</title>\
-         <style>{CSS}</style></head><body>{body}</body></html>",
-        esc(&guide.name)
+         <style>{BASE}{CSS}</style></head><body><div class=\"wrap\">{body}</div></body></html>",
+        esc(&guide.name),
+        BASE = theme::BASE_CSS,
     )
 }
 
+/// Build-guide-specific CSS, layered after [`theme::BASE_CSS`]. Numbered steps
+/// (the sequence is real), monospace part data, and a bench-note treatment for
+/// the per-kind placing copy.
 const CSS: &str = "\
-body{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#222}\
-h1{margin-bottom:.2rem}.sub{color:#666;margin-top:0}\
-.prep{border-top:2px solid #eee;padding:1rem 0}\
-.prep table{border-collapse:collapse;width:100%;font-size:.95rem}\
-.prep th{text-align:left;color:#666;font-weight:600;border-bottom:1px solid #ddd;padding:.35rem .5rem}\
-.prep td{border-bottom:1px solid #f0f0f0;padding:.35rem .5rem;vertical-align:top}\
-.step{border-top:2px solid #eee;padding:1.2rem 0}h2{font-size:1.15rem}\
-.prog{color:#666;margin:.1rem 0 .7rem;font-size:.9rem}\
-.badge{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.02em;\
-background:#eef;color:#446;border-radius:4px;padding:.05rem .4rem;vertical-align:middle}\
-.badge.back{background:#fce8d6;color:#8a4b12}\
-.cols{display:flex;gap:1.5rem;flex-wrap:wrap;align-items:flex-start}\
-.diagram{flex:1 1 340px;min-width:280px}.parts{flex:1 1 240px}\
-svg{width:100%;height:auto;border:1px solid #eee;background:#fafafa;border-radius:6px}\
-ul{margin:0;padding-left:1.1rem}li{margin:.15rem 0}.refs{color:#555}\
-.caution{background:#fff6e0;border-left:3px solid #e0a800;padding:.5rem .7rem;border-radius:4px;margin:.6rem 0 0}\
-@media print{@page{margin:12mm;size:A4}body{margin:0;max-width:none}\
-.prep{break-after:page}\
+.kit-copy{margin:.2rem 0 .4rem}\
+.kit-copy .intro{font-size:1.05rem;color:#3a362f;max-width:64ch;margin:.2rem 0 .9rem}\
+.kit-copy h2{font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;\
+color:var(--muted);margin:.9rem 0 .4rem}\
+.tools{margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:.4rem}\
+.tools li{font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:.82rem;background:var(--panel);\
+border:1px solid var(--line);border-radius:5px;padding:.25rem .6rem}\
+.prep{border-top:1px solid var(--line);padding:1.2rem 0;margin-top:.4rem}\
+.prep h2{font-size:1.15rem;font-weight:700;letter-spacing:-.01em;margin:.1rem 0 .7rem}\
+.prep table{border-collapse:collapse;width:100%;font-size:.9rem}\
+.prep th{text-align:left;color:var(--muted);font-weight:600;font-size:.7rem;letter-spacing:.06em;\
+text-transform:uppercase;border-bottom:1.5px solid var(--copper);padding:.4rem .5rem}\
+.prep td{border-bottom:1px solid var(--line);padding:.4rem .5rem;vertical-align:top}\
+.prep td:first-child{font-weight:600}\
+.step{border-top:1px solid var(--line);padding:1.5rem 0}\
+.step-head{display:flex;gap:.9rem;align-items:baseline}\
+.step-no{font-size:2rem;font-weight:750;color:var(--copper);line-height:1;letter-spacing:-.03em;white-space:nowrap}\
+.step-no .of{font-size:.85rem;color:var(--muted);font-weight:500;letter-spacing:0}\
+.step-title{font-size:1.2rem;font-weight:700;letter-spacing:-.01em;margin:0}\
+.prog{color:var(--muted);margin:.25rem 0 0;font-size:.8rem}\
+.badge{display:inline-block;font-size:.66rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;\
+background:var(--copper-soft);color:#8a4f22;border-radius:4px;padding:.1rem .45rem;vertical-align:middle;margin-left:.5rem}\
+.badge.back{background:#fbe6d2;color:#8a4b12}\
+.cols{display:flex;gap:1.6rem;flex-wrap:wrap;align-items:flex-start;margin-top:.9rem}\
+.diagram{flex:1 1 340px;min-width:280px}.parts{flex:1 1 250px}\
+.diagram svg{width:100%;height:auto;border:1px solid var(--line);background:#fbfbfa;border-radius:8px}\
+ul{margin:0;padding-left:0;list-style:none}\
+li{margin:.28rem 0;padding-left:1rem;position:relative}\
+li::before{content:'';position:absolute;left:0;top:.55em;width:5px;height:5px;background:var(--copper);border-radius:1px}\
+li b{font-family:ui-monospace,'SF Mono',Menlo,monospace}\
+.refs{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:.84rem}\
+.swatch{display:inline-block;vertical-align:middle;margin:0 .2rem}\
+svg.rband{width:58px;height:18px;border:0;background:none;border-radius:0;vertical-align:middle}\
+.howto{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--copper);\
+padding:.55rem .8rem;border-radius:5px;margin:.75rem 0 0;color:#4a453d;font-size:.9rem}\
+.howto::before{content:'Placing';display:block;font-family:ui-monospace,Menlo,monospace;font-size:.62rem;\
+letter-spacing:.16em;text-transform:uppercase;color:var(--copper);margin-bottom:.25rem}\
+.partnote{background:var(--copper-soft);border-radius:5px;padding:.5rem .7rem;margin:.5rem 0 0;\
+color:#5a4327;font-size:.88rem}\
+.pn-ref{font-family:ui-monospace,'SF Mono',Menlo,monospace;font-weight:700;color:#8a4f22;margin-right:.35rem}\
+.caution{background:#fdf4de;border-left:3px solid var(--flux);padding:.55rem .8rem;border-radius:5px;\
+margin:.6rem 0 0;color:#6b4e07;font-size:.9rem}\
+@media print{.prep{break-after:page}\
 .step{break-before:page;break-inside:avoid;border-top:none;padding:0}\
-.step:first-of-type{break-before:avoid}h1,.sub{break-after:avoid}\
-.diagram,.parts{break-inside:avoid}svg{max-height:150mm}}";
+.step:first-of-type{break-before:avoid}\
+.diagram,.parts{break-inside:avoid}.diagram svg{max-height:150mm}}";
 
 /// Draw a highlight marker for one placed part on a PDF page: a red box (filled
 /// over the schematic fallback; outlined over the real-board image so the part
@@ -624,13 +912,11 @@ pub fn guide_to_pdf(
     {
         let mut pg = Page::new();
         pg.set_fill(0.1, 0.1, 0.1);
-        pg.text(
-            m,
-            top,
-            20.0,
-            Font::Bold,
-            &format!("{} - build guide", guide.name),
-        );
+        let title = match &guide.brand {
+            Some(b) => format!("{b} — {} build guide", guide.name),
+            None => format!("{} - build guide", guide.name),
+        };
+        pg.text(m, top, 20.0, Font::Bold, &title);
         pg.set_fill(0.3, 0.3, 0.3);
         pg.text(
             m,
@@ -638,12 +924,29 @@ pub fn guide_to_pdf(
             11.0,
             Font::Regular,
             &format!(
-                "{total} steps, {total_parts} parts. Low-profile to tall{}. \
+                "{}  -  {total} steps, {total_parts} parts. Low-profile to tall{}. \
                  Match every polarity / pin-1 mark to the silkscreen.",
+                guide.kit.label(),
                 if any_back { ", back side first" } else { "" }
             ),
         );
-        let mut ly = top - 52.0;
+
+        // Per-circuit build copy (5uj.5): intro, tools, kit cautions.
+        let mut ly = top - 46.0;
+        if let Some(intro) = &guide.intro {
+            pg.set_fill(0.2, 0.19, 0.17);
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 11.0, Font::Regular, intro) - 4.0;
+        }
+        if !guide.tools.is_empty() {
+            pg.set_fill(0.35, 0.35, 0.35);
+            let tools = format!("Tools: {}", guide.tools.join("  ·  "));
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.5, Font::Regular, &tools) - 4.0;
+        }
+        for c in &guide.kit_cautions {
+            pg.set_fill(0.72, 0.45, 0.0);
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.5, Font::Bold, &format!("[!] {c}")) - 2.0;
+        }
+        ly -= 6.0;
         pg.set_fill(0.13, 0.13, 0.13);
         pg.text(
             m,
@@ -673,6 +976,7 @@ pub fn guide_to_pdf(
                     Font::Regular,
                     &format!("{}x  {}  ({})", refs.len(), v, refs.join(", ")),
                 );
+                pdf_resistor_bands(&mut pg, &step.parts, &refs, &v, pdf::A4_W - m, ly);
                 ly -= 13.0;
             }
             ly -= 4.0;
@@ -796,7 +1100,32 @@ pub fn guide_to_pdf(
                 Font::Regular,
                 &format!("{}x   {}   ({})", refs.len(), value, refs.join(", ")),
             );
+            pdf_resistor_bands(&mut pg, &step.parts, &refs, &value, pdf::A4_W - m, ly);
             ly -= 15.0;
+        }
+        if let Some(a) = &step.assembly {
+            ly -= 10.0;
+            pg.set_fill(0.20, 0.28, 0.40);
+            pg.text(m, ly, 11.0, Font::Bold, "Placing them:");
+            ly -= 15.0;
+            pg.set_fill(0.28, 0.32, 0.38);
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.5, Font::Regular, a);
+        }
+        for pn in &step.part_notes {
+            ly -= 7.0;
+            pg.set_fill(0.69, 0.41, 0.18); // copper — a part-specific callout
+            pg.text(m, ly, 10.5, Font::Bold, &format!("{}:", pn.refs.join(", ")));
+            ly -= 14.0;
+            pg.set_fill(0.35, 0.27, 0.15);
+            ly = pdf_wrapped(
+                &mut pg,
+                m + 10.0,
+                ly,
+                cw - 10.0,
+                10.5,
+                Font::Regular,
+                &pn.steps.join(" "),
+            );
         }
         if let Some(c) = &step.caution {
             ly -= 8.0;
@@ -928,6 +1257,107 @@ fn photoreal_board_svg(
     )
 }
 
+/// Whether a value-group is resistors (refdes prefix `R`, not `RV`/relays).
+fn is_resistor_group(refs: &[String]) -> bool {
+    refs.first().map(|r| prefix_of(r)) == Some("R")
+}
+
+/// Whether a value-group is a *through-hole* resistor group — the gate for the
+/// color-code pictogram. SMD resistors carry a printed numeric code (e.g. `513`),
+/// not color bands, so they get none; color bands are a THT sorting aid. Looks
+/// the group's parts up by refdes in the step.
+fn is_tht_resistor_group(step_parts: &[PlacedPart], refs: &[String]) -> bool {
+    is_resistor_group(refs)
+        && refs.iter().all(|rd| {
+            step_parts
+                .iter()
+                .find(|p| p.refdes.as_str() == rd.as_str())
+                .is_some_and(|p| p.through_hole)
+        })
+}
+
+/// The resistor color-code SVG for a value-group, or empty unless the group is a
+/// through-hole resistor whose value parses as a resistance (`"100n"`/`"TL072"`/
+/// SMD resistors → nothing).
+fn resistor_swatch_html(step_parts: &[PlacedPart], refs: &[String], value: &str) -> String {
+    if !is_tht_resistor_group(step_parts, refs) {
+        return String::new();
+    }
+    match crate::resistor::color_code(value) {
+        Some(cc) => format!("<span class=\"swatch\">{}</span>", cc.to_svg(58.0, 18.0)),
+        None => String::new(),
+    }
+}
+
+/// Draw a through-hole resistor's color bands as a compact vertical-stripe strip
+/// on a PDF page, right edge at `right_x`, sitting on text baseline `y` (a beige
+/// backing so light bands read). No-op for SMD / non-resistor / unparseable groups.
+fn pdf_resistor_bands(
+    pg: &mut Page,
+    step_parts: &[PlacedPart],
+    refs: &[String],
+    value: &str,
+    right_x: f64,
+    y: f64,
+) {
+    if !is_tht_resistor_group(step_parts, refs) {
+        return;
+    }
+    let Some(cc) = crate::resistor::color_code(value) else {
+        return;
+    };
+    let (bw, gap, h) = (3.2, 1.3, 9.0);
+    let strip_w = cc.bands.len() as f64 * (bw + gap);
+    let x0 = right_x - strip_w;
+    let by = y - 1.5;
+    pg.set_fill(0.91, 0.83, 0.63);
+    pg.rect(x0 - 1.5, by - 1.0, strip_w + 3.0, h + 2.0, Paint::Fill);
+    let mut cx = x0;
+    for band in &cc.bands {
+        let (r, g, b) = band.rgb();
+        pg.set_fill(r, g, b);
+        pg.rect(cx, by, bw, h, Paint::Fill);
+        pg.set_line_width(0.2);
+        pg.set_stroke(0.5, 0.5, 0.5);
+        pg.rect(cx, by, bw, h, Paint::Stroke);
+        cx += bw + gap;
+    }
+}
+
+/// Draw `text` word-wrapped to `max_w` points at font `size`, starting at
+/// baseline `y`, and return the baseline just below the last line. The PDF text
+/// primitive doesn't wrap, so this greedily packs words by an estimated advance
+/// width (monospace-ish 0.5·size per char — conservative for the built-in fonts).
+fn pdf_wrapped(
+    pg: &mut Page,
+    x: f64,
+    y: f64,
+    max_w: f64,
+    size: f64,
+    font: Font,
+    text: &str,
+) -> f64 {
+    let max_chars = ((max_w / (size * 0.5)).floor() as usize).max(10);
+    let mut cy = y;
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + word.len() > max_chars {
+            pg.text(x, cy, size, font, &line);
+            cy -= size * 1.35;
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        pg.text(x, cy, size, font, &line);
+        cy -= size * 1.35;
+    }
+    cy
+}
+
 /// Group a step's parts by value, preserving refdes order.
 fn group_by_value(parts: &[PlacedPart]) -> Vec<(String, Vec<String>)> {
     let mut order: Vec<String> = Vec::new();
@@ -1003,9 +1433,39 @@ mod tests {
         let html = guide_to_html(&g, None, None);
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<svg"));
-        assert!(html.contains("Step 1 of 2: Resistors"));
+        // Numbered steps with the resistor step titled in an <h2>.
+        assert!(html.contains("class=\"step-no"));
+        assert!(html.contains("class=\"step-title\">Resistors"));
         // The IC step cautions about pin 1.
         assert!(html.contains("pin 1"));
+    }
+
+    #[test]
+    fn through_hole_resistors_get_color_bands_smd_dont() {
+        // A THROUGH-HOLE board with R1=9k, R2=1k, U1=TL072 (color bands are a THT
+        // sorting aid, so they only render for through-hole resistors).
+        let tht_board = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 105) (layer "Edge.Cuts"))
+          (footprint "R" (layer "F.Cu") (at 100 100 0)
+            (property "Reference" "R1") (pad "1" thru_hole circle (at -1 0) (size 1 1)) (pad "2" thru_hole circle (at 1 0) (size 1 1)))
+          (footprint "R" (layer "F.Cu") (at 110 100 0)
+            (property "Reference" "R2") (pad "1" thru_hole circle (at -1 0) (size 1 1)) (pad "2" thru_hole circle (at 1 0) (size 1 1)))
+          (footprint "U" (layer "F.Cu") (at 120 100 0)
+            (property "Reference" "U1") (pad "1" thru_hole circle (at -2 0) (size 1 1)) (pad "8" thru_hole circle (at 2 0) (size 1 1))))"#;
+        let g = build_guide(&amp(), tht_board).unwrap();
+        let html = guide_to_html(&g, None, None);
+        assert!(html.contains("class=\"rband\""));
+        assert!(html.contains("<title>brown black red gold</title>")); // 1k
+        assert!(html.contains("<title>white black red gold</title>")); // 9k
+                                                                       // Each resistor value appears both in the prep sheet and its step list.
+        assert_eq!(html.matches("class=\"swatch\"").count(), 4);
+        // The IC value (TL072) is not a resistance → no band pictogram for it.
+        assert!(!html.contains("<title>TL072"));
+
+        // The SMD fixture (BOARD, smd pads) gets NO color bands — SMD resistors are
+        // marked with a printed numeric code, not bands.
+        let smd = build_guide(&amp(), BOARD).unwrap();
+        assert!(!guide_to_html(&smd, None, None).contains("class=\"rband\""));
     }
 
     #[test]
@@ -1053,6 +1513,81 @@ mod tests {
     }
 
     #[test]
+    fn kit_type_and_assembly_copy_are_pad_aware() {
+        // A THT board (through-hole pads) → detected THT, per-kind THT copy shown.
+        let board = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 105) (layer "Edge.Cuts"))
+          (footprint "R" (layer "F.Cu") (at 100 100 0)
+            (property "Reference" "R1") (pad "1" thru_hole circle (at -1 0) (size 1 1)) (pad "2" thru_hole circle (at 1 0) (size 1 1)))
+          (footprint "RV" (layer "F.Cu") (at 120 100 0)
+            (property "Reference" "RV1") (pad "1" thru_hole circle (at -2 0) (size 1 1)) (pad "2" thru_hole circle (at 2 0) (size 1 1))))"#;
+        let circ = Circuit {
+            name: "tht".into(),
+            parts: vec![Part::new("R1", "10k"), Part::new("RV1", "A100k")],
+            nets: vec![],
+        };
+        let g = build_guide(&circ, board).unwrap();
+        assert_eq!(g.kit, KitType::Tht);
+        // Resistor step carries THT resistor copy (flush-cut the leads)...
+        let r = g.steps.iter().find(|s| s.title == "Resistors").unwrap();
+        assert!(r.assembly.as_deref().unwrap().contains("flush-cut"));
+        // ...and the pot step names the locating tab — the per-part-note seam (5uj.3).
+        let pot = g
+            .steps
+            .iter()
+            .find(|s| s.title.starts_with("Potentiometers"))
+            .unwrap();
+        assert!(pot.assembly.as_deref().unwrap().contains("locating tab"));
+
+        // The all-SMD fixture (BOARD, smd pads) → detected SMD, SMD copy variant.
+        let g2 = build_guide(&amp(), BOARD).unwrap();
+        assert_eq!(g2.kit, KitType::Smd);
+        let r2 = g2.steps.iter().find(|s| s.title == "Resistors").unwrap();
+        assert!(r2.assembly.as_deref().unwrap().contains("reflow"));
+
+        // The kit label + how-to copy surface in the HTML.
+        let html = guide_to_html(&g, None, None);
+        assert!(html.contains("Through-hole kit"));
+        assert!(html.contains("class=\"howto\""));
+
+        assert_eq!(KitType::parse("SMD"), Some(KitType::Smd));
+        assert_eq!(KitType::parse("through-hole"), Some(KitType::Tht));
+        assert_eq!(KitType::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn attach_part_notes_groups_and_renders_under_the_step() {
+        // amp(): R1, R2 (Resistors step), U1 (ICs step).
+        let mut g = build_guide(&amp(), BOARD).unwrap();
+        let mut notes = BTreeMap::new();
+        // R1 and R2 share a note → one grouped callout; U1 gets its own.
+        let trim = vec!["Trim the leads flush after soldering.".to_string()];
+        notes.insert("R1".to_string(), trim.clone());
+        notes.insert("R2".to_string(), trim.clone());
+        notes.insert(
+            "U1".to_string(),
+            vec!["Use a socket; match the notch.".to_string()],
+        );
+        g.attach_part_notes(&notes);
+
+        let resistors = g.steps.iter().find(|s| s.title == "Resistors").unwrap();
+        assert_eq!(
+            resistors.part_notes.len(),
+            1,
+            "R1+R2 share one grouped note"
+        );
+        assert_eq!(resistors.part_notes[0].refs, vec!["R1", "R2"]);
+        let ics = g.steps.iter().find(|s| s.title == "ICs & sockets").unwrap();
+        assert_eq!(ics.part_notes[0].refs, vec!["U1"]);
+
+        // Rendered: the per-part callout carries the grouped refdes + the text.
+        let html = guide_to_html(&g, None, None);
+        assert!(html.contains("class=\"partnote\""));
+        assert!(html.contains("class=\"pn-ref\">R1, R2</b> Trim the leads flush"));
+        assert!(html.contains("Use a socket; match the notch."));
+    }
+
+    #[test]
     fn mirror_part_x_flips_about_axis_keeping_y() {
         let p = PlacedPart {
             refdes: "C1".into(),
@@ -1062,6 +1597,7 @@ mod tests {
             cy: 100.0,
             bbox: (104.0, 99.0, 106.0, 101.0),
             back: true,
+            through_hole: false,
             pin1: Some((104.0, 100.0)),
             polarity: None,
         };

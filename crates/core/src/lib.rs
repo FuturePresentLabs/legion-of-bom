@@ -13,18 +13,22 @@
 pub mod board;
 pub mod bom;
 pub mod drc;
+pub mod easyeda;
 pub mod fab;
 pub mod fetch;
 pub mod guide;
+pub mod images;
 pub mod jlcpcb;
 pub mod layout;
 pub mod logo;
+pub mod manifest;
 pub mod model;
 pub mod mouser;
 pub mod netlist;
 pub mod panel;
 pub mod parts;
 pub mod pdf;
+pub mod resistor;
 pub mod route;
 mod sexpr;
 pub mod skidl;
@@ -33,6 +37,7 @@ pub mod spice;
 pub mod stage;
 pub mod subboard;
 mod symbols;
+pub mod theme;
 pub mod tools;
 pub mod units;
 pub mod validate;
@@ -44,20 +49,24 @@ pub use board::{
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
+pub use easyeda::product_image_url;
 pub use fab::{
     export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos, png_to_jpeg,
     render_board_jpeg, render_board_png, zip_dir,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use guide::{
-    build_guide, guide_to_html, guide_to_pdf, BoardPng, BuildGuide, BuildStep, PlacedPart,
+    build_guide, guide_to_html, guide_to_pdf, BoardPng, BuildGuide, BuildStep, KitType, PartNote,
+    PlacedPart,
 };
+pub use images::{default_cache_dir as default_image_cache_dir, embed_source, fetch_data_uri};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use layout::{
     measure, run_layout_loop, score, CostWeights, LayoutLoop, LayoutMode, LayoutReport,
     PlacementMetrics,
 };
 pub use logo::Logo;
+pub use manifest::{BuildCopy, CircuitEntry, Defaults, Manifest, ManifestError, RepoMeta};
 pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
@@ -70,6 +79,7 @@ pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
 };
+pub use resistor::{color_code, parse_ohms, Band, ColorCode};
 pub use route::{
     GridRouter, MstRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput, Router, Track,
     Via,

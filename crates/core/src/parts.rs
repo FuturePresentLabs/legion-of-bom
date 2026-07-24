@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS parts (\
   fetched_at DATETIME,\
   verified_by_human BOOLEAN NOT NULL DEFAULT FALSE,\
   verified_at DATETIME,\
-  verified_by VARCHAR(64));\
+  verified_by VARCHAR(64),\
+  image_url TEXT);\
 CREATE TABLE IF NOT EXISTS part_pins (\
   mpn VARCHAR(64) NOT NULL,\
   pin_number VARCHAR(8) NOT NULL,\
@@ -42,7 +43,12 @@ CREATE TABLE IF NOT EXISTS part_ratings (\
   value TEXT,\
   unit VARCHAR(16),\
   cited_page INT,\
-  PRIMARY KEY (mpn, rating_name));";
+  PRIMARY KEY (mpn, rating_name));\
+CREATE TABLE IF NOT EXISTS part_assembly_steps (\
+  mpn VARCHAR(64) NOT NULL,\
+  step_order INT NOT NULL,\
+  text TEXT,\
+  PRIMARY KEY (mpn, step_order));";
 
 /// One pin of a part, with a citation back to the source page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +77,15 @@ pub struct PartRecord {
     /// Gates real use: `layout`/`generate_bom` refuse unverified parts.
     pub verified_by_human: bool,
     pub verified_by: Option<String>,
+    /// Product-photo URL (or `file://` local path) for the Visual BOM — the
+    /// durable per-MPN cache for parts a distributor auto-lookup can't cover
+    /// (boutique DIY jacks/pots). Set via `lob parts set-image`.
+    pub image_url: Option<String>,
+    /// Ordered part-specific assembly notes shown in the build guide, overriding
+    /// the generic per-kind copy — e.g. "snap off the locating tab if unused" for
+    /// a particular pot. Travels with the part like its pinout. Set via
+    /// `lob parts set-assembly`.
+    pub assembly_steps: Vec<String>,
     pub pins: Vec<PinRecord>,
     pub ratings: Vec<RatingRecord>,
 }
@@ -84,6 +99,8 @@ impl PartRecord {
             datasheet_url: None,
             verified_by_human: false,
             verified_by: None,
+            image_url: None,
+            assembly_steps: Vec::new(),
             pins: Vec::new(),
             ratings: Vec::new(),
         }
@@ -126,7 +143,18 @@ impl PartsLibrary {
             lib.dolt(&["init"], "init")?;
         }
         lib.sql(SCHEMA)?;
+        lib.ensure_image_column()?;
         Ok(lib)
+    }
+
+    /// Migrate a pre-existing library that predates the `image_url` column. New
+    /// DBs get it from `SCHEMA`; older ones are missing it, so add it when a probe
+    /// select fails. Version-safe (no reliance on `ADD COLUMN IF NOT EXISTS`).
+    fn ensure_image_column(&self) -> Result<(), PartsError> {
+        if self.query("SELECT image_url FROM parts LIMIT 1").is_err() {
+            self.sql("ALTER TABLE parts ADD COLUMN image_url TEXT")?;
+        }
+        Ok(())
     }
 
     /// Insert or fully replace a part (and its pins/ratings) atomically.
@@ -137,13 +165,15 @@ impl PartsLibrary {
             format!("DELETE FROM parts WHERE mpn={mpn};"),
             format!("DELETE FROM part_pins WHERE mpn={mpn};"),
             format!("DELETE FROM part_ratings WHERE mpn={mpn};"),
+            format!("DELETE FROM part_assembly_steps WHERE mpn={mpn};"),
             format!(
-                "INSERT INTO parts (mpn, manufacturer, datasheet_url, verified_by_human, verified_by) \
-                 VALUES ({mpn}, {}, {}, {}, {});",
+                "INSERT INTO parts (mpn, manufacturer, datasheet_url, verified_by_human, verified_by, image_url) \
+                 VALUES ({mpn}, {}, {}, {}, {}, {});",
                 sql_opt(part.manufacturer.as_deref()),
                 sql_opt(part.datasheet_url.as_deref()),
                 sql_bool(part.verified_by_human),
                 sql_opt(part.verified_by.as_deref()),
+                sql_opt(part.image_url.as_deref()),
             ),
         ];
         for pin in &part.pins {
@@ -163,6 +193,13 @@ impl PartsLibrary {
                 sql_int(rating.cited_page),
             ));
         }
+        for (i, step) in part.assembly_steps.iter().enumerate() {
+            stmts.push(format!(
+                "INSERT INTO part_assembly_steps (mpn, step_order, text) VALUES ({mpn}, {}, {});",
+                i as i64,
+                sql_str(step),
+            ));
+        }
         stmts.push("COMMIT;".to_string());
         self.sql(&stmts.join("\n"))
     }
@@ -171,7 +208,7 @@ impl PartsLibrary {
     pub fn get_part(&self, mpn: &str) -> Result<Option<PartRecord>, PartsError> {
         let key = sql_str(mpn);
         let rows = self.query(&format!(
-            "SELECT mpn, manufacturer, datasheet_url, verified_by_human, verified_by FROM parts WHERE mpn={key}"
+            "SELECT mpn, manufacturer, datasheet_url, verified_by_human, verified_by, image_url FROM parts WHERE mpn={key}"
         ))?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
@@ -202,12 +239,22 @@ impl PartsLibrary {
             })
             .collect();
 
+        let assembly_steps = self
+            .query(&format!(
+                "SELECT text FROM part_assembly_steps WHERE mpn={key} ORDER BY step_order"
+            ))?
+            .into_iter()
+            .filter_map(|r| str_field(&r, "text"))
+            .collect();
+
         Ok(Some(PartRecord {
             mpn: str_field(&row, "mpn").unwrap_or_else(|| mpn.to_string()),
             manufacturer: str_field(&row, "manufacturer"),
             datasheet_url: str_field(&row, "datasheet_url"),
             verified_by_human: bool_field(&row, "verified_by_human"),
             verified_by: str_field(&row, "verified_by"),
+            image_url: str_field(&row, "image_url"),
+            assembly_steps,
             pins,
             ratings,
         }))
@@ -220,6 +267,40 @@ impl PartsLibrary {
             .into_iter()
             .filter_map(|r| str_field(&r, "mpn"))
             .collect())
+    }
+
+    /// Set (or clear, with `None`) a part's product-photo URL. Creates a minimal
+    /// stub row if the MPN isn't in the library yet — a boutique part we only have
+    /// a photo for is still worth caching, and doesn't touch its verified status.
+    pub fn set_image_url(&self, mpn: &str, image_url: Option<&str>) -> Result<(), PartsError> {
+        self.sql(&format!(
+            "INSERT INTO parts (mpn, image_url) VALUES ({}, {}) \
+             ON DUPLICATE KEY UPDATE image_url={};",
+            sql_str(mpn),
+            sql_opt(image_url),
+            sql_opt(image_url),
+        ))
+    }
+
+    /// Replace a part's ordered assembly notes (empty clears them). Creates a
+    /// minimal stub row if the MPN is new — a boutique part we only know a build
+    /// tip for is still worth recording — without touching its verified status.
+    pub fn set_assembly_steps(&self, mpn: &str, steps: &[String]) -> Result<(), PartsError> {
+        let key = sql_str(mpn);
+        let mut stmts = vec![
+            "START TRANSACTION;".to_string(),
+            format!("INSERT IGNORE INTO parts (mpn) VALUES ({key});"),
+            format!("DELETE FROM part_assembly_steps WHERE mpn={key};"),
+        ];
+        for (i, step) in steps.iter().enumerate() {
+            stmts.push(format!(
+                "INSERT INTO part_assembly_steps (mpn, step_order, text) VALUES ({key}, {}, {});",
+                i as i64,
+                sql_str(step),
+            ));
+        }
+        stmts.push("COMMIT;".to_string());
+        self.sql(&stmts.join("\n"))
     }
 
     /// Mark a part human-verified (the gate other stages check).
@@ -459,8 +540,18 @@ mod tests {
         }];
         lib.upsert_part(&part).expect("upsert");
 
+        part.image_url = Some("https://x/lm13700.jpg".into());
+        part.assembly_steps = vec!["Use a socket.".into(), "Match the notch to pin 1.".into()];
+        lib.upsert_part(&part)
+            .expect("re-upsert with image + assembly");
+
         let got = lib.get_part("LM13700").expect("get").expect("present");
         assert_eq!(got.manufacturer.as_deref(), Some("Texas Instruments"));
+        assert_eq!(got.image_url.as_deref(), Some("https://x/lm13700.jpg"));
+        assert_eq!(
+            got.assembly_steps,
+            vec!["Use a socket.", "Match the notch to pin 1."]
+        );
         assert_eq!(got.pins.len(), 2);
         assert_eq!(got.pins[0].pin_name, "AMP BIAS INPUT");
         assert_eq!(got.ratings.len(), 1);
@@ -473,6 +564,25 @@ mod tests {
 
         assert_eq!(lib.list_mpns().expect("list"), vec!["LM13700"]);
         assert!(lib.get_part("NONEXISTENT").expect("get").is_none());
+
+        // set_image_url / set_assembly_steps on a new MPN create a stub row.
+        lib.set_image_url("PJ398SM", Some("file:///photos/thonkiconn.jpg"))
+            .expect("set image on new mpn");
+        lib.set_assembly_steps(
+            "PJ398SM",
+            &["Fit the nut on the front of the panel.".into()],
+        )
+        .expect("set assembly on new mpn");
+        let jack = lib.get_part("PJ398SM").expect("get").expect("stub present");
+        assert_eq!(
+            jack.image_url.as_deref(),
+            Some("file:///photos/thonkiconn.jpg")
+        );
+        assert_eq!(
+            jack.assembly_steps,
+            vec!["Fit the nut on the front of the panel."]
+        );
+        assert!(!jack.verified_by_human); // a photo/tip doesn't imply verification
 
         let _ = std::fs::remove_dir_all(&root);
     }

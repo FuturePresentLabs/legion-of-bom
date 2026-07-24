@@ -36,6 +36,8 @@ pub struct PartPrice {
     pub in_stock: Option<u64>,
     pub datasheet_url: Option<String>,
     pub product_url: Option<String>,
+    /// Product photo URL (Mouser `ImagePath`) — the Visual BOM thumbnail source.
+    pub image_url: Option<String>,
     pub price_breaks: Vec<PriceBreak>,
 }
 
@@ -162,6 +164,7 @@ fn part_from_json(p: &Value) -> PartPrice {
             .and_then(|s| s.parse().ok()),
         datasheet_url: string("DataSheetUrl"),
         product_url: string("ProductDetailUrl"),
+        image_url: string("ImagePath"),
         price_breaks,
     }
 }
@@ -188,6 +191,7 @@ mod tests {
         "Parts": [
           { "ManufacturerPartNumber": "LM13700M/NOPB", "Manufacturer": "Texas Instruments",
             "AvailabilityInStock": "8156", "ProductDetailUrl": "https://mouser.com/x",
+            "ImagePath": "https://www.mouser.com/images/ti/ITP_SOIC-16.jpg",
             "PriceBreaks": [
               {"Quantity": 1, "Price": "$1.48", "Currency": "USD"},
               {"Quantity": 10, "Price": "$1.07", "Currency": "USD"},
@@ -213,6 +217,10 @@ mod tests {
         let price = parse_search(&value, "LM13700M/NOPB").unwrap().unwrap();
         assert_eq!(price.mpn, "LM13700M/NOPB");
         assert_eq!(price.in_stock, Some(8156));
+        assert_eq!(
+            price.image_url.as_deref(),
+            Some("https://www.mouser.com/images/ti/ITP_SOIC-16.jpg")
+        );
         assert_eq!(price.price_breaks.len(), 3);
         // qty 1 → $1.48; qty 50 → the 10-break ($1.07); qty 1000 → the 100-break.
         assert_eq!(price.unit_price_at(1), Some(1.48));

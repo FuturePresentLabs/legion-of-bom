@@ -465,6 +465,7 @@ mod tests {
                     refdes: vec!["C1".into(), "C5".into()],
                     unit_price: None,
                     ext_price: None,
+                    image_url: None,
                 },
                 BomLine {
                     mpn: Some("TL072CDR".into()),
@@ -473,6 +474,7 @@ mod tests {
                     refdes: vec!["U1".into()],
                     unit_price: None,
                     ext_price: None,
+                    image_url: None,
                 },
             ],
         };

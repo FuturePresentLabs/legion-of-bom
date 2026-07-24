@@ -47,13 +47,22 @@ pub struct PythonInfo {
     pub from_venv: bool,
 }
 
-/// Locate the project venv's Python interpreter, if present.
+/// Locate a venv's Python interpreter — the active `$VIRTUAL_ENV` first (so `lob`
+/// finds its SKiDL env when run from a *circuits* repo, not just the tool's own
+/// dir), then a `.venv` in the working directory.
 pub fn venv_python() -> Option<PathBuf> {
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        let candidate = Path::new(&venv).join("bin").join("python");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     let candidate = Path::new(".venv").join("bin").join("python");
     candidate.is_file().then_some(candidate)
 }
 
-/// The interpreter to use: the project venv's Python if present, else `python3`.
+/// The interpreter to use: a venv Python (`$VIRTUAL_ENV` or `./.venv`) if present,
+/// else `python3` on PATH.
 pub fn find_python() -> PythonInfo {
     match venv_python() {
         Some(path) => PythonInfo {
