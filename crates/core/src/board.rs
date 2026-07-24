@@ -1206,15 +1206,28 @@ fn footprint_pads(fp: &Sexpr) -> Vec<FpPad> {
         };
         let px = at.nth_atom(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let py = at.nth_atom(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let rot = at
+            .nth_atom(3)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
         let size = item.get("size");
-        let w = size
+        let sw = size
             .and_then(|s| s.nth_atom(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        let h = size
+        let sh = size
             .and_then(|s| s.nth_atom(2))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
+        // A pad rotated an odd multiple of 90° swaps its width/height in the
+        // footprint frame. Without this a rotated SMD pad is painted at the wrong
+        // extent — fine-pitch rotated pads (a Daisy sub-board's 1.27 mm headers)
+        // merge into an unroutable blob.
+        let (w, h) = if (rot / 90.0).round() as i64 % 2 != 0 {
+            (sh, sw)
+        } else {
+            (sw, sh)
+        };
         let layers: Vec<&str> = item
             .get("layers")
             .and_then(|l| l.as_list())
@@ -1985,13 +1998,36 @@ mod tests {
     }
 
     #[test]
+    fn footprint_pads_swaps_wh_for_rotated_pads() {
+        // A pad rotated 90°/270° swaps its width/height in the footprint frame —
+        // without this a fine-pitch rotated SMD row (a Daisy sub-board's 1.27mm
+        // headers) merges into one unroutable blob (25z.7).
+        let fp = crate::sexpr::Sexpr::parse(
+            r#"(footprint "T" (layer "F.Cu")
+                 (pad "1" smd rect (at 0 0 0) (size 1.98 0.65) (layers "F.Cu"))
+                 (pad "2" smd rect (at 5 0 90) (size 1.98 0.65) (layers "F.Cu"))
+                 (pad "3" smd rect (at 10 0 270) (size 1.98 0.65) (layers "F.Cu"))
+                 (pad "4" smd rect (at 15 0 180) (size 1.98 0.65) (layers "F.Cu")))"#,
+        )
+        .unwrap();
+        let pads = footprint_pads(&fp);
+        let g = |n: &str| pads.iter().find(|p| p.num == n).unwrap();
+        assert_eq!((g("1").w, g("1").h), (1.98, 0.65), "0°: as-is");
+        assert_eq!((g("2").w, g("2").h), (0.65, 1.98), "90°: swapped");
+        assert_eq!((g("3").w, g("3").h), (0.65, 1.98), "270°: swapped");
+        assert_eq!((g("4").w, g("4").h), (1.98, 0.65), "180°: as-is");
+    }
+
+    #[test]
     fn vendored_daisy_footprints_place_and_route() {
         // Real Electrosmith footprints (Patch SM = 40 THT pads, Seed2 DFM = 50 SMD
         // pads), embedded and named by physical pin — a net wired to pin "B2"/"B4"
         // connects straight through and routes. No KiCad install needed.
         for (fp, pads_min, a, b) in [
             ("LobModule:DAISY_PATCH_SM", 40, "B2", "B4"),
-            ("LobModule:DAISY_SEED2_DFM", 50, "D5", "D4"),
+            // A3/A8 are inner fine-pitch SMD pads — routing them exercises the
+            // rotated-pad fanout fix (25z.7).
+            ("LobModule:DAISY_SEED2_DFM", 50, "A3", "A8"),
         ] {
             let c = Circuit {
                 name: "mod".into(),
