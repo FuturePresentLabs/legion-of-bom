@@ -160,7 +160,11 @@ fn fmt_num(x: f64) -> String {
 }
 
 /// Error if a net the harness needs (input/output) isn't in the circuit.
-fn require_net(circuit: &dyn CircuitSource, net_names: &HashSet<&str>, required: &str) -> Result<(), StageError> {
+fn require_net(
+    circuit: &dyn CircuitSource,
+    net_names: &HashSet<&str>,
+    required: &str,
+) -> Result<(), StageError> {
     if net_names.contains(required) {
         return Ok(());
     }
@@ -401,7 +405,10 @@ pub fn generate_tran_deck(
     }
     let out_node = config.node(&config.output_net);
 
-    let mut lines = vec![format!("* legion-of-bom transient deck for {}", circuit.name())];
+    let mut lines = vec![format!(
+        "* legion-of-bom transient deck for {}",
+        circuit.name()
+    )];
     for include in &includes {
         lines.push(format!(".include {}", include.display()));
     }

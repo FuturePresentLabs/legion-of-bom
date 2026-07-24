@@ -17,6 +17,8 @@ pub mod fab;
 pub mod fetch;
 pub mod guide;
 pub mod jlcpcb;
+pub mod layout;
+pub mod logo;
 pub mod model;
 pub mod mouser;
 pub mod netlist;
@@ -36,8 +38,8 @@ pub mod validate;
 pub mod verify;
 
 pub use board::{
-    generate_board, generate_board_report, BoardError, BoardOptions, EurorackPlacer, GridPlacer,
-    PartFacts, Placement, Placer,
+    generate_board, generate_board_artifacts, generate_board_report, BoardArtifacts, BoardError,
+    BoardOptions, EurorackPlacer, GridPlacer, PartFacts, Placement, Placer, SeededPlacer,
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
@@ -50,12 +52,17 @@ pub use guide::{
     build_guide, guide_to_html, guide_to_pdf, BoardPng, BuildGuide, BuildStep, PlacedPart,
 };
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
+pub use layout::{
+    measure, run_layout_loop, score, CostWeights, LayoutLoop, LayoutMode, LayoutReport,
+    PlacementMetrics,
+};
+pub use logo::Logo;
 pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use panel::{
-    default_panel_orders_dir, footprint_shape, panel_to_dxf, panel_to_kicad_pcb, Cutout,
-    CutoutShape, EurorackPanel,
+    default_panel_orders_dir, derive_panel, footprint_shape, panel_to_dxf, panel_to_kicad_pcb,
+    BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec, EurorackPanel,
     MountingHole, PanelFile, PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
 };
 pub use parts::{

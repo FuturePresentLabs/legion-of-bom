@@ -150,6 +150,12 @@ pub struct Net {
     pub name: String,
     /// Pins joined by this net.
     pub pins: Vec<PinRef>,
+    /// KiCad net class carried from the netlist's `(class "…")` field, when it is
+    /// not the default. The circuit author sets it in SKiDL (`net.netclass =
+    /// NetClass("Critical")`) to tag a net for analog-careful layout treatment
+    /// (DESIGN §6.4); the layout loop reads it via [`Net::is_critical`]. `None`
+    /// means the netlist's `"Default"` class (or no class node at all).
+    pub net_class: Option<String>,
 }
 
 impl Net {
@@ -157,7 +163,29 @@ impl Net {
         Net {
             name: name.into(),
             pins,
+            net_class: None,
         }
+    }
+
+    /// Set the net class (builder). The netlist's `"Default"` (and the empty
+    /// string) normalise to `None` — only a meaningful class is retained.
+    pub fn with_class(mut self, class: impl Into<String>) -> Self {
+        let class = class.into();
+        self.net_class =
+            (!class.is_empty() && !class.eq_ignore_ascii_case("Default")).then_some(class);
+        self
+    }
+
+    /// Whether this net is tagged **critical** — it wants a short, direct route
+    /// (feedback network, high-impedance input, matched stereo pair). DESIGN §6.4.
+    /// A net can carry several classes (SKiDL appends, e.g. `"Default,Critical"`),
+    /// so match `"Critical"` against any comma-separated member, case-insensitively.
+    pub fn is_critical(&self) -> bool {
+        self.net_class.as_deref().is_some_and(|classes| {
+            classes
+                .split(',')
+                .any(|c| c.trim().eq_ignore_ascii_case("Critical"))
+        })
     }
 }
 

@@ -12,7 +12,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::logo::Logo;
 use crate::parts::PartsError;
+use crate::source::CircuitSource;
 use crate::tools::find_on_path;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,9 @@ pub struct Cutout {
     /// The board part this cutout is for (e.g. `"J1"`). When set, the board
     /// placer anchors that part at this position so the board mates the panel.
     pub refdes: Option<String>,
+    /// A silkscreen/engraving label for this control (e.g. `"IN"`, `"OUT"`,
+    /// `"RATE"`), rendered next to the cutout. `None` omits it.
+    pub label: Option<String>,
 }
 
 /// The shape of a cutout, derived from its footprint name.
@@ -53,28 +58,139 @@ pub enum CutoutShape {
     },
 }
 
-/// Return the standard [`CutoutShape`] for a footprint name, or `None` if
-/// the footprint is unknown.
-pub fn footprint_shape(footprint: &str) -> Option<CutoutShape> {
-    // Normalise: strip common prefixes/suffixes and lower-case.
-    let name = footprint
-        .rsplit_once(':')
-        .map(|(_, r)| r)
-        .unwrap_or(footprint)
-        .to_ascii_lowercase();
-    match name.as_str() {
-        "thonkiconn" | "pj301m" | "pj301" => Some(CutoutShape::RoundedRect {
-            width_mm: 10.0,
-            height_mm: 8.5,
-            corner_radius_mm: 0.5,
-        }),
-        "alpha9mm" | "alphapot" | "pot_alpha_9mm" => Some(CutoutShape::Circle { diameter_mm: 7.0 }),
-        "led_3mm" | "led3mm" | "led_3" => Some(CutoutShape::Circle { diameter_mm: 3.0 }),
-        "led_5mm" | "led5mm" | "led_5" => Some(CutoutShape::Circle { diameter_mm: 5.0 }),
-        "toggle" | "toggle_spst" | "toggle_spdt" => Some(CutoutShape::Circle { diameter_mm: 6.5 }),
-        "m3" | "mounting_hole_m3" => Some(CutoutShape::Circle { diameter_mm: 3.2 }),
-        _ => None,
+/// Thonkiconn / PJ301M panel barrel-hole diameter (mm): the threaded barrel
+/// passes through and a nut tightens on the front, so the cutout is this hole,
+/// not the jack body.
+const JACK_BARREL_MM: f64 = 6.0;
+/// Alpha 9 mm pot bushing hole diameter (mm).
+const POT_BUSHING_MM: f64 = 7.0;
+/// Toggle switch bushing hole diameter (mm).
+const TOGGLE_MM: f64 = 6.5;
+const LED_5MM_MM: f64 = 5.0;
+const LED_3MM_MM: f64 = 3.0;
+
+/// What kind of front-panel control a part is — drives panel-layout grouping
+/// (knobs/switches up top, jacks at the bottom) and label defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKind {
+    Pot,
+    Switch,
+    Led,
+    Jack,
+}
+
+impl ControlKind {
+    /// The canonical cutout-footprint name a derived panel records for this kind
+    /// (round-trips through [`footprint_shape`] on render).
+    pub fn cutout_name(self) -> &'static str {
+        match self {
+            ControlKind::Pot => "Alpha9mm",
+            ControlKind::Switch => "Toggle",
+            ControlKind::Led => "LED_5mm",
+            ControlKind::Jack => "Thonkiconn",
+        }
     }
+    fn is_jack(self) -> bool {
+        matches!(self, ControlKind::Jack)
+    }
+}
+
+/// A part's panel-mount cutout: opening geometry + control kind. This is **part
+/// data** — see [`CutoutSource`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CutoutSpec {
+    pub shape: CutoutShape,
+    pub kind: ControlKind,
+}
+
+/// Resolves a part to its panel-mount cutout — **the seam**. A part's mechanical
+/// cutout belongs *with the part* (same principle as its SPICE model riding with
+/// the component, not special-cased in the generator), so the real source is the
+/// parts library's verified mechanical data. Until that library carries it,
+/// [`BuiltinCutouts`] backs this with a table of common Eurorack controls; a
+/// library-backed `CutoutSource` then swaps in with no change to panel/derivation
+/// code.
+pub trait CutoutSource {
+    /// The cutout for a part, by MPN (preferred) and/or its KiCad footprint or
+    /// cutout name. `None` = board-only (not panel-mounted) or unknown.
+    fn cutout(&self, mpn: Option<&str>, footprint: &str) -> Option<CutoutSpec>;
+}
+
+/// Fallback catalogue of common Eurorack controls, matched by cutout name or by a
+/// keyword in a full KiCad footprint. An explicit stand-in for the parts
+/// library's verified mechanical data (epic `okm`), not the intended long-term
+/// source.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuiltinCutouts;
+
+impl CutoutSource for BuiltinCutouts {
+    fn cutout(&self, _mpn: Option<&str>, footprint: &str) -> Option<CutoutSpec> {
+        let name = footprint
+            .rsplit_once(':')
+            .map(|(_, r)| r)
+            .unwrap_or(footprint)
+            .to_ascii_lowercase();
+        let round = |kind, diameter_mm| {
+            Some(CutoutSpec {
+                kind,
+                shape: CutoutShape::Circle { diameter_mm },
+            })
+        };
+        // Exact LED sizes first (a bare "led" defaults to 5 mm below).
+        match name.as_str() {
+            "led_3mm" | "led3mm" | "led_3" => return round(ControlKind::Led, LED_3MM_MM),
+            "led_5mm" | "led5mm" | "led_5" => return round(ControlKind::Led, LED_5MM_MM),
+            _ => {}
+        }
+        // Then keyword match — works for both cutout names ("Thonkiconn") and full
+        // KiCad footprints a circuit part carries ("…:Jack_3.5mm_…PJ398SM…").
+        if ["jack", "thonkiconn", "pj301", "pj398"]
+            .iter()
+            .any(|k| name.contains(k))
+        {
+            round(ControlKind::Jack, JACK_BARREL_MM)
+        } else if ["potentiometer", "alpha9mm", "alphapot", "_pot"]
+            .iter()
+            .any(|k| name.contains(k))
+        {
+            round(ControlKind::Pot, POT_BUSHING_MM)
+        } else if name.contains("led") {
+            round(ControlKind::Led, LED_5MM_MM)
+        } else if ["switch", "toggle", "_sw_"]
+            .iter()
+            .any(|k| name.contains(k))
+        {
+            round(ControlKind::Switch, TOGGLE_MM)
+        } else {
+            None
+        }
+    }
+}
+
+/// House silkscreen-layout rules (DESIGN §7.9 — designed once, applied
+/// consistently, not invented per-panel). Millimetres.
+mod silk {
+    /// Title text height and its distance below the top edge.
+    pub const TITLE_FONT_MM: f64 = 2.0;
+    pub const TITLE_TOP_MARGIN_MM: f64 = 7.0;
+    /// Control-label text height and its offset above the cutout centre (clears a
+    /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
+    pub const LABEL_FONT_MM: f64 = 1.8;
+    pub const LABEL_OFFSET_MM: f64 = 6.5;
+    /// Brand logo: fraction of panel width, the minimum width worth drawing, and
+    /// the clearances keeping it off the lowest cutout and the bottom edge/holes.
+    pub const LOGO_WIDTH_FRAC: f64 = 0.4;
+    pub const LOGO_MIN_WIDTH_MM: f64 = 4.0;
+    pub const LOGO_CUTOUT_GAP_MM: f64 = 2.0;
+    pub const BOTTOM_MARGIN_MM: f64 = 6.0;
+}
+
+/// The cutout **geometry** for a cutout footprint/name — the render-time lookup,
+/// resolving an already-chosen cutout by name through the [`BuiltinCutouts`]
+/// catalogue. `None` if unknown. (Classification of a *circuit part* into a
+/// control goes through [`CutoutSource::cutout`].)
+pub fn footprint_shape(footprint: &str) -> Option<CutoutShape> {
+    BuiltinCutouts.cutout(None, footprint).map(|s| s.shape)
 }
 
 /// The format-agnostic panel specification.
@@ -147,11 +263,13 @@ impl EurorackPanel {
             rotation_deg: 0.0,
             footprint: footprint.into(),
             refdes: None,
+            label: None,
         });
         self
     }
 
-    /// Add a cutout with explicit rotation and an optional anchored refdes.
+    /// Add a cutout with explicit rotation, an optional anchored refdes, and an
+    /// optional silkscreen/engraving label.
     pub fn with_cutout_rotated(
         mut self,
         x_mm: f64,
@@ -159,6 +277,7 @@ impl EurorackPanel {
         rotation_deg: f64,
         footprint: impl Into<String>,
         refdes: Option<String>,
+        label: Option<String>,
     ) -> Self {
         self.cutouts.push(Cutout {
             x_mm,
@@ -166,6 +285,7 @@ impl EurorackPanel {
             rotation_deg,
             footprint: footprint.into(),
             refdes,
+            label,
         });
         self
     }
@@ -272,8 +392,11 @@ pub struct CutoutFile {
     pub rotation_deg: f64,
     pub footprint: String,
     /// Board part anchored here (e.g. `"J1"`) — the board placer mates to it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refdes: Option<String>,
+    /// Silkscreen/engraving label for this control (e.g. `"IN"`, `"RATE"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl PanelFile {
@@ -297,6 +420,7 @@ impl PanelFile {
                         c.rotation_deg,
                         c.footprint.clone(),
                         c.refdes.clone(),
+                        c.label.clone(),
                     );
                 }
                 Ok(Box::new(panel))
@@ -304,6 +428,131 @@ impl PanelFile {
             other => Err(format!("unsupported panel format: {other}")),
         }
     }
+
+    /// Serialize back to a TOML document (an editable panel spec).
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+}
+
+/// House rules for the derived layout (DESIGN §7.9), designed once. The pitches
+/// are minimum centre-to-centre spacings by the control's physical body/knob (not
+/// its panel hole), so anchored footprints don't overlap — the failure the tight
+/// even-spacing hit (a jack body is ~13 mm, so 12.8 mm spacing overlapped).
+mod derive_rules {
+    /// Minimum control pitch (mm) — realistic Eurorack spacings.
+    pub const JACK_PITCH_MM: f64 = 16.0;
+    pub const POT_PITCH_MM: f64 = 20.0;
+    pub const SWITCH_PITCH_MM: f64 = 14.0;
+    pub const LED_PITCH_MM: f64 = 9.0;
+    /// Clear zones: below the top-edge title, above the bottom logo + holes.
+    pub const TOP_MARGIN_MM: f64 = 14.0;
+    pub const BOTTOM_MARGIN_MM: f64 = 16.0;
+    /// Default Eurorack panel-PCB thickness (mm).
+    pub const THICKNESS_MM: f64 = 1.6;
+}
+
+/// Minimum centre-to-centre pitch for a control kind.
+fn control_pitch(kind: ControlKind) -> f64 {
+    match kind {
+        ControlKind::Jack => derive_rules::JACK_PITCH_MM,
+        ControlKind::Pot => derive_rules::POT_PITCH_MM,
+        ControlKind::Switch => derive_rules::SWITCH_PITCH_MM,
+        ControlKind::Led => derive_rules::LED_PITCH_MM,
+    }
+}
+
+/// Derive an editable [`PanelFile`] from a circuit: classify its panel-facing
+/// parts (jacks/pots/switches/LEDs) through a [`CutoutSource`], arrange them in a
+/// centred column — controls up top, jacks at the bottom (the Eurorack
+/// convention) — and label each from the signal net it carries. Board-only parts
+/// (passives, ICs, power headers) are skipped. Override any position by hand
+/// afterwards; this is a starting point, not a straitjacket.
+pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
+    // Split panel-facing parts into controls (top band) and jacks (bottom band).
+    let mut controls: Vec<(String, ControlKind)> = Vec::new();
+    let mut jacks: Vec<(String, ControlKind)> = Vec::new();
+    for part in circuit.parts() {
+        let fp = part.footprint.as_deref().unwrap_or("");
+        if let Some(spec) = cutouts.cutout(part.mpn.as_deref(), fp) {
+            let entry = (part.refdes.0.clone(), spec.kind);
+            if spec.kind.is_jack() {
+                jacks.push(entry);
+            } else {
+                controls.push(entry);
+            }
+        }
+    }
+    controls.sort_by(|a, b| a.0.cmp(&b.0));
+    jacks.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let w = f64::from(hp) * HP_MM;
+    let cx = w / 2.0;
+    let h = EURORACK_HEIGHT_MM;
+
+    // Stack controls top→bottom (knobs above jacks), each spaced by its real body
+    // pitch, and centre the whole stack in the clear zone between the title and
+    // the bottom logo/holes.
+    let ordered: Vec<(String, ControlKind)> = controls.into_iter().chain(jacks).collect();
+    let pitches: Vec<f64> = ordered.iter().map(|(_, k)| control_pitch(*k)).collect();
+    let total: f64 = pitches.iter().sum();
+    let avail_top = h - derive_rules::TOP_MARGIN_MM;
+    let avail_bot = derive_rules::BOTTOM_MARGIN_MM;
+    let avail = avail_top - avail_bot;
+    // Centre the stack; if it overflows the panel height it still lays out (tightly
+    // packed) — a signal the module has more controls than the height comfortably
+    // holds, which the caller can act on (wider HP won't help; height is fixed).
+    let mut y = avail_top - (avail - total).max(0.0) / 2.0;
+    let mut out: Vec<CutoutFile> = Vec::new();
+    for ((refdes, kind), pitch) in ordered.iter().zip(&pitches) {
+        out.push(CutoutFile {
+            x_mm: cx,
+            y_mm: y - pitch / 2.0,
+            rotation_deg: 0.0,
+            footprint: kind.cutout_name().to_string(),
+            refdes: Some(refdes.clone()),
+            label: control_label(circuit, refdes),
+        });
+        y -= pitch;
+    }
+
+    PanelFile {
+        format: "eurorack".into(),
+        hp: Some(hp),
+        thickness_mm: derive_rules::THICKNESS_MM,
+        cutouts: out,
+    }
+}
+
+/// A short panel label for a control, from the most signal-like net it touches
+/// (excluding power/ground). `SIG_IN` → "IN", `RATE_CV` → "RATE".
+fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
+    let mut sig: Vec<&str> = circuit
+        .nets()
+        .iter()
+        .filter(|n| n.pins.iter().any(|p| p.refdes.0 == refdes))
+        .map(|n| n.name.as_str())
+        .filter(|n| !is_power_net(n))
+        .collect();
+    sig.sort();
+    sig.first().map(|n| label_from_net(n))
+}
+
+/// Whether a net is a power rail / ground (so it isn't used as a control label).
+fn is_power_net(name: &str) -> bool {
+    let u = name.to_ascii_uppercase();
+    u == "GND"
+        || u.ends_with("GND")
+        || matches!(u.as_str(), "VCC" | "VEE" | "VDD" | "VSS")
+        || ((u.starts_with('+') || u.starts_with('-')) && u.contains('V'))
+}
+
+/// Shorten a net name into a control label: drop a `SIG_` prefix / `_CV` suffix,
+/// spaces for underscores, upper-cased.
+fn label_from_net(net: &str) -> String {
+    let s = net.strip_prefix("SIG_").unwrap_or(net);
+    let s = s.strip_suffix("_CV").unwrap_or(s);
+    s.replace('_', " ").to_uppercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +683,7 @@ pub fn panel_to_dxf(panel: &dyn PanelSpec) -> String {
 ///
 /// Panel coordinates are measured from the bottom-left; KiCad's are top-down, so
 /// Y is flipped here.
-pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
+pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo>) -> String {
     use crate::board::{det_uuid, mm};
     let (w, h) = (panel.width_mm(), panel.height_mm());
     // Centre on KiCad's A4 sheet (297×210 landscape) instead of the (0,0) corner.
@@ -506,16 +755,68 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str) -> String {
             )),
             None => s.push_str(&edge_circle(cx, cy, 1.5, &seed)),
         }
+        // Control label (IN / OUT / RATE), horizontal, just above the cutout so
+        // it reads with the module upright (DESIGN 6.10 / j54.21).
+        if let Some(label) = &c.label {
+            s.push_str(&format!(
+                "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
+                 (effects (font (size {f} {f}) (thickness 0.3))))\n",
+                label,
+                mm(cx),
+                mm(cy - silk::LABEL_OFFSET_MM),
+                det_uuid(&format!("panel.label.{i}")),
+                f = silk::LABEL_FONT_MM,
+            ));
+        }
     }
-    // Title, silkscreen, reading up the panel.
+    // Title, horizontal, along the top edge (below the top mounting holes) so it
+    // never crosses a centred control column — a vertical centre title collides
+    // with the knobs/jacks (the "writing hitting a jack" failure, j54-6f8).
     s.push_str(&format!(
-        "  (gr_text \"{}\" (at {} {} 90) (layer \"F.SilkS\") (uuid \"{}\") \
-         (effects (font (size 2.5 2.5) (thickness 0.35))))\n",
+        "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
+         (effects (font (size {f} {f}) (thickness 0.3))))\n",
         title,
         mm(ox + w / 2.0),
-        mm(oy + h / 2.0),
-        det_uuid("panel.title")
+        mm(oy + silk::TITLE_TOP_MARGIN_MM),
+        det_uuid("panel.title"),
+        f = silk::TITLE_FONT_MM,
     ));
+    // Brand logo on the front silk (DESIGN §7.9), placed in the clear band below
+    // the lowest cutout (above the bottom mounting holes) so it doesn't land on a
+    // jack. Skipped if there's no room.
+    if let Some(logo) = logo {
+        // Lowest cutout edge in KiCad y (larger y = nearer the panel bottom).
+        let lowest = panel
+            .cutouts()
+            .iter()
+            .map(|c| {
+                let r = match footprint_shape(&c.footprint) {
+                    Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
+                    Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
+                    None => 1.5,
+                };
+                fy(c.y_mm) + r
+            })
+            .fold(oy + 10.0, f64::max);
+        let bottom_limit = oy + h - silk::BOTTOM_MARGIN_MM; // clear bottom holes/edge
+        let gap = bottom_limit - lowest;
+        let (lx0, ly0, lx1, ly1) = logo.bbox();
+        let aspect = (ly1 - ly0) / (lx1 - lx0).max(1e-6);
+        // Fit within the house width fraction and the available vertical gap.
+        let target_w = (w * silk::LOGO_WIDTH_FRAC)
+            .min((gap - silk::LOGO_CUTOUT_GAP_MM).max(0.0) / aspect.max(1e-6));
+        if target_w >= silk::LOGO_MIN_WIDTH_MM {
+            let logo_h = target_w * aspect;
+            let center = (
+                ox + w / 2.0,
+                lowest + silk::LOGO_CUTOUT_GAP_MM + logo_h / 2.0,
+            );
+            let placed = logo.place(target_w, center, false);
+            for block in crate::logo::gr_polys(&placed, "F.SilkS", false, "panel.logo") {
+                s.push_str(&block);
+            }
+        }
+    }
     s.push_str(")\n");
     s
 }
@@ -825,15 +1126,40 @@ mod tests {
     fn panel_pcb_has_outline_cutouts_and_title() {
         let panel = EurorackPanel::new(6)
             .with_cutout(15.24, 100.0, "Alpha9mm") // pot -> circle
-            .with_cutout(15.24, 30.0, "Thonkiconn"); // jack -> rect
-        let pcb = panel_to_kicad_pcb(&panel, "demo");
+            .with_cutout(15.24, 30.0, "Thonkiconn"); // jack -> barrel circle
+        let pcb = panel_to_kicad_pcb(&panel, "demo", None);
         assert!(pcb.starts_with("(kicad_pcb"));
         assert!(pcb.contains(r#"(layer "Edge.Cuts")"#));
-        assert!(pcb.contains("gr_circle"), "pot cutout as a circle");
-        // Outline rect + the jack cutout rect (≥2 gr_rect on Edge.Cuts).
-        assert!(pcb.matches("gr_rect").count() >= 2);
+        // Pot + jack are both round holes now (jack = barrel, not a body rect).
+        assert!(
+            pcb.matches("gr_circle").count() >= 2,
+            "pot + jack barrel circles"
+        );
+        // The outline is the one rectangle.
+        assert!(pcb.contains("gr_rect"));
         assert!(pcb.contains(r#"(gr_text "demo""#));
         assert!(pcb.contains(r#"(layer "F.SilkS")"#));
+    }
+
+    #[test]
+    fn cutout_label_renders_on_panel_silk() {
+        let panel = EurorackPanel::new(4)
+            .with_cutout_rotated(
+                10.0,
+                20.0,
+                0.0,
+                "Thonkiconn",
+                Some("J1".into()),
+                Some("IN".into()),
+            )
+            .with_cutout(10.0, 60.0, "Alpha9mm"); // no label → no extra gr_text
+        let pcb = panel_to_kicad_pcb(&panel, "Demo", None);
+        assert!(
+            pcb.contains(r#"(gr_text "IN""#),
+            "labelled cutout gets a silk label"
+        );
+        // Only the title + the one labelled cutout produce silk text.
+        assert_eq!(pcb.matches("gr_text").count(), 2);
     }
 
     #[test]
@@ -862,7 +1188,7 @@ mod tests {
     fn footprint_shape_lookup() {
         assert!(matches!(
             footprint_shape("Thonkiconn"),
-            Some(CutoutShape::RoundedRect { .. })
+            Some(CutoutShape::Circle { diameter_mm: 6.0 })
         ));
         assert!(matches!(
             footprint_shape("Alpha9mm"),
@@ -873,6 +1199,68 @@ mod tests {
             Some(CutoutShape::Circle { diameter_mm: 3.0 })
         ));
         assert!(footprint_shape("UnknownThing").is_none());
+    }
+
+    #[test]
+    fn builtin_cutouts_classify_real_footprints() {
+        let c = BuiltinCutouts;
+        // Full KiCad footprints a circuit part carries → control + barrel geometry.
+        let jack = c
+            .cutout(None, "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM")
+            .unwrap();
+        assert_eq!(jack.kind, ControlKind::Jack);
+        assert!(matches!(
+            jack.shape,
+            CutoutShape::Circle { diameter_mm } if (diameter_mm - JACK_BARREL_MM).abs() < 1e-9
+        ));
+        assert_eq!(
+            c.cutout(None, "Potentiometer_THT:Potentiometer_Alpha_RD901F")
+                .unwrap()
+                .kind,
+            ControlKind::Pot
+        );
+        // Board-only parts are not panel-facing.
+        assert!(c.cutout(None, "Package_DIP:DIP-16_W7.62mm").is_none());
+        assert!(c
+            .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
+            .is_none());
+    }
+
+    #[test]
+    fn derive_panel_classifies_labels_and_orders() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        let mut circ = Circuit::new("m");
+        circ.parts = vec![
+            Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+            Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
+            Part::new("U1", "TL072").with_footprint("Package_SO:SOIC-8"), // board-only
+        ];
+        circ.nets = vec![
+            Net::new("RATE_CV", vec![PinRef::new("RV1", "2")]),
+            Net::new("SIG_IN", vec![PinRef::new("J1", "T")]),
+            Net::new("GND", vec![PinRef::new("J1", "S")]),
+        ];
+        let panel = derive_panel(&circ, 8, &BuiltinCutouts);
+        // Only the pot + jack; the IC is skipped.
+        assert_eq!(panel.cutouts.len(), 2);
+        let rv1 = panel
+            .cutouts
+            .iter()
+            .find(|c| c.refdes.as_deref() == Some("RV1"))
+            .unwrap();
+        assert_eq!(rv1.footprint, "Alpha9mm");
+        assert_eq!(rv1.label.as_deref(), Some("RATE")); // RATE_CV → RATE
+        let j1 = panel
+            .cutouts
+            .iter()
+            .find(|c| c.refdes.as_deref() == Some("J1"))
+            .unwrap();
+        assert_eq!(j1.footprint, "Thonkiconn");
+        assert_eq!(j1.label.as_deref(), Some("IN")); // SIG_IN (not GND) → IN
+                                                     // The knob sits above the jack (larger y in panel bottom-up coords).
+        assert!(rv1.y_mm > j1.y_mm);
+        // The derived spec round-trips through TOML.
+        assert!(panel.to_toml().unwrap().contains("Thonkiconn"));
     }
 
     #[test]

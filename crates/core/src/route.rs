@@ -29,7 +29,7 @@
 //! 0.25 mm signal traces, 0.8/0.4 mm vias, ~0.2 mm clearance.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::board::{det_uuid, mm};
 use crate::sexpr::Sexpr;
@@ -264,35 +264,38 @@ enum Cell {
 #[derive(Debug, Clone, Default)]
 pub struct GridRouter;
 
-/// Max routing passes: the first attempt plus rip-up-free retries that give
-/// previously-failed nets priority. The priority set only grows, so convergence
-/// is bounded; a handful of rounds resolves the common "one net boxed in" case.
-const ROUTE_MAX_ROUNDS: usize = 6;
+/// Max rip-up-and-reroute iterations. Each adds an ordering constraint (a boxed-in
+/// net must route before whatever boxed it in), so the constraint set only grows —
+/// convergence is bounded and a handful resolves the common mutual-conflict cases.
+const RIPUP_MAX_ITERS: usize = 16;
 
 impl Router for GridRouter {
-    /// Route all nets, retrying failures: any net that fails gets first pick of
-    /// the grid on the next pass, so the nets that boxed it in reroute around it.
-    /// The priority set only grows (bounded convergence); the fewest-conflict pass
-    /// wins if none is perfect. A first pass with no failures returns unchanged.
+    /// Route all nets with **rip-up-and-reroute**: route in an order; any net that
+    /// can't reach a pad reports which committed nets boxed it in (blame); those
+    /// blockers are then forced to route *after* it (ripped up and rerouted around
+    /// it) on the next iteration. Ordering constraints only accumulate (bounded),
+    /// unsatisfiable cycles are dropped, and the fewest-conflict attempt wins.
     fn route(&self, nets: &[RouteNet], opts: &RouteOptions) -> RouteOutput {
         let routable: Vec<&RouteNet> = nets.iter().filter(|n| n.pads.len() >= 2).collect();
         if routable.is_empty() {
             return RouteOutput::default();
         }
-        // First-pass order: deterministic by net index.
+        // Base order: deterministic by net index. `net_idx → routable index` maps a
+        // blocker (known by net index) back to an orderable net.
         let mut base: Vec<usize> = (0..routable.len()).collect();
         base.sort_by_key(|&i| routable[i].net_idx);
+        let net_to_rt: HashMap<usize, usize> = routable
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.net_idx, i))
+            .collect();
 
-        let mut priority: Vec<usize> = Vec::new();
+        // Accumulated "a must route before b" constraints (routable indices).
+        let mut before: Vec<(usize, usize)> = Vec::new();
         let mut best: Option<RouteOutput> = None;
-        for _ in 0..ROUTE_MAX_ROUNDS {
-            // Previously-failed nets first (in discovery order), then the rest.
-            let order: Vec<usize> = priority
-                .iter()
-                .copied()
-                .chain(base.iter().copied().filter(|i| !priority.contains(i)))
-                .collect();
-            let (out, failed) = self.route_pass(nets, &routable, &order, opts);
+        for _ in 0..RIPUP_MAX_ITERS {
+            let order = topo_order(&base, &before);
+            let (out, failed, blame) = self.route_pass(nets, &routable, &order, &net_to_rt, opts);
             if failed.is_empty() {
                 return out;
             }
@@ -302,31 +305,84 @@ impl Router for GridRouter {
             {
                 best = Some(out);
             }
-            let newly: Vec<usize> = failed
-                .iter()
-                .copied()
-                .filter(|i| !priority.contains(i))
-                .collect();
-            if newly.is_empty() {
-                break; // no new information — stop and take the best pass
+            // Rip up: each boxed-in net must precede the nets that boxed it in.
+            let mut added = false;
+            for (&victim, blockers) in &blame {
+                for &b in blockers {
+                    if victim != b
+                        && !before.contains(&(victim, b))
+                        && !before.contains(&(b, victim))
+                    {
+                        before.push((victim, b));
+                        added = true;
+                    }
+                }
             }
-            priority.extend(newly);
+            if !added {
+                break; // no new constraint to try — take the best attempt
+            }
         }
         best.unwrap_or_default()
     }
+}
+
+/// Order `base` (a permutation of routable indices) so every `(a, b)` in `before`
+/// has `a` ahead of `b`, using the base order as the tie-break. A constraint that
+/// would form a cycle is dropped (those nets can't both win; one stays unrouted).
+fn topo_order(base: &[usize], before: &[(usize, usize)]) -> Vec<usize> {
+    let n = base.len();
+    let rank: HashMap<usize, usize> = base.iter().enumerate().map(|(p, &i)| (i, p)).collect();
+    let mut succ: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut indeg: HashMap<usize, usize> = base.iter().map(|&i| (i, 0)).collect();
+    for &(a, b) in before {
+        succ.entry(a).or_default().push(b);
+        *indeg.get_mut(&b).unwrap() += 1;
+    }
+    // Kahn's algorithm, always taking the ready node with the lowest base rank.
+    let mut ready: Vec<usize> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&i, _)| i)
+        .collect();
+    let mut out = Vec::with_capacity(n);
+    let mut done: HashSet<usize> = HashSet::new();
+    while !ready.is_empty() {
+        ready.sort_by_key(|i| rank[i]);
+        let i = ready.remove(0);
+        out.push(i);
+        done.insert(i);
+        if let Some(ss) = succ.get(&i) {
+            for &s in ss {
+                let d = indeg.get_mut(&s).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(s);
+                }
+            }
+        }
+    }
+    // Any nodes left are in a constraint cycle — append them in base order.
+    for &i in base {
+        if !done.contains(&i) {
+            out.push(i);
+        }
+    }
+    out
 }
 
 impl GridRouter {
     /// One routing pass over `routable` in the given `order` (indices into
     /// `routable`). Returns the routed output and the indices of nets that did
     /// not fully route this pass.
+    #[allow(clippy::type_complexity)]
     fn route_pass(
         &self,
         nets: &[RouteNet],
         routable: &[&RouteNet],
         order: &[usize],
+        net_to_rt: &HashMap<usize, usize>,
         opts: &RouteOptions,
-    ) -> (RouteOutput, Vec<usize>) {
+    ) -> (RouteOutput, Vec<usize>, HashMap<usize, HashSet<usize>>) {
         let mut out = RouteOutput::default();
         let res = opts.grid_mm.max(0.01);
         let (minx, miny, maxx, maxy) = opts.bounds.unwrap_or_else(|| bounds_of(nets, 2.0));
@@ -402,6 +458,11 @@ impl GridRouter {
 
         // Route each net in the given order, growing a tree from pad 0.
         let mut failed: Vec<usize> = Vec::new();
+        // Blame: victim routable-idx → the routable nets whose committed copper
+        // boxes in one of its pads (candidates to rip up and reroute).
+        let mut blame: HashMap<usize, HashSet<usize>> = HashMap::new();
+        // How far around an unreachable pad to look for the nets fencing it in.
+        let blame_radius = (halo * 3).max(6);
         for &ni in order {
             let net = routable[ni];
             let costs = Costs {
@@ -454,11 +515,29 @@ impl GridRouter {
                         if !failed.contains(&ni) {
                             failed.push(ni);
                         }
+                        // Blame the routable nets whose copper boxes in this pad.
+                        for &l in tlayer.layers() {
+                            for dr in -blame_radius..=blame_radius {
+                                for dc in -blame_radius..=blame_radius {
+                                    let (c, r) = (tc as isize + dc, tr as isize + dr);
+                                    if c < 0 || r < 0 || c >= cols as isize || r >= rows as isize {
+                                        continue;
+                                    }
+                                    if let Cell::Owner(m) = grid.get(c as usize, r as usize, l) {
+                                        if m != net.net_idx {
+                                            if let Some(&rt) = net_to_rt.get(&m) {
+                                                blame.entry(ni).or_default().insert(rt);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        (out, failed)
+        (out, failed, blame)
     }
 }
 
@@ -567,19 +646,35 @@ impl Grid {
             back: back_penalty,
         } = costs;
         let n = self.cols * self.rows * 2;
+        let cr = self.cols * self.rows;
         let mut dist = vec![i64::MAX; n];
         let mut prev = vec![usize::MAX; n];
-        let mut heap = BinaryHeap::new();
+        // A* heuristic: cost-scaled Manhattan distance to the nearest target.
+        // Admissible + consistent on this 4-connected grid, so the least-cost path
+        // is still found — but the search heads for the target instead of flooding
+        // the whole board (routing a wide board in ms instead of not finishing).
+        let heuristic = |i: usize| -> i64 {
+            let rem = i % cr;
+            let (c, r) = ((rem % self.cols) as isize, (rem / self.cols) as isize);
+            targets
+                .iter()
+                .map(|&(tc, tr, _)| (c - tc as isize).abs() + (r - tr as isize).abs())
+                .min()
+                .unwrap_or(0) as i64
+                * step
+        };
+        // Heap of (f = g + h, g, cell); `dist` tracks g (the actual cost so far).
+        let mut heap: BinaryHeap<Reverse<(i64, i64, usize)>> = BinaryHeap::new();
         for &(c, r, l) in sources {
             let i = self.idx(c, r, l);
             if dist[i] != 0 {
                 dist[i] = 0;
-                heap.push(Reverse((0i64, i)));
+                heap.push(Reverse((heuristic(i), 0i64, i)));
             }
         }
         let tgt: Vec<usize> = targets.iter().map(|&(c, r, l)| self.idx(c, r, l)).collect();
-        while let Some(Reverse((d, i))) = heap.pop() {
-            if d > dist[i] {
+        while let Some(Reverse((_f, g, i))) = heap.pop() {
+            if g > dist[i] {
                 continue;
             }
             if tgt.contains(&i) {
@@ -612,9 +707,11 @@ impl Grid {
                 // Bias signals to the front: routing on the back (pour layer)
                 // costs extra, so the back stays a mostly-intact ground plane.
                 let move_cost = step + if layer == BACK { back_penalty } else { 0 };
+                let j = self.idx(nc, nr, layer);
                 relax(
-                    self.idx(nc, nr, layer),
-                    d + move_cost,
+                    j,
+                    g + move_cost,
+                    heuristic(j),
                     i,
                     &mut dist,
                     &mut prev,
@@ -625,9 +722,11 @@ impl Grid {
             // so its whole body must clear other nets on both layers.
             let other = layer ^ 1;
             if self.via_area_clear(c, r, net, via_halo) {
+                let j = self.idx(c, r, other);
                 relax(
-                    self.idx(c, r, other),
-                    d + via_cost,
+                    j,
+                    g + via_cost,
+                    heuristic(j),
                     i,
                     &mut dist,
                     &mut prev,
@@ -642,15 +741,17 @@ impl Grid {
 fn relax(
     j: usize,
     nd: i64,
+    hj: i64,
     from: usize,
     dist: &mut [i64],
     prev: &mut [usize],
-    heap: &mut BinaryHeap<Reverse<(i64, usize)>>,
+    heap: &mut BinaryHeap<Reverse<(i64, i64, usize)>>,
 ) {
+    // `nd` is the actual cost g to reach j; the heap is ordered by f = g + h.
     if nd < dist[j] {
         dist[j] = nd;
         prev[j] = from;
-        heap.push(Reverse((nd, j)));
+        heap.push(Reverse((nd + hj, nd, j)));
     }
 }
 
@@ -1083,5 +1184,35 @@ mod tests {
         assert!(via_sexpr(&v, "F.Cu", "B.Cu")
             .to_sexpr_string()
             .contains(r#"(layers "F.Cu" "B.Cu")"#));
+    }
+
+    #[test]
+    fn topo_order_respects_ripup_constraints_and_drops_cycles() {
+        // The rip-up loop feeds `topo_order` accumulated "a must route before b"
+        // constraints (a boxed-in victim must precede whatever boxed it in). This
+        // pins down that ordering logic directly, since the end-to-end boxed-in
+        // case only reproduces under real board congestion.
+
+        // No constraints: the base (net-index) order is preserved verbatim.
+        assert_eq!(topo_order(&[0, 1, 2], &[]), vec![0, 1, 2]);
+
+        // A single "1 before 0" constraint (net 1 was boxed in by net 0) puts the
+        // victim first so net 0 reroutes around it.
+        assert_eq!(topo_order(&[0, 1], &[(1, 0)]), vec![1, 0]);
+
+        // Ties break by base rank, so the order stays as close to the base as the
+        // constraints allow (deterministic, minimal churn): "3 before 1" moves 1
+        // only, leaving 0 and 2 where they were.
+        assert_eq!(topo_order(&[0, 1, 2, 3], &[(3, 1)]), vec![0, 2, 3, 1]);
+
+        // A contradictory pair (0<1 and 1<0) is unsatisfiable — the cycle is
+        // dropped and the tangled nets fall back to base order (one loses and
+        // stays unrouted, rather than the loop spinning forever).
+        assert_eq!(topo_order(&[0, 1], &[(0, 1), (1, 0)]), vec![0, 1]);
+
+        // Even with a cycle, every input index appears exactly once in the output.
+        let mut got = topo_order(&[0, 1, 2, 3], &[(2, 1), (1, 2)]);
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2, 3]);
     }
 }

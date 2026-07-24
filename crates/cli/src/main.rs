@@ -13,14 +13,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, export_cpl,
-    export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report, generate_bom,
-    guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf, panel_to_kicad_pcb,
-    parse_netlist_file,
-    png_to_jpeg, render_board_png, run_drc, simulate_ac, validate_erc, zip_dir, BoardOptions,
-    BoardPng, CircuitSource, EurorackPlacer, Finding, JlcpcbClient, MouserClient, PanelFile,
-    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, ResolutionStatus,
-    Severity, SimConfig, SkidlRunner, StageOutcome,
+    analytic_check, build_guide, default_panel_orders_dir, default_parts_dir, derive_panel,
+    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_report,
+    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, render_board_png, run_drc,
+    run_layout_loop, simulate_ac, validate_erc, zip_dir, BoardOptions, BoardPng, BuiltinCutouts,
+    CircuitSource, EurorackPlacer, Finding, JlcpcbClient, LayoutLoop, LayoutMode, Logo,
+    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, StageOutcome,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -71,6 +71,16 @@ enum Command {
         /// the board to the panel (vertical 3U) instead of a bounding-box strip.
         #[arg(long)]
         panel: Option<PathBuf>,
+        /// Layout cost-function mode (only affects the panel-anchored loop):
+        /// analog | digital | mixed.
+        #[arg(long, default_value = "analog")]
+        mode: String,
+        /// Iterative layout attempts over a panel board (0 = one-shot placement).
+        #[arg(long, default_value_t = 6)]
+        iterations: usize,
+        /// Brand logo SVG to render on the back silk (bottom-centre).
+        #[arg(long)]
+        logo: Option<PathBuf>,
     },
     /// Run DRC on a .kicad_pcb and report violations (the layout loop's check step).
     Drc {
@@ -87,6 +97,19 @@ enum Command {
         /// Eurorack panel spec (TOML): build the vertical panel-anchored board.
         #[arg(long)]
         panel: Option<PathBuf>,
+        /// Layout cost-function mode: analog | digital | mixed.
+        #[arg(long, default_value = "analog")]
+        mode: String,
+        /// Iterative layout attempts over a panel board (0 = one-shot placement).
+        #[arg(long, default_value_t = 6)]
+        iterations: usize,
+        /// Run full KiCad DRC on every layout attempt (slow; default is a single
+        /// final-gate DRC).
+        #[arg(long)]
+        drc_every_iter: bool,
+        /// Brand logo SVG to render on the back silk (bottom-centre).
+        #[arg(long)]
+        logo: Option<PathBuf>,
     },
     /// Generate a step-by-step visual assembly guide (HTML) from a circuit.
     Guide {
@@ -169,6 +192,21 @@ enum PanelCmd {
         /// Output .kicad_pcb path (default: same name with .kicad_pcb extension).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Brand logo SVG to render on the front silk (bottom-centre).
+        #[arg(long)]
+        logo: Option<PathBuf>,
+    },
+    /// Derive an editable panel spec (TOML) from a circuit's panel-facing parts
+    /// (jacks/pots/switches) — instead of hand-writing cutout coordinates.
+    Derive {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Panel width in HP.
+        #[arg(long, default_value_t = 8)]
+        hp: u16,
+        /// Output TOML path (default: <circuit>_panel.toml next to the circuit).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Show the current order status for a module.
     Status {
@@ -207,13 +245,20 @@ fn main() -> ExitCode {
             circuit,
             out,
             panel,
-        } => board_cmd(circuit, out, panel),
+            mode,
+            iterations,
+            logo,
+        } => board_cmd(circuit, out, panel, mode, iterations, logo),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab {
             circuit,
             out,
             panel,
-        } => fab_cmd(circuit, out, panel),
+            mode,
+            iterations,
+            drc_every_iter,
+            logo,
+        } => fab_cmd(circuit, out, panel, mode, iterations, drc_every_iter, logo),
         Command::Guide {
             circuit,
             out,
@@ -323,42 +368,117 @@ fn run(circuit: PathBuf) -> Result<()> {
 /// spec is given: jacks/pots are anchored to the panel's cutouts (Y flipped from
 /// the panel's bottom-up frame to KiCad top-down) and the board outline becomes
 /// the panel size (vertical 3U). Otherwise the default grid placement.
+/// Shared panel geometry both the board outline and the placer need: panel size
+/// (mm), the sheet origin that centres it on A4, and refdes→(x,y) anchors (Y
+/// flipped from the panel's bottom-up cutouts to KiCad top-down).
+type PanelGeometry = (
+    f64,
+    f64,
+    (f64, f64),
+    std::collections::HashMap<String, (f64, f64)>,
+);
+
+fn panel_geometry(spec_path: &std::path::Path) -> Result<PanelGeometry> {
+    let toml = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("reading {}", spec_path.display()))?;
+    let file =
+        PanelFile::from_toml(&toml).with_context(|| format!("parsing {}", spec_path.display()))?;
+    let spec = file
+        .to_spec()
+        .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
+    let (w, h) = (spec.width_mm(), spec.height_mm());
+    let mut anchors = std::collections::HashMap::new();
+    for c in spec.cutouts() {
+        if let Some(refdes) = &c.refdes {
+            anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
+        }
+    }
+    // Centre the board on KiCad's A4 sheet (297×210 landscape) rather than jamming
+    // it in the (0,0) corner.
+    let ox = ((297.0 - w) / 2.0).max(10.0);
+    let oy = ((210.0 - h) / 2.0).max(10.0);
+    Ok((w, h, (ox, oy), anchors))
+}
+
+/// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
+/// Build board options, using panel-anchored Eurorack placement when a panel
+/// spec is given: jacks/pots are anchored to the panel's cutouts and the board
+/// outline becomes the panel size (vertical 3U). Otherwise the default grid
+/// placement. The placer here is the one-shot [`EurorackPlacer`]; the iterative
+/// loop swaps in a [`SeededPlacer`] per attempt.
 fn board_options_with_panel(
     footprint_dir: PathBuf,
     panel: &Option<PathBuf>,
 ) -> Result<BoardOptions> {
     let mut opts = BoardOptions::new(footprint_dir);
     if let Some(spec_path) = panel {
-        let toml = std::fs::read_to_string(spec_path)
-            .with_context(|| format!("reading {}", spec_path.display()))?;
-        let file = PanelFile::from_toml(&toml)
-            .with_context(|| format!("parsing {}", spec_path.display()))?;
-        let spec = file
-            .to_spec()
-            .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
-        let (w, h) = (spec.width_mm(), spec.height_mm());
-        let mut anchors = std::collections::HashMap::new();
-        for c in spec.cutouts() {
-            if let Some(refdes) = &c.refdes {
-                anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
-            }
-        }
-        // Centre the board on KiCad's A4 sheet (297×210 landscape) rather than
-        // jamming it in the (0,0) corner.
-        let ox = ((297.0 - w) / 2.0).max(10.0);
-        let oy = ((210.0 - h) / 2.0).max(10.0);
+        let (w, h, origin, anchors) = panel_geometry(spec_path)?;
         opts.placer = Box::new(EurorackPlacer {
             width_mm: w,
             height_mm: h,
-            origin_mm: (ox, oy),
+            origin_mm: origin,
             anchors,
         });
-        opts.fixed_outline = Some((ox, oy, ox + w, oy + h));
+        opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
     }
     Ok(opts)
 }
 
-fn board_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Result<()> {
+/// The seeded-placer template for the iterative layout loop, when a panel is
+/// given. `None` (no panel) means there's nothing to anchor to, so the loop is
+/// skipped and one-shot placement stands.
+fn seeded_template(panel: &Option<PathBuf>) -> Result<Option<SeededPlacer>> {
+    match panel {
+        Some(spec_path) => {
+            let (w, h, origin, anchors) = panel_geometry(spec_path)?;
+            Ok(Some(SeededPlacer::new(w, h, origin, anchors)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A human-readable board title from a file stem: `slew_limiter` → `Slew Limiter`.
+fn pretty_title(stem: &str) -> String {
+    stem.split(['_', '-'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Load a brand logo SVG, if a path is given.
+fn load_logo(path: &Option<PathBuf>) -> Result<Option<Logo>> {
+    match path {
+        Some(p) => {
+            let svg = std::fs::read_to_string(p)
+                .with_context(|| format!("reading logo {}", p.display()))?;
+            let logo = Logo::from_svg(&svg).map_err(|e| anyhow::anyhow!("parsing logo: {e}"))?;
+            Ok(Some(logo))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Parse `--mode`, erroring clearly on an unknown value.
+fn parse_mode(mode: &str) -> Result<LayoutMode> {
+    LayoutMode::parse(mode)
+        .ok_or_else(|| anyhow::anyhow!("unknown --mode '{mode}' (analog | digital | mixed)"))
+}
+
+fn board_cmd(
+    circuit: PathBuf,
+    out: Option<PathBuf>,
+    panel: Option<PathBuf>,
+    mode: String,
+    iterations: usize,
+    logo: Option<PathBuf>,
+) -> Result<()> {
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -374,15 +494,39 @@ fn board_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> 
 
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    let options = board_options_with_panel(footprint_dir, &panel)?;
-    let (board, conflicts) = generate_board_report(&model, &options)?;
-
+    let mut options = board_options_with_panel(footprint_dir, &panel)?;
+    options.title = Some(pretty_title(stem));
+    options.logo = load_logo(&logo)?;
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
+
+    // Iterative, connectivity-aware layout when a panel is given (needs anchors);
+    // otherwise the one-shot placement path.
+    let (board, conflicts) = match (seeded_template(&panel)?, iterations) {
+        (Some(template), iters) if iters > 0 => {
+            let cfg = LayoutLoop {
+                mode: parse_mode(&mode)?,
+                max_iters: iters,
+                kicad_cli: None,
+                drc_every_iter: false,
+            };
+            let report = run_layout_loop(&model, options, template, &cfg)?;
+            println!(
+                "  seeded layout ({mode}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
+                report.iterations,
+                report.metrics.signal_hpwl_mm,
+                report.metrics.critical_hpwl_mm,
+                report.metrics.via_count,
+            );
+            (report.board, report.unresolved)
+        }
+        _ => generate_board_report(&model, &options)?,
+    };
+
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
     let tracks = board.matches("(segment").count();
     let vias = board.matches("(via").count();
     println!("wrote {}", path.display());
-    println!("  placed (grid) + routed: {tracks} tracks, {vias} vias, outline + GND pour");
+    println!("  placed + routed: {tracks} tracks, {vias} vias, outline + GND pour");
     if !conflicts.is_empty() {
         eprintln!(
             "  ⚠ {} connection(s) left unrouted (for manual/iterative routing):",
@@ -449,7 +593,15 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
 
 /// Handle `lob fab <circuit> [--out]` — generate a board, gate it on DRC, and
 /// write the JLCPCB-ready manufacturing package (Gerbers + drill + CPL + BOM).
-fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Result<()> {
+fn fab_cmd(
+    circuit: PathBuf,
+    out: Option<PathBuf>,
+    panel: Option<PathBuf>,
+    mode: String,
+    iterations: usize,
+    drc_every_iter: bool,
+    logo: Option<PathBuf>,
+) -> Result<()> {
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -466,8 +618,34 @@ fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Re
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    let options = board_options_with_panel(footprint_dir, &panel)?;
-    let (board, conflicts) = generate_board_report(&model, &options)?;
+    let mut options = board_options_with_panel(footprint_dir, &panel)?;
+    options.title = Some(pretty_title(stem));
+    options.logo = load_logo(&logo)?;
+    let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
+
+    // Iterative, connectivity-aware layout when a panel is given; else one-shot.
+    // The DRC gate below is the loop's final verification (§6.5), so the loop
+    // scores in-process unless `--drc-every-iter` is set.
+    let (board, conflicts) = match (seeded_template(&panel)?, iterations) {
+        (Some(template), iters) if iters > 0 => {
+            let cfg = LayoutLoop {
+                mode: parse_mode(&mode)?,
+                max_iters: iters,
+                kicad_cli: drc_every_iter.then(|| kicad.clone()),
+                drc_every_iter,
+            };
+            let report = run_layout_loop(&model, options, template, &cfg)?;
+            println!(
+                "  seeded layout ({mode}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
+                report.iterations,
+                report.metrics.signal_hpwl_mm,
+                report.metrics.critical_hpwl_mm,
+                report.metrics.via_count,
+            );
+            (report.board, report.unresolved)
+        }
+        _ => generate_board_report(&model, &options)?,
+    };
 
     let pkg = out.unwrap_or_else(|| work_dir.join("fab"));
     std::fs::create_dir_all(&pkg)?;
@@ -480,8 +658,6 @@ fn fab_cmd(circuit: PathBuf, out: Option<PathBuf>, panel: Option<PathBuf>) -> Re
             eprintln!("      - {c}");
         }
     }
-
-    let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
 
     // DRC gate — do not ship a package for a board with errors.
     let report = run_drc(&board_path, &kicad)?;
@@ -801,7 +977,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 panel.cutouts().len(),
             );
         }
-        PanelCmd::Pcb { spec, out } => {
+        PanelCmd::Pcb { spec, out, logo } => {
             let toml = std::fs::read_to_string(&spec)
                 .with_context(|| format!("reading {}", spec.display()))?;
             let file = PanelFile::from_toml(&toml)
@@ -809,11 +985,12 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             let panel = file
                 .to_spec()
                 .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
-            let stem = spec
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("panel");
-            let pcb = panel_to_kicad_pcb(panel.as_ref(), stem);
+            let stem = spec.file_stem().and_then(|s| s.to_str()).unwrap_or("panel");
+            // Drop a trailing "_panel"/"-panel" and prettify: "slew_limiter_panel"
+            // → "Slew Limiter".
+            let title = pretty_title(stem.trim_end_matches("_panel").trim_end_matches("-panel"));
+            let logo = load_logo(&logo)?;
+            let pcb = panel_to_kicad_pcb(panel.as_ref(), &title, logo.as_ref());
             let out_path = out.unwrap_or_else(|| spec.with_extension("kicad_pcb"));
             std::fs::write(&out_path, pcb)
                 .with_context(|| format!("writing {}", out_path.display()))?;
@@ -828,18 +1005,64 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             );
             // Gerbers, if kicad-cli is available (panels are mechanical: Edge.Cuts + silk).
             if let Some(kicad) = kicad_cli_path() {
-                let gdir = out_path.with_extension("").with_file_name(format!("{stem}-panel-gerbers"));
+                let gdir = out_path
+                    .with_extension("")
+                    .with_file_name(format!("{stem}-panel-gerbers"));
                 match export_gerbers(&out_path, &gdir, &kicad) {
                     Ok(()) => {
                         let zip = gdir.with_extension("zip");
                         let zipped = zip_dir(&gdir, &zip).unwrap_or(false);
                         println!(
                             "  gerbers: {}",
-                            if zipped { zip.display().to_string() } else { gdir.display().to_string() }
+                            if zipped {
+                                zip.display().to_string()
+                            } else {
+                                gdir.display().to_string()
+                            }
                         );
                     }
                     Err(e) => println!("  gerbers: skipped ({e})"),
                 }
+            }
+        }
+        PanelCmd::Derive { circuit, hp, out } => {
+            let circuit = circuit
+                .canonicalize()
+                .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+            let stem = circuit
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("circuit");
+            let work_dir = PathBuf::from("out").join(stem);
+            let run = SkidlRunner::discover(&work_dir)
+                .run(&circuit)
+                .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+            let model = parse_netlist_file(&run.netlist_path)?;
+            // Cutout dims resolve through the CutoutSource seam; BuiltinCutouts is
+            // the fallback until the parts library carries verified mechanical data.
+            let panel = derive_panel(&model, hp, &BuiltinCutouts);
+            let toml = panel
+                .to_toml()
+                .map_err(|e| anyhow::anyhow!("serialising panel: {e}"))?;
+            let out_path =
+                out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_panel.toml")));
+            std::fs::write(&out_path, &toml)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!(
+                "derived panel: {} ({} control(s), {} HP)",
+                out_path.display(),
+                panel.cutouts.len(),
+                hp
+            );
+            for c in &panel.cutouts {
+                println!(
+                    "  {:<4} {:<10} @ ({:5.1}, {:5.1})  {}",
+                    c.refdes.as_deref().unwrap_or("?"),
+                    c.footprint,
+                    c.x_mm,
+                    c.y_mm,
+                    c.label.as_deref().unwrap_or("")
+                );
             }
         }
         PanelCmd::Status { module } => {

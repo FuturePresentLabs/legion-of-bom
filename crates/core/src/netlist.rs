@@ -92,10 +92,11 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 .filter_map(|node| Some(PinRef::new(node.field("ref")?, node.field("pin")?)))
                 .collect();
             pins.sort_by(|a, b| (&a.refdes, &a.pin).cmp(&(&b.refdes, &b.pin)));
-            nets.push(Net {
-                name: net_name,
-                pins,
-            });
+            // KiCad emits `(class "Default")` on every net; a circuit author who
+            // tags a net critical in SKiDL (`net.netclass = NetClass("Critical")`)
+            // gets `(class "Critical")`. `with_class` drops the default to `None`.
+            let net_class = net.field("class").unwrap_or_default();
+            nets.push(Net::new(net_name, pins).with_class(net_class));
         }
     }
 
@@ -194,6 +195,37 @@ mod tests {
             out.pins,
             vec![PinRef::new("C1", "1"), PinRef::new("R1", "2")]
         );
+
+        // Every net here is the default class — none is critical, and the default
+        // normalises away rather than being stored verbatim.
+        assert!(c.nets().iter().all(|n| n.net_class.is_none()));
+        assert!(c.nets().iter().all(|n| !n.is_critical()));
+    }
+
+    #[test]
+    fn critical_net_class_survives_parse() {
+        let nl = r#"
+        (export (version "E")
+          (components
+            (comp (ref "U1") (value "LM13700") (libsource (lib "x") (part "y")))
+            (comp (ref "C1") (value "47n") (libsource (lib "Device") (part "C"))))
+          (nets
+            (net (code 1) (name "SLEW_NODE") (class "Critical")
+              (node (ref "C1") (pin "1")) (node (ref "U1") (pin "5")))
+            (net (code 3) (name "SIG_IN") (class "Default,Critical")
+              (node (ref "U1") (pin "3")) (node (ref "C1") (pin "1")))
+            (net (code 2) (name "GND") (class "Default")
+              (node (ref "C1") (pin "2")))))"#;
+        let c = parse_netlist_str(nl, "x").unwrap();
+        let slew = c.nets().iter().find(|n| n.name == "SLEW_NODE").unwrap();
+        assert_eq!(slew.net_class.as_deref(), Some("Critical"));
+        assert!(slew.is_critical());
+        // SKiDL appends classes; "Default,Critical" is still critical.
+        let sig = c.nets().iter().find(|n| n.name == "SIG_IN").unwrap();
+        assert!(sig.is_critical());
+        let gnd = c.nets().iter().find(|n| n.name == "GND").unwrap();
+        assert!(gnd.net_class.is_none());
+        assert!(!gnd.is_critical());
     }
 
     #[test]
