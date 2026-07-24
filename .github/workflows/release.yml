@@ -1,0 +1,110 @@
+name: release
+
+# Build the `lob` CLI for macOS and Linux whenever a version tag is pushed.
+# The guard job below ensures the tagged commit is actually reachable from
+# `master`, so only "master tagged commits" produce release artifacts.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release and upload assets
+
+jobs:
+  # Reject tags that don't point at a commit contained in master, so a tag
+  # pushed on a side branch never ships a "release".
+  guard:
+    name: verify tag is on master
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so `merge-base` can see master
+      - name: Ensure tag commit is an ancestor of master
+        run: |
+          git fetch --no-tags origin master
+          if git merge-base --is-ancestor "${GITHUB_SHA}" origin/master; then
+            echo "Tag ${GITHUB_REF_NAME} is on master."
+          else
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not reachable from master; refusing to build release artifacts."
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13 # Intel runner
+            target: x86_64-apple-darwin
+          - os: macos-latest # Apple Silicon runner
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      - name: Build lob (release)
+        run: cargo build --release --locked --target ${{ matrix.target }} -p legion-of-bom-cli
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          bin="lob"
+          staging="lob-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/$bin" "$staging/"
+          cp README.md LICENSE "$staging/" 2>/dev/null || true
+          tar czf "$staging.tar.gz" "$staging"
+          shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lob-${{ matrix.target }}
+          path: |
+            lob-*.tar.gz
+            lob-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create/update release and attach binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/lob-*.tar.gz
+            dist/lob-*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
