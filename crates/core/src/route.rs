@@ -120,6 +120,11 @@ pub struct RouteOptions {
     pub via_size_mm: f64,
     pub via_drill_mm: f64,
     pub clearance_mm: f64,
+    /// Minimum copper-to-board-edge clearance (mm). When `bounds` is the board
+    /// outline, the router keeps every track and via this far inside it. Matches
+    /// KiCad's default `copper_edge_clearance`; without it a net routed to the edge
+    /// of a tight (narrow-HP) board trips `copper_edge_clearance` DRC.
+    pub edge_clearance_mm: f64,
     /// Routing-grid cell size (mm). Finer = more precise, slower.
     pub grid_mm: f64,
     /// Cost (mm-equivalent) charged for a layer change, to discourage vias.
@@ -143,6 +148,7 @@ impl Default for RouteOptions {
             via_size_mm: 0.8,
             via_drill_mm: 0.4,
             clearance_mm: 0.2,
+            edge_clearance_mm: 0.5,
             grid_mm: 0.2,
             via_cost_mm: 2.0,
             // Small per-cell surcharge on the back layer: it accumulates so a long
@@ -385,7 +391,23 @@ impl GridRouter {
     ) -> (RouteOutput, Vec<usize>, HashMap<usize, HashSet<usize>>) {
         let mut out = RouteOutput::default();
         let res = opts.grid_mm.max(0.01);
-        let (minx, miny, maxx, maxy) = opts.bounds.unwrap_or_else(|| bounds_of(nets, 2.0));
+        // `bounds`, when given, is the board outline: inset the routable area by the
+        // edge clearance plus the widest copper half (a via) so no track/via lands
+        // within `edge_clearance_mm` of the edge. The pad-bbox fallback has no board
+        // edge, so it is used as-is.
+        let (minx, miny, maxx, maxy) = match opts.bounds {
+            Some((x0, y0, x1, y1)) => {
+                let inset = opts.edge_clearance_mm
+                    + (opts.via_size_mm / 2.0).max(opts.signal_width_mm / 2.0)
+                    + res / 2.0;
+                if x1 - x0 > 2.0 * inset && y1 - y0 > 2.0 * inset {
+                    (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
+                } else {
+                    (x0, y0, x1, y1) // too small to inset — leave it (surfaces as conflicts)
+                }
+            }
+            None => bounds_of(nets, 2.0),
+        };
         let cols = (((maxx - minx) / res).ceil() as usize).max(1) + 1;
         let rows = (((maxy - miny) / res).ceil() as usize).max(1) + 1;
         let cell_of = |x: f64, y: f64| {
@@ -1214,5 +1236,41 @@ mod tests {
         let mut got = topo_order(&[0, 1, 2, 3], &[(2, 1), (1, 2)]);
         got.sort();
         assert_eq!(got, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn routing_refuses_to_enter_the_board_edge_band() {
+        // When `bounds` is the board outline, the router keeps copper an
+        // edge-clearance inset inside it. A net whose only path runs through the
+        // edge band (here: a wall sealing the board except a gap hard against the
+        // bottom edge) must NOT be routed into the band — that trips
+        // copper_edge_clearance DRC. It is surfaced as a conflict instead.
+        let opts = RouteOptions {
+            bounds: Some((0.0, 0.0, 20.0, 10.0)),
+            ..RouteOptions::default()
+        };
+        let mut nets = vec![RouteNet {
+            net_idx: 1,
+            name: "SIG".into(),
+            pads: vec![pad("A", "1", 5.0, 5.0), pad("B", "1", 15.0, 5.0)],
+        }];
+        // A solid vertical wall of through-hole obstacle pads at x = 10, spanning
+        // y = 1..=10 (the top edge). The only crossing is y < 1 — inside the band.
+        for y in 1..=10 {
+            nets.push(RouteNet {
+                net_idx: 0,
+                name: String::new(),
+                pads: vec![pad_on("W", "1", 10.0, y as f64, PadLayer::Both)],
+            });
+        }
+        let out = GridRouter.route(&nets, &opts);
+        assert!(
+            !out.conflicts.is_empty(),
+            "a net routable only through the edge band must be surfaced, not routed into it"
+        );
+        assert!(
+            out.tracks.iter().all(|t| t.net_idx != 1),
+            "the boxed-in net must not be routed into the edge band"
+        );
     }
 }

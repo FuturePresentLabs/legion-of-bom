@@ -907,7 +907,14 @@ pub fn generate_board_artifacts(
                 pads: vec![point],
             });
         }
-        route = router.route(&nets, &options.route_options);
+        // Hand the router the board outline as its `bounds` so it keeps copper an
+        // edge-clearance inset inside the real edge (a narrow-HP board otherwise
+        // routes traces onto Edge.Cuts → copper_edge_clearance DRC errors).
+        let mut route_opts = options.route_options.clone();
+        if route_opts.bounds.is_none() {
+            route_opts.bounds = outline;
+        }
+        route = router.route(&nets, &route_opts);
         for track in &route.tracks {
             board.push(track_sexpr(track));
         }
