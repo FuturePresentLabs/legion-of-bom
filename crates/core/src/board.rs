@@ -21,7 +21,7 @@ use crate::logo::Logo;
 use crate::model::Side;
 use crate::route::{
     track_sexpr, via_sexpr, GridRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput,
-    Router,
+    Router, Track, Via,
 };
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
@@ -948,6 +948,42 @@ pub fn generate_board_artifacts(
                 &options.route_options.back,
             ));
         }
+        // GND stitching vias tie the two-sided pour together next to each
+        // through-hole ground pad, so a pour island fenced off by a dense THT grid
+        // (a sub-board header) reconnects — fixes starved_thermal (25z.2).
+        if let (Some(rect), Some(gnd)) = (outline, &options.ground_net) {
+            if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
+                let gnd_idx = net_index[name.as_str()];
+                let pad_geo: Vec<PadGeo> = nets
+                    .iter()
+                    .flat_map(|n| {
+                        let idx = n.net_idx;
+                        n.pads.iter().map(move |p| PadGeo {
+                            x: p.x_mm,
+                            y: p.y_mm,
+                            w: p.w_mm,
+                            h: p.h_mm,
+                            net_idx: idx,
+                            tht: matches!(p.layer, PadLayer::Both),
+                        })
+                    })
+                    .collect();
+                for via in ground_stitching_vias(
+                    rect,
+                    gnd_idx,
+                    &pad_geo,
+                    &route.tracks,
+                    &route.vias,
+                    &route_opts,
+                ) {
+                    board.push(via_sexpr(
+                        &via,
+                        &options.route_options.front,
+                        &options.route_options.back,
+                    ));
+                }
+            }
+        }
     }
 
     Ok(BoardArtifacts {
@@ -1443,6 +1479,102 @@ fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &s
     ])
 }
 
+/// A placed pad's geometry for stitching-via clearance (absolute board coords).
+struct PadGeo {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    net_idx: usize,
+    /// Through-hole (both layers) — the pads that punch a hole in *both* ground
+    /// pours and so can strand a pour island.
+    tht: bool,
+}
+
+/// Distance from point `p` to segment `a`–`b`.
+fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 <= 1e-12 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+    };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+/// GND **stitching vias**: one beside each through-hole ground pad, tying the
+/// F.Cu and B.Cu pours together there. The two-sided pour (DESIGN 6.2) relies on
+/// through-hole GND pads to bridge its layers; where a GND pad is alone in a
+/// region a dense THT grid (a sub-board header) fenced off, its pour becomes an
+/// isolated island (KiCad `starved_thermal`). A via just off the pad reconnects
+/// that island to the intact pour on the other layer. Each via is kept inside the
+/// board edge and clear of all *other-net* copper (pads, tracks, vias); a pad
+/// with no clear spot around it is skipped rather than forced. (25z.2)
+fn ground_stitching_vias(
+    outline: Rect,
+    gnd_idx: usize,
+    pads: &[PadGeo],
+    tracks: &[Track],
+    routed_vias: &[Via],
+    opts: &RouteOptions,
+) -> Vec<Via> {
+    let via_r = opts.via_size_mm / 2.0;
+    let clr = opts.clearance_mm;
+    let (x0, y0, x1, y1) = outline;
+    let inset = opts.edge_clearance_mm + via_r;
+
+    let clear = |vx: f64, vy: f64, placed: &[Via]| -> bool {
+        if vx < x0 + inset || vx > x1 - inset || vy < y0 + inset || vy > y1 - inset {
+            return false;
+        }
+        for p in pads {
+            // Overlap-avoid for same-net pads; full clearance for other nets.
+            let m = via_r + if p.net_idx == gnd_idx { 0.0 } else { clr };
+            if vx > p.x - p.w / 2.0 - m
+                && vx < p.x + p.w / 2.0 + m
+                && vy > p.y - p.h / 2.0 - m
+                && vy < p.y + p.h / 2.0 + m
+            {
+                return false;
+            }
+        }
+        for t in tracks.iter().filter(|t| t.net_idx != gnd_idx) {
+            if point_seg_dist((vx, vy), t.start, t.end) < via_r + t.width_mm / 2.0 + clr {
+                return false;
+            }
+        }
+        for v in routed_vias.iter().filter(|v| v.net_idx != gnd_idx) {
+            if (vx - v.at.0).hypot(vy - v.at.1) < via_r + v.size_mm / 2.0 + clr {
+                return false;
+            }
+        }
+        // Don't cluster two stitches on the same island.
+        !placed
+            .iter()
+            .any(|v| (vx - v.at.0).hypot(vy - v.at.1) < 1.0)
+    };
+
+    let mut vias: Vec<Via> = Vec::new();
+    for p in pads.iter().filter(|p| p.net_idx == gnd_idx && p.tht) {
+        let off = p.w.max(p.h) / 2.0 + via_r + clr + 0.2;
+        for k in 0..8 {
+            let ang = k as f64 * std::f64::consts::FRAC_PI_4;
+            let (vx, vy) = (p.x + off * ang.cos(), p.y + off * ang.sin());
+            if clear(vx, vy, &vias) {
+                vias.push(Via {
+                    at: (vx, vy),
+                    size_mm: opts.via_size_mm,
+                    drill_mm: opts.via_drill_mm,
+                    net_idx: gnd_idx,
+                });
+                break;
+            }
+        }
+    }
+    vias
+}
+
 fn net(index: usize, name: &str) -> Sexpr {
     Sexpr::list(vec![
         Sexpr::sym("net"),
@@ -1582,6 +1714,83 @@ mod tests {
             art.route.conflicts
         );
         assert!(art.pcb.contains("(segment"), "AUDIO net becomes a track");
+    }
+
+    #[test]
+    fn stitching_via_lands_beside_a_through_hole_ground_pad() {
+        let opts = RouteOptions::default();
+        let gnd = 5;
+        let outline = (0.0, 0.0, 40.0, 40.0);
+        let pads = vec![
+            // A through-hole GND pad in open board → gets a stitch beside it.
+            PadGeo {
+                x: 20.0,
+                y: 20.0,
+                w: 1.7,
+                h: 1.7,
+                net_idx: gnd,
+                tht: true,
+            },
+            // An unrelated SMD pad, far away.
+            PadGeo {
+                x: 5.0,
+                y: 5.0,
+                w: 1.0,
+                h: 1.0,
+                net_idx: 2,
+                tht: false,
+            },
+        ];
+        let vias = ground_stitching_vias(outline, gnd, &pads, &[], &[], &opts);
+        assert_eq!(vias.len(), 1, "one stitch for the one THT GND pad");
+        assert_eq!(vias[0].net_idx, gnd);
+        let d = (vias[0].at.0 - 20.0).hypot(vias[0].at.1 - 20.0);
+        assert!(d > 0.85 && d < 3.0, "stitch sits just off the pad (d={d})");
+    }
+
+    #[test]
+    fn stitching_skips_smd_pads_and_boxed_in_pads() {
+        let opts = RouteOptions::default();
+        let gnd = 5;
+        let outline = (0.0, 0.0, 40.0, 40.0);
+        // An SMD (single-layer) GND pad doesn't bridge the pours → no stitch.
+        let smd = vec![PadGeo {
+            x: 20.0,
+            y: 20.0,
+            w: 1.0,
+            h: 1.0,
+            net_idx: gnd,
+            tht: false,
+        }];
+        assert!(ground_stitching_vias(outline, gnd, &smd, &[], &[], &opts).is_empty());
+        // A THT GND pad fenced in on every side by other-net copper is skipped,
+        // never forced into a clearance violation.
+        let wall = |x: f64, y: f64, w: f64, h: f64| PadGeo {
+            x,
+            y,
+            w,
+            h,
+            net_idx: 2,
+            tht: false,
+        };
+        let boxed = vec![
+            PadGeo {
+                x: 20.0,
+                y: 20.0,
+                w: 1.7,
+                h: 1.7,
+                net_idx: gnd,
+                tht: true,
+            },
+            wall(17.5, 20.0, 2.0, 10.0),
+            wall(22.5, 20.0, 2.0, 10.0),
+            wall(20.0, 17.5, 10.0, 2.0),
+            wall(20.0, 22.5, 10.0, 2.0),
+        ];
+        assert!(
+            ground_stitching_vias(outline, gnd, &boxed, &[], &[], &opts).is_empty(),
+            "a boxed-in pad is skipped, not forced"
+        );
     }
 
     #[test]
