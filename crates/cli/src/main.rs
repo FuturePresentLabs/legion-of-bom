@@ -17,10 +17,11 @@ use legion_of_bom_core::{
     export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
     generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
     panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, render_board_png, run_drc,
-    run_layout_loop, simulate_ac, validate_erc, zip_dir, BoardOptions, BoardPng, BuiltinCutouts,
-    CircuitSource, EurorackPlacer, Finding, JlcpcbClient, LayoutLoop, LayoutMode, Logo,
-    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, StageOutcome,
+    run_layout_loop, simulate_ac, simulate_tran, validate_erc, zip_dir, BoardOptions, BoardPng,
+    BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, JlcpcbClient, LayoutLoop, LayoutMode,
+    Logo, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
+    PipelineReport, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, StageOutcome,
+    TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -324,13 +325,34 @@ fn run(circuit: PathBuf) -> Result<()> {
     // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep. Infer
     // the I/O and supply nets from the circuit (SIG_IN/SIG_OUT, +12V/-12V) rather
     // than assuming IN/OUT/±15 V (tus.9).
-    let ac = simulate_ac(&model, &SimConfig::infer(&model), &work_dir)
+    let sim_config = SimConfig::infer(&model);
+    let ac = simulate_ac(&model, &sim_config, &work_dir)
         .with_context(|| "simulate stage failed (try `lob doctor`)")?;
     report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
         "AC sweep: {} points, passband {:.2} dB",
         ac.points.len(),
         ac.passband_gain_db().unwrap_or(0.0)
     ))));
+
+    // Stage: transient — a step response, which shows time-domain behaviour (a
+    // slew limiter's peak slew rate) that an AC sweep can't (tus.10). Soft: a
+    // circuit whose step response won't converge is surfaced, not fatal.
+    match simulate_tran(&model, &sim_config, &TranAnalysis::default(), &work_dir) {
+        Ok(t) => {
+            let slew = t.max_slew_v_per_s().map_or_else(
+                || "n/a".to_string(),
+                |s| format!("{:.0} V/s ({:.2} V/ms)", s, s / 1e3),
+            );
+            report.push(
+                StageOutcome::passed("transient")
+                    .with(Finding::info(format!("step response: peak slew {slew}"))),
+            );
+        }
+        Err(e) => report.push(
+            StageOutcome::passed("transient")
+                .with(Finding::warning(format!("step response did not run: {e}"))),
+        ),
+    }
 
     // Stage: verify — assert the simulated response against the textbook value
     // for this topology (RC cutoff, op-amp gain, …).
