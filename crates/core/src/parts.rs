@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS house_parts (\
   mpn VARCHAR(64) NOT NULL,\
   uses INT NOT NULL DEFAULT 1,\
   seen_on TEXT,\
+  photo TEXT,\
   PRIMARY KEY (kind, value, package));";
 
 /// A part we actually build with: what we reach for given a kind, a value and a
@@ -70,6 +71,10 @@ pub struct HousePart {
     pub uses: i64,
     /// Which boards, so a choice can be traced to something that shipped.
     pub seen_on: String,
+    /// Our own photo of the part, if we have taken one — a repo-relative path
+    /// or a URL. Worth more than a datasheet render for telling two similar
+    /// jacks apart on the bench.
+    pub photo: Option<String>,
     /// Whether this matched value *and* package, or was a broader fallback.
     pub exact: bool,
 }
@@ -168,6 +173,7 @@ impl PartsLibrary {
         }
         lib.sql(SCHEMA)?;
         lib.ensure_image_column()?;
+        lib.ensure_house_photo_column()?;
         Ok(lib)
     }
 
@@ -179,6 +185,46 @@ impl PartsLibrary {
             self.sql("ALTER TABLE parts ADD COLUMN image_url TEXT")?;
         }
         Ok(())
+    }
+
+    /// Same migration for `house_parts.photo`, added after the table shipped.
+    fn ensure_house_photo_column(&self) -> Result<(), PartsError> {
+        if self.query("SELECT photo FROM house_parts LIMIT 1").is_err() {
+            self.sql("ALTER TABLE house_parts ADD COLUMN photo TEXT")?;
+        }
+        Ok(())
+    }
+
+    /// Attach our own photo of a part we build with.
+    ///
+    /// Returns false when no such library entry exists, so a typo in the key is
+    /// reported rather than silently storing a photo nothing points at.
+    pub fn set_house_photo(
+        &self,
+        kind: &str,
+        value: &str,
+        package: &str,
+        photo: &str,
+    ) -> Result<bool, PartsError> {
+        let where_key = format!(
+            "kind = {} AND value = {} AND package = {}",
+            sql_str(kind),
+            sql_str(value),
+            sql_str(package)
+        );
+        if self
+            .query(&format!(
+                "SELECT mpn FROM house_parts WHERE {where_key} LIMIT 1"
+            ))?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        self.sql(&format!(
+            "UPDATE house_parts SET photo = {} WHERE {where_key}",
+            sql_str(photo)
+        ))?;
+        Ok(true)
     }
 
     /// Insert or fully replace a part (and its pins/ratings) atomically.
@@ -448,7 +494,7 @@ impl PartsLibrary {
                 wheres.push(format!("package = {}", sql_str(p)));
             }
             let rows = self.query(&format!(
-                "SELECT kind, value, package, mpn, uses, seen_on FROM house_parts \
+                "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
                  WHERE {} ORDER BY uses DESC LIMIT 1",
                 wheres.join(" AND ")
             ))?;
@@ -466,6 +512,7 @@ impl PartsLibrary {
                     mpn: get("mpn"),
                     uses: r.get("uses").and_then(|v| v.as_i64()).unwrap_or(1),
                     seen_on: get("seen_on"),
+                    photo: r.get("photo").and_then(|v| v.as_str()).map(String::from),
                     exact: v.is_some() && p.is_some(),
                 }));
             }
@@ -476,7 +523,7 @@ impl PartsLibrary {
     /// Every house part, most-used first.
     pub fn house_parts(&self) -> Result<Vec<HousePart>, PartsError> {
         let rows = self.query(
-            "SELECT kind, value, package, mpn, uses, seen_on FROM house_parts \
+            "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
              ORDER BY uses DESC, kind, value",
         )?;
         Ok(rows
@@ -495,6 +542,7 @@ impl PartsLibrary {
                     mpn: get("mpn"),
                     uses: r.get("uses").and_then(|v| v.as_i64()).unwrap_or(1),
                     seen_on: get("seen_on"),
+                    photo: r.get("photo").and_then(|v| v.as_str()).map(String::from),
                     exact: true,
                 }
             })
@@ -592,16 +640,41 @@ impl PartsLibrary {
     }
 }
 
-/// The default cross-project parts-library location (override with `LOB_PARTS_DIR`).
+/// Where the parts library lives, in order of precedence:
+///
+/// 1. `LOB_PARTS_DIR`, an explicit override;
+/// 2. `.lob/parts` in the nearest enclosing circuits repo — the parts a repo
+///    buys are part of that repo's record, so they version with it and travel
+///    to anyone who clones it;
+/// 3. a user-global store, for work outside any repo.
 pub fn default_parts_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOB_PARTS_DIR") {
         return PathBuf::from(dir);
+    }
+    if let Some(repo) = enclosing_circuits_repo() {
+        return repo.join(".lob").join("parts");
     }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("legion-of-bom").join("parts")
+}
+
+/// The nearest ancestor of the working directory holding a `lob.toml`.
+///
+/// A repo that already has a parts store counts too, so a library keeps
+/// working after the manifest is renamed or moved.
+fn enclosing_circuits_repo() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join("lob.toml").is_file() || dir.join(".lob").join("parts").is_dir() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 // ---- SQL literal helpers (careful escaping for the shell-out layer) ----

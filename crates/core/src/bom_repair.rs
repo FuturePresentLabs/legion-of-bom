@@ -323,7 +323,9 @@ pub fn value_key(comment: &str, package: &str) -> String {
 /// text would never match across two projects.
 fn normalize_value(value: &str) -> String {
     let mut v = value.trim().to_ascii_uppercase().replace(' ', "");
-    for unit in ["OHMS", "OHM", "Ω", "R"] {
+    // Trailing unit symbols only. `100NF` and `100N` are one capacitor, and
+    // `10UH` and `10U` one inductor — projects disagree about writing them.
+    for unit in ["OHMS", "OHM", "Ω", "R", "F", "H"] {
         if let Some(head) = v.strip_suffix(unit) {
             // Only a trailing unit, never the magnitude itself (`10R` is 10 ohm,
             // but a bare `R` with no number in front is not a value at all).
@@ -527,7 +529,7 @@ mod tests {
         // resistor on the board shares one library key.
         assert_eq!(value_key("100k1%0603", "0603RES"), "100K");
         assert_eq!(value_key("60.4k1%0603", "0603RES"), "60.4K");
-        assert_eq!(value_key("100nf50V0603", "0603CAP"), "100NF");
+        assert_eq!(value_key("100nf50V0603", "0603CAP"), "100N");
         // A part number is still not a value: `1N4148WS` must not read as 1 nano.
         assert_eq!(value_key("1N4148WS", "SOD-323"), "");
         // The same part spelled four ways must land on one key, or the library
@@ -536,6 +538,11 @@ mod tests {
             assert_eq!(value_key(spelling, "0603RES"), "10K", "{spelling}");
         }
         assert_eq!(value_key("2.2MEG", "0603RES"), "2.2M");
+        // The same capacitor, spelled with and without the farad.
+        assert_eq!(
+            value_key("100nf50V0603", "0603CAP"),
+            value_key("100n", "C-US0603")
+        );
     }
 
     #[test]

@@ -173,8 +173,23 @@ enum PartsCmd {
     /// kind/value/package, so a later board can resolve "a 10k 0603" or "a jack"
     /// from what shipped rather than from a distributor search.
     Learn {
-        /// Package directories to learn from.
+        /// Fab-package directories, or Eagle `.sch` files/folders, to learn from.
         packages: Vec<PathBuf>,
+    },
+    /// Attach our own photo to a part we build with.
+    ///
+    /// A photo of the actual part beats a datasheet render when two jacks look
+    /// alike on the bench. Takes a URL or a path; a path inside the repo is
+    /// stored relative to it so the library travels with a clone.
+    Photo {
+        /// Part kind (jack, pot, resistor, ...) — as shown by `lob parts house`.
+        kind: String,
+        /// Value, or `-` for a part that has none (a jack, an IC).
+        value: String,
+        /// Package key, as shown by `lob parts house`.
+        package: String,
+        /// Image URL, or a path to an image file.
+        photo: String,
     },
     /// Show the parts we build with, most-used first.
     House {
@@ -1500,6 +1515,47 @@ fn has_letter_run(s: &str, n: usize) -> bool {
 }
 
 /// Handle `lob parts …` against the global parts library.
+/// The repo a path sits in — the nearest ancestor holding `lob.toml` or `.git`.
+fn find_repo_root(from: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = from.to_path_buf();
+    loop {
+        if dir.join("lob.toml").is_file() || dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Eagle schematics at a path: the file itself, or any directly inside a folder.
+///
+/// An empty result means "not an Eagle source", which is how `learn` decides
+/// whether to read a fab package instead.
+fn eagle_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let is_sch = |p: &std::path::Path| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sch"))
+    };
+    if path.is_file() {
+        return if is_sch(path) {
+            vec![path.to_path_buf()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut found: Vec<_> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_sch(p))
+        .collect();
+    found.sort();
+    found
+}
+
 fn parts_cmd(action: PartsCmd) -> Result<()> {
     // `suggest` is about parts NOT yet in the library (generic, no MPN), so it
     // doesn't need Dolt — handle it before opening the library.
@@ -1510,48 +1566,105 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         .with_context(|| "opening the parts library (is `dolt` installed?)")?;
     match action {
         PartsCmd::Learn { packages } => {
-            let (mut learned, mut skipped) = (0usize, 0usize);
-            for dir in &packages {
-                let board = legion_of_bom_core::read_package(dir)
-                    .with_context(|| format!("reading {}", dir.display()))?;
-                let source = dir
-                    .file_name()
+            let (mut learned, mut skipped, mut wanted) = (0usize, 0usize, Vec::new());
+            for path in &packages {
+                let source = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                for part in &board.parts {
-                    // Only learn from a line that names a real part. A value or a
-                    // signal label tells us nothing about what to buy.
-                    // A part-number column is authoritative. Only fall back to
-                    // reading the comment when the board gives us no column —
-                    // a comment like `100nf50V0603` merely *looks* like a part
-                    // number and must not outrank the real one.
-                    let mpn = match &part.part_number {
-                        Some(m) if !m.is_empty() => m.clone(),
-                        _ => match plan_repair(&part.value, &part.footprint) {
-                            Repair::UsePartNumber(m) => m,
+
+                // An Eagle schematic states what a board is built from but not
+                // what was bought — Mutable's carry `value` and `device` and no
+                // part number at all. Those still tell us which parts we need an
+                // answer for, so they are recorded as demand, not as a choice.
+                if eagle_paths(path).is_empty() {
+                    let board = legion_of_bom_core::read_package(path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    for part in &board.parts {
+                        // A part-number column is authoritative. Only fall back
+                        // to reading the comment when the board gives us no
+                        // column — a comment like `100nf50V0603` merely *looks*
+                        // like a part number and must not outrank the real one.
+                        let mpn = match &part.part_number {
+                            Some(m) if !m.is_empty() => m.clone(),
+                            _ => match plan_repair(&part.value, &part.footprint) {
+                                Repair::UsePartNumber(m) => m,
+                                _ => {
+                                    skipped += 1;
+                                    continue;
+                                }
+                            },
+                        };
+                        let refdes = part.refdes.first().map(String::as_str).unwrap_or("");
+                        lib.learn_house_part(
+                            part_kind_of(refdes, &part.footprint),
+                            &value_key(&part.value, &part.footprint),
+                            &package_key(&part.footprint),
+                            &mpn,
+                            &source,
+                        )?;
+                        learned += 1;
+                    }
+                    println!("  {source}: {} BOM line(s)", board.parts.len());
+                    continue;
+                }
+
+                for sch in eagle_paths(path) {
+                    let name = sch.file_stem().and_then(|s| s.to_str()).unwrap_or(&source);
+                    let xml = std::fs::read_to_string(&sch)
+                        .with_context(|| format!("reading {}", sch.display()))?;
+                    let imp = legion_of_bom_core::eagle::parse_schematic(&xml, name);
+                    let (mut here, mut gaps) = (0usize, 0usize);
+                    for part in &imp.circuit.parts {
+                        let package = part.footprint.clone().unwrap_or_default();
+                        let kind = part_kind_of(&part.refdes.0, &package);
+                        let value = value_key(&part.value, &package);
+                        let pkg = package_key(&package);
+                        match &part.mpn {
+                            Some(m) if !m.is_empty() => {
+                                lib.learn_house_part(kind, &value, &pkg, m, name)?;
+                                learned += 1;
+                                here += 1;
+                            }
                             _ => {
                                 skipped += 1;
-                                continue;
+                                if lib.house_part(kind, &value, &pkg)?.is_none() {
+                                    gaps += 1;
+                                    wanted.push((kind.to_string(), value, pkg, name.to_string()));
+                                }
                             }
-                        },
-                    };
-                    let refdes = part.refdes.first().map(String::as_str).unwrap_or("");
-                    lib.learn_house_part(
-                        part_kind_of(refdes, &part.footprint),
-                        &value_key(&part.value, &part.footprint),
-                        &package_key(&part.footprint),
-                        &mpn,
-                        &source,
-                    )?;
-                    learned += 1;
+                        }
+                    }
+                    println!(
+                        "  {name}: {} part(s), {here} named a part number, {gaps} we have no answer for",
+                        imp.circuit.parts.len()
+                    );
                 }
-                println!("  {source}: {} BOM line(s)", board.parts.len());
             }
             println!(
-                "learned {learned} part choice(s) from {} board(s); {skipped} line(s) named no part",
+                "learned {learned} part choice(s) from {} source(s); {skipped} line(s) named no part",
                 packages.len()
             );
+            if !wanted.is_empty() {
+                // Deduplicate: one line per distinct part we cannot answer for,
+                // not one per instance, or a board of 40 resistors buries it.
+                let mut seen = std::collections::BTreeMap::new();
+                for (kind, value, pkg, board) in wanted {
+                    seen.entry((kind, value, pkg)).or_insert(board);
+                }
+                println!(
+                    "\n{} part(s) used but not in the library — these need sourcing:",
+                    seen.len()
+                );
+                for ((kind, value, pkg), board) in seen.iter().take(20) {
+                    let v = if value.is_empty() { "—" } else { value };
+                    println!("  {kind:<11} {v:<10} {pkg:<20} (on {board})");
+                }
+                if seen.len() > 20 {
+                    println!("  … and {} more", seen.len() - 20);
+                }
+            }
         }
 
         PartsCmd::House { kind } => {
@@ -1566,12 +1679,49 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             }
             for h in &shown {
                 let val = if h.value.is_empty() { "—" } else { &h.value };
+                let photo = if h.photo.is_some() { " 📷" } else { "" };
                 println!(
-                    "  {:<10} {:<10} {:<10} {:<22} x{}  ({})",
+                    "  {:<10} {:<10} {:<10} {:<22} x{}  ({}){photo}",
                     h.kind, val, h.package, h.mpn, h.uses, h.seen_on
                 );
             }
-            println!("{} part choice(s)", shown.len());
+            let with_photo = shown.iter().filter(|h| h.photo.is_some()).count();
+            println!("{} part choice(s), {with_photo} with a photo", shown.len());
+        }
+
+        PartsCmd::Photo {
+            kind,
+            value,
+            package,
+            photo,
+        } => {
+            // `-` reads better than an empty argument for the parts that have
+            // no value, which is how `lob parts house` displays them too.
+            let value = if value == "-" { String::new() } else { value };
+            // A path inside the repo is stored relative to it, so the library
+            // and its photos survive a clone or a move. Anything else (a URL,
+            // a path outside) is stored as written.
+            let stored = match std::fs::canonicalize(&photo) {
+                Ok(abs) => {
+                    let repo = std::env::current_dir()
+                        .ok()
+                        .and_then(|d| find_repo_root(&d))
+                        .unwrap_or_default();
+                    abs.strip_prefix(&repo)
+                        .map(|r| r.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
+                }
+                Err(_) => photo.clone(),
+            };
+            if lib.set_house_photo(&kind, &value, &package, &stored)? {
+                println!("photo set for {kind} {package}: {stored}");
+            } else {
+                let val = if value.is_empty() { "—" } else { &value };
+                println!(
+                    "no such part in the library: {kind} {val} {package}\n\
+                     check `lob parts house --kind {kind}` for the exact key"
+                );
+            }
         }
 
         PartsCmd::List => {
