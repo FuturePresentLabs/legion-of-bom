@@ -51,7 +51,13 @@ mod sheet {
 }
 
 /// A part awaiting placement: refdes, value, and its resolved symbol.
-type PendingPart<'a> = (&'a str, &'a str, Option<SymbolGraphics>, Vec<String>);
+type PendingPart<'a> = (
+    &'a str,
+    &'a str,
+    Option<SymbolGraphics>,
+    Vec<String>,
+    (bool, bool),
+);
 
 /// Where a net attaches to one part: the part, the pin's connection point, and
 /// the breakout point a short way out along the pin.
@@ -69,6 +75,11 @@ struct Placed {
     /// Pin identifiers used by the box fallback, in netlist order, so a symbol-less
     /// part still has one distinct attach point per pin.
     box_pins: Vec<String>,
+    /// Quarter-turn the symbol, so a part wired in series along the signal path
+    /// lies across it instead of standing on end and making the router detour.
+    rot90: bool,
+    /// Mirror the symbol, so its pins face the side its wires actually come from.
+    flip: bool,
 }
 
 impl Placed {
@@ -85,11 +96,38 @@ impl Placed {
         self.y() + sheet::BOX_H / 2.0
     }
 
+    /// Apply this part's orientation to a symbol-space point or vector: mirror
+    /// first, then the quarter turn. Both are axis-aligned, so the same routine
+    /// serves points, directions and bounding-box corners.
+    fn orient(&self, x: f64, y: f64) -> (f64, f64) {
+        let x = if self.flip { -x } else { x };
+        if self.rot90 {
+            (-y, x)
+        } else {
+            (x, y)
+        }
+    }
+
+    /// Orientation applied to a direction vector.
+    fn orient_dir(&self, (x, y): (f64, f64)) -> (f64, f64) {
+        self.orient(x, y)
+    }
+
+    /// The symbol's bounds after orientation.
+    fn oriented_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        let (x0, y0, x1, y1) = self.sym.as_ref()?.bounds();
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            let (px, py) = self.orient(x, y);
+            b = (b.0.min(px), b.1.min(py), b.2.max(px), b.3.max(py));
+        }
+        Some(b)
+    }
+
     /// Symbol-space → sheet-px transform: `(scale, bcx, bcy)`, sized so the symbol
     /// fits its slot without being blown up past [`sheet::SYM_PX_PER_MM`].
     fn sym_fit(&self) -> Option<(f64, f64, f64)> {
-        let g = self.sym.as_ref()?;
-        let (x0, y0, x1, y1) = g.bounds();
+        let (x0, y0, x1, y1) = self.oriented_bounds()?;
         let (bw, bh) = ((x1 - x0).max(0.1), (y1 - y0).max(0.1));
         let scale = (sheet::SYM_MAX_W / bw)
             .min(sheet::SYM_MAX_H / bh)
@@ -97,8 +135,10 @@ impl Placed {
         Some((scale, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
     }
 
-    /// A symbol point in sheet px. KiCad symbol space is Y-**up**, the sheet Y-down.
+    /// A symbol point in sheet px, oriented. KiCad symbol space is Y-**up**, the
+    /// sheet Y-down.
     fn sym_px(&self, x: f64, y: f64) -> (f64, f64) {
+        let (x, y) = self.orient(x, y);
         match self.sym_fit() {
             Some((s, bcx, bcy)) => (self.cx() + (x - bcx) * s, self.cy() - (y - bcy) * s),
             None => (self.cx(), self.cy()),
@@ -115,7 +155,7 @@ impl Placed {
         match self.sym.as_ref() {
             Some(g) => {
                 let p = g.pins.iter().find(|p| p.number == pin)?;
-                let (ox, oy) = p.outward();
+                let (ox, oy) = self.orient_dir(p.outward());
                 // Symbol space is Y-up, the sheet Y-down, so the vertical flips.
                 Some((self.sym_px(p.x, p.y), (ox, -oy)))
             }
@@ -293,6 +333,63 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
         }
     }
 
+    // Orientation, decided from the netlist rather than from pixels.
+    //
+    // A part wired between two *signal* nets sits in the flow, so it's turned to lie
+    // across it — a resistor in series reads (and routes) far better lying down than
+    // standing on end. A part with a leg on a rail or ground (a pull-down, a bypass
+    // cap) stays upright, because that leg wants to point at its rail symbol.
+    //
+    // Then, if a part's pins face one way while its wires come from the other — an
+    // output jack whose contacts point away from the stage feeding it, a pot whose
+    // wiper points away from the net it drives — it gets mirrored.
+    let mut orient: HashMap<&str, (bool, bool)> = HashMap::new();
+    for part in circuit.parts() {
+        let r = part.refdes.0.as_str();
+        let my_col = rank.get(r).copied().unwrap_or(0) as f64;
+        let mut signal_pins: Vec<&str> = Vec::new();
+        let mut on_power = false;
+        let mut want = 0.0f64; // + = this part's wires come from the right
+        for net in circuit.nets() {
+            if !net.pins.iter().any(|p| p.refdes.0 == r) {
+                continue;
+            }
+            if is_power(&net.name) {
+                on_power = true;
+                continue;
+            }
+            for p in net.pins.iter().filter(|p| p.refdes.0 == r) {
+                signal_pins.push(p.pin.as_str());
+            }
+            for other in net.pins.iter().filter(|p| p.refdes.0 != r) {
+                want += rank.get(other.refdes.0.as_str()).copied().unwrap_or(0) as f64 - my_col;
+            }
+        }
+        let sym = symbol_for(part.library_part.as_deref());
+        let Some(g) = sym.as_ref() else {
+            orient.insert(r, (false, false));
+            continue;
+        };
+        let upright = g.pins.iter().all(|q| q.outward().0.abs() < 0.5);
+        let rot90 = upright && !on_power && signal_pins.len() >= 2;
+
+        // Where the signal pins point once turned.
+        let have: f64 = signal_pins
+            .iter()
+            .filter_map(|n| g.pins.iter().find(|q| &q.number == n))
+            .map(|q| {
+                let (ox, oy) = q.outward();
+                if rot90 {
+                    -oy
+                } else {
+                    ox
+                }
+            })
+            .sum();
+        let flip = have.abs() > 1e-6 && want.abs() > 1e-6 && have.signum() != want.signum();
+        orient.insert(r, (rot90, flip));
+    }
+
     let mut by_col: HashMap<usize, Vec<PendingPart>> = HashMap::new();
     for p in circuit.parts() {
         let c = rank.get(&p.refdes.0).copied().unwrap_or(0);
@@ -301,10 +398,16 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
             .get(p.refdes.0.as_str())
             .cloned()
             .unwrap_or_default();
-        by_col
-            .entry(c)
-            .or_default()
-            .push((p.refdes.0.as_str(), p.value.as_str(), sym, pins));
+        by_col.entry(c).or_default().push((
+            p.refdes.0.as_str(),
+            p.value.as_str(),
+            sym,
+            pins,
+            orient
+                .get(p.refdes.0.as_str())
+                .copied()
+                .unwrap_or((false, false)),
+        ));
     }
     let mut out = Vec::new();
     let mut cols: Vec<usize> = by_col.keys().copied().collect();
@@ -312,7 +415,7 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     for (ci, c) in cols.iter().enumerate() {
         let mut parts = by_col.remove(c).unwrap_or_default();
         parts.sort_by(|a, b| a.0.cmp(b.0));
-        for (ri, (refdes, value, sym, box_pins)) in parts.into_iter().enumerate() {
+        for (ri, (refdes, value, sym, box_pins, (rot90, flip))) in parts.into_iter().enumerate() {
             out.push(Placed {
                 refdes: refdes.to_string(),
                 value: value.to_string(),
@@ -320,6 +423,8 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
                 row: ri,
                 sym,
                 box_pins,
+                rot90,
+                flip,
             });
         }
     }
@@ -540,15 +645,28 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         // leaving the bottom pin. When any pin runs sideways — a jack's contacts, a
         // header's two rows — the sides are exactly where the stubs and their
         // labels are, so the caption goes below instead.
-        let sideways = p
-            .sym
-            .as_ref()
-            .is_some_and(|g| g.pins.iter().any(|q| q.outward().0.abs() > 0.5));
+        // Judge on the pins as *drawn* — a resistor turned into the signal path now
+        // has horizontal pins, so it needs the below-caption too.
+        let sideways = p.sym.as_ref().is_some_and(|g| {
+            g.pins
+                .iter()
+                .any(|q| p.orient_dir(q.outward()).0.abs() > 0.5)
+        });
         let (label_x, label_y, value_y, anchor) = match p.sym.as_ref() {
-            Some(g) if !sideways => {
-                let (_, _, x1, _) = g.bounds();
-                let (right, _) = p.sym_px(x1, 0.0);
-                (right + 7.0, p.cy() - 2.0, p.cy() + 11.0, "start")
+            Some(_) if !sideways => {
+                // Oriented bounds: after a quarter turn the symbol's right edge is
+                // not where the raw symbol's was.
+                let half = p
+                    .oriented_bounds()
+                    .map(|(x0, _, x1, _)| (x1 - x0) / 2.0)
+                    .unwrap_or(0.0);
+                let scale = p.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
+                (
+                    p.cx() + half * scale + 7.0,
+                    p.cy() - 2.0,
+                    p.cy() + 11.0,
+                    "start",
+                )
             }
             Some(_) => {
                 let below = lowest
@@ -826,6 +944,45 @@ mod tests {
             Net::new("GND", vec![PinRef::new("J1", "S"), PinRef::new("C1", "2")]),
         ];
         c
+    }
+
+    /// Orientation is decided from the netlist: a part bridging two *signal* nets
+    /// lies across the signal path, a part with a leg on a rail stays upright so
+    /// that leg points at its rail symbol, and a part whose pins face away from
+    /// where its wires come from gets mirrored.
+    #[test]
+    fn orients_parts_from_their_connections() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        fn lib_part(refdes: &str, value: &str, lib: &str) -> Part {
+            let mut p = Part::new(refdes, value);
+            p.library_part = Some(lib.to_string());
+            p
+        }
+        let mut c = Circuit::new("o");
+        c.parts = vec![
+            Part::new("J1", "in"),
+            lib_part("R1", "10k", "Device:R"),
+            lib_part("R2", "10k", "Device:R"),
+            lib_part("U1", "TL072", "Amplifier_Operational:TL072"),
+        ];
+        c.nets = vec![
+            Net::new("IN", vec![PinRef::new("J1", "T"), PinRef::new("R1", "1")]),
+            // R1 bridges two signal nets → lies across the path.
+            Net::new("MID", vec![PinRef::new("R1", "2"), PinRef::new("U1", "3")]),
+            // R2 has a leg on a rail → stays upright.
+            Net::new("MID2", vec![PinRef::new("R2", "1"), PinRef::new("U1", "2")]),
+            Net::new("-12V", vec![PinRef::new("R2", "2")]),
+        ];
+        let placed = layout(&c);
+        let by = |r: &str| placed.iter().find(|p| p.refdes == r).unwrap();
+        // Only meaningful when the KiCad symbol libraries are present.
+        if by("R1").sym.is_none() {
+            return;
+        }
+        assert!(by("R1").rot90, "series resistor should lie across the path");
+        assert!(!by("R2").rot90, "resistor with a rail leg stays upright");
+        // A multi-unit op-amp keeps its box, and a box is never re-oriented.
+        assert!(!by("U1").rot90 && !by("U1").flip);
     }
 
     #[test]
