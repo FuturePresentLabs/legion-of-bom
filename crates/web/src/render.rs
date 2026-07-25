@@ -118,7 +118,10 @@ impl IntoResponse for RenderErr {
             ),
             RenderErr::BadView(v) => (
                 StatusCode::BAD_REQUEST,
-                format!("unknown view '{v}' (board-top | board-bottom | board-layout | panel | schematic | gerber)"),
+                format!(
+                    "unknown view '{v}' (board-top | board-bottom | board-layout | panel | \
+                     schematic | gerber | gerber-panel)"
+                ),
             ),
             RenderErr::Failed(m) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -183,15 +186,27 @@ fn render_view(
             write_cache(&cache, &png);
             Ok(Rendered::Png(png))
         }
-        "gerber" => {
-            // The fab package's own gerbers — the file the board house receives.
-            let dir = root.join("out").join(name).join("fab").join("gerbers");
+        "gerber" | "gerber-panel" => {
+            // The gerbers a board house receives: the circuit's fab package, or the
+            // panel's own — `lob panel pcb` writes those next to the spec.
+            let (dir, missing) = if view == "gerber-panel" {
+                let stem = panel_rel
+                    .and_then(|p| FsPath::new(p).file_stem().and_then(|s| s.to_str()))
+                    .ok_or(RenderErr::NoPanel)?;
+                (
+                    root.join(format!("{stem}-panel-gerbers")),
+                    format!("no panel gerbers — run `lob panel pcb {stem}.toml`"),
+                )
+            } else {
+                (
+                    root.join("out").join(name).join("fab").join("gerbers"),
+                    format!("no fab package — run `lob build {name}`"),
+                )
+            };
             if !dir.is_dir() {
-                return Err(RenderErr::NotBuilt(format!(
-                    "no fab package — run `lob build {name}`"
-                )));
+                return Err(RenderErr::NotBuilt(missing));
             }
-            let cache = cache_path(&dir, &format!("gerber:{layer_sel}"), "svg");
+            let cache = cache_path(&dir, &format!("{view}:{layer_sel}"), "svg");
             if let Ok(svg) = std::fs::read_to_string(&cache) {
                 return Ok(Rendered::Svg(svg));
             }

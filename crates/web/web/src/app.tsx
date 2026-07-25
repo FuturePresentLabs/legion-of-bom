@@ -432,6 +432,7 @@ const PCB_VIEWS: { key: string; label: string }[] = [
   { key: "board-bottom", label: "Bottom" },
   { key: "schematic", label: "Schematic" },
   { key: "gerber", label: "Gerber" },
+  { key: "gerber-panel", label: "Gerber (panel)" },
 ];
 
 // Fab layers, in the order the checklist shows them. Defaults are the stack you
@@ -458,8 +459,10 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
   const [layers, setLayers] = useState<string[]>(
     GERBER_LAYERS.filter((l) => l.on).map((l) => l.key),
   );
+  const [flip, setFlip] = useState(false);
+  const [resetKey, setResetKey] = useState(0);
   const isBoard = view.startsWith("board-");
-  const isGerber = view === "gerber";
+  const isGerber = view.startsWith("gerber");
   const src =
     `/api/circuits/${encodeURIComponent(name)}/render?view=${view}&v=${version}` +
     (isBoard && !smd ? "&smd=0" : "") +
@@ -485,6 +488,22 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
         {isGerber && (
           <span class="layer-count muted">{layers.length} layers</span>
         )}
+        <span class="spacer" />
+        <button
+          class="btn tiny"
+          aria-pressed={flip}
+          onClick={() => setFlip((f) => !f)}
+          title="Mirror the view — how the board reads from the other side"
+        >
+          Flip
+        </button>
+        <button
+          class="btn tiny"
+          onClick={() => setResetKey((k) => k + 1)}
+          title="Reset zoom and pan"
+        >
+          Reset
+        </button>
         {isBoard && (
           <label class="smd-toggle" title="Hide surface-mount parts — the through-hole board you solder">
             <input
@@ -512,7 +531,12 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
         </div>
       )}
       {/* key=view remounts on toggle so the transform resets between views */}
-      <ZoomPan key={`${view}-${smd}`} src={src} alt={`PCB ${view}`} />
+      <ZoomPan
+        key={`${view}-${smd}-${resetKey}`}
+        src={src}
+        alt={`PCB ${view}`}
+        flip={flip}
+      />
       <p class="pcb-hint muted">scroll to zoom · drag to pan · double-click to reset</p>
     </div>
   );
@@ -520,7 +544,15 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
 
 // A pannable, zoomable image (wheel = zoom toward cursor, drag = pan). Vanilla —
 // no dependency; works for both the raster render and the vector layout.
-function ZoomPan({ src, alt }: { src: string; alt: string }) {
+function ZoomPan({
+  src,
+  alt,
+  flip = false,
+}: {
+  src: string;
+  alt: string;
+  flip?: boolean;
+}) {
   const box = useRef<HTMLDivElement | null>(null);
   const [t, setT] = useState({ s: 1, x: 0, y: 0 });
   const [status, setStatus] = useState<"loading" | "ok" | "error">("loading");
@@ -584,7 +616,7 @@ function ZoomPan({ src, alt }: { src: string; alt: string }) {
         alt={alt}
         draggable={false}
         class={status === "error" ? "hidden" : ""}
-        style={`transform: translate(${t.x}px, ${t.y}px) scale(${t.s})`}
+        style={`transform: translate(${t.x}px, ${t.y}px) scale(${t.s}) scaleX(${flip ? -1 : 1}); transform-origin: 0 0`}
         onLoad={() => {
           setStatus("ok");
           center();
