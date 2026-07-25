@@ -48,7 +48,31 @@ CREATE TABLE IF NOT EXISTS part_assembly_steps (\
   mpn VARCHAR(64) NOT NULL,\
   step_order INT NOT NULL,\
   text TEXT,\
-  PRIMARY KEY (mpn, step_order));";
+  PRIMARY KEY (mpn, step_order));\
+CREATE TABLE IF NOT EXISTS house_parts (\
+  kind VARCHAR(32) NOT NULL,\
+  value VARCHAR(64) NOT NULL,\
+  package VARCHAR(64) NOT NULL,\
+  mpn VARCHAR(64) NOT NULL,\
+  uses INT NOT NULL DEFAULT 1,\
+  seen_on TEXT,\
+  PRIMARY KEY (kind, value, package));";
+
+/// A part we actually build with: what we reach for given a kind, a value and a
+/// package, learned from boards that were really manufactured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HousePart {
+    pub kind: String,
+    pub value: String,
+    pub package: String,
+    pub mpn: String,
+    /// How many boards we have seen it on — the tie-breaker between choices.
+    pub uses: i64,
+    /// Which boards, so a choice can be traced to something that shipped.
+    pub seen_on: String,
+    /// Whether this matched value *and* package, or was a broader fallback.
+    pub exact: bool,
+}
 
 /// One pin of a part, with a citation back to the source page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +375,130 @@ impl PartsLibrary {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             })
         }
+    }
+
+    // -----------------------------------------------------------------------
+    //  House parts — the parts we actually build with
+    // -----------------------------------------------------------------------
+
+    /// Record that a board used `mpn` for a given kind/value/package, or bump the
+    /// count if we already knew.
+    ///
+    /// This is the other half of the library, and the more useful one day to day.
+    /// `parts` describes a part we have looked up *by MPN*; `house_parts` answers
+    /// the question a builder actually asks — "what do we use for a 10k 0603?" —
+    /// so grabbing a jack or a pot needs no search at all. It is learned from the
+    /// BOMs of boards that were really manufactured, which is a far better source
+    /// than a keyword search: those parts were bought, assembled and shipped.
+    pub fn learn_house_part(
+        &self,
+        kind: &str,
+        value: &str,
+        package: &str,
+        mpn: &str,
+        seen_on: &str,
+    ) -> Result<(), PartsError> {
+        // Dolt speaks MySQL, so an upsert that also bumps a counter and appends
+        // provenance is one statement.
+        self.sql(&format!(
+            "INSERT INTO house_parts (kind, value, package, mpn, uses, seen_on) \
+             VALUES ({}, {}, {}, {}, 1, {}) \
+             ON DUPLICATE KEY UPDATE uses = uses + 1, \
+             seen_on = IF(INSTR(seen_on, {}) > 0, seen_on, CONCAT(seen_on, ', ', {}))",
+            sql_str(kind),
+            sql_str(value),
+            sql_str(package),
+            sql_str(mpn),
+            sql_str(seen_on),
+            sql_str(seen_on),
+            sql_str(seen_on),
+        ))
+    }
+
+    /// The part we use for a kind/value/package, most-used first.
+    ///
+    /// Falls back from the exact match outward, because how specific an answer
+    /// needs to be depends on the part: a 10k resistor must match its value and
+    /// package, but "a jack" is a jack — we only buy one kind.
+    pub fn house_part(
+        &self,
+        kind: &str,
+        value: &str,
+        package: &str,
+    ) -> Result<Option<HousePart>, PartsError> {
+        // For a passive the value *is* the part — a 10k and a 100k are not
+        // substitutes — so a match that ignores the value would quietly answer
+        // the wrong resistor. There, no answer is the correct answer.
+        let value_is_identity = matches!(kind, "resistor" | "capacitor" | "inductor");
+        if value_is_identity && value.is_empty() {
+            return Ok(None);
+        }
+        let mut steps = vec![(Some(value), Some(package)), (Some(value), None)];
+        if !value_is_identity {
+            steps.push((None, Some(package)));
+            steps.push((None, None));
+        }
+
+        for (v, p) in steps {
+            let mut wheres = vec![format!("kind = {}", sql_str(kind))];
+            if let Some(v) = v.filter(|v| !v.is_empty()) {
+                wheres.push(format!("value = {}", sql_str(v)));
+            }
+            if let Some(p) = p.filter(|p| !p.is_empty()) {
+                wheres.push(format!("package = {}", sql_str(p)));
+            }
+            let rows = self.query(&format!(
+                "SELECT kind, value, package, mpn, uses, seen_on FROM house_parts \
+                 WHERE {} ORDER BY uses DESC LIMIT 1",
+                wheres.join(" AND ")
+            ))?;
+            if let Some(r) = rows.first() {
+                let get = |k: &str| {
+                    r.get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                return Ok(Some(HousePart {
+                    kind: get("kind"),
+                    value: get("value"),
+                    package: get("package"),
+                    mpn: get("mpn"),
+                    uses: r.get("uses").and_then(|v| v.as_i64()).unwrap_or(1),
+                    seen_on: get("seen_on"),
+                    exact: v.is_some() && p.is_some(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every house part, most-used first.
+    pub fn house_parts(&self) -> Result<Vec<HousePart>, PartsError> {
+        let rows = self.query(
+            "SELECT kind, value, package, mpn, uses, seen_on FROM house_parts \
+             ORDER BY uses DESC, kind, value",
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let get = |k: &str| {
+                    r.get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                HousePart {
+                    kind: get("kind"),
+                    value: get("value"),
+                    package: get("package"),
+                    mpn: get("mpn"),
+                    uses: r.get("uses").and_then(|v| v.as_i64()).unwrap_or(1),
+                    seen_on: get("seen_on"),
+                    exact: true,
+                }
+            })
+            .collect())
     }
 
     fn sql(&self, sql: &str) -> Result<(), PartsError> {

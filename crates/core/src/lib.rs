@@ -60,7 +60,8 @@ pub use board::{
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use bom_repair::{
-    classify as classify_comment, plan as plan_repair, search_keyword, Comment, Repair,
+    classify as classify_comment, package_key, part_kind_of, plan as plan_repair, search_keyword,
+    value_key, Comment, Repair,
 };
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use eagle::{
@@ -103,7 +104,7 @@ pub use panel::{
 };
 pub use panel_edit::{apply_panel_edit_str, edit_panel, PanelEdit, PanelEditError};
 pub use parts::{
-    default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
+    default_parts_dir, HousePart, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
 };
 pub use project::{ArtifactKind, ArtifactStatus, ArtifactView, CircuitView, ProjectView, RepoView};

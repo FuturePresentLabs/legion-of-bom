@@ -240,6 +240,141 @@ pub fn search_keyword(value: &str, package: &str) -> String {
         .join(" ")
 }
 
+/// The class of part a line describes, from its designator and package. This is
+/// the first key into the house-parts library — "what do we use for a jack?"
+/// starts with knowing the line *is* a jack.
+pub fn part_kind_of(refdes: &str, package: &str) -> &'static str {
+    let p = package.to_ascii_uppercase();
+    // The package is the stronger signal where it is distinctive, since
+    // designator conventions vary between projects.
+    if is_connector(&p) {
+        return if p.contains("JACK") || p.contains("THONKICONN") {
+            "jack"
+        } else {
+            "header"
+        };
+    }
+    let prefix: String = refdes
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match prefix.as_str() {
+        "R" => "resistor",
+        "C" => "capacitor",
+        "L" => "inductor",
+        "D" => {
+            if p.contains("LED") {
+                "led"
+            } else {
+                "diode"
+            }
+        }
+        "Q" => "transistor",
+        "U" | "IC" | "OTA" => "ic",
+        "RV" | "VR" | "POT" => "pot",
+        "S" | "SW" => "switch",
+        "J" | "JP" | "P" => "header",
+        "X" | "Y" => "crystal",
+        _ => "other",
+    }
+}
+
+/// A normalised package key for the house-parts library.
+///
+/// Package strings are written for people — `0603 CAP`, `CAP_1206`, `RES_0603`
+/// all mean the same chip size — so the size is what gets stored, and anything
+/// without one keeps its own name.
+pub fn package_key(package: &str) -> String {
+    let p = package.to_ascii_uppercase();
+    for size in [
+        "0201", "0402", "0603", "0805", "1206", "1210", "2010", "2512",
+    ] {
+        if p.contains(size) {
+            return size.to_string();
+        }
+    }
+    p.trim().to_string()
+}
+
+/// The value key for the house-parts library: the component value when the line
+/// has one, and nothing when it does not (a jack has no "value" — it is a jack).
+pub fn value_key(comment: &str, package: &str) -> String {
+    if let Comment::Value { value, .. } = classify(comment, package) {
+        return normalize_value(&value);
+    }
+    // A passive is identified by its package, and a passive's comment is its
+    // value — never a part number. Some projects run the value together with
+    // its tolerance and size (`100k1%0603`, `100nf50V0603`, `1n0603`), which is
+    // indistinguishable from a part number by string shape alone; without the
+    // package to tell us, every passive on the board collapses to one key.
+    if package_is_passive(package) {
+        return leading_value(comment)
+            .map(|v| normalize_value(&v))
+            .unwrap_or_default();
+    }
+    String::new()
+}
+
+/// Fold the spellings of one value onto a single library key.
+///
+/// Boards written by different people spell the same resistor `10kΩ`, `10K`,
+/// `10k ohm`, and `10kR`. They are one part, and a library keyed on the raw
+/// text would never match across two projects.
+fn normalize_value(value: &str) -> String {
+    let mut v = value.trim().to_ascii_uppercase().replace(' ', "");
+    for unit in ["OHMS", "OHM", "Ω", "R"] {
+        if let Some(head) = v.strip_suffix(unit) {
+            // Only a trailing unit, never the magnitude itself (`10R` is 10 ohm,
+            // but a bare `R` with no number in front is not a value at all).
+            if !head.is_empty() && head.chars().any(|c| c.is_ascii_digit()) {
+                v = head.to_string();
+                break;
+            }
+        }
+    }
+    // `MEG` and `M` are the same magnitude in every notation we read.
+    if let Some(head) = v.strip_suffix("MEG") {
+        v = format!("{head}M");
+    }
+    v
+}
+
+fn package_is_passive(package: &str) -> bool {
+    let p = package.to_ascii_uppercase();
+    p.contains("RES") || p.contains("CAP") || p.contains("IND") || {
+        // A bare imperial size code only ever names a passive chip part.
+        const SIZES: [&str; 7] = ["0201", "0402", "0603", "0805", "1206", "1210", "2512"];
+        SIZES.iter().any(|s| p.contains(s))
+    }
+}
+
+/// Pull a leading value off a run-together string: `100k1%0603` → `100K`.
+///
+/// Deliberately only applied to packages already known to be passive, because a
+/// value and a part number are otherwise indistinguishable — `1N4148WS` would
+/// read as "1 nano" by exactly this rule.
+fn leading_value(s: &str) -> Option<String> {
+    let t = s.trim();
+    let split = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(t.len());
+    let (num, rest) = t.split_at(split);
+    if num.is_empty() || num.parse::<f64>().is_err() {
+        return None;
+    }
+    // Take the magnitude/unit letters immediately following the number.
+    let mag: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == 'Ω' || *c == 'µ')
+        .collect();
+    // A bare number with nothing after it is a quantity, not a value.
+    if mag.is_empty() {
+        return None;
+    }
+    Some(format!("{num}{mag}").to_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +500,42 @@ mod tests {
         assert!(!looks_like_value("1N4148WS"));
         assert!(looks_like_value("2.2MEG"));
         assert!(looks_like_value("100n"));
+    }
+
+    /// The library is keyed by what a builder asks for, so the keys have to be
+    /// stable across the several ways projects write the same thing.
+    #[test]
+    fn derives_stable_library_keys() {
+        assert_eq!(part_kind_of("R14", "RES_0603"), "resistor");
+        assert_eq!(part_kind_of("C2", "0603 CAP"), "capacitor");
+        assert_eq!(part_kind_of("J3", "Thonkiconn Jack"), "jack");
+        assert_eq!(part_kind_of("J1", "10P_euro_power"), "header");
+        assert_eq!(part_kind_of("D4", "LEDT1"), "led");
+        assert_eq!(part_kind_of("D1", "SOD-323"), "diode");
+        assert_eq!(part_kind_of("OTA1", "SOIC-16/150mil"), "ic");
+        assert_eq!(part_kind_of("RV1", "EVUF"), "pot");
+
+        // The same chip size, however the project spells it.
+        for p in ["0603 CAP", "CAP_0603", "RES_0603", "0603"] {
+            assert_eq!(package_key(p), "0603", "{p}");
+        }
+
+        // A jack has no value; a resistor does.
+        assert_eq!(value_key("CV", "Thonkiconn Jack"), "");
+        assert_eq!(value_key("10k 0603 1%", "0603 RES"), "10K");
+        // Run together, as some projects write them — without this every
+        // resistor on the board shares one library key.
+        assert_eq!(value_key("100k1%0603", "0603RES"), "100K");
+        assert_eq!(value_key("60.4k1%0603", "0603RES"), "60.4K");
+        assert_eq!(value_key("100nf50V0603", "0603CAP"), "100NF");
+        // A part number is still not a value: `1N4148WS` must not read as 1 nano.
+        assert_eq!(value_key("1N4148WS", "SOD-323"), "");
+        // The same part spelled four ways must land on one key, or the library
+        // never matches across two projects.
+        for spelling in ["10kΩ", "10K", "10k ohm", "10kR"] {
+            assert_eq!(value_key(spelling, "0603RES"), "10K", "{spelling}");
+        }
+        assert_eq!(value_key("2.2MEG", "0603RES"), "2.2M");
     }
 
     #[test]

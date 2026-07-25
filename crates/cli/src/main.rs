@@ -17,14 +17,14 @@ use legion_of_bom_core::{
     default_parts_dir, derive_panel, embed_source, export_cpl, export_gerbers, fetch_data_uri,
     fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts, generate_board_report,
     generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, minimum_hp,
-    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, plan_repair, png_to_jpeg,
-    product_image_url, render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran,
-    suggest_by_keyword, suggest_mpns, validate_erc, zip_dir, ArtifactKind, ArtifactStatus,
-    BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer,
-    Finding, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient,
-    PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, ProjectView,
-    Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, SourcingClients,
-    StageOutcome, TranAnalysis,
+    package_key, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of, plan_repair,
+    png_to_jpeg, product_image_url, render_board_png, run_drc, run_layout_loop, simulate_ac,
+    simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
+    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
+    CircuitSource, EurorackPlacer, Finding, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo,
+    Manifest, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
+    PipelineReport, ProjectView, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig,
+    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -167,6 +167,21 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum PartsCmd {
     List,
+    /// Learn the parts we build with from boards that were really manufactured.
+    ///
+    /// Reads each fab package's BOM and records what was actually used for every
+    /// kind/value/package, so a later board can resolve "a 10k 0603" or "a jack"
+    /// from what shipped rather than from a distributor search.
+    Learn {
+        /// Package directories to learn from.
+        packages: Vec<PathBuf>,
+    },
+    /// Show the parts we build with, most-used first.
+    House {
+        /// Only this kind (resistor, capacitor, jack, pot, ic, ...).
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Show a part (pins, ratings, verification status) by MPN.
     Show {
         mpn: String,
@@ -1494,6 +1509,71 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
     let lib = PartsLibrary::open(default_parts_dir())
         .with_context(|| "opening the parts library (is `dolt` installed?)")?;
     match action {
+        PartsCmd::Learn { packages } => {
+            let (mut learned, mut skipped) = (0usize, 0usize);
+            for dir in &packages {
+                let board = legion_of_bom_core::read_package(dir)
+                    .with_context(|| format!("reading {}", dir.display()))?;
+                let source = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                for part in &board.parts {
+                    // Only learn from a line that names a real part. A value or a
+                    // signal label tells us nothing about what to buy.
+                    // A part-number column is authoritative. Only fall back to
+                    // reading the comment when the board gives us no column —
+                    // a comment like `100nf50V0603` merely *looks* like a part
+                    // number and must not outrank the real one.
+                    let mpn = match &part.part_number {
+                        Some(m) if !m.is_empty() => m.clone(),
+                        _ => match plan_repair(&part.value, &part.footprint) {
+                            Repair::UsePartNumber(m) => m,
+                            _ => {
+                                skipped += 1;
+                                continue;
+                            }
+                        },
+                    };
+                    let refdes = part.refdes.first().map(String::as_str).unwrap_or("");
+                    lib.learn_house_part(
+                        part_kind_of(refdes, &part.footprint),
+                        &value_key(&part.value, &part.footprint),
+                        &package_key(&part.footprint),
+                        &mpn,
+                        &source,
+                    )?;
+                    learned += 1;
+                }
+                println!("  {source}: {} BOM line(s)", board.parts.len());
+            }
+            println!(
+                "learned {learned} part choice(s) from {} board(s); {skipped} line(s) named no part",
+                packages.len()
+            );
+        }
+
+        PartsCmd::House { kind } => {
+            let all = lib.house_parts()?;
+            let shown: Vec<_> = all
+                .iter()
+                .filter(|h| kind.as_deref().is_none_or(|k| h.kind == k))
+                .collect();
+            if shown.is_empty() {
+                println!("nothing learned yet — try `lob parts learn <package>...`");
+                return Ok(());
+            }
+            for h in &shown {
+                let val = if h.value.is_empty() { "—" } else { &h.value };
+                println!(
+                    "  {:<10} {:<10} {:<10} {:<22} x{}  ({})",
+                    h.kind, val, h.package, h.mpn, h.uses, h.seen_on
+                );
+            }
+            println!("{} part choice(s)", shown.len());
+        }
+
         PartsCmd::List => {
             let mpns = lib.list_mpns()?;
             if mpns.is_empty() {
@@ -1690,7 +1770,13 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                 println!("(no distributor key found — set MOUSER_API_KEY to search)");
             }
 
+            // The parts we already buy are the best answer available, and they
+            // cost nothing to consult — a jack or a pot we have shipped before
+            // is known good, so it should never reach a distributor search.
+            let lib = PartsLibrary::open(default_parts_dir()).ok();
+
             let (mut have, mut found, mut todo, mut skip) = (0usize, 0usize, 0usize, 0usize);
+            let mut known = 0usize;
             for part in &board.parts {
                 let refs = part.refdes.join(", ");
                 if part.part_number.is_some() {
@@ -1703,6 +1789,25 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                         println!("  {refs:<24} {mpn}   (from the comment)");
                     }
                     Repair::Search(keyword) => {
+                        let refdes = part.refdes.first().map(String::as_str).unwrap_or("");
+                        let hit = lib.as_ref().and_then(|l| {
+                            l.house_part(
+                                part_kind_of(refdes, &part.footprint),
+                                &value_key(&part.value, &part.footprint),
+                                &package_key(&part.footprint),
+                            )
+                            .ok()
+                            .flatten()
+                        });
+                        if let Some(h) = hit {
+                            known += 1;
+                            let how = if h.exact { "we use" } else { "closest we use" };
+                            println!(
+                                "  {refs:<24} {}   ({how}, x{} on {})",
+                                h.mpn, h.uses, h.seen_on
+                            );
+                            continue;
+                        }
                         todo += 1;
                         println!("  {refs:<24} ? {keyword}");
                         if search && clients.any() {
@@ -1731,7 +1836,8 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
             }
             println!(
                 "\n{have} already had a part number · {found} recovered from the comment · \
-                 {todo} need a search · {skip} not sourceable from this BOM"
+                 {known} known from parts we use · {todo} need a search · \
+                 {skip} not sourceable from this BOM"
             );
             if found > 0 {
                 println!(
