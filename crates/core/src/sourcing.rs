@@ -237,6 +237,29 @@ pub fn suggest_mpns(part: &Part, clients: &SourcingClients, limit: usize) -> Vec
         return Vec::new();
     };
     let want_pkg = part.footprint.as_deref().and_then(package_hint);
+    suggest_for_query(&query, want_pkg.as_deref(), clients, limit)
+}
+
+/// [`suggest_mpns`] for a query built elsewhere.
+///
+/// An imported BOM has no `Part` to derive a query from — its evidence is a
+/// comment and a package column, which [`crate::bom_repair`] turns into a
+/// keyword. Same search, same ranking, different starting point.
+pub fn suggest_by_keyword(
+    query: &str,
+    clients: &SourcingClients,
+    limit: usize,
+) -> Vec<MpnCandidate> {
+    suggest_for_query(query, None, clients, limit)
+}
+
+fn suggest_for_query(
+    query: &str,
+    want_pkg: Option<&str>,
+    clients: &SourcingClients,
+    limit: usize,
+) -> Vec<MpnCandidate> {
+    let query = query.to_string();
 
     let mut candidates: Vec<MpnCandidate> = Vec::new();
 
@@ -281,7 +304,7 @@ pub fn suggest_mpns(part: &Part, clients: &SourcingClients, limit: usize) -> Vec
         }
     }
 
-    dedup_and_rank(candidates, want_pkg.as_deref(), limit)
+    dedup_and_rank(candidates, want_pkg, limit)
 }
 
 /// De-duplicate by MPN (keeping the richer of two same-MPN hits), score, sort,

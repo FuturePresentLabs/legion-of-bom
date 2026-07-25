@@ -17,13 +17,14 @@ use legion_of_bom_core::{
     default_parts_dir, derive_panel, embed_source, export_cpl, export_gerbers, fetch_data_uri,
     fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts, generate_board_report,
     generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, minimum_hp,
-    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, png_to_jpeg, product_image_url,
-    render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_mpns,
-    validate_erc, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine,
-    BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, JlcpcbClient, KitType,
-    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelOrders, PartRecord,
-    PartResolution, PartsLibrary, PipelineReport, ProjectView, ResolutionStatus, SeededPlacer,
-    Severity, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, plan_repair, png_to_jpeg,
+    product_image_url, render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran,
+    suggest_by_keyword, suggest_mpns, validate_erc, zip_dir, ArtifactKind, ArtifactStatus,
+    BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer,
+    Finding, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient,
+    PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, ProjectView,
+    Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, SourcingClients,
+    StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -255,6 +256,18 @@ enum ImportCmd {
         /// Write a SKiDL script here (default: <schematic>.py next to it).
         #[arg(long)]
         skidl: Option<PathBuf>,
+    },
+    /// Recover part numbers for an imported BOM that has none.
+    Repair {
+        /// The package directory.
+        package: PathBuf,
+        /// Also search a distributor for the lines that need one (needs
+        /// MOUSER_API_KEY); otherwise just report the plan.
+        #[arg(long)]
+        search: bool,
+        /// Candidates to show per searched line.
+        #[arg(long, default_value_t = 3)]
+        limit: usize,
     },
     /// Build a DIY assembly guide and Visual BOM for an imported fab package.
     Guide {
@@ -1662,6 +1675,70 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                 "  NOTE: symbol libraries are inferred from each reference designator — \
                  review the Part(...) lines before running it."
             );
+            Ok(())
+        }
+
+        ImportCmd::Repair {
+            package,
+            search,
+            limit,
+        } => {
+            let board = legion_of_bom_core::read_package(&package)
+                .with_context(|| format!("reading {}", package.display()))?;
+            let clients = search.then(SourcingClients::from_env).unwrap_or_default();
+            if search && !clients.any() {
+                println!("(no distributor key found — set MOUSER_API_KEY to search)");
+            }
+
+            let (mut have, mut found, mut todo, mut skip) = (0usize, 0usize, 0usize, 0usize);
+            for part in &board.parts {
+                let refs = part.refdes.join(", ");
+                if part.part_number.is_some() {
+                    have += 1;
+                    continue;
+                }
+                match plan_repair(&part.value, &part.footprint) {
+                    Repair::UsePartNumber(mpn) => {
+                        found += 1;
+                        println!("  {refs:<24} {mpn}   (from the comment)");
+                    }
+                    Repair::Search(keyword) => {
+                        todo += 1;
+                        println!("  {refs:<24} ? {keyword}");
+                        if search && clients.any() {
+                            for c in suggest_by_keyword(&keyword, &clients, limit) {
+                                let stock = c
+                                    .in_stock
+                                    .map(|n| format!(", {n} in stock"))
+                                    .unwrap_or_default();
+                                let price = c
+                                    .unit_price
+                                    .map(|p| format!(", ${p:.3}"))
+                                    .unwrap_or_default();
+                                println!(
+                                    "        {} [{}{stock}{price}]",
+                                    c.mpn,
+                                    c.manufacturer.as_deref().unwrap_or(c.source)
+                                );
+                            }
+                        }
+                    }
+                    Repair::NotSourceable(what) => {
+                        skip += 1;
+                        println!("  {refs:<24} — {what}");
+                    }
+                }
+            }
+            println!(
+                "\n{have} already had a part number · {found} recovered from the comment · \
+                 {todo} need a search · {skip} not sourceable from this BOM"
+            );
+            if found > 0 {
+                println!(
+                    "Recovered numbers come from what the author wrote, not from a \
+                     distributor — confirm them before ordering."
+                );
+            }
             Ok(())
         }
 

@@ -12,6 +12,7 @@
 
 pub mod board;
 pub mod bom;
+pub mod bom_repair;
 pub mod drc;
 pub mod eagle;
 pub mod easyeda;
@@ -58,6 +59,9 @@ pub use board::{
     Placer, SeededPlacer,
 };
 pub use bom::{generate_bom, Bom, BomLine};
+pub use bom_repair::{
+    classify as classify_comment, plan as plan_repair, search_keyword, Comment, Repair,
+};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use eagle::{
     map_footprint, map_footprint_for, parse_board as parse_eagle_board,
@@ -111,7 +115,10 @@ pub use route::{
 pub use schematic::schematic_to_svg;
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
-pub use sourcing::{build_query, part_kind, suggest_mpns, MpnCandidate, PartKind, SourcingClients};
+pub use sourcing::{
+    build_query, part_kind, suggest_by_keyword, suggest_mpns, MpnCandidate, PartKind,
+    SourcingClients,
+};
 pub use spice::{
     simulate_ac, simulate_tran, simulate_tran_drive, AcPoint, AcResult, SimConfig, TranAnalysis,
     TranDrive, TranPoint, TranResult,
