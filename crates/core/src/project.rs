@@ -116,8 +116,12 @@ pub struct RepoView {
 #[derive(Debug, Clone, Serialize)]
 pub struct CircuitView {
     pub name: String,
-    /// SKiDL source, repo-relative, exactly as declared in `lob.toml`.
-    pub source: String,
+    /// SKiDL source, repo-relative, exactly as declared in `lob.toml`. `None` for
+    /// an imported circuit, which has no definition to show.
+    pub source: Option<String>,
+    /// Imported fab-package directory, repo-relative, when this circuit is
+    /// somebody else's finished board rather than one defined here.
+    pub import: Option<String>,
     /// Panel spec, repo-relative, if declared.
     pub panel: Option<String>,
     /// Panel width in HP, read from the declared panel spec (if any).
@@ -176,7 +180,12 @@ impl ProjectView {
                 // Newest input: the source, its panel (if any), and the manifest
                 // itself — matching `lob status`. `Option`'s ordering treats a
                 // missing file as older than any present one.
-                let mut input = mtime(&c.source_path(root)).max(manifest_mtime);
+                // An imported circuit has no source; its package is the input.
+                let mut input = c
+                    .source_path(root)
+                    .as_deref()
+                    .and_then(mtime)
+                    .max(manifest_mtime);
                 // Panel spec: fold its mtime into freshness AND read its HP /
                 // finish / format so the dashboard can show and tune them.
                 let (panel_hp, panel_finish, panel_format, panel_mtime_ms) =
@@ -220,6 +229,7 @@ impl ProjectView {
                 CircuitView {
                     name: c.name.clone(),
                     source: c.source.clone(),
+                    import: c.import.clone(),
                     panel: c.panel.clone(),
                     panel_hp,
                     panel_finish,

@@ -971,9 +971,16 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
             }
         )
     })?;
+    // Commands that build need a definition; an imported circuit has none.
+    let source = entry.source_path(&root).ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' is an imported circuit (fab package only) — it has no source to build from",
+            entry.name
+        )
+    })?;
     Ok(ResolvedCircuit {
         name: entry.name.clone(),
-        source: entry.source_path(&root),
+        source,
         panel: entry.panel_path(&root),
         kit: entry.effective_kit(&manifest.defaults).map(str::to_string),
         build: entry.build.clone(),
@@ -1009,7 +1016,13 @@ fn circuits_cmd() -> Result<()> {
         } else {
             ""
         };
-        println!("  {:<20} {}  ({kit}{panel}{copy})", c.name, c.source);
+        // An imported circuit shows where its package came from instead.
+        let origin = match (&c.source, &c.import) {
+            (Some(src), _) => src.clone(),
+            (None, Some(pkg)) => format!("{pkg}  [imported]"),
+            _ => "—".to_string(),
+        };
+        println!("  {:<20} {origin}  ({kit}{panel}{copy})", c.name);
     }
     Ok(())
 }

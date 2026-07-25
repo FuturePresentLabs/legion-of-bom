@@ -19,6 +19,15 @@ use serde::{Deserialize, Serialize};
 pub const MANIFEST_NAME: &str = "lob.toml";
 
 /// Errors loading a circuits-repo manifest.
+/// A circuit declaration that makes no sense — caught after parsing, since serde
+/// can only see that fields are absent, not that the combination is meaningless.
+#[derive(Debug, thiserror::Error)]
+#[error("circuit '{name}': {problem}")]
+pub struct CircuitDeclError {
+    pub name: String,
+    pub problem: &'static str,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("no {MANIFEST_NAME} found in {0} or any parent directory")]
@@ -73,8 +82,19 @@ pub struct Defaults {
 pub struct CircuitEntry {
     /// Stable id — used for `out/<name>/…` and as the `lob <cmd> <name>` handle.
     pub name: String,
-    /// SKiDL source, relative to the repo root.
-    pub source: String,
+    /// SKiDL source, relative to the repo root. Absent for an imported circuit,
+    /// which has no definition we can run — only the artefacts of one.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// An **imported** circuit: a directory holding somebody else's finished fab
+    /// package (JLC-style BOM + CPL + gerbers), relative to the repo root.
+    ///
+    /// A fab package carries components and where they sit, but no netlist, so an
+    /// imported circuit can be seen, costed and re-ordered, and cannot be
+    /// simulated, ERC'd or re-laid-out. Keeping it a distinct field rather than a
+    /// flavour of `source` is what keeps that distinction impossible to miss.
+    #[serde(default)]
+    pub import: Option<String>,
     /// Panel spec (TOML), relative to the repo root.
     #[serde(default)]
     pub panel: Option<String>,
@@ -108,6 +128,28 @@ impl Manifest {
     /// Parse a manifest from TOML text.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
+    }
+
+    /// Circuits that declare neither a source nor an import, or both. A circuit is
+    /// either defined here or brought in from somewhere else; it cannot be
+    /// neither, and "both" hides which one the pipeline would actually use.
+    pub fn declaration_errors(&self) -> Vec<CircuitDeclError> {
+        self.circuits
+            .iter()
+            .filter_map(|c| {
+                let problem = match (&c.source, &c.import) {
+                    (None, None) => {
+                        "needs either `source` (a definition) or `import` (a fab package)"
+                    }
+                    (Some(_), Some(_)) => "has both `source` and `import` — pick one",
+                    _ => return None,
+                };
+                Some(CircuitDeclError {
+                    name: c.name.clone(),
+                    problem,
+                })
+            })
+            .collect()
     }
 
     /// Load the manifest at `repo_root/lob.toml`.
@@ -146,8 +188,18 @@ impl Manifest {
 
 impl CircuitEntry {
     /// The SKiDL source path, resolved against the repo root.
-    pub fn source_path(&self, repo_root: &Path) -> PathBuf {
-        repo_root.join(&self.source)
+    pub fn source_path(&self, repo_root: &Path) -> Option<PathBuf> {
+        self.source.as_ref().map(|s| repo_root.join(s))
+    }
+
+    /// The imported fab-package directory, resolved against the repo root.
+    pub fn import_path(&self, repo_root: &Path) -> Option<PathBuf> {
+        self.import.as_ref().map(|p| repo_root.join(p))
+    }
+
+    /// Whether this circuit is imported rather than defined here.
+    pub fn is_imported(&self) -> bool {
+        self.source.is_none() && self.import.is_some()
     }
 
     /// The panel-spec path, resolved against the repo root, if declared.
@@ -197,7 +249,7 @@ mod tests {
         assert_eq!(m.circuits.len(), 2);
 
         let slew = m.circuit("slew_limiter").expect("slew present");
-        assert_eq!(slew.source, "slew_limiter.py");
+        assert_eq!(slew.source.as_deref(), Some("slew_limiter.py"));
         assert_eq!(slew.panel.as_deref(), Some("slew_limiter_panel.toml"));
         let build = slew.build.as_ref().expect("build copy");
         assert_eq!(
@@ -229,7 +281,10 @@ mod tests {
         let m = Manifest::from_toml(SAMPLE).unwrap();
         let root = Path::new("/repo");
         let slew = m.circuit("slew_limiter").unwrap();
-        assert_eq!(slew.source_path(root), Path::new("/repo/slew_limiter.py"));
+        assert_eq!(
+            slew.source_path(root),
+            Some(PathBuf::from("/repo/slew_limiter.py"))
+        );
         assert_eq!(
             slew.panel_path(root),
             Some(PathBuf::from("/repo/slew_limiter_panel.toml"))
@@ -239,8 +294,29 @@ mod tests {
 
     #[test]
     fn missing_required_field_is_a_parse_error() {
-        // `source` is required.
-        assert!(Manifest::from_toml("[[circuit]]\nname = \"x\"\n").is_err());
+        // `name` is still required by the schema itself.
+        assert!(Manifest::from_toml("[[circuit]]\nsource = \"x.py\"\n").is_err());
+    }
+
+    /// `source` became optional so a circuit can be *imported* instead, which
+    /// means serde alone can no longer tell a valid declaration from a useless
+    /// one. The combination is checked separately.
+    #[test]
+    fn a_circuit_needs_exactly_one_of_source_or_import() {
+        let neither = Manifest::from_toml("[[circuit]]\nname = \"x\"\n").unwrap();
+        assert_eq!(neither.declaration_errors().len(), 1);
+
+        let both =
+            Manifest::from_toml("[[circuit]]\nname = \"x\"\nsource = \"x.py\"\nimport = \"pkg\"\n")
+                .unwrap();
+        assert_eq!(both.declaration_errors().len(), 1);
+
+        let ok = Manifest::from_toml(
+            "[[circuit]]\nname = \"a\"\nsource = \"a.py\"\n\
+             [[circuit]]\nname = \"b\"\nimport = \"pkg/b\"\n",
+        )
+        .unwrap();
+        assert!(ok.declaration_errors().is_empty());
     }
 
     #[test]

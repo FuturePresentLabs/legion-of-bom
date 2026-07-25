@@ -61,9 +61,9 @@ pub async fn render(
     let layer_sel = q.layers.clone().unwrap_or_default();
 
     // The circuit must exist; grab its panel spec + the repo brand logo.
-    let (panel_rel, logo_rel) = match state.project() {
+    let (panel_rel, logo_rel, import_rel) = match state.project() {
         Ok(v) => match v.circuit(&name) {
-            Some(c) => (c.panel.clone(), v.repo.logo.clone()),
+            Some(c) => (c.panel.clone(), v.repo.logo.clone(), c.import.clone()),
             None => return err(StatusCode::NOT_FOUND, &format!("no circuit '{name}'")),
         },
         Err(e) => {
@@ -76,15 +76,16 @@ pub async fn render(
 
     let root = state.root().to_path_buf();
     match tokio::task::spawn_blocking(move || {
-        render_view(
-            &root,
-            &name,
-            &view,
+        render_view(&RenderReq {
+            root: &root,
+            name: &name,
+            view: &view,
             show_smd,
-            &layer_sel,
-            panel_rel.as_deref(),
-            logo_rel.as_deref(),
-        )
+            layer_sel: &layer_sel,
+            panel_rel: panel_rel.as_deref(),
+            logo_rel: logo_rel.as_deref(),
+            import_rel: import_rel.as_deref(),
+        })
     })
     .await
     {
@@ -132,15 +133,30 @@ impl IntoResponse for RenderErr {
     }
 }
 
-fn render_view(
-    root: &FsPath,
-    name: &str,
-    view: &str,
+/// Everything one render needs: which circuit, which drawing, and where its
+/// declared inputs live.
+struct RenderReq<'a> {
+    root: &'a FsPath,
+    name: &'a str,
+    view: &'a str,
     show_smd: bool,
-    layer_sel: &str,
-    panel_rel: Option<&str>,
-    logo_rel: Option<&str>,
-) -> Result<Rendered, RenderErr> {
+    layer_sel: &'a str,
+    panel_rel: Option<&'a str>,
+    logo_rel: Option<&'a str>,
+    import_rel: Option<&'a str>,
+}
+
+fn render_view(req: &RenderReq<'_>) -> Result<Rendered, RenderErr> {
+    let RenderReq {
+        root,
+        name,
+        view,
+        show_smd,
+        layer_sel,
+        panel_rel,
+        logo_rel,
+        import_rel,
+    } = *req;
     match view {
         "panel" => {
             let rel = panel_rel.ok_or(RenderErr::NoPanel)?;
@@ -196,6 +212,12 @@ fn render_view(
                 (
                     root.join(format!("{stem}-panel-gerbers")),
                     format!("no panel gerbers — run `lob panel pcb {stem}.toml`"),
+                )
+            } else if let Some(pkg) = import_rel {
+                // An imported circuit's gerbers came with it.
+                (
+                    root.join(pkg).join("gerbers"),
+                    format!("imported package at {pkg} has no gerbers/ directory"),
                 )
             } else {
                 (

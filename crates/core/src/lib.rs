@@ -21,6 +21,7 @@ pub mod gerber;
 pub mod git;
 pub mod guide;
 pub mod images;
+pub mod import;
 pub mod jlcpcb;
 pub mod layout;
 pub mod logo;
@@ -71,6 +72,10 @@ pub use guide::{
     PlacedPart,
 };
 pub use images::{default_cache_dir as default_image_cache_dir, embed_source, fetch_data_uri};
+pub use import::{
+    parse_bom as parse_imported_bom, parse_cpl as parse_imported_cpl, read_package, ImportedBoard,
+    ImportedPart, ImportedPlacement,
+};
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use layout::{
     measure, run_layout_loop, score, CostWeights, LayoutLoop, LayoutMode, LayoutReport,

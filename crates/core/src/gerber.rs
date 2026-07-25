@@ -113,26 +113,34 @@ impl LayerKind {
             "drl" | "xln" | "txt" => return LayerKind::Drill,
             _ => {}
         }
-        // Otherwise go by the descriptive part of the name.
+        // Otherwise read the descriptive name. Tools disagree wildly here: KiCad
+        // writes `-F_Cu`/`-B_Silkscreen`, DipTrace writes `1 - Top`/`TopSilk`/
+        // `BoardOutline`. Match on meaning, and test the compound names first —
+        // "TopSilk" is silk, not copper, and "BottomAssembly" is a drawing.
         let has = |k: &str| n.contains(k);
-        if has("edge") || has("outline") || has("profile") {
+        let top = has("top") || has("f_cu") || has("front") || n.starts_with("1 ");
+        let bottom = has("bottom") || has("b_cu") || has("back") || n.starts_with("2 ");
+        let side = |t: LayerKind, b: LayerKind| if bottom && !top { b } else { t };
+
+        if has("silk") {
+            side(LayerKind::SilkTop, LayerKind::SilkBottom)
+        } else if has("mask") {
+            side(LayerKind::MaskTop, LayerKind::MaskBottom)
+        } else if has("paste") {
+            side(LayerKind::PasteTop, LayerKind::PasteBottom)
+        } else if has("assembly")
+            || has("dimension")
+            || has("courtyard")
+            || has("fab")
+            || has("margin")
+            || has("comment")
+        {
+            // Drawings for people, not for the board.
+            LayerKind::Other
+        } else if has("outline") || has("edge") || has("profile") || has("keepout") {
             LayerKind::Outline
-        } else if has("f_cu") || has("front_copper") {
-            LayerKind::CopperTop
-        } else if has("b_cu") || has("back_copper") {
-            LayerKind::CopperBottom
-        } else if has("f_silk") {
-            LayerKind::SilkTop
-        } else if has("b_silk") {
-            LayerKind::SilkBottom
-        } else if has("f_mask") {
-            LayerKind::MaskTop
-        } else if has("b_mask") {
-            LayerKind::MaskBottom
-        } else if has("f_paste") {
-            LayerKind::PasteTop
-        } else if has("b_paste") {
-            LayerKind::PasteBottom
+        } else if top || bottom {
+            side(LayerKind::CopperTop, LayerKind::CopperBottom)
         } else {
             LayerKind::Other
         }
@@ -656,19 +664,34 @@ pub fn parse_drill(text: &str, file_name: &str) -> Layer {
                 .parse()
                 .unwrap_or(0);
             if let Some(ci) = l.find('C') {
-                let d: f64 = l[ci + 1..].trim().parse().unwrap_or(0.0);
+                let d: f64 = l[ci + 1..]
+                    .trim()
+                    .trim_start_matches('+')
+                    .parse()
+                    .unwrap_or(0.0);
                 tools.insert(num, if metric { d } else { d * 25.4 });
             } else {
                 cur = num;
             }
         } else if l.starts_with('X') || l.starts_with('Y') {
+            // Coordinates may be signed, and are often written with an *implicit*
+            // decimal point — `X+013476` is 1.3476 inches, not 13476 of anything.
+            // Reading those literally puts every hole thousands of mm off-board,
+            // which is silent: the holes simply never appear.
             let get = |k: char| -> Option<f64> {
                 let i = l.find(k)?;
                 let s = &l[i + 1..];
                 let end = s
-                    .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
                     .unwrap_or(s.len());
-                s[..end].parse::<f64>().ok()
+                let tok = &s[..end];
+                let v: f64 = tok.trim_start_matches('+').parse().ok()?;
+                Some(if tok.contains('.') {
+                    v
+                } else {
+                    // Excellon's usual implicit formats: 2.4 for inch, 3.3 for mm.
+                    v / if metric { 1_000.0 } else { 10_000.0 }
+                })
             };
             if let (Some(x), Some(y)) = (get('X'), get('Y')) {
                 let s = if metric { 1.0 } else { 25.4 };
@@ -840,6 +863,27 @@ pub fn layers_to_svg(layers: &[Layer], show: &[LayerKind]) -> String {
 mod tests {
     use super::*;
 
+    /// DipTrace writes descriptive names with a plain `.gbr` extension, so the
+    /// classifier has to read meaning rather than lean on the extension — and it
+    /// has to test the compound names first, or `TopSilk` reads as copper.
+    #[test]
+    fn classifies_diptrace_descriptive_names() {
+        for (name, want) in [
+            ("1 - Top.gbr", LayerKind::CopperTop),
+            ("2 - Bottom.gbr", LayerKind::CopperBottom),
+            ("TopSilk.gbr", LayerKind::SilkTop),
+            ("BottomSilk.gbr", LayerKind::SilkBottom),
+            ("TopMask.gbr", LayerKind::MaskTop),
+            ("BottomPaste.gbr", LayerKind::PasteBottom),
+            ("BoardOutline.gbr", LayerKind::Outline),
+            ("BottomAssembly.gbr", LayerKind::Other),
+            ("TopDimension.gbr", LayerKind::Other),
+            ("Through.drl", LayerKind::Drill),
+        ] {
+            assert_eq!(LayerKind::classify(name), want, "{name}");
+        }
+    }
+
     #[test]
     fn classifies_kicad_and_protel_names() {
         assert_eq!(
@@ -918,6 +962,23 @@ mod tests {
         assert!((eval("$1+$1", &[0.25]) - 0.5).abs() < 1e-9);
         assert!((eval("2x$2", &[0.0, 3.0]) - 6.0).abs() < 1e-9);
         assert!((eval("1.5", &[]) - 1.5).abs() < 1e-9);
+    }
+
+    /// DipTrace writes signed, implicit-decimal Excellon: `X+013476` is 1.3476
+    /// inches. Parsed literally the hole lands thousands of mm away and silently
+    /// vanishes from the board — which is exactly what happened.
+    #[test]
+    fn reads_implicit_decimal_inch_drill() {
+        let d = "M48\nINCH\nT01C0.0394\n%\nT01\nX+013476Y+044146\nM30\n";
+        let l = parse_drill(d, "Through.drl");
+        assert_eq!(l.prims.len(), 1, "the hole must not be dropped");
+        let Some(Prim::Disc { cx, cy, d, .. }) = l.prims.first() else {
+            panic!("expected a hole");
+        };
+        // 1.3476in = 34.229mm, 4.4146in = 112.13mm, tool 0.0394in = 1.0mm.
+        assert!((cx - 34.229).abs() < 0.01, "x={cx}");
+        assert!((cy - 112.13).abs() < 0.01, "y={cy}");
+        assert!((d - 1.0).abs() < 0.01, "d={d}");
     }
 
     #[test]

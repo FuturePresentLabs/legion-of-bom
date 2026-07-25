@@ -75,6 +75,11 @@ pub async fn source(State(state): State<Arc<AppState>>, Path(name): Path<String>
         },
         Err(e) => return repo_error(e),
     };
+    // An imported circuit is somebody else's finished board: there is no
+    // definition to show, and saying so beats a misleading empty pane.
+    let Some(src_rel) = src_rel else {
+        return not_found("imported circuit — no source, it was defined elsewhere");
+    };
     let path = root.join(&src_rel);
     match tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await {
         Ok(Ok(content)) => Json(SourceDoc {
