@@ -175,6 +175,13 @@ enum PartsCmd {
     Learn {
         /// Fab-package directories, or Eagle `.sch` files/folders, to learn from.
         packages: Vec<PathBuf>,
+        /// A BOM naming what was bought, joined to an Eagle source by refdes.
+        ///
+        /// Eagle records what a board is made of, not what was ordered, so a
+        /// schematic alone can only say which parts we need an answer for. Pair
+        /// it with the BOM that built the board and both halves are present.
+        #[arg(long)]
+        bom: Option<PathBuf>,
     },
     /// Attach our own photo to a part we build with.
     ///
@@ -1565,8 +1572,33 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
     let lib = PartsLibrary::open(default_parts_dir())
         .with_context(|| "opening the parts library (is `dolt` installed?)")?;
     match action {
-        PartsCmd::Learn { packages } => {
+        PartsCmd::Learn { packages, bom } => {
+            // A BOM states what was bought, keyed by refdes — the half an Eagle
+            // schematic never carries. Joining them recovers the part choice.
+            let mut bought: std::collections::HashMap<String, (String, String)> =
+                Default::default();
+            if let Some(path) = &bom {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                for line in legion_of_bom_core::parse_imported_bom(&text) {
+                    let Some(mpn) = line.part_number.filter(|m| !m.is_empty()).or_else(|| {
+                        match plan_repair(&line.value, &line.footprint) {
+                            Repair::UsePartNumber(m) => Some(m),
+                            _ => None,
+                        }
+                    }) else {
+                        continue;
+                    };
+                    let stated = value_key(&line.value, &line.footprint);
+                    for refdes in line.refdes {
+                        bought.insert(refdes.to_ascii_uppercase(), (mpn.clone(), stated.clone()));
+                    }
+                }
+                println!("  {}: {} refdes named a part", path.display(), bought.len());
+            }
+
             let (mut learned, mut skipped, mut wanted) = (0usize, 0usize, Vec::new());
+            let mut mismatched = 0usize;
             for path in &packages {
                 let source = path
                     .file_stem()
@@ -1621,7 +1653,28 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                         let kind = part_kind_of(&part.refdes.0, &package);
                         let value = value_key(&part.value, &package);
                         let pkg = package_key(&package);
-                        match &part.mpn {
+                        let mut mpn = part.mpn.clone().filter(|m| !m.is_empty());
+                        if mpn.is_none() {
+                            if let Some((m, stated)) =
+                                bought.get(&part.refdes.0.to_ascii_uppercase())
+                            {
+                                // A BOM and a schematic that disagree about what
+                                // a refdes is cannot both be right, and guessing
+                                // teaches the library a part number for the wrong
+                                // part. Refuse the pairing and say so.
+                                if !stated.is_empty() && !value.is_empty() && *stated != value {
+                                    eprintln!(
+                                        "  ! {} is {value} on the schematic but {stated} in the BOM \
+                                         — not learning {m}",
+                                        part.refdes.0
+                                    );
+                                    mismatched += 1;
+                                    continue;
+                                }
+                                mpn = Some(m.clone());
+                            }
+                        }
+                        match &mpn {
                             Some(m) if !m.is_empty() => {
                                 lib.learn_house_part(kind, &value, &pkg, m, name)?;
                                 learned += 1;
@@ -1646,6 +1699,12 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                 "learned {learned} part choice(s) from {} source(s); {skipped} line(s) named no part",
                 packages.len()
             );
+            if mismatched > 0 {
+                println!(
+                    "{mismatched} refdes disagreed between the BOM and the schematic — \
+                     check the BOM is the one that built this revision"
+                );
+            }
             if !wanted.is_empty() {
                 // Deduplicate: one line per distinct part we cannot answer for,
                 // not one per instance, or a board of 40 resistors buries it.
