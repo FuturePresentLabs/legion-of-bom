@@ -1651,7 +1651,14 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             };
             // Cutout dims resolve through the CutoutSource seam; BuiltinCutouts is
             // the fallback until the parts library carries verified mechanical data.
+            let requested_hp = hp;
             let mut panel = derive_panel(&model, hp, &BuiltinCutouts);
+            // derive_panel widens a panel too narrow for its own hardware, so report
+            // what was actually emitted, not what was asked for.
+            let hp = panel.hp.unwrap_or(hp);
+            if hp > requested_hp {
+                println!("  widened to {hp} HP — {requested_hp} HP can't fit the control hardware");
+            }
             let out_path =
                 out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_panel.toml")));
             // Re-deriving must not wipe the builder-owned finish / thickness they set

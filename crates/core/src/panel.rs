@@ -69,6 +69,40 @@ const TOGGLE_MM: f64 = 6.5;
 const LED_5MM_MM: f64 = 5.0;
 const LED_3MM_MM: f64 = 3.0;
 
+/// Mechanical envelopes `(width, height)` mm — the space each control really
+/// occupies on a built panel, versus the much smaller hole it pokes through. Each
+/// is the larger of the panel-side hardware and the PCB body that anchors to it,
+/// measured from the parts we actually build with. See [`CutoutSpec::envelope_mm`].
+mod envelope {
+    /// Thonkiconn / PJ301M: the KiCad body is 10.0 × 14.4 mm — larger than the
+    /// ~7.6 mm nut, and larger than the ~12 mm spacing dense modules use to leave
+    /// finger room for a plug, so the body governs.
+    pub const JACK: (f64, f64) = (10.0, 14.4);
+    /// Alpha 9 mm vertical pot: the PCB body spans 13.75 × 12.82 mm including its
+    /// solder lugs; a common small Eurorack knob (Davies 1900h ≈ 13.8 mm, Rogan
+    /// 1PS ≈ 12.7 mm) is about the same, so 14 mm covers both.
+    pub const POT: (f64, f64) = (14.0, 14.0);
+    /// Sub-mini toggle: bushing plus the lever's throw and finger room.
+    pub const SWITCH: (f64, f64) = (10.0, 12.0);
+    /// An LED needs only its bezel plus a little material.
+    pub const LED: (f64, f64) = (6.0, 6.0);
+    /// Minimum panel material left between a control envelope and the panel edge —
+    /// a knob may not overhang, or it fouls the neighbouring module.
+    pub const EDGE_MM: f64 = 1.0;
+    /// Minimum gap between two adjacent control envelopes.
+    pub const GAP_MM: f64 = 2.0;
+}
+
+/// The default mechanical envelope for a control kind.
+fn kind_envelope(kind: ControlKind) -> (f64, f64) {
+    match kind {
+        ControlKind::Jack => envelope::JACK,
+        ControlKind::Pot => envelope::POT,
+        ControlKind::Switch => envelope::SWITCH,
+        ControlKind::Led => envelope::LED,
+    }
+}
+
 /// What kind of front-panel control a part is — drives panel-layout grouping
 /// (knobs/switches up top, jacks at the bottom) and label defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +129,22 @@ impl ControlKind {
     }
 }
 
-/// A part's panel-mount cutout: opening geometry + control kind. This is **part
-/// data** — see [`CutoutSource`].
+/// A part's panel-mount cutout: opening geometry + control kind + the space the
+/// hardware really occupies. This is **part data** — see [`CutoutSource`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CutoutSpec {
     pub shape: CutoutShape,
     pub kind: ControlKind,
+    /// The mechanical envelope `(width, height)` in mm this control actually needs
+    /// on the panel — **not** its hole. It is the larger of the panel-side hardware
+    /// (a knob's skirt, a jack's nut plus room to grip a plug) and the PCB body the
+    /// panel anchors, because both must clear their neighbours: knobs must not
+    /// collide, and the anchored footprints must not overlap on the board.
+    ///
+    /// Deriving a panel from hole sizes alone is what produced panels that looked
+    /// fine and could not be built — a 3 HP panel is 15.24 mm wide, which cannot
+    /// hold a 13.75 mm pot body with any material left at the edges.
+    pub envelope_mm: (f64, f64),
 }
 
 /// Resolves a part to its panel-mount cutout — **the seam**. A part's mechanical
@@ -134,6 +178,15 @@ impl CutoutSource for BuiltinCutouts {
             Some(CutoutSpec {
                 kind,
                 shape: CutoutShape::Circle { diameter_mm },
+                // An LED's envelope is its own bezel; every other kind carries the
+                // hardware/body envelope for its class.
+                envelope_mm: match kind {
+                    ControlKind::Led => {
+                        let d: f64 = diameter_mm;
+                        (d + 1.0, d + 1.0)
+                    }
+                    k => kind_envelope(k),
+                },
             })
         };
         // Exact LED sizes first (a bare "led" defaults to 5 mm below).
@@ -581,14 +634,18 @@ fn control_pitch(kind: ControlKind) -> f64 {
 /// convention) — and label each from the signal net it carries. Board-only parts
 /// (passives, ICs, power headers) are skipped. Override any position by hand
 /// afterwards; this is a starting point, not a straitjacket.
-pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
-    // Split panel-facing parts into controls (top band) and jacks (bottom band).
-    let mut controls: Vec<(String, ControlKind)> = Vec::new();
-    let mut jacks: Vec<(String, ControlKind)> = Vec::new();
+/// The panel-facing controls of a circuit, in layout order (knobs/switches first,
+/// jacks last), each with the mechanical envelope it needs.
+fn panel_controls(
+    circuit: &dyn CircuitSource,
+    cutouts: &dyn CutoutSource,
+) -> Vec<(String, ControlKind, (f64, f64))> {
+    let mut controls = Vec::new();
+    let mut jacks = Vec::new();
     for part in circuit.parts() {
         let fp = part.footprint.as_deref().unwrap_or("");
         if let Some(spec) = cutouts.cutout(part.mpn.as_deref(), fp) {
-            let entry = (part.refdes.0.clone(), spec.kind);
+            let entry = (part.refdes.0.clone(), spec.kind, spec.envelope_mm);
             if spec.kind.is_jack() {
                 jacks.push(entry);
             } else {
@@ -598,16 +655,46 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
     }
     controls.sort_by(|a, b| a.0.cmp(&b.0));
     jacks.sort_by(|a, b| a.0.cmp(&b.0));
+    controls.into_iter().chain(jacks).collect()
+}
+
+/// The narrowest panel (HP) whose **hardware actually fits** — the widest control
+/// envelope plus edge material on both sides (DESIGN §6.1).
+///
+/// This is the panel-side constraint, independent of whether the PCB's parts and
+/// traces fit (see `board::minimum_hp`); a buildable module needs both. Without
+/// it a derivation happily emits, say, a 3 HP panel (15.24 mm) carrying a 13.75 mm
+/// pot body, which cannot be built.
+pub fn min_panel_hp(circuit: &dyn CircuitSource, cutouts: &dyn CutoutSource) -> u16 {
+    let widest = panel_controls(circuit, cutouts)
+        .iter()
+        .map(|(_, _, env)| env.0)
+        .fold(0.0f64, f64::max);
+    if widest <= 0.0 {
+        return 1;
+    }
+    let needed = widest + 2.0 * envelope::EDGE_MM;
+    (needed / HP_MM).ceil().max(1.0) as u16
+}
+
+pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
+    let ordered = panel_controls(circuit, cutouts);
+
+    // Never emit a panel too narrow for its own hardware — a derived spec that
+    // can't be built is worse than a wider one.
+    let hp = hp.max(min_panel_hp(circuit, cutouts));
 
     let w = f64::from(hp) * HP_MM;
     let cx = w / 2.0;
     let h = EURORACK_HEIGHT_MM;
 
-    // Stack controls top→bottom (knobs above jacks), each spaced by its real body
-    // pitch, and centre the whole stack in the clear zone between the title and
-    // the bottom logo/holes.
-    let ordered: Vec<(String, ControlKind)> = controls.into_iter().chain(jacks).collect();
-    let pitches: Vec<f64> = ordered.iter().map(|(_, k)| control_pitch(*k)).collect();
+    // Stack controls top→bottom (knobs above jacks), spaced by the real envelope
+    // each one needs plus a gap — never closer than the class minimum — and centre
+    // the stack in the clear zone between the title and the bottom logo/holes.
+    let pitches: Vec<f64> = ordered
+        .iter()
+        .map(|(_, k, env)| (env.1 + envelope::GAP_MM).max(control_pitch(*k)))
+        .collect();
     let total: f64 = pitches.iter().sum();
     let avail_top = h - derive_rules::TOP_MARGIN_MM;
     let avail_bot = derive_rules::BOTTOM_MARGIN_MM;
@@ -617,7 +704,7 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
     // holds, which the caller can act on (wider HP won't help; height is fixed).
     let mut y = avail_top - (avail - total).max(0.0) / 2.0;
     let mut out: Vec<CutoutFile> = Vec::new();
-    for ((refdes, kind), pitch) in ordered.iter().zip(&pitches) {
+    for ((refdes, kind, _), pitch) in ordered.iter().zip(&pitches) {
         out.push(CutoutFile {
             x_mm: cx,
             y_mm: y - pitch / 2.0,
@@ -1555,6 +1642,58 @@ mod tests {
         assert!(c
             .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
             .is_none());
+    }
+
+    /// A derived panel must be physically buildable: every control's mechanical
+    /// envelope (knob skirt / PCB body — not the little hole) has to fit inside the
+    /// panel with edge material left, and envelopes must not overlap vertically.
+    /// Deriving from hole sizes alone produced 3 HP panels carrying 13.75 mm pot
+    /// bodies, which look fine on screen and cannot be built (5p5).
+    #[test]
+    fn derived_panel_hardware_physically_fits() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        let mut circ = Circuit::new("m");
+        circ.parts = vec![
+            Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+            Part::new("RV2", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+            Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
+        ];
+        circ.nets = vec![Net::new("SIG_IN", vec![PinRef::new("J1", "T")])];
+
+        // A pot body is 14 mm; 2 HP is 10.16 mm, so it cannot possibly fit — the
+        // derivation must widen rather than emit an unbuildable panel.
+        let min = min_panel_hp(&circ, &BuiltinCutouts);
+        assert_eq!(min, 4, "14mm control + 2x1mm edge needs 16mm => 4 HP");
+        let panel = derive_panel(&circ, 2, &BuiltinCutouts);
+        assert_eq!(panel.hp, Some(4), "asked for 2 HP, widened to what fits");
+
+        let w = f64::from(panel.hp.unwrap()) * HP_MM;
+        let env = |fp: &str| match fp {
+            "Alpha9mm" => envelope::POT,
+            "Thonkiconn" => envelope::JACK,
+            _ => (6.0, 6.0),
+        };
+        // Every envelope sits inside the panel with edge material to spare.
+        for c in &panel.cutouts {
+            let (ew, _) = env(&c.footprint);
+            assert!(
+                c.x_mm - ew / 2.0 >= envelope::EDGE_MM - 1e-9
+                    && c.x_mm + ew / 2.0 <= w - envelope::EDGE_MM + 1e-9,
+                "{:?} envelope runs off the panel",
+                c.refdes
+            );
+        }
+        // And no two envelopes overlap vertically.
+        let mut stack: Vec<(f64, f64)> = panel
+            .cutouts
+            .iter()
+            .map(|c| (c.y_mm, env(&c.footprint).1))
+            .collect();
+        stack.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for w in stack.windows(2) {
+            let gap = (w[0].0 - w[0].1 / 2.0) - (w[1].0 + w[1].1 / 2.0);
+            assert!(gap >= -1e-9, "control envelopes overlap by {:.2}mm", -gap);
+        }
     }
 
     #[test]

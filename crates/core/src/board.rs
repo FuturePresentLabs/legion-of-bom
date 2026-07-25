@@ -1171,10 +1171,15 @@ pub fn build_facts(
 /// [`crate::panel::derive_panel`]), then, for each candidate width smallest-first,
 /// runs [`EurorackPlacer`] and takes the first HP where no part is pushed into the
 /// off-board overflow lane. Height is fixed (3U), so this optimizes width only.
+///
+/// The search starts at [`crate::panel::min_panel_hp`], never below: a width the
+/// *board* squeezes into is useless if the panel hardware it must carry doesn't
+/// physically fit there (a 3 HP panel is 15.24 mm; an Alpha pot body is 13.75 mm).
 pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts>) -> u16 {
     use crate::panel::PanelSpec;
     const MAX_HP: u16 = 42;
-    for hp in 2u16..=MAX_HP {
+    let floor_hp = crate::panel::min_panel_hp(circuit, &crate::panel::BuiltinCutouts).max(2);
+    for hp in floor_hp..=MAX_HP {
         let dims = crate::panel::EurorackPanel::new(hp);
         let (w, h) = (dims.width_mm(), dims.height_mm());
         // Auto-arranged controls become the anchors (cutout y is bottom-up).
