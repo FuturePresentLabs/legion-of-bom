@@ -28,6 +28,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/circuits/{name}/orders", get(api::orders))
         .route("/circuits/{name}/render", get(crate::render::render))
         .route("/circuits/{name}/sim", post(crate::sim::sim))
+        .route("/circuits/{name}/build", post(crate::build::build))
         .route("/edit", post(api::edit));
     Router::new()
         .nest("/api", api)

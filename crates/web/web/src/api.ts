@@ -116,6 +116,11 @@ export interface Orders {
 }
 
 /** A whitelisted metadata edit — never touches topology. Absent field = leave. */
+export interface BuildResult {
+  ok: boolean;
+  output: string;
+}
+
 export interface CircuitEditPayload {
   name: string;
   build_intro?: string;
@@ -161,6 +166,11 @@ export interface SimPayload {
 export const api = {
   repo: () => getJson<RepoInfo>("/api/repo"),
   circuits: () => getJson<Circuit[]>("/api/circuits"),
+  build: (name: string) =>
+    postJson<BuildResult>(
+      `/api/circuits/${encodeURIComponent(name)}/build`,
+      {},
+    ),
   circuit: (name: string) =>
     getJson<Circuit>(`/api/circuits/${encodeURIComponent(name)}`),
   source: (name: string) =>

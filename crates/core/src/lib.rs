@@ -60,8 +60,8 @@ pub use board::{
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use bom_repair::{
-    classify as classify_comment, package_key, part_kind_of, plan as plan_repair, search_keyword,
-    value_key, Comment, Repair,
+    classify as classify_comment, fill_mpns, package_key, part_kind_of, plan as plan_repair,
+    search_keyword, value_key, Comment, FillReport, Repair,
 };
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use eagle::{

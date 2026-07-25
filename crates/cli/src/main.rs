@@ -1116,6 +1116,50 @@ fn circuits_cmd() -> Result<()> {
 /// Handle `lob build [circuit]` — produce a circuit's full artifact set (guide +
 /// Visual BOM + fab package), or every circuit in the repo. Each artifact is
 /// independent, so one failing (e.g. a DRC-blocked fab) still leaves the others.
+/// Build the artifacts an imported board *can* have.
+///
+/// There is no source to lay out or fabricate, but the fab package already
+/// states what goes where, which is everything the guide and the Visual BOM
+/// need. Writing them under `out/<name>/` is what puts an imported board on
+/// the dashboard beside the ones we designed.
+fn build_imported(root: &Path, name: &str, package: &Path) -> Result<Vec<&'static str>> {
+    let board = legion_of_bom_core::read_package(package)
+        .with_context(|| format!("reading {}", package.display()))?;
+    let dir = root.join("out").join(name);
+    std::fs::create_dir_all(&dir)?;
+
+    // No photoreal render: an imported board has gerbers, not a KiCad board we
+    // can ask kicad-cli to draw.
+    let guide = board.to_guide(name);
+    let gpath = dir.join(format!("{name}-guide.html"));
+    std::fs::write(&gpath, guide_to_html(&guide, None, None))
+        .with_context(|| format!("writing {}", gpath.display()))?;
+
+    let mut bom = board.to_bom();
+    // An imported package usually names its parts in the comment column rather
+    // than a dedicated one, so a Visual BOM built straight from it has no part
+    // numbers and cannot be ordered from. Recover them the same way `lob import
+    // repair` does, including from the parts we already build with.
+    let lib = PartsLibrary::open(default_parts_dir()).ok();
+    let filled = legion_of_bom_core::fill_mpns(&mut bom, lib.as_ref());
+    if filled.from_comment + filled.from_library > 0 {
+        println!(
+            "  {name}: {} part number(s) from the comment, {} from parts we use, {} still unknown",
+            filled.from_comment, filled.from_library, filled.unresolved
+        );
+    }
+    let cache = default_image_cache_dir();
+    let thumbs: Vec<Option<String>> = bom.lines.iter().map(|l| resolve_photo(l, &cache)).collect();
+    let vpath = dir.join(format!("{name}-vbom.html"));
+    std::fs::write(&vpath, bom.to_visual_html(name, &thumbs))
+        .with_context(|| format!("writing {}", vpath.display()))?;
+
+    let cpath = dir.join(format!("{name}_bom.csv"));
+    std::fs::write(&cpath, bom.to_csv()).with_context(|| format!("writing {}", cpath.display()))?;
+
+    Ok(vec!["guide", "vbom", "bom"])
+}
+
 fn build_cmd(name: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let (_root, manifest) = Manifest::discover(&cwd)
@@ -1134,9 +1178,28 @@ fn build_cmd(name: Option<String>) -> Result<()> {
         return Ok(());
     }
 
+    let root = _root;
     let mut failures: Vec<String> = Vec::new();
     for name in &targets {
         println!("\n━━━━━━━━━━  build {name}  ━━━━━━━━━━");
+
+        // An imported board has no source, but it does have a fab package —
+        // enough for a guide and a Visual BOM, which is what a builder needs.
+        if let Some(pkg) = manifest
+            .circuit(name)
+            .filter(|c| c.is_imported())
+            .and_then(|c| c.import_path(&root))
+        {
+            match build_imported(&root, name, &pkg) {
+                Ok(done) => println!("✓ {name}: {} (imported)", done.join(" + ")),
+                Err(e) => {
+                    eprintln!("  ✗ {e:#}");
+                    failures.push(name.clone());
+                }
+            }
+            continue;
+        }
+
         let arg = || PathBuf::from(name);
         let steps: [(&str, Result<()>); 3] = [
             ("guide", guide_cmd(arg(), None, None, "auto".into())),

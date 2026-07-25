@@ -12,9 +12,10 @@
 
 pub mod api;
 pub mod assets;
+pub mod build;
 pub mod render;
 pub mod routes;
-pub mod sim;
+mod sim;
 pub mod state;
 
 use std::net::SocketAddr;

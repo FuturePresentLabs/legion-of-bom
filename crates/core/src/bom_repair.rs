@@ -578,3 +578,61 @@ mod tests {
         ));
     }
 }
+
+/// What filling a BOM's part numbers achieved, so the caller can report it
+/// rather than leave the builder guessing how a number was arrived at.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FillReport {
+    /// Already carried a part number from the source package.
+    pub had: usize,
+    /// Recovered from what the author wrote in the comment.
+    pub from_comment: usize,
+    /// Answered by a part we have shipped before.
+    pub from_library: usize,
+    /// Still unknown — these need a search before anyone can order.
+    pub unresolved: usize,
+}
+
+/// Fill in a BOM's missing part numbers from the comment, then from the parts
+/// we already build with.
+///
+/// A Visual BOM without part numbers cannot be ordered from, and an imported
+/// package often states the part in its comment column rather than a dedicated
+/// one. Only an exact library match is accepted: for ordering, a near-miss is
+/// worse than a blank, because a blank is obviously unfinished.
+pub fn fill_mpns(
+    bom: &mut crate::bom::Bom,
+    lib: Option<&crate::parts::PartsLibrary>,
+) -> FillReport {
+    let mut report = FillReport::default();
+    for line in &mut bom.lines {
+        if line.mpn.as_ref().is_some_and(|m| !m.is_empty()) {
+            report.had += 1;
+            continue;
+        }
+        let package = line.footprint.clone().unwrap_or_default();
+        if let Repair::UsePartNumber(mpn) = plan(&line.value, &package) {
+            line.mpn = Some(mpn);
+            report.from_comment += 1;
+            continue;
+        }
+        let refdes = line.refdes.first().map(String::as_str).unwrap_or("");
+        let hit = lib.and_then(|l| {
+            l.house_part(
+                part_kind_of(refdes, &package),
+                &value_key(&line.value, &package),
+                &package_key(&package),
+            )
+            .ok()
+            .flatten()
+        });
+        match hit.filter(|h| h.exact) {
+            Some(h) => {
+                line.mpn = Some(h.mpn);
+                report.from_library += 1;
+            }
+            None => report.unresolved += 1,
+        }
+    }
+    report
+}

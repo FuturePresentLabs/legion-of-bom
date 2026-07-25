@@ -955,3 +955,22 @@ table.bom tfoot td {
 .sw-outline { background: #f2c14e; }
 .sw-other { background: #7a7f87; }
 .layer-count { font-size: 0.75rem; }
+
+/* Build-from-the-dashboard (ef6): the transcript matters as much as the button,
+   so give it room and a scroll of its own rather than letting it stretch the
+   page. */
+.build-run {
+  margin-top: 0.75rem;
+}
+.build-run .build-log {
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+}
+.build-run .ok {
+  color: var(--ok, #2e7d32);
+}

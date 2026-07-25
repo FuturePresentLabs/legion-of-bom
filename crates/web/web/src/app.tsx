@@ -7,6 +7,7 @@ import {
   artifactUrl,
   type Artifact,
   type Bom,
+  type BuildResult,
   type Circuit,
   type EditResult,
   type ManifestEditPayload,
@@ -375,6 +376,7 @@ function CircuitPage({ name }: { name: string }) {
 
         <Section title="Artifacts">
           <ArtifactChips artifacts={circuit.artifacts} name={circuit.name} />
+          <BuildButton name={circuit.name} />
         </Section>
 
         <EmbeddedDoc artifacts={circuit.artifacts} label="guide" title="Build guide" />
@@ -382,6 +384,51 @@ function CircuitPage({ name }: { name: string }) {
 
         <OrdersSection name={circuit.name} />
       </main>
+    </div>
+  );
+}
+
+// Run the build from here rather than dropping to a terminal (ef6). The whole
+// transcript is shown, because a failed build fails for a reason worth reading
+// — a missing footprint, a tool not installed — and "build failed" alone would
+// send the user to the terminal anyway.
+function BuildButton({ name }: { name: string }) {
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<BuildResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run() {
+    setRunning(true);
+    setError(null);
+    setResult(null);
+    try {
+      const r = await api.build(name);
+      // Artifacts changed on disk; the page's live poll picks them up.
+      setResult(r);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div class="build-run">
+      <button type="button" onClick={run} disabled={running}>
+        {running ? "Building…" : `Build ${name}`}
+      </button>
+      {running && (
+        <span class="muted"> running the same steps as `lob build`…</span>
+      )}
+      {error && <p class="error">{error}</p>}
+      {result && (
+        <>
+          <p class={result.ok ? "ok" : "error"}>
+            {result.ok ? "Build complete" : "Build did not finish"}
+          </p>
+          <pre class="build-log">{result.output}</pre>
+        </>
+      )}
     </div>
   );
 }
