@@ -13,6 +13,7 @@
 pub mod board;
 pub mod bom;
 pub mod drc;
+pub mod eagle;
 pub mod easyeda;
 pub mod edit;
 pub mod fab;
@@ -58,6 +59,10 @@ pub use board::{
 };
 pub use bom::{generate_bom, Bom, BomLine};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
+pub use eagle::{
+    map_footprint, map_footprint_for, parse_board as parse_eagle_board,
+    parse_schematic as parse_eagle_schematic, to_skidl, EagleImport, EaglePlacement,
+};
 pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCandidate};
 pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
 pub use fab::{

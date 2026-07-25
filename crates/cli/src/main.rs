@@ -151,6 +151,11 @@ enum Command {
         #[arg(long, default_value = "auto")]
         kit: String,
     },
+    /// Import a board from another EDA tool.
+    Import {
+        #[command(subcommand)]
+        action: ImportCmd,
+    },
     /// Panel design: generate DXF, track orders.
     Panel {
         #[command(subcommand)]
@@ -231,6 +236,25 @@ enum PartsCmd {
     /// structural block against unverified part data.
     Gate {
         circuit: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportCmd {
+    /// Read an Eagle schematic (and optionally its board) into a circuit.
+    ///
+    /// Unlike a fab package, an Eagle schematic carries the netlist, so the
+    /// result is a circuit the pipeline can work on — and can be re-emitted as
+    /// SKiDL to become a definition you edit and re-run.
+    Eagle {
+        /// The `.sch` file.
+        schematic: PathBuf,
+        /// The matching `.brd`, to report the existing placement.
+        #[arg(long)]
+        board: Option<PathBuf>,
+        /// Write a SKiDL script here (default: <schematic>.py next to it).
+        #[arg(long)]
+        skidl: Option<PathBuf>,
     },
 }
 
@@ -337,6 +361,7 @@ fn main() -> ExitCode {
             panel,
             kit,
         } => guide_cmd(circuit, out, panel, kit),
+        Command::Import { action } => import_cmd(action),
         Command::Panel { action } => panel_cmd(action),
     };
 
@@ -1566,6 +1591,71 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
 }
 
 /// Handle `lob panel ...` commands.
+/// `lob import eagle` — read an Eagle design into a circuit, and write SKiDL.
+fn import_cmd(action: ImportCmd) -> Result<()> {
+    match action {
+        ImportCmd::Eagle {
+            schematic,
+            board,
+            skidl,
+        } => {
+            let xml = std::fs::read_to_string(&schematic)
+                .with_context(|| format!("reading {}", schematic.display()))?;
+            let name = schematic
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported");
+            let imp = legion_of_bom_core::parse_eagle_schematic(&xml, name);
+
+            println!(
+                "{name}: {} part(s), {} net(s)",
+                imp.circuit.parts.len(),
+                imp.circuit.nets.len()
+            );
+            if !imp.symbols_skipped.is_empty() {
+                println!(
+                    "  {} schematic symbol(s) skipped (frames, GND/supply markers — not components)",
+                    imp.symbols_skipped.len()
+                );
+            }
+            if !imp.unmapped_footprints.is_empty() {
+                println!(
+                    "  ⚠ {} package(s) have no KiCad footprint and are marked `eagle:` — \
+                     resolve before laying this out:",
+                    imp.unmapped_footprints.len()
+                );
+                for p in imp.unmapped_footprints.iter().take(12) {
+                    println!("      {p}");
+                }
+                if imp.unmapped_footprints.len() > 12 {
+                    println!("      … and {} more", imp.unmapped_footprints.len() - 12);
+                }
+            }
+
+            if let Some(brd) = &board {
+                let btext = std::fs::read_to_string(brd)
+                    .with_context(|| format!("reading {}", brd.display()))?;
+                let places = legion_of_bom_core::parse_eagle_board(&btext);
+                let back = places.iter().filter(|p| p.back).count();
+                println!(
+                    "  board: {} placement(s), {back} on the back — the existing layout, reusable as-is",
+                    places.len()
+                );
+            }
+
+            let out = skidl.unwrap_or_else(|| schematic.with_extension("py"));
+            std::fs::write(&out, legion_of_bom_core::to_skidl(&imp))
+                .with_context(|| format!("writing {}", out.display()))?;
+            println!("  SKiDL: {}", out.display());
+            println!(
+                "  NOTE: symbol libraries are inferred from each reference designator — \
+                 review the Part(...) lines before running it."
+            );
+            Ok(())
+        }
+    }
+}
+
 fn panel_cmd(action: PanelCmd) -> Result<()> {
     match action {
         PanelCmd::Dxf { spec, out } => {
