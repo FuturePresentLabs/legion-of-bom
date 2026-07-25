@@ -17,6 +17,7 @@ pub mod easyeda;
 pub mod edit;
 pub mod fab;
 pub mod fetch;
+pub mod gerber;
 pub mod git;
 pub mod guide;
 pub mod images;
@@ -63,6 +64,7 @@ pub use fab::{
     render_board_jpeg, render_board_png, strip_smd, zip_dir,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
+pub use gerber::{layers_to_svg, read_layers, Layer as GerberLayer, LayerKind};
 pub use git::{stage as git_stage, staged_paths, GitError};
 pub use guide::{
     build_guide, guide_to_html, guide_to_pdf, BoardPng, BuildGuide, BuildStep, KitType, PartNote,

@@ -431,6 +431,23 @@ const PCB_VIEWS: { key: string; label: string }[] = [
   { key: "board-layout", label: "Layout" },
   { key: "board-bottom", label: "Bottom" },
   { key: "schematic", label: "Schematic" },
+  { key: "gerber", label: "Gerber" },
+];
+
+// Fab layers, in the order the checklist shows them. Defaults are the stack you
+// actually want to see first: both coppers, the outline and the holes.
+const GERBER_LAYERS: { key: string; label: string; on: boolean }[] = [
+  { key: "cu-top", label: "Copper top", on: true },
+  { key: "cu-bot", label: "Copper bottom", on: true },
+  { key: "silk-top", label: "Silk top", on: false },
+  { key: "silk-bot", label: "Silk bottom", on: false },
+  { key: "mask-top", label: "Mask top", on: false },
+  { key: "mask-bot", label: "Mask bottom", on: false },
+  { key: "paste-top", label: "Paste top", on: false },
+  { key: "paste-bot", label: "Paste bottom", on: false },
+  { key: "drill", label: "Drill", on: true },
+  { key: "outline", label: "Outline", on: true },
+  { key: "other", label: "Fab / courtyard", on: false },
 ];
 
 // Toggle photoreal render ↔ 2D layout ↔ schematic, zoom + pan (hk0), plus an SMD
@@ -438,10 +455,19 @@ const PCB_VIEWS: { key: string; label: string }[] = [
 function PcbViewer({ name, version }: { name: string; version: number }) {
   const [view, setView] = useState("board-top");
   const [smd, setSmd] = useState(true);
+  const [layers, setLayers] = useState<string[]>(
+    GERBER_LAYERS.filter((l) => l.on).map((l) => l.key),
+  );
   const isBoard = view.startsWith("board-");
+  const isGerber = view === "gerber";
   const src =
     `/api/circuits/${encodeURIComponent(name)}/render?view=${view}&v=${version}` +
-    (isBoard && !smd ? "&smd=0" : "");
+    (isBoard && !smd ? "&smd=0" : "") +
+    (isGerber ? `&layers=${layers.join(",")}` : "");
+  const toggleLayer = (k: string) =>
+    setLayers((cur) =>
+      cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k],
+    );
   return (
     <div class="pcb-viewer">
       <div class="pcb-bar">
@@ -456,6 +482,9 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
             </button>
           ))}
         </div>
+        {isGerber && (
+          <span class="layer-count muted">{layers.length} layers</span>
+        )}
         {isBoard && (
           <label class="smd-toggle" title="Hide surface-mount parts — the through-hole board you solder">
             <input
@@ -467,6 +496,21 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
           </label>
         )}
       </div>
+      {isGerber && (
+        <div class="layer-list" role="group" aria-label="Gerber layers">
+          {GERBER_LAYERS.map((l) => (
+            <label key={l.key} class="layer-item">
+              <input
+                type="checkbox"
+                checked={layers.includes(l.key)}
+                onChange={() => toggleLayer(l.key)}
+              />
+              <span class={`swatch sw-${l.key}`} />
+              {l.label}
+            </label>
+          ))}
+        </div>
+      )}
       {/* key=view remounts on toggle so the transform resets between views */}
       <ZoomPan key={`${view}-${smd}`} src={src} alt={`PCB ${view}`} />
       <p class="pcb-hint muted">scroll to zoom · drag to pan · double-click to reset</p>

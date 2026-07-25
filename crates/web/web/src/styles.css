@@ -916,3 +916,42 @@ table.bom tfoot td {
   accent-color: var(--accent);
   cursor: pointer;
 }
+
+/* Gerber layer checklist (02b) — colours match the render's conventions */
+.layer-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.9rem;
+  margin-bottom: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--off-bg);
+}
+.layer-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.layer-item input {
+  cursor: pointer;
+}
+.swatch {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 2px;
+  border: 1px solid rgb(0 0 0 / 0.25);
+}
+.sw-cu-top { background: #c8791f; }
+.sw-cu-bot { background: #3f7fbf; }
+.sw-silk-top, .sw-silk-bot { background: #e8e8e4; }
+.sw-mask-top, .sw-mask-bot { background: #2f7d4f; }
+.sw-paste-top, .sw-paste-bot { background: #9aa0a6; }
+.sw-drill { background: #12141a; }
+.sw-outline { background: #f2c14e; }
+.sw-other { background: #7a7f87; }
+.layer-count { font-size: 0.75rem; }

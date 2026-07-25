@@ -23,8 +23,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use legion_of_bom_core::{
-    default_image_cache_dir, export_board_svg, kicad_cli_path, panel_to_svg, parse_netlist_file,
-    render_board_png, schematic_to_svg, strip_smd, Logo, PanelFile,
+    default_image_cache_dir, export_board_svg, kicad_cli_path, layers_to_svg, panel_to_svg,
+    parse_netlist_file, read_layers, render_board_png, schematic_to_svg, strip_smd, LayerKind,
+    Logo, PanelFile,
 };
 
 use crate::state::AppState;
@@ -37,6 +38,10 @@ pub struct RenderQuery {
     /// picture a builder of a mixed kit actually works on (a2r).
     #[serde(default)]
     smd: Option<u8>,
+    /// For `view=gerber`: comma-separated layer keys to draw (`cu-top,silk-top`).
+    /// Absent or empty draws the whole stack.
+    #[serde(default)]
+    layers: Option<String>,
 }
 
 /// A rasterized board render or a vector panel.
@@ -53,6 +58,7 @@ pub async fn render(
 ) -> Response {
     let view = q.view.unwrap_or_else(|| "board-top".to_string());
     let show_smd = q.smd != Some(0);
+    let layer_sel = q.layers.clone().unwrap_or_default();
 
     // The circuit must exist; grab its panel spec + the repo brand logo.
     let (panel_rel, logo_rel) = match state.project() {
@@ -75,6 +81,7 @@ pub async fn render(
             &name,
             &view,
             show_smd,
+            &layer_sel,
             panel_rel.as_deref(),
             logo_rel.as_deref(),
         )
@@ -111,7 +118,7 @@ impl IntoResponse for RenderErr {
             ),
             RenderErr::BadView(v) => (
                 StatusCode::BAD_REQUEST,
-                format!("unknown view '{v}' (board-top | board-bottom | board-layout | panel | schematic)"),
+                format!("unknown view '{v}' (board-top | board-bottom | board-layout | panel | schematic | gerber)"),
             ),
             RenderErr::Failed(m) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -127,6 +134,7 @@ fn render_view(
     name: &str,
     view: &str,
     show_smd: bool,
+    layer_sel: &str,
     panel_rel: Option<&str>,
     logo_rel: Option<&str>,
 ) -> Result<Rendered, RenderErr> {
@@ -174,6 +182,33 @@ fn render_view(
                 .0;
             write_cache(&cache, &png);
             Ok(Rendered::Png(png))
+        }
+        "gerber" => {
+            // The fab package's own gerbers — the file the board house receives.
+            let dir = root.join("out").join(name).join("fab").join("gerbers");
+            if !dir.is_dir() {
+                return Err(RenderErr::NotBuilt(format!(
+                    "no fab package — run `lob build {name}`"
+                )));
+            }
+            let cache = cache_path(&dir, &format!("gerber:{layer_sel}"), "svg");
+            if let Ok(svg) = std::fs::read_to_string(&cache) {
+                return Ok(Rendered::Svg(svg));
+            }
+            let layers = read_layers(&dir).map_err(|e| RenderErr::Failed(e.to_string()))?;
+            let show: Vec<LayerKind> = layer_sel
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|k| {
+                    LAYER_KEYS
+                        .iter()
+                        .find(|(key, _)| *key == k)
+                        .map(|(_, v)| *v)
+                })
+                .collect();
+            let svg = layers_to_svg(&layers, &show);
+            write_cache(&cache, svg.as_bytes());
+            Ok(Rendered::Svg(svg))
         }
         "schematic" => {
             // Drawn from the parsed netlist — no kicad-cli, so it's always
@@ -256,6 +291,21 @@ fn tht_only_board(board: &FsPath, name: &str) -> Result<PathBuf, RenderErr> {
     std::fs::write(&out, strip_smd(&src)).map_err(|e| RenderErr::Failed(e.to_string()))?;
     Ok(out)
 }
+
+/// URL keys the gerber view accepts, in the order the layer list shows them.
+const LAYER_KEYS: &[(&str, LayerKind)] = &[
+    ("cu-top", LayerKind::CopperTop),
+    ("cu-bot", LayerKind::CopperBottom),
+    ("silk-top", LayerKind::SilkTop),
+    ("silk-bot", LayerKind::SilkBottom),
+    ("mask-top", LayerKind::MaskTop),
+    ("mask-bot", LayerKind::MaskBottom),
+    ("paste-top", LayerKind::PasteTop),
+    ("paste-bot", LayerKind::PasteBottom),
+    ("drill", LayerKind::Drill),
+    ("outline", LayerKind::Outline),
+    ("other", LayerKind::Other),
+];
 
 /// The board file for `name`, or `NotBuilt` when it hasn't been built.
 fn board_path(root: &FsPath, name: &str) -> Result<PathBuf, RenderErr> {
