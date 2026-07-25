@@ -77,7 +77,7 @@ impl Polarity {
 
 /// Resolve a part's polarity from its reference designator and footprint. A
 /// ceramic/film cap is unpolarised; an electrolytic/tantalum one is `Plus`.
-fn detect_polarity(refdes: &str, footprint: &str) -> Option<Polarity> {
+pub(crate) fn detect_polarity(refdes: &str, footprint: &str) -> Option<Polarity> {
     let name = footprint
         .rsplit(':')
         .next()
@@ -353,7 +353,7 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         .collect();
 
     // Attach the circuit value + resolve polarity per part.
-    let mut parts: Vec<PlacedPart> = placed
+    let parts: Vec<PlacedPart> = placed
         .into_iter()
         .map(|mut p| {
             if let Some(v) = values.get(p.refdes.as_str()) {
@@ -363,6 +363,24 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
             p
         })
         .collect();
+    Ok(guide_from_parts(
+        circuit.name(),
+        parts,
+        board_outline(board_pcb).unwrap_or((0.0, 0.0, 10.0, 10.0)),
+    ))
+}
+
+/// Build the ordered steps from already-placed parts.
+///
+/// Shared by the two ways a board reaches us: one we laid out (parsed from its
+/// `.kicad_pcb`) and one that was imported, where position and side come from a
+/// pick-and-place file and there is no footprint library behind them. The
+/// sequencing is a property of the parts, not of where they were read from.
+pub fn guide_from_parts(
+    name: &str,
+    mut parts: Vec<PlacedPart>,
+    outline: (f64, f64, f64, f64),
+) -> BuildGuide {
     parts.sort_by_key(|p| refdes_key(&p.refdes));
 
     // Group into ordered steps by side then kind: the BACK side first (mostly SMD
@@ -403,16 +421,16 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
         }
     }
 
-    Ok(BuildGuide {
-        name: circuit.name().to_string(),
-        outline: board_outline(board_pcb).unwrap_or((0.0, 0.0, 10.0, 10.0)),
+    BuildGuide {
+        name: name.to_string(),
+        outline,
         kit: detect_kit(&parts),
         brand: None,
         intro: None,
         tools: Vec::new(),
         kit_cautions: Vec::new(),
         steps,
-    })
+    }
 }
 
 impl BuildGuide {

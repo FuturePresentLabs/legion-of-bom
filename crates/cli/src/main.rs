@@ -256,6 +256,17 @@ enum ImportCmd {
         #[arg(long)]
         skidl: Option<PathBuf>,
     },
+    /// Build a DIY assembly guide and Visual BOM for an imported fab package.
+    Guide {
+        /// The package directory (BOM + pick-and-place + gerbers).
+        package: PathBuf,
+        /// Name for the guide (default: the directory's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Where to write; defaults to the package directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1651,6 +1662,64 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                 "  NOTE: symbol libraries are inferred from each reference designator — \
                  review the Part(...) lines before running it."
             );
+            Ok(())
+        }
+
+        ImportCmd::Guide { package, name, out } => {
+            let board = legion_of_bom_core::read_package(&package)
+                .with_context(|| format!("reading {}", package.display()))?;
+            let stem = name.unwrap_or_else(|| {
+                package
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("imported")
+                    .to_string()
+            });
+            let dir = out.unwrap_or_else(|| package.clone());
+            std::fs::create_dir_all(&dir)?;
+
+            let guide = board.to_guide(&stem);
+            let steps = guide.steps.len();
+            let placed: usize = guide.steps.iter().map(|s| s.parts.len()).sum();
+            // No photoreal render: an imported board has gerbers, not a KiCad
+            // board we can ask kicad-cli to draw.
+            let html = guide_to_html(&guide, None, None);
+            let gpath = dir.join(format!("{stem}-guide.html"));
+            std::fs::write(&gpath, html).with_context(|| format!("writing {}", gpath.display()))?;
+            println!("{stem}: {steps} step(s), {placed} part(s)");
+            println!("  guide: {}", gpath.display());
+
+            let bom = board.to_bom();
+            let cache = default_image_cache_dir();
+            let mut fetched = 0usize;
+            let thumbs: Vec<Option<String>> = bom
+                .lines
+                .iter()
+                .map(|l| {
+                    let t = resolve_photo(l, &cache);
+                    fetched += t.is_some() as usize;
+                    t
+                })
+                .collect();
+            let vpath = dir.join(format!("{stem}-vbom.html"));
+            std::fs::write(&vpath, bom.to_visual_html(&stem, &thumbs))
+                .with_context(|| format!("writing {}", vpath.display()))?;
+            println!(
+                "  vbom:  {} ({fetched}/{} photo(s))",
+                vpath.display(),
+                bom.lines.len()
+            );
+
+            let with_mpn = bom.lines.iter().filter(|l| l.mpn.is_some()).count();
+            if with_mpn < bom.lines.len() {
+                println!(
+                    "  NOTE: {}/{} BOM lines carry no part number — this package left the \
+                     distributor column blank, so those cannot be priced or ordered directly. \
+                     `lob parts suggest` can propose candidates from value + package.",
+                    bom.lines.len() - with_mpn,
+                    bom.lines.len()
+                );
+            }
             Ok(())
         }
     }
