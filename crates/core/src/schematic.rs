@@ -31,7 +31,9 @@ mod sheet {
     pub const ROW_H: f64 = 175.0;
     pub const BOX_W: f64 = 108.0;
     pub const BOX_H: f64 = 46.0;
-    pub const MARGIN: f64 = 40.0;
+    /// Clear space between the sheet frame and the drawing, so net labels and rail
+    /// symbols sit inside it rather than on it.
+    pub const MARGIN: f64 = 62.0;
     /// Extra room on the right for a trunk + net label hanging off the last column.
     pub const GUTTER: f64 = 70.0;
     /// Preferred symbol scale, and the slot a symbol is fitted into.
@@ -277,6 +279,12 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     // down its sides so every pin still gets its own attach point.
     let mut used_pins: HashMap<&str, Vec<String>> = HashMap::new();
     for net in circuit.nets() {
+        // Power pins are drawn as rail/ground stubs off the top and bottom, so they
+        // must not also claim a slot on the box's sides — a pin shown in two places
+        // is worse than a pin shown in one.
+        if is_power(&net.name) {
+            continue;
+        }
         for pin in &net.pins {
             let e = used_pins.entry(pin.refdes.0.as_str()).or_default();
             if !e.contains(&pin.pin) {
@@ -522,14 +530,41 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
 
     // Parts on top: the real KiCad symbol where one resolved, else a labelled box.
     for p in &placed {
-        // Caption sits below everything this part draws — body *and* any downward
-        // ground stub — so a cap's value can't sit on top of its ground symbol.
-        let label_y = lowest
-            .get(p.refdes.as_str())
-            .copied()
-            .unwrap_or(p.y() + sheet::BOX_H)
-            + 14.0;
-        let value_y = label_y + 12.0;
+        // Caption placement. A symbol's pins run out of its top and bottom and the
+        // wires leave along them, so putting the caption underneath drops it right
+        // on a wire — which is what made a resistor look like it had a third lead.
+        // Beside the body instead, the way KiCad does it. A fallback box is wide and
+        // has its pins on the sides, so that one keeps its caption below.
+        // Beside the body when every pin runs vertically (a resistor, a cap): the
+        // sides are clear, and putting it underneath would drop it on the wire
+        // leaving the bottom pin. When any pin runs sideways — a jack's contacts, a
+        // header's two rows — the sides are exactly where the stubs and their
+        // labels are, so the caption goes below instead.
+        let sideways = p
+            .sym
+            .as_ref()
+            .is_some_and(|g| g.pins.iter().any(|q| q.outward().0.abs() > 0.5));
+        let (label_x, label_y, value_y, anchor) = match p.sym.as_ref() {
+            Some(g) if !sideways => {
+                let (_, _, x1, _) = g.bounds();
+                let (right, _) = p.sym_px(x1, 0.0);
+                (right + 7.0, p.cy() - 2.0, p.cy() + 11.0, "start")
+            }
+            Some(_) => {
+                let below = lowest
+                    .get(p.refdes.as_str())
+                    .copied()
+                    .unwrap_or(p.y() + sheet::BOX_H);
+                (p.cx(), below + 14.0, below + 26.0, "middle")
+            }
+            None => {
+                let below = lowest
+                    .get(p.refdes.as_str())
+                    .copied()
+                    .unwrap_or(p.y() + sheet::BOX_H);
+                (p.cx(), below + 14.0, below + 26.0, "middle")
+            }
+        };
         match p.sym.as_ref() {
             Some(g) => {
                 s.push_str(&symbol_svg(p, g, ink));
@@ -564,17 +599,16 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
             }
         }
         s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{label_y:.1}\" font-family=\"ui-monospace,monospace\" \
-             font-size=\"13\" font-weight=\"600\" fill=\"{ink}\" text-anchor=\"middle\">{}</text>",
-            p.cx(),
+            "<text x=\"{label_x:.1}\" y=\"{label_y:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"12\" font-weight=\"600\" fill=\"{ink}\" text-anchor=\"{anchor}\">{}</text>",
             xml_escape(&p.refdes)
         ));
         if !p.value.is_empty() {
-            let value = ellipsize(&p.value, 16);
+            // Beside a symbol there is only the column gutter to play with.
+            let value = ellipsize(&p.value, if anchor == "start" { 11 } else { 18 });
             s.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{value_y:.1}\" font-family=\"ui-monospace,monospace\" \
-                 font-size=\"10\" fill=\"#6b7280\" text-anchor=\"middle\">{}</text>",
-                p.cx(),
+                "<text x=\"{label_x:.1}\" y=\"{value_y:.1}\" font-family=\"ui-monospace,monospace\" \
+                 font-size=\"10\" fill=\"#6b7280\" text-anchor=\"{anchor}\">{}</text>",
                 xml_escape(&value)
             ));
         }
