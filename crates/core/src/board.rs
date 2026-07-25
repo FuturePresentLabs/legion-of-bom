@@ -98,11 +98,13 @@ impl PartFacts {
         )
     }
 
-    /// [`keepout_at`](Self::keepout_at) for a footprint rotated `rot_deg`. Only
-    /// quarter turns change the box: 90°/270° swap width and height (the pad-offset
-    /// rotation is negligible for the near-centred controls this is used on).
+    /// [`keepout_at`](Self::keepout_at) for a footprint rotated `rot_deg`. Quarter
+    /// turns swap width and height **and** carry the keep-out's origin offset
+    /// around with them — a footprint whose origin isn't its centre (a pot's origin
+    /// sits at pin 1, its body several mm away) lands somewhere quite different
+    /// once rotated, so the offset must rotate too.
     fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
-        let (ox, oy) = self.origin_offset;
+        let (ox, oy) = rotate_offset(self.origin_offset, rot_deg);
         let ox = if back { -ox } else { ox };
         let (w, h) = self.extent;
         let (ew, eh) = if (rot_deg / 90.0).round() as i64 % 2 != 0 {
@@ -119,16 +121,37 @@ impl PartFacts {
     }
 
     /// This part's through-hole pad keep-outs in absolute board coordinates for a
-    /// placement with origin at `(x, y)` (X mirrored on the back, like the pads).
-    fn tht_pads_at(&self, x: f64, y: f64, back: bool) -> Vec<Rect> {
+    /// placement with origin at `(x, y)`, rotated `rot_deg` (X mirrored on the back,
+    /// like the pads). Pins occupy both copper layers, so these gate what may sit
+    /// opposite them — and a rotated part's pins move, so the rotation must be
+    /// applied here or the placer reserves the wrong squares (a rotated pot's
+    /// mounting lugs land on top of a back-side SMD pad).
+    fn tht_pads_at(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Vec<Rect> {
         self.tht_pads
             .iter()
-            .map(|&(a, b, c, d)| {
+            .map(|&r| {
+                let (a, b, c, d) = rotate_rect(r, rot_deg);
                 let (x0, x1) = if back { (-c, -a) } else { (a, c) };
                 (x + x0, y + b, x + x1, y + d)
             })
             .collect()
     }
+}
+
+/// Rotate a footprint-relative rect by `deg` (quarter turns) about the footprint
+/// origin, re-normalised to `(min_x, min_y, max_x, max_y)`.
+///
+/// Uses **KiCad's** footprint-rotation sense — a `(at x y 90)` footprint maps a
+/// local pad `(x, y)` to `(y, -x)` (KiCad's Y axis points down) — which is
+/// [`rotate_offset`] with the angle negated, and matches the free-part path's own
+/// `(origin_offset.1, -origin_offset.0)`. Getting this backwards still yields a
+/// DRC-clean board (the reserved squares just land elsewhere) but reserves the
+/// wrong space and measurably degrades routing, so it is pinned here deliberately.
+fn rotate_rect(rect: Rect, deg: f64) -> Rect {
+    let (a, b, c, d) = rect;
+    let (x0, y0) = rotate_offset((a, b), -deg);
+    let (x1, y1) = rotate_offset((c, d), -deg);
+    (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
 }
 
 /// Assigns a board position to each part — **the** extensibility seam. The
@@ -232,23 +255,22 @@ impl Placer for GridPlacer {
 /// whose *pins* form a wide horizontal row is rotated so the pins face into the
 /// board.
 fn control_rotation(f: &PartFacts) -> f64 {
-    // Stand a control on end when its through-hole pins sit in a horizontal row so
-    // they face into the board rather than splaying sideways. Keys off the pin span
-    // (the courtyard is often square even when the pins are a wide row); falls back
-    // to the courtyard for parts with no through-hole pads.
-    //
-    // NOTE: [`PartFacts::body_extent`] shows a pot's *body* is landscape (wider than
-    // tall), so the ideal orientation is a quarter-turn (pins horizontal). But
-    // rotating an anchored control 90° currently makes the placer collide with
-    // neighbours/edges and the router can't recover (DRC errors + unstable
-    // placement) — so that stays gated behind the deeper placer/router work rather
-    // than a rotation heuristic. See the pot-rotation bead.
-    let (w, h) = pad_span(f).unwrap_or(f.extent);
-    if w > h * 1.2 {
-        90.0
-    } else {
-        0.0
+    // Stand a control narrow on the board's width axis. Decide on the physical
+    // *body* (courtyard), not the keep-out — a pot's solder lugs inflate its
+    // keep-out taller-than-wide even though the body is landscape, so rotating it a
+    // quarter turn lays its pin column into a horizontal row (the ideal). A jack,
+    // taller than wide, stays upright. A square-bodied part whose pins form a wide
+    // row still rotates so the pins face into the board.
+    let (ew, eh) = f.body_extent;
+    if ew > eh * 1.05 {
+        return 90.0;
     }
+    if let Some((pw, ph)) = pad_span(f) {
+        if pw > ph * 1.2 {
+            return 90.0;
+        }
+    }
+    0.0
 }
 
 /// Physical body span `(w, h)` for orientation decisions — the courtyard if the
@@ -675,7 +697,7 @@ impl Placer for SeededPlacer {
                 back,
                 height_mm: f.height_mm,
                 standoff_mm: f.standoff_mm,
-                tht_pads: f.tht_pads_at(px, py, back),
+                tht_pads: f.tht_pads_at(px, py, back, rotation_deg),
             });
             // Centroid seed = the mount point (cutout), where the body sits.
             pos.insert(refdes.clone(), (x, y));
@@ -712,7 +734,7 @@ impl Placer for SeededPlacer {
                 back,
                 height_mm: f.height_mm,
                 standoff_mm: f.standoff_mm,
-                tht_pads: f.tht_pads_at(cx, cy, back),
+                tht_pads: f.tht_pads_at(cx, cy, back, rotation_deg),
             });
             pos.insert(refdes.clone(), (cx, cy));
             placed.insert(refdes.clone());
@@ -852,15 +874,9 @@ impl Placer for SeededPlacer {
             let target = (target.0 + nudge.0, target.1 + nudge.1);
 
             // Through-hole pins at a candidate keep-out centre (cx,cy): the origin
-            // sits at (cx-ox, cy-oy). Only computed for the un-rotated case (a
-            // rotated part is a wide SMD one with no through-holes).
-            let cand_tht = |cx: f64, cy: f64| -> Vec<Rect> {
-                if rot == 0.0 {
-                    f.tht_pads_at(cx - ox, cy - oy, back)
-                } else {
-                    Vec::new()
-                }
-            };
+            // sits at (cx-ox, cy-oy), and the pins rotate with the part.
+            let cand_tht =
+                |cx: f64, cy: f64| -> Vec<Rect> { f.tht_pads_at(cx - ox, cy - oy, back, rot) };
             // Nearest spot whose body + pins clash with nothing already placed
             // (side- and height-aware — 25z.5); if the board is full, drop it just
             // below the outline where DRC flags it (never overlap).
@@ -2121,8 +2137,13 @@ fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &s
             Sexpr::sym("edge"),
             Sexpr::sym("0.5"),
         ]),
+        // Solid-connect pads to the plane (a low-impedance ground; jack sleeves +
+        // header GND especially want it). Also removes the fragile thermal-spoke
+        // dependency so a tightly-placed edge-hugging GND pad can't "starve" to a
+        // single spoke.
         Sexpr::list(vec![
             Sexpr::sym("connect_pads"),
+            Sexpr::sym("yes"),
             kv("clearance", Sexpr::sym("0.2")),
         ]),
         kv("min_thickness", Sexpr::sym("0.25")),
@@ -2343,6 +2364,30 @@ mod tests {
         assert_eq!(rotate_offset((3.0, 1.0), 90.0), (-1.0, 3.0));
         assert_eq!(rotate_offset((3.0, 1.0), 180.0), (-3.0, -1.0));
         assert_eq!(rotate_offset((3.0, 1.0), 270.0), (1.0, -3.0));
+    }
+
+    /// The THT keep-outs of a *rotated* part must move with it, in KiCad's
+    /// rotation sense — a local pad `(x, y)` maps to `(y, -x)` at +90°. Reserving
+    /// the un-rotated (or oppositely-rotated) squares still yields a DRC-clean
+    /// board, it just reserves the wrong space and degrades routing, so pin it.
+    #[test]
+    fn tht_keepouts_rotate_with_the_part_in_kicad_sense() {
+        // A lug 7.5mm out on +X, like an Alpha pot's mounting tab.
+        let f = a_fact((14.0, 14.0), (0.0, 0.0), vec![(7.0, -0.5, 8.0, 0.5)]);
+
+        // Un-rotated: the lug stays on +X of the origin.
+        let flat = f.tht_pads_at(100.0, 50.0, false, 0.0);
+        assert_eq!(flat, vec![(107.0, 49.5, 108.0, 50.5)]);
+
+        // Rotated 90°: (x, y) -> (y, -x), so the +X lug swings to -Y.
+        let turned = f.tht_pads_at(100.0, 50.0, false, 90.0);
+        assert_eq!(turned, vec![(99.5, 42.0, 100.5, 43.0)]);
+
+        // A rotated part's keep-out box carries its origin offset around too.
+        let off = a_fact((10.0, 4.0), (3.0, 0.0), vec![]);
+        let box_rot = off.keepout_at_rot(0.0, 0.0, false, 90.0);
+        // extent swaps to (4,10) and the offset rotates to (0,3).
+        assert_eq!(box_rot, (-2.0, -2.0, 2.0, 8.0));
     }
 
     #[test]
