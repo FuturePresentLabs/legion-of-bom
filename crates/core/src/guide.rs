@@ -222,10 +222,23 @@ pub struct BoardPng<'a> {
     pub height: u32,
 }
 
-/// Fraction of the render frame KiCad's `pcb render` fits the board bbox to
-/// (orthographic top, centred) — calibrated against real renders. Board-mm →
-/// image-px scale is `PHOTOREAL_FIT · min(W/w_mm, H/h_mm)`.
-const PHOTOREAL_FIT: f64 = 0.70;
+/// Board-mm → image-px scale for a `pcb render` frame of `w_px` × `h_px` showing a
+/// board of `w_mm` × `h_mm`, centred.
+///
+/// KiCad renders orthographically with a camera that frames the board's **bounding
+/// circle**, so what fits the viewport is the board's *diagonal* — against the
+/// frame's smaller dimension, since the circle has to fit both ways. That makes the
+/// scale depend on the board's aspect ratio, which is why a single "fraction of the
+/// frame" constant could never be right: it was ~40% short on a tall 5 HP Eurorack
+/// board, dragging every highlight box off its part. Measured against a real render
+/// this predicts the board's pixel size to within 0.2%.
+fn render_scale(w_px: f64, h_px: f64, w_mm: f64, h_mm: f64) -> f64 {
+    let diagonal = w_mm.hypot(h_mm);
+    if diagonal <= 0.0 {
+        return 1.0;
+    }
+    w_px.min(h_px) / diagonal
+}
 
 /// A build-step kind, in low-profile-first assembly order (DESIGN 7.8). Polarity
 /// cautions are derived per part (see [`detect_polarity`]), not fixed per kind —
@@ -490,6 +503,24 @@ fn refdes_key(refdes: &str) -> (String, u64) {
     (p.to_string(), n)
 }
 
+/// Quarter turns in `deg`, normalised to 0..=3.
+fn quarter_turns(deg: f64) -> i64 {
+    (((deg / 90.0).round() as i64) % 4 + 4) % 4
+}
+
+/// Rotate a footprint-local point by a footprint orientation, in **KiCad's** sense:
+/// a `(at x y 90)` footprint maps a local `(x, y)` to `(y, -x)` (KiCad's Y axis
+/// points down). Matches `board::rotate_rect`, which places the pads in the first
+/// place — the two must agree or the highlight drifts off the part.
+fn rotate_kicad((x, y): (f64, f64), deg: f64) -> (f64, f64) {
+    match quarter_turns(deg) {
+        1 => (y, -x),
+        2 => (-x, -y),
+        3 => (-y, x),
+        _ => (x, y),
+    }
+}
+
 /// Parse footprints from a `.kicad_pcb`: refdes, centre, pad bounding box, side.
 fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
     let root = Sexpr::parse(board_pcb)?;
@@ -500,6 +531,12 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
             at.and_then(|a| a.nth_atom(1)).and_then(f).unwrap_or(0.0),
             at.and_then(|a| a.nth_atom(2)).and_then(f).unwrap_or(0.0),
         );
+        // A footprint's rotation is the third atom of its `(at …)`. Pad positions
+        // are stored *un*-rotated (KiCad applies the footprint's orientation when it
+        // draws), so the highlight box must apply it too — otherwise every rotated
+        // part (a 90° pot, the power header) gets a box of the wrong shape in the
+        // wrong place.
+        let frot = at.and_then(|a| a.nth_atom(3)).and_then(f).unwrap_or(0.0);
         let refdes = fp
             .get_all("property")
             .into_iter()
@@ -541,7 +578,15 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
                 size.and_then(|s| s.nth_atom(1)).and_then(f).unwrap_or(0.5),
                 size.and_then(|s| s.nth_atom(2)).and_then(f).unwrap_or(0.5),
             );
-            let (x, y) = (fx + px, fy + py);
+            // Rotate the pad about the footprint origin, then translate. A 90° turn
+            // also swaps the pad's own width/height.
+            let (rx, ry) = rotate_kicad((px, py), frot);
+            let (pw, ph) = if quarter_turns(frot) % 2 != 0 {
+                (ph, pw)
+            } else {
+                (pw, ph)
+            };
+            let (x, y) = (fx + rx, fy + ry);
             bb.0 = bb.0.min(x - pw / 2.0);
             bb.1 = bb.1.min(y - ph / 2.0);
             bb.2 = bb.2.max(x + pw / 2.0);
@@ -1038,7 +1083,7 @@ pub fn guide_to_pdf(
             let ds = (cw / iw).min(360.0 / ih); // page pt per image px
             let (dw, dh) = (iw * ds, ih * ds);
             let ix = m + (cw - dw) / 2.0;
-            let sc = PHOTOREAL_FIT * (iw / (ox1 - ox0)).min(ih / (oy1 - oy0)); // px/mm
+            let sc = render_scale(iw, ih, ox1 - ox0, oy1 - oy0); // px/mm
             let (cx, cy) = ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0);
             let mapx = |x: f64| ix + (iw / 2.0 + (x - cx) * sc) * ds;
             let mapy = |y: f64| diag_top - (ih / 2.0 + (y - cy) * sc) * ds;
@@ -1239,7 +1284,7 @@ fn photoreal_board_svg(
 ) -> String {
     let (x0, y0, x1, y1) = outline;
     let (w, h) = (board.width as f64, board.height as f64);
-    let scale = PHOTOREAL_FIT * (w / (x1 - x0)).min(h / (y1 - y0));
+    let scale = render_scale(w, h, x1 - x0, y1 - y0);
     let (cxmm, cymm) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let png = base64::engine::general_purpose::STANDARD.encode(board.png);
     let fs = label_size(outline);
@@ -1606,6 +1651,53 @@ mod tests {
         assert_eq!(m.bbox, (114.0, 99.0, 116.0, 101.0)); // L/R swapped + mirrored
         assert_eq!(m.pin1, Some((116.0, 100.0)));
         assert_eq!(m.cy, 100.0); // Y unchanged
+    }
+
+    /// A rotated part's highlight box must follow the part. Pads are stored
+    /// un-rotated in the board file, so parsing has to apply the footprint's
+    /// orientation — otherwise a 90° pot or power header gets a box of the wrong
+    /// shape in the wrong place (fsn).
+    #[test]
+    fn pad_boxes_follow_footprint_rotation() {
+        // KiCad's sense: +90° maps local (x, y) -> (y, -x).
+        assert_eq!(rotate_kicad((3.0, 1.0), 0.0), (3.0, 1.0));
+        assert_eq!(rotate_kicad((3.0, 1.0), 90.0), (1.0, -3.0));
+        assert_eq!(rotate_kicad((3.0, 1.0), 180.0), (-3.0, -1.0));
+        assert_eq!(rotate_kicad((3.0, 1.0), 270.0), (-1.0, 3.0));
+
+        // A two-pad part rotated 90° yields a box that is wide, not tall.
+        let pcb = r#"(kicad_pcb (footprint "X" (layer "F.Cu") (at 100 50 90)
+              (property "Reference" "RV1")
+              (pad "1" thru_hole circle (at 0 0) (size 1 1))
+              (pad "2" thru_hole circle (at 0 6) (size 1 1))))"#;
+        let parts = parse_board(pcb).expect("parse");
+        let p = parts.iter().find(|p| p.refdes == "RV1").unwrap();
+        let (x0, y0, x1, y1) = p.bbox;
+        assert!(
+            (x1 - x0) > (y1 - y0),
+            "rotated part's box should be landscape, got {:.1}x{:.1}",
+            x1 - x0,
+            y1 - y0
+        );
+        // Pads land at (100,50) and (106,50) after the turn.
+        assert!(
+            (x0 - 99.5).abs() < 1e-6 && (x1 - 106.5).abs() < 1e-6,
+            "{p:?}"
+        );
+    }
+
+    /// KiCad frames the board's bounding *circle*, so the mm→px scale depends on
+    /// the diagonal, not on a fixed fraction of the frame. Pinned against a real
+    /// 5 HP render: a 25.4 × 128.5 mm board in a 1568 × 1176 px frame measured
+    /// ~9.0 px/mm (the old fixed-fraction constant gave 6.41 and dragged every
+    /// highlight off its part).
+    #[test]
+    fn render_scale_matches_a_real_render() {
+        let s = render_scale(1568.0, 1176.0, 25.4, 128.5);
+        assert!((s - 8.98).abs() < 0.05, "expected ~8.98 px/mm, got {s:.3}");
+        // Square frame, square board: the diagonal governs.
+        let sq = render_scale(1000.0, 1000.0, 100.0, 100.0);
+        assert!((sq - 1000.0 / 141.42).abs() < 0.01, "got {sq}");
     }
 
     #[test]
