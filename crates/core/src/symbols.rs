@@ -388,26 +388,42 @@ pub enum SymShape {
     },
 }
 
-/// A symbol pin: where its wire attaches, in symbol space.
+/// A symbol pin, in symbol space (mm, Y up).
+///
+/// In KiCad's format a pin's `(at x y angle)` is its **connection point** — the
+/// free end a wire attaches to — and the pin graphic runs from there *into* the
+/// body along `angle`. (A `Device:R` pin sits at y = 3.81 while the body top is
+/// 2.54: exactly one pin length away, pointing back at the body.) Reading this
+/// backwards attaches every wire to the body edge instead of the pin end.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymPin {
+    /// Pin identifier. KiCad calls it the "number" but it is often a name — an
+    /// audio jack's pins are `T`, `S`, `TN` — and the netlist uses the same token,
+    /// so the two match directly.
     pub number: String,
-    /// The pin's root (where it meets the body).
+    /// The connection point: where a wire attaches.
     pub x: f64,
     pub y: f64,
-    /// Direction the pin points, degrees CCW (0 = +X).
+    /// Direction from the connection point toward the body, degrees CCW (0 = +X).
     pub angle: f64,
     pub length: f64,
 }
 
 impl SymPin {
-    /// The far end of the pin — where a wire connects.
-    pub fn tip(&self) -> (f64, f64) {
+    /// Where the pin meets the symbol body — the inner end of the drawn lead.
+    pub fn body_end(&self) -> (f64, f64) {
         let r = self.angle.to_radians();
         (
             self.x + self.length * r.cos(),
             self.y + self.length * r.sin(),
         )
+    }
+
+    /// Unit vector pointing *away* from the body, so a wire can leave along the
+    /// pin and read as continuing it rather than crossing it.
+    pub fn outward(&self) -> (f64, f64) {
+        let r = self.angle.to_radians();
+        (-r.cos(), -r.sin())
     }
 }
 
@@ -453,8 +469,8 @@ impl SymbolGraphics {
         }
         for p in &self.pins {
             add(p.x, p.y);
-            let (tx, ty) = p.tip();
-            add(tx, ty);
+            let (bx, by) = p.body_end();
+            add(bx, by);
         }
         if b.0 > b.2 {
             (0.0, 0.0, 0.0, 0.0)
@@ -658,13 +674,19 @@ mod tests {
         assert!(fills.contains(&SymFill::Background));
         assert!(fills.contains(&SymFill::Outline));
 
-        // A pin's wire attaches at its tip, `length` away along its angle.
+        // A pin's `(at …)` IS the wire connection point, and the drawn lead runs
+        // from there *into* the body, one `length` along `angle`. Reading it the
+        // other way round attaches every wire to the body edge instead of the pin.
         let p1 = g.pins.iter().find(|p| p.number == "1").unwrap();
-        let (tx, ty) = p1.tip();
+        assert_eq!((p1.x, p1.y), (0.0, 3.81), "connection point is the `at`");
+        let (bx, by) = p1.body_end();
         assert!(
-            (tx - 0.0).abs() < 1e-9 && (ty - 2.54).abs() < 1e-9,
-            "{tx},{ty}"
+            bx.abs() < 1e-9 && (by - 2.54).abs() < 1e-9,
+            "body end sits one pin length toward the body, got ({bx},{by})"
         );
+        // …and a wire leaves the opposite way, continuing the pin outward.
+        let (ox, oy) = p1.outward();
+        assert!(ox.abs() < 1e-9 && (oy - 1.0).abs() < 1e-9, "({ox},{oy})");
     }
 
     /// KiCad defines many parts by inheritance — `TL072` is `(extends "LM2904")` —

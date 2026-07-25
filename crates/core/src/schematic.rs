@@ -36,13 +36,16 @@ mod sheet {
     pub const SYM_PX_PER_MM: f64 = 6.5;
     pub const SYM_MAX_W: f64 = 104.0;
     pub const SYM_MAX_H: f64 = 74.0;
+    /// How far a wire runs out along its pin before turning toward the trunk.
+    pub const PIN_STUB: f64 = 10.0;
 }
 
 /// A part awaiting placement: refdes, value, and its resolved symbol.
 type PendingPart<'a> = (&'a str, &'a str, Option<SymbolGraphics>);
 
-/// Where a net attaches to one part: the part, and the point in sheet px.
-type Attach<'a> = (&'a Placed, (f64, f64));
+/// Where a net attaches to one part: the part, the pin's connection point, and
+/// the breakout point a short way out along the pin.
+type Attach<'a> = (&'a Placed, (f64, f64), (f64, f64));
 
 /// A part positioned on the sheet, with its KiCad symbol when one resolved.
 struct Placed {
@@ -89,13 +92,14 @@ impl Placed {
         }
     }
 
-    /// Where a wire should attach for this part's `pin` — the pin's tip when the
-    /// symbol resolved, else the box edge.
-    fn pin_anchor(&self, pin: &str) -> Option<(f64, f64)> {
+    /// Where a wire attaches for this part's `pin`, and the sheet-space direction
+    /// it should leave along: the pin's connection point and its outward vector.
+    fn pin_anchor(&self, pin: &str) -> Option<((f64, f64), (f64, f64))> {
         let g = self.sym.as_ref()?;
         let p = g.pins.iter().find(|p| p.number == pin)?;
-        let (tx, ty) = p.tip();
-        Some(self.sym_px(tx, ty))
+        let (ox, oy) = p.outward();
+        // Symbol space is Y-up, the sheet Y-down, so the vertical component flips.
+        Some((self.sym_px(p.x, p.y), (ox, -oy)))
     }
 }
 
@@ -272,13 +276,21 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
             let Some(p) = pos.get(pin.refdes.0.as_str()).copied() else {
                 continue;
             };
-            if pts.iter().any(|(q, _)| q.refdes == p.refdes) {
+            if pts.iter().any(|(q, _, _)| q.refdes == p.refdes) {
                 continue; // one attach point per part is enough to read
             }
-            let anchor = p.pin_anchor(&pin.pin).unwrap_or((p.cx(), p.cy()));
-            pts.push((p, anchor));
+            // Leave the pin along its own direction before turning toward the
+            // trunk, so the wire continues the pin instead of striking it
+            // side-on. Parts with no resolved symbol just break out sideways.
+            let (at, (dx, dy)) = p.pin_anchor(&pin.pin).unwrap_or_else(|| {
+                // No symbol (a multi-unit part keeps its box): leave from the box
+                // edge, not its middle, so the wire still starts on the outline.
+                ((p.x() + sheet::BOX_W, p.cy()), (1.0, 0.0))
+            });
+            let breakout = (at.0 + dx * sheet::PIN_STUB, at.1 + dy * sheet::PIN_STUB);
+            pts.push((p, at, breakout));
         }
-        pts.sort_by_key(|(p, _)| (p.col, p.row));
+        pts.sort_by_key(|(p, _, _)| (p.col, p.row));
         if pts.len() >= 2 {
             routed.push((net.name.as_str(), pts));
         }
@@ -306,17 +318,20 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         let channel = sheet::COL_W - sheet::BOX_W;
         let trunk =
             pts[0].0.x() + sheet::BOX_W + channel * (lane as f64 + 1.0) / (lanes as f64 + 1.0);
-        let (y0, y1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), (_, a)| {
-            (lo.min(a.1), hi.max(a.1))
-        });
+        let (y0, y1) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), (_, _, b)| {
+                (lo.min(b.1), hi.max(b.1))
+            });
         s.push_str(&format!(
             "<path d=\"M{trunk:.1} {y0:.1} L{trunk:.1} {y1:.1}\" stroke=\"{ink}\" \
              stroke-width=\"1.3\" fill=\"none\"/>"
         ));
-        for (_, (ax, ay)) in pts.iter() {
+        for (_, (ax, ay), (bx, by)) in pts.iter() {
+            // pin end → out along the pin → across to the trunk.
             s.push_str(&format!(
-                "<path d=\"M{ax:.1} {ay:.1} L{trunk:.1} {ay:.1}\" stroke=\"{ink}\" \
-                 stroke-width=\"1.3\" fill=\"none\"/>"
+                "<path d=\"M{ax:.1} {ay:.1} L{bx:.1} {by:.1} L{trunk:.1} {by:.1}\" \
+                 stroke=\"{ink}\" stroke-width=\"1.3\" fill=\"none\"/>"
             ));
         }
         // Net label at the top of the trunk, on a small backing so it stays legible
@@ -325,7 +340,8 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         let lw = label.chars().count() as f64 * 6.0 + 6.0;
         // Stagger by lane as well as by x: two nets leaving the same column at the
         // same height would otherwise print their labels on top of each other.
-        let ly = y0 - 6.0 - lane as f64 * 12.0;
+        // Never let the stagger push a label off the top of the sheet.
+        let ly = (y0 - 6.0 - lane as f64 * 12.0).max(14.0);
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{lw:.1}\" height=\"12\" fill=\"{SHEET_BG}\"/>\
              <text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
@@ -539,11 +555,11 @@ fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
         }
     }
 
-    // Pin leads: body root out to the tip a wire attaches at.
+    // Pin leads: from the connection point in to where the pin meets the body.
     for pin in &g.pins {
         let (rx, ry) = pt(pin.x, pin.y);
-        let (tx, ty) = pin.tip();
-        let (tx, ty) = pt(tx, ty);
+        let (bx, by) = pin.body_end();
+        let (tx, ty) = pt(bx, by);
         s.push_str(&format!(
             "<path d=\"M{rx:.1} {ry:.1} L{tx:.1} {ty:.1}\" stroke=\"{ink}\" \
              stroke-width=\"1.2\" fill=\"none\"/>"
