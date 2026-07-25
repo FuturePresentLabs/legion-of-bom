@@ -426,14 +426,36 @@ function panelCaption(c: Circuit): string {
   return bits.join(" · ");
 }
 
-const PCB_VIEWS: { key: string; label: string }[] = [
-  { key: "board-top", label: "Render" },
-  { key: "board-layout", label: "Layout" },
-  { key: "board-bottom", label: "Bottom" },
+// The viewer is three independent choices, not one flat list: WHAT you are
+// looking at, HOW it is drawn, and WHICH SIDE. Flattened into one row, "Bottom"
+// sat as a peer of "Gerber" and the panel was offered a side it does not have.
+const SUBJECTS: { key: string; label: string }[] = [
+  { key: "pcb", label: "PCB" },
+  { key: "panel", label: "Panel" },
   { key: "schematic", label: "Schematic" },
-  { key: "gerber", label: "Gerber" },
-  { key: "gerber-panel", label: "Gerber (panel)" },
 ];
+const MODES: { key: string; label: string }[] = [
+  { key: "render", label: "Render" },
+  { key: "layout", label: "Layout" },
+  { key: "gerber", label: "Gerber" },
+];
+
+// Which drawings exist for a subject: a panel has no 2D layout export of its
+// own, and a schematic is only ever itself.
+function modesFor(subject: string): string[] {
+  if (subject === "panel") return ["render", "gerber"];
+  if (subject === "schematic") return [];
+  return ["render", "layout", "gerber"];
+}
+
+// The render endpoint's view name for a given choice.
+function viewName(subject: string, mode: string, side: string): string {
+  if (subject === "schematic") return "schematic";
+  if (subject === "panel") return mode === "gerber" ? "gerber-panel" : "panel";
+  if (mode === "gerber") return "gerber";
+  if (mode === "layout") return "board-layout";
+  return side === "bottom" ? "board-bottom" : "board-top";
+}
 
 // Fab layers, in the order the checklist shows them. Defaults are the stack you
 // actually want to see first: both coppers, the outline and the holes.
@@ -451,49 +473,97 @@ const GERBER_LAYERS: { key: string; label: string; on: boolean }[] = [
   { key: "other", label: "Fab / courtyard", on: false },
 ];
 
-// Toggle photoreal render ↔ 2D layout ↔ schematic, zoom + pan (hk0), plus an SMD
-// filter (a2r) — off shows the through-hole-only board a mixed-kit builder solders.
+// One viewer for every artifact (hk0, a2r, 02b): subject x mode x side, with
+// zoom/pan, an SMD filter on board renders, and a layer checklist on gerbers.
 function PcbViewer({ name, version }: { name: string; version: number }) {
-  const [view, setView] = useState("board-top");
+  const [subject, setSubject] = useState("pcb");
+  const [mode, setMode] = useState("render");
+  const [side, setSide] = useState("top");
   const [smd, setSmd] = useState(true);
+  const [flip, setFlip] = useState(false);
+  const [resetKey, setResetKey] = useState(0);
   const [layers, setLayers] = useState<string[]>(
     GERBER_LAYERS.filter((l) => l.on).map((l) => l.key),
   );
-  const [flip, setFlip] = useState(false);
-  const [resetKey, setResetKey] = useState(0);
-  const isBoard = view.startsWith("board-");
-  const isGerber = view.startsWith("gerber");
+
+  const allowed = modesFor(subject);
+  // Keep the mode legal when the subject changes — a panel has no layout.
+  const activeMode = allowed.includes(mode) ? mode : (allowed[0] ?? "render");
+  const view = viewName(subject, activeMode, side);
+  const isGerber = activeMode === "gerber" && subject !== "schematic";
+  // A side only means something on a photoreal board render: on a gerber you
+  // pick layers instead, and a panel has one face.
+  const hasSide = subject === "pcb" && activeMode === "render";
+  const hasSmd = subject === "pcb" && activeMode !== "gerber";
+
   const src =
     `/api/circuits/${encodeURIComponent(name)}/render?view=${view}&v=${version}` +
-    (isBoard && !smd ? "&smd=0" : "") +
+    (hasSmd && !smd ? "&smd=0" : "") +
     (isGerber ? `&layers=${layers.join(",")}` : "");
   const toggleLayer = (k: string) =>
     setLayers((cur) =>
       cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k],
     );
+
   return (
     <div class="pcb-viewer">
       <div class="pcb-bar">
-        <div class="seg pcb-seg" role="group" aria-label="PCB view">
-          {PCB_VIEWS.map((v) => (
+        <div class="seg" role="group" aria-label="Subject">
+          {SUBJECTS.map((sub) => (
             <button
-              key={v.key}
-              aria-pressed={view === v.key}
-              onClick={() => setView(v.key)}
+              key={sub.key}
+              aria-pressed={subject === sub.key}
+              onClick={() => setSubject(sub.key)}
             >
-              {v.label}
+              {sub.label}
             </button>
           ))}
         </div>
-        {isGerber && (
-          <span class="layer-count muted">{layers.length} layers</span>
+        {allowed.length > 0 && (
+          <div class="seg" role="group" aria-label="Drawing">
+            {MODES.filter((m) => allowed.includes(m.key)).map((m) => (
+              <button
+                key={m.key}
+                aria-pressed={activeMode === m.key}
+                onClick={() => setMode(m.key)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {hasSide && (
+          <div class="seg" role="group" aria-label="Side">
+            {["top", "bottom"].map((sd) => (
+              <button
+                key={sd}
+                aria-pressed={side === sd}
+                onClick={() => setSide(sd)}
+              >
+                {sd === "top" ? "Top" : "Bottom"}
+              </button>
+            ))}
+          </div>
+        )}
+        {hasSmd && (
+          <label
+            class="smd-toggle"
+            title="Hide surface-mount parts — the through-hole board you solder"
+          >
+            <input
+              type="checkbox"
+              checked={smd}
+              onChange={(e) => setSmd((e.target as HTMLInputElement).checked)}
+            />
+            SMD
+          </label>
         )}
         <span class="spacer" />
         <button
           class="btn tiny"
           aria-pressed={flip}
           onClick={() => setFlip((f) => !f)}
-          title="Mirror the view — how the board reads from the other side"
+          title="Mirror the view — how it reads from the other side"
         >
           Flip
         </button>
@@ -504,17 +574,8 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
         >
           Reset
         </button>
-        {isBoard && (
-          <label class="smd-toggle" title="Hide surface-mount parts — the through-hole board you solder">
-            <input
-              type="checkbox"
-              checked={smd}
-              onChange={(e) => setSmd((e.target as HTMLInputElement).checked)}
-            />
-            SMD
-          </label>
-        )}
       </div>
+
       {isGerber && (
         <div class="layer-list" role="group" aria-label="Gerber layers">
           {GERBER_LAYERS.map((l) => (
@@ -530,14 +591,16 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
           ))}
         </div>
       )}
-      {/* key=view remounts on toggle so the transform resets between views */}
+      {/* Remount on any choice change so the transform resets between views. */}
       <ZoomPan
         key={`${view}-${smd}-${resetKey}`}
         src={src}
-        alt={`PCB ${view}`}
+        alt={`${subject} ${activeMode}`}
         flip={flip}
       />
-      <p class="pcb-hint muted">scroll to zoom · drag to pan · double-click to reset</p>
+      <p class="pcb-hint muted">
+        scroll to zoom · drag to pan · double-click to reset
+      </p>
     </div>
   );
 }
