@@ -202,6 +202,56 @@ fn strip_models(src: &str) -> String {
     out
 }
 
+/// Remove every surface-mount footprint from a board's S-expression, leaving the
+/// through-hole parts, the copper and the outline (a2r).
+///
+/// On a mixed kit — SMD pre-assembled by the fab, through-hole soldered by the
+/// builder — this is the picture of the board the builder actually works on. A
+/// footprint counts as SMD when none of its pads are `thru_hole`/`np_thru_hole`,
+/// which is also how [`crate::board::PartFacts`] classifies them.
+pub fn strip_smd(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(pos) = rest.find("(footprint ") {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        // Paren-balanced end of this footprint, skipping quoted strings so a paren
+        // inside a name or path can't throw the depth off.
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut end = tail.len();
+        let mut prev = '\0';
+        for (off, c) in tail.char_indices() {
+            if in_str {
+                if c == '"' && prev != '\\' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = off + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            prev = c;
+        }
+        let block = &tail[..end];
+        if block.contains("thru_hole") {
+            out.push_str(block);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Pixel dimensions from a PNG's IHDR (width/height at bytes 16–23) — no decode.
 fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     if png.len() < 24 || &png[0..8] != b"\x89PNG\r\n\x1a\n" {
@@ -500,6 +550,38 @@ mod tests {
         assert!(!out.contains("(model "), "model stripped: {out}");
         // Everything else (both pads) survives.
         assert!(out.contains(r#"(pad "1""#) && out.contains(r#"(pad "2""#));
+    }
+
+    /// The through-hole-only view keeps the parts a builder solders and drops the
+    /// fab-assembled SMD, without disturbing the copper or outline around them.
+    #[test]
+    fn strip_smd_keeps_through_hole_parts_and_everything_else() {
+        let src = concat!(
+            r#"(kicad_pcb (gr_line (start 0 0) (end 10 0))"#,
+            r#"(footprint "R_0603" (layer "B.Cu") (property "Reference" "R1")"#,
+            r#" (pad "1" smd roundrect (at 0 0) (size 1 1)))"#,
+            r#"(footprint "Jack" (layer "F.Cu") (property "Reference" "J1")"#,
+            r#" (pad "T" thru_hole circle (at 0 0) (size 2 2)))"#,
+            r#"(zone (net 1)))"#,
+        );
+        let out = strip_smd(src);
+        assert!(out.contains(r#""Reference" "J1""#), "THT jack kept: {out}");
+        assert!(!out.contains(r#""Reference" "R1""#), "SMD dropped: {out}");
+        // Board furniture around the footprints survives untouched.
+        assert!(out.contains("(gr_line") && out.contains("(zone"));
+    }
+
+    /// A paren inside a quoted footprint name must not desync the block scan.
+    #[test]
+    fn strip_smd_survives_parens_inside_names() {
+        let src = concat!(
+            r#"(footprint "Weird_(x)_0603" (property "Reference" "C9")"#,
+            r#" (pad "1" smd rect (at 0 0) (size 1 1)))"#,
+            r#"(gr_text "after")"#,
+        );
+        let out = strip_smd(src);
+        assert!(!out.contains("C9"), "SMD dropped: {out}");
+        assert!(out.contains(r#"(gr_text "after")"#), "tail intact: {out}");
     }
 
     #[test]

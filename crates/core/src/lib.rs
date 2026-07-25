@@ -60,7 +60,7 @@ pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCand
 pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
 pub use fab::{
     export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos, png_to_jpeg,
-    render_board_jpeg, render_board_png, zip_dir,
+    render_board_jpeg, render_board_png, strip_smd, zip_dir,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use git::{stage as git_stage, staged_paths, GitError};

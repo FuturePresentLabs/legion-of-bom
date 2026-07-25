@@ -433,25 +433,42 @@ const PCB_VIEWS: { key: string; label: string }[] = [
   { key: "schematic", label: "Schematic" },
 ];
 
-// Toggle photoreal render ↔ 2D layout, zoom + pan (bead hk0).
+// Toggle photoreal render ↔ 2D layout ↔ schematic, zoom + pan (hk0), plus an SMD
+// filter (a2r) — off shows the through-hole-only board a mixed-kit builder solders.
 function PcbViewer({ name, version }: { name: string; version: number }) {
   const [view, setView] = useState("board-top");
-  const src = `/api/circuits/${encodeURIComponent(name)}/render?view=${view}&v=${version}`;
+  const [smd, setSmd] = useState(true);
+  const isBoard = view.startsWith("board-");
+  const src =
+    `/api/circuits/${encodeURIComponent(name)}/render?view=${view}&v=${version}` +
+    (isBoard && !smd ? "&smd=0" : "");
   return (
     <div class="pcb-viewer">
-      <div class="seg pcb-seg" role="group" aria-label="PCB view">
-        {PCB_VIEWS.map((v) => (
-          <button
-            key={v.key}
-            aria-pressed={view === v.key}
-            onClick={() => setView(v.key)}
-          >
-            {v.label}
-          </button>
-        ))}
+      <div class="pcb-bar">
+        <div class="seg pcb-seg" role="group" aria-label="PCB view">
+          {PCB_VIEWS.map((v) => (
+            <button
+              key={v.key}
+              aria-pressed={view === v.key}
+              onClick={() => setView(v.key)}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+        {isBoard && (
+          <label class="smd-toggle" title="Hide surface-mount parts — the through-hole board you solder">
+            <input
+              type="checkbox"
+              checked={smd}
+              onChange={(e) => setSmd((e.target as HTMLInputElement).checked)}
+            />
+            SMD
+          </label>
+        )}
       </div>
       {/* key=view remounts on toggle so the transform resets between views */}
-      <ZoomPan key={view} src={src} alt={`PCB ${view}`} />
+      <ZoomPan key={`${view}-${smd}`} src={src} alt={`PCB ${view}`} />
       <p class="pcb-hint muted">scroll to zoom · drag to pan · double-click to reset</p>
     </div>
   );

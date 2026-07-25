@@ -24,7 +24,7 @@ use serde_json::json;
 
 use legion_of_bom_core::{
     default_image_cache_dir, export_board_svg, kicad_cli_path, panel_to_svg, parse_netlist_file,
-    render_board_png, schematic_to_svg, Logo, PanelFile,
+    render_board_png, schematic_to_svg, strip_smd, Logo, PanelFile,
 };
 
 use crate::state::AppState;
@@ -33,6 +33,10 @@ use crate::state::AppState;
 pub struct RenderQuery {
     #[serde(default)]
     view: Option<String>,
+    /// `smd=0` hides surface-mount parts from a board view — the through-hole-only
+    /// picture a builder of a mixed kit actually works on (a2r).
+    #[serde(default)]
+    smd: Option<u8>,
 }
 
 /// A rasterized board render or a vector panel.
@@ -48,6 +52,7 @@ pub async fn render(
     Query(q): Query<RenderQuery>,
 ) -> Response {
     let view = q.view.unwrap_or_else(|| "board-top".to_string());
+    let show_smd = q.smd != Some(0);
 
     // The circuit must exist; grab its panel spec + the repo brand logo.
     let (panel_rel, logo_rel) = match state.project() {
@@ -69,6 +74,7 @@ pub async fn render(
             &root,
             &name,
             &view,
+            show_smd,
             panel_rel.as_deref(),
             logo_rel.as_deref(),
         )
@@ -120,6 +126,7 @@ fn render_view(
     root: &FsPath,
     name: &str,
     view: &str,
+    show_smd: bool,
     panel_rel: Option<&str>,
     logo_rel: Option<&str>,
 ) -> Result<Rendered, RenderErr> {
@@ -144,12 +151,23 @@ fn render_view(
         "board-top" | "board-bottom" => {
             let board = board_path(root, name)?;
             let back = view == "board-bottom";
-            // Serve a cached render when the board hasn't changed since.
-            let cache = cache_path(&board, view, "png");
+            // Serve a cached render when the board hasn't changed since. The SMD
+            // filter is part of the key — the two variants are different pictures.
+            let key = if show_smd {
+                view.to_string()
+            } else {
+                format!("{view}-tht")
+            };
+            let cache = cache_path(&board, &key, "png");
             if let Ok(bytes) = std::fs::read(&cache) {
                 return Ok(Rendered::Png(bytes));
             }
             let kicad = kicad_cli_path().ok_or(RenderErr::NoKicad)?;
+            let board = if show_smd {
+                board
+            } else {
+                tht_only_board(&board, name)?
+            };
             // bare=true (unpopulated, 3D models stripped) — the proven guide path.
             let png = render_board_png(&board, &kicad, true, back)
                 .map_err(|e| RenderErr::Failed(e.to_string()))?
@@ -175,11 +193,21 @@ fn render_view(
         "board-layout" => {
             // The flat 2D layout: copper + silk + fab + edge, as a scalable SVG.
             let board = board_path(root, name)?;
-            let cache = cache_path(&board, view, "svg");
+            let key = if show_smd {
+                view.to_string()
+            } else {
+                format!("{view}-tht")
+            };
+            let cache = cache_path(&board, &key, "svg");
             if let Ok(svg) = std::fs::read_to_string(&cache) {
                 return Ok(Rendered::Svg(svg));
             }
             let kicad = kicad_cli_path().ok_or(RenderErr::NoKicad)?;
+            let board = if show_smd {
+                board
+            } else {
+                tht_only_board(&board, name)?
+            };
             let svg =
                 export_board_svg(&board, &kicad).map_err(|e| RenderErr::Failed(e.to_string()))?;
             write_cache(&cache, svg.as_bytes());
@@ -213,6 +241,20 @@ fn render_panel_svg(
         &finish,
         logo.as_ref(),
     ))
+}
+
+/// Write a through-hole-only copy of the board to the cache dir and return its
+/// path, so `kicad-cli` renders the picture a builder of a mixed kit works on.
+fn tht_only_board(board: &FsPath, name: &str) -> Result<PathBuf, RenderErr> {
+    let src = std::fs::read_to_string(board).map_err(|e| RenderErr::Failed(e.to_string()))?;
+    let out = default_image_cache_dir()
+        .join("lob-render")
+        .join(format!("{name}-tht.kicad_pcb"));
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&out, strip_smd(&src)).map_err(|e| RenderErr::Failed(e.to_string()))?;
+    Ok(out)
 }
 
 /// The board file for `name`, or `NotBuilt` when it hasn't been built.

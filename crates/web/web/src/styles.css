@@ -891,3 +891,28 @@ table.bom tfoot td {
 .scope-page {
   max-width: 1100px;
 }
+
+/* PCB view bar: view segments + the SMD filter (a2r) */
+.pcb-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+  flex-wrap: wrap;
+}
+.pcb-bar .pcb-seg {
+  margin-bottom: 0;
+}
+.smd-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.smd-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
