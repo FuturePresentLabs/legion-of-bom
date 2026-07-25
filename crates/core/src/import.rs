@@ -245,6 +245,37 @@ pub fn read_package(dir: &Path) -> std::io::Result<ImportedBoard> {
         }
     }
 
+    // A package built from CAD sources rather than a fab house ships no
+    // pick-and-place, but an Eagle board file states every part's position —
+    // which is all the build guide needs. Only consulted as a fallback, since a
+    // real CPL describes the board as actually manufactured.
+    if board.placements.is_empty() {
+        for path in &entries {
+            let is_brd = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("brd"));
+            if !is_brd {
+                continue;
+            }
+            if let Ok(xml) = std::fs::read_to_string(path) {
+                board.placements = crate::eagle::parse_board(&xml)
+                    .into_iter()
+                    .map(|p| ImportedPlacement {
+                        refdes: p.refdes,
+                        x_mm: p.x_mm,
+                        y_mm: p.y_mm,
+                        rotation_deg: p.rotation_deg,
+                        back: p.back,
+                    })
+                    .collect();
+                if !board.placements.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
     if board.parts.is_empty() && board.placements.is_empty() {
         board
             .skipped

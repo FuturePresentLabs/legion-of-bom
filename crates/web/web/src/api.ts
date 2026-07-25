@@ -53,7 +53,10 @@ export interface BuildCopy {
 
 export interface Circuit {
   name: string;
-  source: string;
+  /// Null for an imported circuit, which has no source to show.
+  source: string | null;
+  /// The imported fab-package directory, when this is somebody else's board.
+  import: string | null;
   panel: string | null;
   panel_hp: number | null;
   panel_finish: string | null;

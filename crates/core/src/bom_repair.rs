@@ -339,6 +339,16 @@ fn normalize_value(value: &str) -> String {
     if let Some(head) = v.strip_suffix("MEG") {
         v = format!("{head}M");
     }
+    // `1.0N` and `1N` are one capacitor. Canonicalise the number so a trailing
+    // zero cannot split a part across two library keys — or, worse, read as a
+    // disagreement between a BOM and the schematic it was generated from.
+    let split = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let (num, rest) = v.split_at(split);
+    if let Ok(n) = num.parse::<f64>() {
+        v = format!("{n}{rest}");
+    }
     v
 }
 
@@ -538,6 +548,10 @@ mod tests {
             assert_eq!(value_key(spelling, "0603RES"), "10K", "{spelling}");
         }
         assert_eq!(value_key("2.2MEG", "0603RES"), "2.2M");
+        // A trailing zero is not a different capacitor. Mutable's schematics
+        // say `1.0n` where their BOM says `1n`.
+        assert_eq!(value_key("1.0n", "C-US0603"), value_key("1n", "C-US0603"));
+        assert_eq!(value_key("1.0K", "0402"), "1K");
         // The same capacitor, spelled with and without the farad.
         assert_eq!(
             value_key("100nf50V0603", "0603CAP"),

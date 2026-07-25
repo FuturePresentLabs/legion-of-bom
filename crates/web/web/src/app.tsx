@@ -216,21 +216,71 @@ function HomePage() {
       {list.data && list.data.length === 0 && (
         <p class="muted">No circuits declared in lob.toml.</p>
       )}
-      <ul class="circuit-list">
-        {list.data?.map((c) => (
-          <li key={c.name}>
-            <Link to={`/c/${encodeURIComponent(c.name)}`}>
-              <span class="c-name">{c.name}</span>
-            </Link>
-            <span class="c-meta">
-              {c.kit && <span class="tag">{c.kit}</span>}
-              {c.has_build_copy && <span class="tag ghost">build copy</span>}
-            </span>
-            <ArtifactChips artifacts={c.artifacts} name={c.name} compact />
-          </li>
-        ))}
-      </ul>
+      {list.data && <CircuitFolders circuits={list.data} />}
     </>
+  );
+}
+
+// Group the circuit list by the folder each one lives in. A repo that has
+// grown a `supersynthesis/` and a `mutable/` alongside its own designs reads as
+// three separate bodies of work, and a flat list hides that. Our own circuits
+// sit at the repo root, so they come first under the repo's own name.
+function CircuitFolders({ circuits }: { circuits: Circuit[] }) {
+  // Declaration order within a folder is the author's order — keep it.
+  const folders = new Map<string, Circuit[]>();
+  for (const c of circuits) {
+    const path = c.import ?? c.source ?? "";
+    const cut = path.lastIndexOf("/");
+    const folder = cut === -1 ? "" : path.slice(0, cut);
+    const bucket = folders.get(folder);
+    if (bucket) bucket.push(c);
+    else folders.set(folder, [c]);
+  }
+  // Root first, then the rest alphabetically.
+  const names = [...folders.keys()].sort((a, b) =>
+    a === "" ? -1 : b === "" ? 1 : a.localeCompare(b),
+  );
+  // One unnamed group is just a list — don't invent hierarchy that isn't there.
+  if (names.length === 1) {
+    return <CircuitRows circuits={folders.get(names[0]) ?? []} />;
+  }
+  return (
+    <>
+      {names.map((folder) => {
+        const rows = folders.get(folder) ?? [];
+        return (
+          <section class="folder" key={folder || "(root)"}>
+            <h2 class="folder-name">
+              {folder || "This repo"}
+              <span class="folder-count">
+                {rows.length} {rows.length === 1 ? "circuit" : "circuits"}
+              </span>
+            </h2>
+            <CircuitRows circuits={rows} />
+          </section>
+        );
+      })}
+    </>
+  );
+}
+
+function CircuitRows({ circuits }: { circuits: Circuit[] }) {
+  return (
+    <ul class="circuit-list">
+      {circuits.map((c) => (
+        <li key={c.name}>
+          <Link to={`/c/${encodeURIComponent(c.name)}`}>
+            <span class="c-name">{c.name}</span>
+          </Link>
+          <span class="c-meta">
+            {c.kit && <span class="tag">{c.kit}</span>}
+            {c.import && <span class="tag ghost">imported</span>}
+            {c.has_build_copy && <span class="tag ghost">build copy</span>}
+          </span>
+          <ArtifactChips artifacts={c.artifacts} name={c.name} compact />
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -388,10 +438,10 @@ function CircuitPage({ name }: { name: string }) {
   );
 }
 
-// Run the build from here rather than dropping to a terminal (ef6). The whole
-// transcript is shown, because a failed build fails for a reason worth reading
-// — a missing footprint, a tool not installed — and "build failed" alone would
-// send the user to the terminal anyway.
+// Run `lob build <name>` from here rather than dropping to a terminal (ef6).
+// The whole transcript is shown, because a failed build fails for a reason worth
+// reading — a missing footprint, a tool not installed — and "build failed" alone
+// would send the user to the terminal anyway.
 function BuildButton({ name }: { name: string }) {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<BuildResult | null>(null);
@@ -417,9 +467,7 @@ function BuildButton({ name }: { name: string }) {
       <button type="button" onClick={run} disabled={running}>
         {running ? "Building…" : `Build ${name}`}
       </button>
-      {running && (
-        <span class="muted"> running the same steps as `lob build`…</span>
-      )}
+      {running && <span class="muted"> running lob build {name}…</span>}
       {error && <p class="error">{error}</p>}
       {result && (
         <>

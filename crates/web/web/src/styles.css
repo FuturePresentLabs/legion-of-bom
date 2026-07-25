@@ -974,3 +974,37 @@ table.bom tfoot td {
 .build-run .ok {
   color: var(--ok, #2e7d32);
 }
+
+/* Folders on the index: a repo that has grown a `supersynthesis/` and a
+   `mutable/` beside its own designs is three bodies of work, and the grouping
+   should say so without turning into chrome. */
+.folder {
+  margin-top: 1.75rem;
+}
+.folder:first-of-type {
+  margin-top: 1rem;
+}
+.folder-name {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin: 0 0 0.4rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted, #6b7280);
+}
+.folder-name::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--rule, rgba(128, 128, 128, 0.25));
+}
+.folder-count {
+  order: 3;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
