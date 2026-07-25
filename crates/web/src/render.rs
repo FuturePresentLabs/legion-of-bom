@@ -23,8 +23,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use legion_of_bom_core::{
-    default_image_cache_dir, export_board_svg, kicad_cli_path, panel_to_svg, render_board_png,
-    Logo, PanelFile,
+    default_image_cache_dir, export_board_svg, kicad_cli_path, panel_to_svg, parse_netlist_file,
+    render_board_png, schematic_to_svg, Logo, PanelFile,
 };
 
 use crate::state::AppState;
@@ -105,7 +105,7 @@ impl IntoResponse for RenderErr {
             ),
             RenderErr::BadView(v) => (
                 StatusCode::BAD_REQUEST,
-                format!("unknown view '{v}' (board-top | board-bottom | board-layout | panel)"),
+                format!("unknown view '{v}' (board-top | board-bottom | board-layout | panel | schematic)"),
             ),
             RenderErr::Failed(m) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -156,6 +156,21 @@ fn render_view(
                 .0;
             write_cache(&cache, &png);
             Ok(Rendered::Png(png))
+        }
+        "schematic" => {
+            // Drawn from the parsed netlist — no kicad-cli, so it's always
+            // available once the circuit has been built.
+            let netlist = root.join("out").join(name).join(format!("{name}.net"));
+            let model = parse_netlist_file(&netlist).map_err(|_| {
+                RenderErr::NotBuilt(format!("circuit not built — run `lob build {name}`"))
+            })?;
+            let cache = cache_path(&netlist, view, "svg");
+            if let Ok(svg) = std::fs::read_to_string(&cache) {
+                return Ok(Rendered::Svg(svg));
+            }
+            let svg = schematic_to_svg(&model);
+            write_cache(&cache, svg.as_bytes());
+            Ok(Rendered::Svg(svg))
         }
         "board-layout" => {
             // The flat 2D layout: copper + silk + fab + edge, as a scalable SVG.

@@ -34,6 +34,7 @@ pub mod pdf;
 pub mod project;
 pub mod resistor;
 pub mod route;
+pub mod schematic;
 mod sexpr;
 pub mod skidl;
 pub mod source;
@@ -95,6 +96,7 @@ pub use route::{
     GridRouter, MstRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput, Router, Track,
     Via,
 };
+pub use schematic::schematic_to_svg;
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
 pub use sourcing::{build_query, part_kind, suggest_mpns, MpnCandidate, PartKind, SourcingClients};

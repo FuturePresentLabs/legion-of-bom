@@ -430,6 +430,7 @@ const PCB_VIEWS: { key: string; label: string }[] = [
   { key: "board-top", label: "Render" },
   { key: "board-layout", label: "Layout" },
   { key: "board-bottom", label: "Bottom" },
+  { key: "schematic", label: "Schematic" },
 ];
 
 // Toggle photoreal render ↔ 2D layout, zoom + pan (bead hk0).
