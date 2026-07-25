@@ -15,6 +15,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::source::CircuitSource;
+use crate::symbols::{read_symbol_graphics, SymFill, SymShape, SymbolGraphics};
+
+/// The sheet colour — also what a `background`-filled symbol shape paints with.
+const SHEET_BG: &str = "#fbfbf7";
 
 /// Sheet geometry (px). The diagram is emitted at these units and scaled by the
 /// viewer's `viewBox`.
@@ -28,14 +32,27 @@ mod sheet {
     pub const MARGIN: f64 = 40.0;
     /// Extra room on the right for a trunk + net label hanging off the last column.
     pub const GUTTER: f64 = 70.0;
+    /// Preferred symbol scale, and the slot a symbol is fitted into.
+    pub const SYM_PX_PER_MM: f64 = 6.5;
+    pub const SYM_MAX_W: f64 = 104.0;
+    pub const SYM_MAX_H: f64 = 74.0;
 }
 
-/// A part positioned on the sheet.
+/// A part awaiting placement: refdes, value, and its resolved symbol.
+type PendingPart<'a> = (&'a str, &'a str, Option<SymbolGraphics>);
+
+/// Where a net attaches to one part: the part, and the point in sheet px.
+type Attach<'a> = (&'a Placed, (f64, f64));
+
+/// A part positioned on the sheet, with its KiCad symbol when one resolved.
 struct Placed {
     refdes: String,
     value: String,
     col: usize,
     row: usize,
+    /// The drawn body from the KiCad symbol library. `None` — no library, unknown
+    /// symbol, or a multi-unit part — falls back to a labelled box.
+    sym: Option<SymbolGraphics>,
 }
 
 impl Placed {
@@ -50,6 +67,35 @@ impl Placed {
     }
     fn cy(&self) -> f64 {
         self.y() + sheet::BOX_H / 2.0
+    }
+
+    /// Symbol-space → sheet-px transform: `(scale, bcx, bcy)`, sized so the symbol
+    /// fits its slot without being blown up past [`sheet::SYM_PX_PER_MM`].
+    fn sym_fit(&self) -> Option<(f64, f64, f64)> {
+        let g = self.sym.as_ref()?;
+        let (x0, y0, x1, y1) = g.bounds();
+        let (bw, bh) = ((x1 - x0).max(0.1), (y1 - y0).max(0.1));
+        let scale = (sheet::SYM_MAX_W / bw)
+            .min(sheet::SYM_MAX_H / bh)
+            .min(sheet::SYM_PX_PER_MM);
+        Some((scale, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    }
+
+    /// A symbol point in sheet px. KiCad symbol space is Y-**up**, the sheet Y-down.
+    fn sym_px(&self, x: f64, y: f64) -> (f64, f64) {
+        match self.sym_fit() {
+            Some((s, bcx, bcy)) => (self.cx() + (x - bcx) * s, self.cy() - (y - bcy) * s),
+            None => (self.cx(), self.cy()),
+        }
+    }
+
+    /// Where a wire should attach for this part's `pin` — the pin's tip when the
+    /// symbol resolved, else the box edge.
+    fn pin_anchor(&self, pin: &str) -> Option<(f64, f64)> {
+        let g = self.sym.as_ref()?;
+        let p = g.pins.iter().find(|p| p.number == pin)?;
+        let (tx, ty) = p.tip();
+        Some(self.sym_px(tx, ty))
     }
 }
 
@@ -148,13 +194,30 @@ fn rank_parts(circuit: &dyn CircuitSource) -> HashMap<String, usize> {
 /// Lay parts out in columns by rank, stacked in refdes order within a column.
 fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     let rank = rank_parts(circuit);
-    let mut by_col: HashMap<usize, Vec<(&str, &str)>> = HashMap::new();
+    // Resolve each part's KiCad symbol once, cached by `lib:part` since a circuit
+    // reuses the same handful. Multi-unit parts (an op-amp is two amplifiers plus a
+    // power unit) are declined here: drawing them properly means splitting their
+    // pins across separately-placed units, so they fall back to a box.
+    let dir = crate::skidl::kicad_symbol_dir();
+    let mut cache: HashMap<String, Option<SymbolGraphics>> = HashMap::new();
+    let mut symbol_for = |lib_part: Option<&str>| -> Option<SymbolGraphics> {
+        let dir = dir.as_ref()?;
+        let key = lib_part?;
+        let (lib, part) = key.split_once(':')?;
+        cache
+            .entry(key.to_string())
+            .or_insert_with(|| read_symbol_graphics(dir.path(), lib, part).filter(|g| g.units == 1))
+            .clone()
+    };
+
+    let mut by_col: HashMap<usize, Vec<PendingPart>> = HashMap::new();
     for p in circuit.parts() {
         let c = rank.get(&p.refdes.0).copied().unwrap_or(0);
+        let sym = symbol_for(p.library_part.as_deref());
         by_col
             .entry(c)
             .or_default()
-            .push((p.refdes.0.as_str(), p.value.as_str()));
+            .push((p.refdes.0.as_str(), p.value.as_str(), sym));
     }
     let mut out = Vec::new();
     let mut cols: Vec<usize> = by_col.keys().copied().collect();
@@ -162,12 +225,13 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     for (ci, c) in cols.iter().enumerate() {
         let mut parts = by_col.remove(c).unwrap_or_default();
         parts.sort_by(|a, b| a.0.cmp(b.0));
-        for (ri, (refdes, value)) in parts.into_iter().enumerate() {
+        for (ri, (refdes, value, sym)) in parts.into_iter().enumerate() {
             out.push(Placed {
                 refdes: refdes.to_string(),
                 value: value.to_string(),
                 col: ci,
                 row: ri,
+                sym,
             });
         }
     }
@@ -188,7 +252,7 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
     s.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w:.0} {h:.0}\" \
          width=\"{w:.0}\" height=\"{h:.0}\" role=\"img\" aria-label=\"{} schematic\">\
-         <rect width=\"{w:.0}\" height=\"{h:.0}\" fill=\"#fbfbf7\"/>",
+         <rect width=\"{w:.0}\" height=\"{h:.0}\" fill=\"{SHEET_BG}\"/>",
         xml_escape(circuit.name()),
     ));
 
@@ -196,18 +260,25 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
     // same column would otherwise share one trunk line — and stack their labels on
     // top of each other — so each column's channel is divided into lanes.
     let ink = "#2a2a28";
-    let mut routed: Vec<(&str, Vec<&Placed>)> = Vec::new();
+    // Each connection is a (part, attach-point): the pin's own tip when the symbol
+    // resolved, else the middle of the fallback box.
+    let mut routed: Vec<(&str, Vec<Attach>)> = Vec::new();
     for net in circuit.nets() {
         if is_power(&net.name) {
             continue;
         }
-        let mut pts: Vec<&Placed> = net
-            .pins
-            .iter()
-            .filter_map(|p| pos.get(p.refdes.0.as_str()).copied())
-            .collect();
-        pts.sort_by_key(|p| (p.col, p.row));
-        pts.dedup_by(|a, b| a.refdes == b.refdes);
+        let mut pts: Vec<Attach> = Vec::new();
+        for pin in &net.pins {
+            let Some(p) = pos.get(pin.refdes.0.as_str()).copied() else {
+                continue;
+            };
+            if pts.iter().any(|(q, _)| q.refdes == p.refdes) {
+                continue; // one attach point per part is enough to read
+            }
+            let anchor = p.pin_anchor(&pin.pin).unwrap_or((p.cx(), p.cy()));
+            pts.push((p, anchor));
+        }
+        pts.sort_by_key(|(p, _)| (p.col, p.row));
         if pts.len() >= 2 {
             routed.push((net.name.as_str(), pts));
         }
@@ -218,10 +289,10 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         let mut per_col: HashMap<usize, usize> = HashMap::new();
         let mut counts: HashMap<usize, usize> = HashMap::new();
         for (_, pts) in &routed {
-            *counts.entry(pts[0].col).or_default() += 1;
+            *counts.entry(pts[0].0.col).or_default() += 1;
         }
         for (_, pts) in &routed {
-            let c = pts[0].col;
+            let c = pts[0].0.col;
             let i = per_col.entry(c).or_insert(0);
             lane_of.push((*i, counts[&c]));
             *i += 1;
@@ -234,40 +305,35 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         // the next, so parallel nets stay visually distinct.
         let channel = sheet::COL_W - sheet::BOX_W;
         let trunk =
-            pts[0].x() + sheet::BOX_W + channel * (lane as f64 + 1.0) / (lanes as f64 + 1.0);
-        let (y0, y1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
-            (lo.min(p.cy()), hi.max(p.cy()))
+            pts[0].0.x() + sheet::BOX_W + channel * (lane as f64 + 1.0) / (lanes as f64 + 1.0);
+        let (y0, y1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), (_, a)| {
+            (lo.min(a.1), hi.max(a.1))
         });
         s.push_str(&format!(
             "<path d=\"M{trunk:.1} {y0:.1} L{trunk:.1} {y1:.1}\" stroke=\"{ink}\" \
              stroke-width=\"1.3\" fill=\"none\"/>"
         ));
-        for p in pts.iter() {
-            // Leave the box on the side the trunk is on.
-            let from = if p.x() + sheet::BOX_W <= trunk {
-                p.x() + sheet::BOX_W
-            } else {
-                p.x()
-            };
+        for (_, (ax, ay)) in pts.iter() {
             s.push_str(&format!(
-                "<path d=\"M{from:.1} {:.1} L{trunk:.1} {:.1}\" stroke=\"{ink}\" \
-                 stroke-width=\"1.3\" fill=\"none\"/>",
-                p.cy(),
-                p.cy()
+                "<path d=\"M{ax:.1} {ay:.1} L{trunk:.1} {ay:.1}\" stroke=\"{ink}\" \
+                 stroke-width=\"1.3\" fill=\"none\"/>"
             ));
         }
         // Net label at the top of the trunk, on a small backing so it stays legible
         // where it crosses a wire.
         let label = ellipsize(name, 14);
         let lw = label.chars().count() as f64 * 6.0 + 6.0;
+        // Stagger by lane as well as by x: two nets leaving the same column at the
+        // same height would otherwise print their labels on top of each other.
+        let ly = y0 - 6.0 - lane as f64 * 12.0;
         s.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{lw:.1}\" height=\"12\" fill=\"#fbfbf7\"/>\
+            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{lw:.1}\" height=\"12\" fill=\"{SHEET_BG}\"/>\
              <text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
              font-size=\"10\" fill=\"#6b7280\" text-anchor=\"middle\">{}</text>",
             trunk - lw / 2.0,
-            y0 - 16.0,
+            ly - 10.0,
             trunk,
-            y0 - 6.0,
+            ly,
             xml_escape(&label)
         ));
     }
@@ -331,36 +397,158 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         }
     }
 
-    // Part boxes on top.
+    // Parts on top: the real KiCad symbol where one resolved, else a labelled box.
     for p in &placed {
+        let mut label_y = p.cy() - 2.0;
+        let mut value_y = p.cy() + 13.0;
+        match p.sym.as_ref() {
+            Some(g) => {
+                s.push_str(&symbol_svg(p, g, ink));
+                // Caption below the symbol, clear of its pins.
+                let (_, _, _, y1) = g.bounds();
+                let (_, top) = p.sym_px(0.0, y1);
+                let (_, bottom) = p.sym_px(0.0, g.bounds().1);
+                label_y = bottom.max(top) + 13.0;
+                value_y = label_y + 12.0;
+            }
+            None => {
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.0}\" height=\"{:.0}\" rx=\"4\" \
+                     fill=\"#ffffff\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    p.x(),
+                    p.y(),
+                    sheet::BOX_W,
+                    sheet::BOX_H
+                ));
+            }
+        }
         s.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.0}\" height=\"{:.0}\" rx=\"4\" \
-             fill=\"#ffffff\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
-            p.x(),
-            p.y(),
-            sheet::BOX_W,
-            sheet::BOX_H
-        ));
-        s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
+            "<text x=\"{:.1}\" y=\"{label_y:.1}\" font-family=\"ui-monospace,monospace\" \
              font-size=\"13\" font-weight=\"600\" fill=\"{ink}\" text-anchor=\"middle\">{}</text>",
             p.cx(),
-            p.cy() - 2.0,
             xml_escape(&p.refdes)
         ));
         if !p.value.is_empty() {
             let value = ellipsize(&p.value, 16);
             s.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
+                "<text x=\"{:.1}\" y=\"{value_y:.1}\" font-family=\"ui-monospace,monospace\" \
                  font-size=\"10\" fill=\"#6b7280\" text-anchor=\"middle\">{}</text>",
                 p.cx(),
-                p.cy() + 13.0,
                 xml_escape(&value)
             ));
         }
     }
 
     s.push_str("</svg>");
+    s
+}
+
+/// Draw a resolved KiCad symbol: its body primitives plus a lead for every pin,
+/// mapped from symbol space (mm, Y up) into sheet px.
+fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
+    let mut s = String::new();
+    // KiCad fill modes: `outline` is solid in the line colour, `background` is the
+    // sheet colour (it occludes, it doesn't go black), `none` is open.
+    let paint = |f: SymFill| match f {
+        SymFill::Outline => ink,
+        SymFill::Background => SHEET_BG,
+        SymFill::None => "none",
+    };
+    let pt = |x: f64, y: f64| p.sym_px(x, y);
+
+    for shape in &g.shapes {
+        match shape {
+            SymShape::Rect {
+                x0,
+                y0,
+                x1,
+                y1,
+                fill,
+            } => {
+                let (ax, ay) = pt(*x0, *y0);
+                let (bx, by) = pt(*x1, *y1);
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                     fill=\"{}\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    ax.min(bx),
+                    ay.min(by),
+                    (bx - ax).abs(),
+                    (by - ay).abs(),
+                    paint(*fill),
+                ));
+            }
+            SymShape::Poly { pts, fill } => {
+                let d: Vec<String> = pts
+                    .iter()
+                    .map(|&(x, y)| {
+                        let (px, py) = pt(x, y);
+                        format!("{px:.1},{py:.1}")
+                    })
+                    .collect();
+                s.push_str(&format!(
+                    "<polyline points=\"{}\" fill=\"{}\" stroke=\"{ink}\" \
+                     stroke-width=\"1.4\" stroke-linejoin=\"round\"/>",
+                    d.join(" "),
+                    paint(*fill)
+                ));
+            }
+            SymShape::Circle { cx, cy, r, fill } => {
+                let (px, py) = pt(*cx, *cy);
+                let rr = r * p.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
+                s.push_str(&format!(
+                    "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"{rr:.1}\" fill=\"{}\" \
+                     stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    paint(*fill)
+                ));
+            }
+            SymShape::Arc { start, mid, end } => {
+                // Three-point arc → SVG arc. The radius comes from the
+                // circumcircle of the three points; degenerate (collinear) cases
+                // fall back to a straight line, which is what they look like.
+                let (ax, ay) = pt(start.0, start.1);
+                let (mx, my) = pt(mid.0, mid.1);
+                let (bx, by) = pt(end.0, end.1);
+                let d = 2.0 * (ax * (my - by) + mx * (by - ay) + bx * (ay - my));
+                if d.abs() < 1e-6 {
+                    s.push_str(&format!(
+                        "<path d=\"M{ax:.1} {ay:.1} L{bx:.1} {by:.1}\" fill=\"none\" \
+                         stroke=\"{ink}\" stroke-width=\"1.4\"/>"
+                    ));
+                    continue;
+                }
+                let ux = ((ax * ax + ay * ay) * (my - by)
+                    + (mx * mx + my * my) * (by - ay)
+                    + (bx * bx + by * by) * (ay - my))
+                    / d;
+                let uy = ((ax * ax + ay * ay) * (bx - mx)
+                    + (mx * mx + my * my) * (ax - bx)
+                    + (bx * bx + by * by) * (mx - ax))
+                    / d;
+                let r = ((ax - ux).powi(2) + (ay - uy).powi(2)).sqrt();
+                // Sweep direction from the sign of the cross product at the mid point.
+                let sweep = if (mx - ax) * (by - ay) - (my - ay) * (bx - ax) > 0.0 {
+                    1
+                } else {
+                    0
+                };
+                s.push_str(&format!(
+                    "<path d=\"M{ax:.1} {ay:.1} A{r:.1} {r:.1} 0 0 {sweep} {bx:.1} {by:.1}\" \
+                     fill=\"none\" stroke=\"{ink}\" stroke-width=\"1.4\"/>"
+                ));
+            }
+        }
+    }
+
+    // Pin leads: body root out to the tip a wire attaches at.
+    for pin in &g.pins {
+        let (rx, ry) = pt(pin.x, pin.y);
+        let (tx, ty) = pin.tip();
+        let (tx, ty) = pt(tx, ty);
+        s.push_str(&format!(
+            "<path d=\"M{rx:.1} {ry:.1} L{tx:.1} {ty:.1}\" stroke=\"{ink}\" \
+             stroke-width=\"1.2\" fill=\"none\"/>"
+        ));
+    }
     s
 }
 

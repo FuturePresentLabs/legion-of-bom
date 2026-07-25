@@ -344,9 +344,370 @@ fn builtin_model(part: &crate::model::Part) -> Option<SpiceModel> {
     })
 }
 
+// ---------------------------------------------------------------------------
+//  Symbol *graphics* — the drawn body, for the schematic view (n5l)
+// ---------------------------------------------------------------------------
+
+/// How a symbol shape is filled. KiCad has three modes and they mean different
+/// things: `outline` paints it solid in the line colour (a jack's plug tip),
+/// `background` paints it in the *sheet* colour so it occludes what's behind
+/// without going black, and `none` leaves it open. Collapsing these to a boolean
+/// turns every background-filled body into a black blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymFill {
+    None,
+    Background,
+    Outline,
+}
+
+/// A drawable primitive from a symbol body, in KiCad symbol space (mm, Y **up**).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymShape {
+    Rect {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        fill: SymFill,
+    },
+    Poly {
+        pts: Vec<(f64, f64)>,
+        fill: SymFill,
+    },
+    Circle {
+        cx: f64,
+        cy: f64,
+        r: f64,
+        fill: SymFill,
+    },
+    /// A three-point arc (start → mid → end), as KiCad stores it.
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+    },
+}
+
+/// A symbol pin: where its wire attaches, in symbol space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymPin {
+    pub number: String,
+    /// The pin's root (where it meets the body).
+    pub x: f64,
+    pub y: f64,
+    /// Direction the pin points, degrees CCW (0 = +X).
+    pub angle: f64,
+    pub length: f64,
+}
+
+impl SymPin {
+    /// The far end of the pin — where a wire connects.
+    pub fn tip(&self) -> (f64, f64) {
+        let r = self.angle.to_radians();
+        (
+            self.x + self.length * r.cos(),
+            self.y + self.length * r.sin(),
+        )
+    }
+}
+
+/// A symbol's drawn body plus its pins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolGraphics {
+    pub shapes: Vec<SymShape>,
+    pub pins: Vec<SymPin>,
+    /// Highest unit index in the definition. `1` is a plain single-unit part; more
+    /// means the part is drawn as several separate units on a real schematic (an
+    /// LM2904 is two amplifiers plus a power unit), which needs pin-to-unit
+    /// splitting the caller may not want to attempt.
+    pub units: usize,
+}
+
+impl SymbolGraphics {
+    /// Bounding box of the body **and** pin tips: `(x0, y0, x1, y1)`.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let mut add = |x: f64, y: f64| {
+            b.0 = b.0.min(x);
+            b.1 = b.1.min(y);
+            b.2 = b.2.max(x);
+            b.3 = b.3.max(y);
+        };
+        for s in &self.shapes {
+            match s {
+                SymShape::Rect { x0, y0, x1, y1, .. } => {
+                    add(*x0, *y0);
+                    add(*x1, *y1);
+                }
+                SymShape::Poly { pts, .. } => pts.iter().for_each(|&(x, y)| add(x, y)),
+                SymShape::Circle { cx, cy, r, .. } => {
+                    add(cx - r, cy - r);
+                    add(cx + r, cy + r);
+                }
+                SymShape::Arc { start, mid, end } => {
+                    for p in [start, mid, end] {
+                        add(p.0, p.1);
+                    }
+                }
+            }
+        }
+        for p in &self.pins {
+            add(p.x, p.y);
+            let (tx, ty) = p.tip();
+            add(tx, ty);
+        }
+        if b.0 > b.2 {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            b
+        }
+    }
+}
+
+/// Read a symbol's drawn body from `<lib>.kicad_sym`, following `(extends …)`
+/// inheritance (KiCad defines e.g. `TL072` as an extension of `LM2904`).
+///
+/// Returns `None` when the library or symbol isn't there — symbol libraries ship
+/// with KiCad, so a machine without it simply gets no graphics and the caller
+/// falls back to its own rendering.
+pub fn read_symbol_graphics(symbol_dir: &Path, lib: &str, part: &str) -> Option<SymbolGraphics> {
+    let text = std::fs::read_to_string(symbol_dir.join(format!("{lib}.kicad_sym"))).ok()?;
+    let root = Sexpr::parse(&text).ok()?;
+    let find = |name: &str| {
+        root.get_all("symbol")
+            .into_iter()
+            .find(|s| s.nth_atom(1) == Some(name))
+    };
+
+    // Follow the inheritance chain to the definition that carries the drawing.
+    let mut sym = find(part)?;
+    let mut hops = 0;
+    while let Some(base) = sym.field("extends") {
+        if hops > 8 {
+            break; // cycle guard
+        }
+        match find(base) {
+            Some(next) => sym = next,
+            None => break,
+        }
+        hops += 1;
+    }
+
+    let num = |e: Option<&Sexpr>, i: usize| -> Option<f64> { e?.nth_atom(i)?.parse().ok() };
+    let xy = |e: Option<&Sexpr>| -> Option<(f64, f64)> { Some((num(e, 1)?, num(e, 2)?)) };
+    let fill_of = |e: &Sexpr| -> SymFill {
+        match e.get("fill").and_then(|f| f.field("type")) {
+            Some("outline") => SymFill::Outline,
+            Some("background") => SymFill::Background,
+            _ => SymFill::None,
+        }
+    };
+
+    let mut shapes = Vec::new();
+    let mut pins: Vec<SymPin> = Vec::new();
+    let mut units = 1usize;
+
+    // Body graphics live in nested unit sub-symbols named `<NAME>_<unit>_<style>`.
+    // Unit 0 is common to every unit; unit 1 is the first real one.
+    for unit in sym.get_all("symbol") {
+        let uname = unit.nth_atom(1).unwrap_or_default();
+        let idx: usize = uname
+            .rsplit('_')
+            .nth(1)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1);
+        units = units.max(idx);
+        if idx > 1 {
+            continue; // additional units are drawn separately on a real schematic
+        }
+
+        for r in unit.get_all("rectangle") {
+            if let (Some((x0, y0)), Some((x1, y1))) = (xy(r.get("start")), xy(r.get("end"))) {
+                shapes.push(SymShape::Rect {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    fill: fill_of(r),
+                });
+            }
+        }
+        for p in unit.get_all("polyline") {
+            if let Some(pts) = p.get("pts") {
+                let pts: Vec<(f64, f64)> = pts
+                    .get_all("xy")
+                    .into_iter()
+                    .filter_map(|e| xy(Some(e)))
+                    .collect();
+                if pts.len() >= 2 {
+                    shapes.push(SymShape::Poly {
+                        pts,
+                        fill: fill_of(p),
+                    });
+                }
+            }
+        }
+        for c in unit.get_all("circle") {
+            if let (Some((cx, cy)), Some(r)) = (xy(c.get("center")), num(c.get("radius"), 1)) {
+                shapes.push(SymShape::Circle {
+                    cx,
+                    cy,
+                    r,
+                    fill: fill_of(c),
+                });
+            }
+        }
+        for a in unit.get_all("arc") {
+            if let (Some(start), Some(mid), Some(end)) =
+                (xy(a.get("start")), xy(a.get("mid")), xy(a.get("end")))
+            {
+                shapes.push(SymShape::Arc { start, mid, end });
+            }
+        }
+        for p in unit.get_all("pin") {
+            let at = p.get("at");
+            let (Some(x), Some(y)) = (num(at, 1), num(at, 2)) else {
+                continue;
+            };
+            let number = p
+                .get("number")
+                .and_then(|n| n.nth_atom(1))
+                .unwrap_or_default()
+                .to_string();
+            if number.is_empty() {
+                continue;
+            }
+            pins.push(SymPin {
+                number,
+                x,
+                y,
+                angle: num(at, 3).unwrap_or(0.0),
+                length: p
+                    .get("length")
+                    .and_then(|l| l.nth_atom(1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2.54),
+            });
+        }
+    }
+
+    if shapes.is_empty() && pins.is_empty() {
+        return None;
+    }
+    Some(SymbolGraphics {
+        shapes,
+        pins,
+        units,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway symbol library, cleaned up on drop.
+    struct TempLib(PathBuf);
+    impl Drop for TempLib {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn temp_lib(tag: &str, body: &str) -> TempLib {
+        let dir = std::env::temp_dir().join(format!(
+            "lob-sym-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("T.kicad_sym"), body).unwrap();
+        TempLib(dir)
+    }
+
+    /// KiCad has three fill modes and they are not interchangeable: `outline` is
+    /// solid in the line colour, `background` paints the sheet colour so a body
+    /// occludes what is behind it, `none` is open. Treating them as one boolean
+    /// turned every background-filled symbol (an audio jack) into a black blob.
+    #[test]
+    fn reads_body_shapes_pins_and_distinguishes_fill_modes() {
+        let lib = temp_lib(
+            "fill",
+            r#"(kicad_symbol_lib (symbol "P"
+                 (symbol "P_0_1"
+                   (rectangle (start -1 -2) (end 1 2) (fill (type none)))
+                   (polyline (pts (xy 0 0) (xy 1 1)) (fill (type background)))
+                   (circle (center 0 0) (radius 0.5) (fill (type outline))))
+                 (symbol "P_1_1"
+                   (pin passive line (at 0 3.81 270) (length 1.27) (number "1"))
+                   (pin passive line (at 0 -3.81 90) (length 1.27) (number "2")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "P").expect("graphics");
+        assert_eq!(g.units, 1);
+        assert_eq!(g.pins.len(), 2);
+        let fills: Vec<SymFill> = g
+            .shapes
+            .iter()
+            .map(|s| match s {
+                SymShape::Rect { fill, .. }
+                | SymShape::Poly { fill, .. }
+                | SymShape::Circle { fill, .. } => *fill,
+                SymShape::Arc { .. } => SymFill::None,
+            })
+            .collect();
+        assert!(fills.contains(&SymFill::None));
+        assert!(fills.contains(&SymFill::Background));
+        assert!(fills.contains(&SymFill::Outline));
+
+        // A pin's wire attaches at its tip, `length` away along its angle.
+        let p1 = g.pins.iter().find(|p| p.number == "1").unwrap();
+        let (tx, ty) = p1.tip();
+        assert!(
+            (tx - 0.0).abs() < 1e-9 && (ty - 2.54).abs() < 1e-9,
+            "{tx},{ty}"
+        );
+    }
+
+    /// KiCad defines many parts by inheritance — `TL072` is `(extends "LM2904")` —
+    /// so the graphics live on the base symbol and the chain must be followed.
+    #[test]
+    fn follows_extends_to_the_symbol_that_holds_the_drawing() {
+        let lib = temp_lib(
+            "ext",
+            r#"(kicad_symbol_lib
+                 (symbol "Base"
+                   (symbol "Base_0_1" (rectangle (start -1 -1) (end 1 1) (fill (type none))))
+                   (symbol "Base_1_1" (pin passive line (at 0 2 270) (length 1) (number "1"))))
+                 (symbol "Derived" (extends "Base")))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "Derived").expect("inherited graphics");
+        assert_eq!(g.shapes.len(), 1);
+        assert_eq!(g.pins.len(), 1);
+    }
+
+    /// A part drawn as several units (an op-amp is two amplifiers plus a power
+    /// unit) needs its pins split across separately-placed units, so callers are
+    /// told the unit count and can decline.
+    #[test]
+    fn reports_multi_unit_parts() {
+        let lib = temp_lib(
+            "units",
+            r#"(kicad_symbol_lib (symbol "Dual"
+                 (symbol "Dual_1_1" (pin passive line (at 0 2 270) (length 1) (number "1")))
+                 (symbol "Dual_2_1" (pin passive line (at 0 2 270) (length 1) (number "5")))
+                 (symbol "Dual_3_1" (pin power_in line (at 0 2 270) (length 1) (number "8")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "Dual").expect("graphics");
+        assert_eq!(g.units, 3, "three units detected");
+        // Only unit 1 is drawn; the rest belong to separate placements.
+        assert_eq!(g.pins.len(), 1);
+    }
+
+    #[test]
+    fn missing_symbol_or_library_is_not_an_error() {
+        let lib = temp_lib("none", r#"(kicad_symbol_lib (symbol "X"))"#);
+        assert!(read_symbol_graphics(&lib.0, "T", "Nope").is_none());
+        assert!(read_symbol_graphics(&lib.0, "NoSuchLib", "X").is_none());
+    }
 
     #[test]
     fn builtin_catalog_models_active_parts_without_a_symbol_model() {

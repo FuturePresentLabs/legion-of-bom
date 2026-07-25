@@ -42,7 +42,7 @@ pub mod sourcing;
 pub mod spice;
 pub mod stage;
 pub mod subboard;
-mod symbols;
+pub mod symbols;
 pub mod theme;
 pub mod tools;
 pub mod units;
