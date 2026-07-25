@@ -347,9 +347,9 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     for part in circuit.parts() {
         let r = part.refdes.0.as_str();
         let my_col = rank.get(r).copied().unwrap_or(0) as f64;
-        let mut signal_pins: Vec<&str> = Vec::new();
+        // Per signal pin: which side its net lies on.
+        let mut signal_pins: Vec<(&str, f64)> = Vec::new();
         let mut on_power = false;
-        let mut want = 0.0f64; // + = this part's wires come from the right
         for net in circuit.nets() {
             if !net.pins.iter().any(|p| p.refdes.0 == r) {
                 continue;
@@ -358,11 +358,14 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
                 on_power = true;
                 continue;
             }
+            let toward: f64 = net
+                .pins
+                .iter()
+                .filter(|p| p.refdes.0 != r)
+                .map(|o| rank.get(o.refdes.0.as_str()).copied().unwrap_or(0) as f64 - my_col)
+                .sum();
             for p in net.pins.iter().filter(|p| p.refdes.0 == r) {
-                signal_pins.push(p.pin.as_str());
-            }
-            for other in net.pins.iter().filter(|p| p.refdes.0 != r) {
-                want += rank.get(other.refdes.0.as_str()).copied().unwrap_or(0) as f64 - my_col;
+                signal_pins.push((p.pin.as_str(), toward));
             }
         }
         let sym = symbol_for(part.library_part.as_deref());
@@ -373,19 +376,19 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
         let upright = g.pins.iter().all(|q| q.outward().0.abs() < 0.5);
         let rot90 = upright && !on_power && signal_pins.len() >= 2;
 
-        // Where the signal pins point once turned.
-        let have: f64 = signal_pins
-            .iter()
-            .filter_map(|n| g.pins.iter().find(|q| &q.number == n))
-            .map(|q| {
-                let (ox, oy) = q.outward();
-                if rot90 {
-                    -oy
-                } else {
-                    ox
-                }
-            })
-            .sum();
+        // A mirror is horizontal, so only pins that point sideways get a say in it.
+        // A pot's wiper is its one horizontal pin; its two end pins run up and down
+        // and would otherwise cancel the wiper's vote and leave the part unflipped.
+        let (mut want, mut have) = (0.0f64, 0.0f64);
+        for (pin, toward) in &signal_pins {
+            let Some(q) = g.pins.iter().find(|q| &q.number == pin) else {
+                continue;
+            };
+            let (ox, oy) = q.outward();
+            let dir = if rot90 { -oy } else { ox };
+            want += dir.abs() * toward;
+            have += dir;
+        }
         let flip = have.abs() > 1e-6 && want.abs() > 1e-6 && have.signum() != want.signum();
         orient.insert(r, (rot90, flip));
     }
@@ -524,6 +527,15 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
                 "<path d=\"M{ax:.1} {ay:.1} L{bx:.1} {by:.1} L{trunk:.1} {by:.1}\" \
                  stroke=\"{ink}\" stroke-width=\"1.3\" fill=\"none\"/>"
             ));
+            // Junction dot where a branch tees off a trunk that carries on past it.
+            // Without one, a wire crossing and a wire joining look identical — the
+            // ambiguity real schematics use this dot to settle. The ends of the
+            // trunk are plain corners, so only interior joins get one.
+            if *by > y0 + 0.5 && *by < y1 - 0.5 {
+                s.push_str(&format!(
+                    "<circle cx=\"{trunk:.1}\" cy=\"{by:.1}\" r=\"2.6\" fill=\"{ink}\"/>"
+                ));
+            }
         }
         // Net label at the top of the trunk, on a small backing so it stays legible
         // where it crosses a wire.
@@ -983,6 +995,38 @@ mod tests {
         assert!(!by("R2").rot90, "resistor with a rail leg stays upright");
         // A multi-unit op-amp keeps its box, and a box is never re-oriented.
         assert!(!by("U1").rot90 && !by("U1").flip);
+    }
+
+    /// A mirror is horizontal, so only pins that point sideways may vote on it. A
+    /// pot has two end pins running up and down and one wiper running across; if
+    /// the end pins get a vote they cancel the wiper's and the part never flips,
+    /// leaving the wiper pointing away from the net it drives.
+    #[test]
+    fn only_sideways_pins_vote_on_a_mirror() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        let mut c = Circuit::new("p");
+        let mut pot = Part::new("RV1", "100k");
+        pot.library_part = Some("Device:R_Potentiometer".into());
+        c.parts = vec![Part::new("R1", "1k"), pot, Part::new("J1", "in")];
+        // Ranking seeds at J1 and fans right, so J1 is left of RV1 and R1 right of
+        // it: the wiper's net lies to the LEFT while an end pin reaches RIGHT.
+        // Summed naively those cancel; weighted by how sideways each pin is, only
+        // the wiper — the pot's one horizontal pin — gets a vote.
+        c.nets = vec![
+            Net::new(
+                "WIPE",
+                vec![PinRef::new("J1", "T"), PinRef::new("RV1", "2")],
+            ),
+            Net::new("TOP", vec![PinRef::new("RV1", "1"), PinRef::new("R1", "1")]),
+        ];
+        let placed = layout(&c);
+        let rv1 = placed.iter().find(|p| p.refdes == "RV1").unwrap();
+        let Some(g) = rv1.sym.as_ref() else { return }; // needs KiCad libraries
+        assert_eq!(g.units, 1, "a pot is a single-unit symbol");
+        assert!(
+            rv1.flip,
+            "wiper should be mirrored to face the net it drives"
+        );
     }
 
     #[test]
