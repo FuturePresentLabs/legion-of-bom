@@ -1199,27 +1199,74 @@ pub fn derive_panel_for(
         .iter()
         .map(|(_, k, env)| (env.1 + envelope::GAP_MM).max(control_pitch(*k)))
         .collect();
-    let total: f64 = pitches.iter().sum();
     let (top_margin, avail_bot) = derive_rules::margins_mm(hp);
     let avail_top = h - top_margin;
     let avail = avail_top - avail_bot;
-    // Centre the stack; if it overflows the panel height it still lays out (tightly
-    // packed) — a signal the module has more controls than the height comfortably
-    // holds, which the caller can act on (wider HP won't help; height is fixed).
-    let mut y = avail_top - (avail - total).max(0.0) / 2.0;
-    let mut out: Vec<CutoutFile> = Vec::new();
-    for ((refdes, kind, _), pitch) in ordered.iter().zip(&pitches) {
-        out.push(CutoutFile {
-            x_mm: cx,
-            y_mm: y - pitch / 2.0,
-            rotation_deg: 0.0,
-            footprint: kind.cutout_name().to_string(),
-            refdes: Some(refdes.clone()),
-            label: control_label(circuit, refdes),
-            role: Some(cutout_role(circuit, refdes, *kind).as_str().to_string()),
-        });
-        y -= pitch;
+
+    // How many columns the width can hold, and how many the height demands.
+    //
+    // A single centred column was fine for a three-control module and fell apart
+    // past that: an eight-control board asked for 42 HP and put a jack at
+    // y = -12mm, off the panel entirely (`legion-of-bom-lau`). Height is fixed
+    // at 3U, so the only way to carry more controls is sideways.
+    let widest = ordered
+        .iter()
+        .map(|(_, _, env)| env.0)
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+    let fits_wide = (((w - 2.0 * envelope::EDGE_MM) + envelope::GAP_MM)
+        / (widest + envelope::GAP_MM))
+        .floor()
+        .max(1.0) as usize;
+    let total: f64 = pitches.iter().sum();
+    let needed = (total / avail.max(1.0)).ceil().max(1.0) as usize;
+    let cols = needed.min(fits_wide).max(1);
+
+    // Split into columns by *height*, not by count: a column of three pots is
+    // taller than a column of three jacks, and balancing the counts would leave
+    // one column overflowing while another had room.
+    let target = total / cols as f64;
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); cols];
+    let (mut g, mut run) = (0usize, 0.0f64);
+    for (i, pitch) in pitches.iter().enumerate() {
+        let remaining_cols = cols - g;
+        let remaining_items = pitches.len() - i;
+        // Leave at least one control for each remaining column.
+        if g + 1 < cols && run + pitch / 2.0 > target && remaining_items > remaining_cols {
+            g += 1;
+            run = 0.0;
+        }
+        groups[g].push(i);
+        run += pitch;
     }
+
+    let mut out: Vec<CutoutFile> = Vec::new();
+    let col_w = (w - 2.0 * envelope::EDGE_MM) / cols as f64;
+    for (ci, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let col_x = envelope::EDGE_MM + col_w * (ci as f64 + 0.5);
+        let col_total: f64 = group.iter().map(|&i| pitches[i]).sum();
+        let mut y = avail_top - (avail - col_total).max(0.0) / 2.0;
+        for &i in group {
+            let (refdes, kind, _) = &ordered[i];
+            // Clamp inside the panel. A derived spec that puts hardware off the
+            // edge is not a spec, and it used to happen silently.
+            let cy = (y - pitches[i] / 2.0).clamp(avail_bot, avail_top);
+            out.push(CutoutFile {
+                x_mm: col_x,
+                y_mm: cy,
+                rotation_deg: 0.0,
+                footprint: kind.cutout_name().to_string(),
+                refdes: Some(refdes.clone()),
+                label: control_label(circuit, refdes),
+                role: Some(cutout_role(circuit, refdes, *kind).as_str().to_string()),
+            });
+            y -= pitches[i];
+        }
+    }
+    let _ = cx;
 
     PanelFile {
         format: format.as_str().into(),
@@ -2284,6 +2331,67 @@ mod panel_from_board_tests {
             .unwrap()
             .parse()
             .expect("y number")
+    }
+
+    /// The lau case: enough controls that one column cannot hold them. They must
+    /// spread sideways and every cutout must stay on the panel — the reported
+    /// failure put a jack at y = -12.1mm, off the bottom edge, and the board then
+    /// could not route against it.
+    #[test]
+    fn a_crowded_panel_uses_columns_and_never_places_hardware_off_it() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let pot = "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
+        let mut c = Circuit::new("crowded");
+        for i in 1..=4 {
+            c.parts
+                .push(Part::new(format!("RV{i}"), "100k").with_footprint(pot));
+        }
+        for i in 1..=6 {
+            c.parts
+                .push(Part::new(format!("J{i}"), "io").with_footprint(jack));
+        }
+        let hp = 8;
+        let p = derive_panel_for(&c, PanelFormat::Eurorack3U, hp, &BuiltinCutouts);
+        assert_eq!(p.cutouts.len(), 10);
+
+        let w = f64::from(hp) * HP_MM;
+        for cut in &p.cutouts {
+            assert!(
+                cut.y_mm > 0.0 && cut.y_mm < EURORACK_HEIGHT_MM,
+                "{:?} at y={} is off the panel",
+                cut.refdes,
+                cut.y_mm
+            );
+            assert!(
+                cut.x_mm > 0.0 && cut.x_mm < w,
+                "{:?} off the side",
+                cut.refdes
+            );
+        }
+        // …and it actually used more than one column rather than stacking.
+        let mut xs: Vec<f64> = p.cutouts.iter().map(|c| c.x_mm).collect();
+        xs.sort_by(f64::total_cmp);
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert!(xs.len() >= 2, "expected multiple columns, got {xs:?}");
+    }
+
+    /// A module that fits in one column keeps one — columns are a response to
+    /// crowding, not a default.
+    #[test]
+    fn a_sparse_panel_stays_a_single_centred_column() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let mut c = Circuit::new("sparse");
+        for i in 1..=2 {
+            c.parts
+                .push(Part::new(format!("J{i}"), "io").with_footprint(jack));
+        }
+        let p = derive_panel_for(&c, PanelFormat::Eurorack3U, 8, &BuiltinCutouts);
+        let xs: Vec<f64> = p.cutouts.iter().map(|c| c.x_mm).collect();
+        assert!(
+            xs.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+            "one column: {xs:?}"
+        );
+        assert!((xs[0] - 8.0 * HP_MM / 2.0).abs() < 0.01, "centred: {xs:?}");
     }
 
     /// CV inputs sit above the audio I/O: a player scans down for the signal
