@@ -327,7 +327,7 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                 // own keepout_at_rot does. Reading the placement origin as the
                 // box centre is what let a pot's pad reach the board edge while
                 // this rule called it clear.
-                let (ox, oy) = crate::board::rotate_offset(*origin_offset, p.rotation_deg);
+                let (ox, oy) = crate::board::rotate_local(*origin_offset, p.rotation_deg);
                 let ox = if p.back { -ox } else { ox };
                 let (px, py) = (p.x_mm + ox, p.y_mm + oy);
                 // A part the placer stood on end occupies its extent swapped.

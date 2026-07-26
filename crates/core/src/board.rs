@@ -104,7 +104,7 @@ impl PartFacts {
     /// sits at pin 1, its body several mm away) lands somewhere quite different
     /// once rotated, so the offset must rotate too.
     fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
-        let (ox, oy) = rotate_offset(self.origin_offset, rot_deg);
+        let (ox, oy) = rotate_local(self.origin_offset, rot_deg);
         let ox = if back { -ox } else { ox };
         let (w, h) = self.extent;
         let (ew, eh) = if (rot_deg / 90.0).round() as i64 % 2 != 0 {
@@ -149,8 +149,8 @@ impl PartFacts {
 /// wrong space and measurably degrades routing, so it is pinned here deliberately.
 fn rotate_rect(rect: Rect, deg: f64) -> Rect {
     let (a, b, c, d) = rect;
-    let (x0, y0) = rotate_offset((a, b), -deg);
-    let (x1, y1) = rotate_offset((c, d), -deg);
+    let (x0, y0) = rotate_local((a, b), deg);
+    let (x1, y1) = rotate_local((c, d), deg);
     (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
 }
 
@@ -284,7 +284,24 @@ fn body_span(courtyard: Option<Rect>, pad_box: Option<Rect>) -> (f64, f64) {
 }
 
 /// Rotate an `(x, y)` offset by a footprint rotation of `deg` (quarter turns).
-pub(crate) fn rotate_offset((x, y): (f64, f64), deg: f64) -> (f64, f64) {
+/// Rotate a footprint-local point into board coordinates, in **KiCad's** sense:
+/// an `(at x y 90)` footprint maps a local `(x, y)` to `(y, -x)`, because KiCad's
+/// Y axis points down.
+///
+/// This is the only rotation any caller should want, and it exists because the
+/// codebase had both senses in it. [`rotate_rect`] (pads) used KiCad's;
+/// `keepout_at_rot` and the two anchor-to-origin conversions used the inverse.
+/// Self-consistently, so the placer reserved a box exactly on the cutout — but
+/// the *real* footprint rotates KiCad's way, so a 90°-rotated pot's shaft landed
+/// ~11mm from the panel hole it was anchored to. Latent on every shipped board
+/// so far only because nothing had been rotated yet.
+pub(crate) fn rotate_local(p: (f64, f64), deg: f64) -> (f64, f64) {
+    rotate_offset(p, -deg)
+}
+
+/// Quarter-turn rotation in the mathematical sense (counter-clockwise for a
+/// Y-up axis). Prefer [`rotate_local`]; this is its primitive.
+fn rotate_offset((x, y): (f64, f64), deg: f64) -> (f64, f64) {
     match (((deg / 90.0).round() as i64) % 4 + 4) % 4 {
         1 => (-y, x),
         2 => (-x, -y),
@@ -398,7 +415,7 @@ impl Placer for EurorackPlacer {
                 .map(|f| f.origin_offset)
                 .unwrap_or((0.0, 0.0));
             let (ox, oy) = if back { (-ox, oy) } else { (ox, oy) };
-            let (rox, roy) = rotate_offset((ox, oy), rotation_deg);
+            let (rox, roy) = rotate_local((ox, oy), rotation_deg);
             out.insert(
                 refdes.clone(),
                 Placement {
@@ -714,7 +731,7 @@ impl Placer for SeededPlacer {
             // Align the mount point (courtyard centre ≈ shaft/barrel) to the
             // cutout: put the footprint origin at `cutout - offset`.
             let (ox, oy) = offset_of(&f, back);
-            let (rox, roy) = rotate_offset((ox, oy), rotation_deg);
+            let (rox, roy) = rotate_local((ox, oy), rotation_deg);
             let (px, py) = (x - rox, y - roy);
             out.insert(
                 refdes.clone(),
@@ -2636,11 +2653,31 @@ mod tests {
         let turned = f.tht_pads_at(100.0, 50.0, false, 90.0);
         assert_eq!(turned, vec![(99.5, 42.0, 100.5, 43.0)]);
 
-        // A rotated part's keep-out box carries its origin offset around too.
+        // A rotated part's keep-out box carries its origin offset around too —
+        // and in the SAME sense as the pads above. This assertion used to say
+        // (0, +3), the opposite way, and the two lived side by side in this test
+        // without anyone noticing. Self-consistent inside the placer (it
+        // reserved a box exactly on the anchor) but wrong against the real
+        // footprint, so a 90°-rotated pot's shaft landed ~11mm from its panel
+        // hole. Latent until something actually got rotated.
         let off = a_fact((10.0, 4.0), (3.0, 0.0), vec![]);
         let box_rot = off.keepout_at_rot(0.0, 0.0, false, 90.0);
-        // extent swaps to (4,10) and the offset rotates to (0,3).
-        assert_eq!(box_rot, (-2.0, -2.0, 2.0, 8.0));
+        // extent swaps to (4,10); the +X offset swings to -Y, like the lug.
+        assert_eq!(box_rot, (-2.0, -8.0, 2.0, 2.0));
+
+        // The invariant, stated directly: a part's keep-out and its pads rotate
+        // the same way. A lug on +X and an offset on +X must both end on -Y.
+        let both = a_fact((4.0, 4.0), (5.0, 0.0), vec![(4.5, -0.5, 5.5, 0.5)]);
+        let (kx, ky) = {
+            let b = both.keepout_at_rot(0.0, 0.0, false, 90.0);
+            ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0)
+        };
+        let pad = both.tht_pads_at(0.0, 0.0, false, 90.0)[0];
+        let (px, py) = ((pad.0 + pad.2) / 2.0, (pad.1 + pad.3) / 2.0);
+        assert!(
+            (kx - px).abs() < 1e-9 && (ky - py).abs() < 1e-9,
+            "keep-out {kx},{ky} and pad {px},{py} must rotate together"
+        );
     }
 
     #[test]
