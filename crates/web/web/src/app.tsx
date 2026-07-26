@@ -5,9 +5,11 @@ import python from "highlight.js/lib/languages/python";
 import {
   api,
   artifactUrl,
+  photoUrl,
   type Artifact,
   type BoardSides,
   type Bom,
+  type BomLine,
   type BuildResult,
   type Circuit,
   type EditResult,
@@ -1141,23 +1143,181 @@ function EmbeddedDoc({
   );
 }
 
+/**
+ * Choose the part of a shop photo that is actually the part.
+ *
+ * Thonk photograph what they sell, which for jack sockets is a handful of jack
+ * sockets — fine as a listing, poor as a 13mm Visual BOM cell. The box is locked
+ * to the aspect ratio the BOM renders at (square), so what you frame here is
+ * exactly what comes out: drag inside to move it, drag the corner to scale it.
+ */
+function CropEditor({
+  src,
+  initial,
+  onClose,
+}: {
+  src: string;
+  initial: [number, number, number, number] | null;
+  onClose: (saved: boolean) => void;
+}) {
+  // Fractions of the source image. Default to the largest centred square, which
+  // is usually close to what is wanted for a photo of several loose parts.
+  const [box, setBox] = useState(() => {
+    const [x, y, w, h] = initial ?? [0.25, 0.25, 0.5, 0.5];
+    return { x, y, w, h };
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const frame = useRef<HTMLDivElement | null>(null);
+  // The rendered aspect of the image, so a square *crop* stays square on screen
+  // even though the photo itself may not be.
+  const [ar, setAr] = useState(1);
+
+  // Drag state: what we grabbed, and where, in fractions.
+  const drag = useRef<{
+    mode: "move" | "resize";
+    px: number;
+    py: number;
+    box: { x: number; y: number; w: number; h: number };
+  } | null>(null);
+
+  const onDown = (mode: "move" | "resize") => (e: PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    drag.current = { mode, px: e.clientX, py: e.clientY, box: { ...box } };
+  };
+
+  const onMove = (e: PointerEvent) => {
+    const d = drag.current;
+    const el = frame.current;
+    if (!d || !el) return;
+    const r = el.getBoundingClientRect();
+    const dx = (e.clientX - d.px) / r.width;
+    const dy = (e.clientY - d.py) / r.height;
+    if (d.mode === "move") {
+      setBox({
+        ...d.box,
+        x: clamp(d.box.x + dx, 0, 1 - d.box.w),
+        y: clamp(d.box.y + dy, 0, 1 - d.box.h),
+      });
+      return;
+    }
+    // Resize from the top-left anchor, keeping the on-screen box square: one
+    // pointer axis drives the size and the other follows from the aspect.
+    const wantW = clamp(d.box.w + dx, 0.05, 1 - d.box.x);
+    const wantH = clamp(wantW * ar, 0.05, 1 - d.box.y);
+    setBox({ ...d.box, w: wantH / ar, h: wantH });
+  };
+
+  const onUp = () => {
+    drag.current = null;
+  };
+
+  const save = async (crop: [number, number, number, number] | null) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.saveCrop(src, crop);
+      onClose(true);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div class="crop-backdrop" onClick={() => onClose(false)}>
+      <div class="crop-modal" onClick={(e) => e.stopPropagation()}>
+        <p class="crop-hint">
+          Drag the box to move it, the corner to scale it. The box is locked to
+          the square the Visual BOM renders.
+        </p>
+        <div
+          class="crop-frame"
+          ref={frame}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerCancel={onUp}
+        >
+          <img
+            src={photoUrl(src, true)}
+            alt=""
+            onLoad={(e) => {
+              const im = e.currentTarget as HTMLImageElement;
+              if (im.clientWidth && im.clientHeight) {
+                setAr(im.clientWidth / im.clientHeight);
+              }
+            }}
+          />
+          <div
+            class="crop-box"
+            style={{
+              left: `${box.x * 100}%`,
+              top: `${box.y * 100}%`,
+              width: `${box.w * 100}%`,
+              height: `${box.h * 100}%`,
+            }}
+            onPointerDown={onDown("move")}
+          >
+            <span class="crop-grip" onPointerDown={onDown("resize")} />
+          </div>
+        </div>
+        {err && <p class="error">{err}</p>}
+        <div class="crop-actions">
+          <button disabled={busy} onClick={() => save([box.x, box.y, box.w, box.h])}>
+            Save crop
+          </button>
+          <button class="ghost" disabled={busy} onClick={() => save(null)}>
+            Use full photo
+          </button>
+          <button class="ghost" disabled={busy} onClick={() => onClose(false)}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v));
+}
+
 function BomSection({ name, version }: { name: string; version: number }) {
   const [price, setPrice] = useState(false);
+  const [photos, setPhotos] = useState(false);
+  // Bumped on every saved crop, to bust the browser's cache of `/api/image`.
+  const [shot, setShot] = useState(0);
+  const [editing, setEditing] = useState<BomLine | null>(null);
   // `version` (board mtime) in the deps refetches the BOM when the board rebuilds.
-  const bom = useAsync<Bom>(() => api.bom(name, price), [name, price, version]);
+  const bom = useAsync<Bom>(
+    () => api.bom(name, price, photos),
+    [name, price, photos, version, shot],
+  );
 
   return (
     <Section
       title="Bill of materials"
       extra={
-        <label class="price-toggle">
-          <input
-            type="checkbox"
-            checked={price}
-            onChange={(e) => setPrice((e.target as HTMLInputElement).checked)}
-          />{" "}
-          live pricing
-        </label>
+        <>
+          <label class="price-toggle">
+            <input
+              type="checkbox"
+              checked={photos}
+              onChange={(e) => setPhotos((e.target as HTMLInputElement).checked)}
+            />{" "}
+            photos
+          </label>
+          <label class="price-toggle">
+            <input
+              type="checkbox"
+              checked={price}
+              onChange={(e) => setPrice((e.target as HTMLInputElement).checked)}
+            />{" "}
+            live pricing
+          </label>
+        </>
       }
     >
       {bom.loading && <p class="muted">Loading…</p>}
@@ -1173,6 +1333,7 @@ function BomSection({ name, version }: { name: string; version: number }) {
           <table class="bom">
             <thead>
               <tr>
+                {photos && <th class="photo-col" />}
                 <th>Refs</th>
                 <th>Value</th>
                 <th>Footprint</th>
@@ -1184,6 +1345,22 @@ function BomSection({ name, version }: { name: string; version: number }) {
             <tbody>
               {bom.data.lines.map((l, i) => (
                 <tr key={i}>
+                  {photos && (
+                    <td class="photo-col">
+                      {l.photo_src ? (
+                        <button
+                          class="photo-btn"
+                          title={l.crop ? "Cropped — click to adjust" : "Click to crop"}
+                          onClick={() => setEditing(l)}
+                        >
+                          <img src={photoUrl(l.photo_src, false, shot)} alt="" />
+                          {l.crop && <span class="photo-cropped" />}
+                        </button>
+                      ) : (
+                        <span class="muted">—</span>
+                      )}
+                    </td>
+                  )}
                   <td>{l.refdes.join(", ")}</td>
                   <td>{l.value}</td>
                   <td class="mono">{l.footprint ?? "—"}</td>
@@ -1203,6 +1380,16 @@ function BomSection({ name, version }: { name: string; version: number }) {
             )}
           </table>
         </>
+      )}
+      {editing?.photo_src && (
+        <CropEditor
+          src={editing.photo_src}
+          initial={editing.crop}
+          onClose={(saved) => {
+            setEditing(null);
+            if (saved) setShot((n) => n + 1);
+          }}
+        />
       )}
     </Section>
   );

@@ -13,6 +13,7 @@
 pub mod api;
 pub mod assets;
 pub mod build;
+pub mod image;
 pub mod render;
 pub mod routes;
 mod sim;

@@ -94,6 +94,10 @@ export interface BomLine {
   unit_price: number | null;
   ext_price: number | null;
   image_url: string | null;
+  /** The photo this line uses, resolved as the Visual BOM resolves it. */
+  photo_src: string | null;
+  /** Crop over `photo_src` as `[x, y, w, h]` fractions, if one was chosen. */
+  crop: [number, number, number, number] | null;
 }
 
 export interface Bom {
@@ -215,10 +219,18 @@ export const api = {
     getJson<Circuit>(`/api/circuits/${encodeURIComponent(name)}`),
   source: (name: string) =>
     getJson<SourceDoc>(`/api/circuits/${encodeURIComponent(name)}/source`),
-  bom: (name: string, price = false) =>
-    getJson<Bom>(
-      `/api/circuits/${encodeURIComponent(name)}/bom${price ? "?price=true" : ""}`,
-    ),
+  bom: (name: string, price = false, photos = false) => {
+    const q = new URLSearchParams();
+    if (price) q.set("price", "true");
+    if (photos) q.set("photos", "true");
+    const qs = q.toString();
+    return getJson<Bom>(
+      `/api/circuits/${encodeURIComponent(name)}/bom${qs ? `?${qs}` : ""}`,
+    );
+  },
+  /** Save a crop over a part photo, or clear it with `null`. */
+  saveCrop: (src: string, crop: [number, number, number, number] | null) =>
+    postJson<{ ok: boolean; cropped: boolean }>("/api/image/crop", { src, crop }),
   orders: (name: string) =>
     getJson<Orders>(`/api/circuits/${encodeURIComponent(name)}/orders`),
   edit: (payload: ManifestEditPayload) =>
@@ -229,6 +241,20 @@ export const api = {
       payload,
     ),
 };
+
+/**
+ * URL serving a part photo's bytes. `raw` gives the uncropped original (what the
+ * crop editor works on); otherwise the cropped result the build will use.
+ *
+ * `v` busts the browser cache: the bytes change when a crop is saved but the
+ * source URL does not, so without it a save appears to do nothing.
+ */
+export function photoUrl(src: string, raw = false, v = 0): string {
+  const q = new URLSearchParams({ src });
+  if (raw) q.set("raw", "true");
+  if (v) q.set("v", String(v));
+  return `/api/image?${q.toString()}`;
+}
 
 /** URL that serves a built artifact file (strips the leading `out/`). */
 export function artifactUrl(path: string): string {

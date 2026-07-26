@@ -15,18 +15,17 @@ use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, embed_source, eurorack_trial_build,
-    export_cpl, export_gerbers, fetch_data_uri, fetch_from_jlcpcb, fetch_from_kicad,
-    generate_board_artifacts, generate_board_report, generate_bom, guide_to_html, guide_to_pdf,
-    jlc_bom_csv, kicad_cli_path, minimum_hp, minimum_routable_hp, package_key, panel_from_board,
-    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of, plan_repair, png_to_jpeg,
-    product_image_url, render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran,
-    suggest_by_keyword, suggest_mpns, thonk_image_url, validate_erc, value_key, zip_dir,
-    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, EurorackPlacer, Finding, GuideOptions, HpSearch, JlcpcbClient, KitType,
-    LayoutLoop, LayoutMode, LineKind, Logo, Manifest, MouserClient, PanelFile, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
-    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis,
+    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
+    generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
+    minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
+    render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword,
+    suggest_mpns, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
+    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding,
+    GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest,
+    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -1631,112 +1630,13 @@ fn bom_cmd(
     Ok(())
 }
 
-/// Resolve an embeddable thumbnail (`data:` URI) for a BOM line, best source
-/// first: a curated or priced `image_url`, then Thonk for the shop goods they
-/// supply, then an EasyEDA/LCSC catalog photo. `None` → the Visual BOM falls back
-/// to a life-size swatch / package silhouette / blank.
-///
-/// Order matters. LCSC has no picture of a bag of jack nuts and a poor one of an
-/// Alpha pot; Thonk sells both and photographs them on a bench. For a jellybean
-/// op-amp it is the other way round, which is why the Thonk attempt is gated on
-/// [`thonk_keyword`] rather than tried for everything.
+/// The Visual BOM's photo for a line: the source [`photo_source`] chooses,
+/// embedded as a `data:` URI with any crop applied. `None` → the Visual BOM
+/// falls back to a life-size swatch / package silhouette / blank.
 fn resolve_photo(line: &BomLine, cache: &Path) -> Option<String> {
-    // A curated/library image (may be a `file://` local photo) wins.
-    if let Some(src) = &line.image_url {
-        if let Some(thumb) = embed_source(src, cache) {
-            return Some(thumb);
-        }
-    }
-    if let Some(keyword) = thonk_keyword(line) {
-        if let Some(thumb) = thonk_image_url(&keyword).and_then(|u| fetch_data_uri(&u, cache)) {
-            return Some(thumb);
-        }
-    }
-    let keyword = photo_keyword(line)?;
-    let url = product_image_url(&keyword)?;
-    fetch_data_uri(&url, cache)
+    embed_source(&photo_source(line, cache)?, cache)
 }
 
-/// A Thonk-shaped search term for a line, or `None` when Thonk is the wrong shop
-/// to ask.
-///
-/// Thonk is searched by what a thing *is* ("Alpha 9mm pot"), not by MPN — they
-/// stock `WQP-PJ398SM` jacks but that string returns nothing, while "Thonkiconn
-/// 3.5mm jack" returns the product. So this maps our footprint vocabulary onto
-/// theirs, and stays silent for anything that is really a catalog part.
-fn thonk_keyword(line: &BomLine) -> Option<String> {
-    if line.kind == LineKind::Hardware {
-        // "M6 jack nut" / "Pot washer" → the bag Thonk actually sells.
-        let v = line.value.to_ascii_lowercase();
-        if v.contains("jack") {
-            return Some("jack nuts and washers".into());
-        }
-        if v.contains("pot") {
-            return Some("potentiometer nuts washers".into());
-        }
-        return None;
-    }
-    let fp = line.footprint.as_deref()?.to_ascii_lowercase();
-    let term = if fp.contains("pj398sm") || fp.contains("thonkiconn") {
-        "thonkiconn 3.5mm jack sockets"
-    } else if fp.contains("pj301") {
-        "pj301bm 3.5mm jack sockets"
-    } else if fp.contains("jack_3.5mm") || fp.contains("audiojack") {
-        "3.5mm jack sockets"
-    } else if fp.contains("rd901f") || fp.contains("potentiometer") {
-        "alpha 9mm pots vertical"
-    // Panel LEDs, by the size that decides which bag they came from.
-    } else if fp.contains("led_d3") || fp.contains("led_d3.0") {
-        "3mm led"
-    } else if fp.contains("led_d5") || fp.contains("led_d5.0") {
-        "5mm led"
-    } else if fp.contains("pinheader_2x05") {
-        "eurorack power header shrouded"
-    } else {
-        return None;
-    };
-    Some(term.to_string())
-}
-
-/// The photo-search keyword for a line, or `None` when a photo isn't wanted:
-/// passives (R/C) get a swatch/blank, and a generic value with no MPN (e.g.
-/// `"100k"`) would only return noise — so require a part-number-like token.
-fn photo_keyword(line: &BomLine) -> Option<String> {
-    let prefix: String = line
-        .refdes
-        .first()?
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect();
-    if matches!(prefix.as_str(), "R" | "C") {
-        return None;
-    }
-    let keyword = line
-        .mpn
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(line.value.as_str());
-    if keyword.is_empty() || (line.mpn.is_none() && !has_letter_run(keyword, 2)) {
-        return None;
-    }
-    Some(keyword.to_string())
-}
-
-/// Whether `s` contains a run of at least `n` consecutive ASCII letters — a cheap
-/// "looks like a part number, not a bare value" test (`"LM13700"`/`"TL072"` yes,
-/// `"100k"`/`"4.7k"` no — a passive's unit suffix is a lone letter).
-fn has_letter_run(s: &str, n: usize) -> bool {
-    let mut run = 0usize;
-    for c in s.chars() {
-        run = if c.is_ascii_alphabetic() { run + 1 } else { 0 };
-        if run >= n {
-            return true;
-        }
-    }
-    false
-}
-
-/// Handle `lob parts …` against the global parts library.
 /// One CSV cell, quoted only when it has to be.
 fn csv_cell(v: &str) -> String {
     if v.contains([',', '"', '\n']) {
@@ -1787,6 +1687,7 @@ fn eagle_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// Handle `lob parts …` against the global parts library.
 fn parts_cmd(action: PartsCmd) -> Result<()> {
     // `suggest` is about parts NOT yet in the library (generic, no MPN), so it
     // doesn't need Dolt — handle it before opening the library.

@@ -24,8 +24,8 @@ use serde_json::json;
 use legion_of_bom_core::manifest::MANIFEST_NAME;
 use legion_of_bom_core::{
     build_query, default_panel_orders_dir, edit_manifest, generate_bom, git_stage,
-    parse_netlist_file, staged_paths, suggest_mpns, CircuitSource, EditError, ManifestEdit,
-    MouserClient, PanelOrders, SourcingClients,
+    parse_netlist_file, photo_source, read_crop, staged_paths, suggest_mpns, CircuitSource,
+    EditError, ManifestEdit, MouserClient, PanelOrders, SourcingClients,
 };
 
 use crate::assets::content_type;
@@ -112,9 +112,9 @@ pub async fn bom(
     }
 
     let root = state.root().to_path_buf();
-    let price = q.price;
-    // fs parse (+ optional blocking Mouser HTTP) off the async runtime.
-    match tokio::task::spawn_blocking(move || load_bom(&root, &name, price)).await {
+    let (price, photos) = (q.price, q.photos);
+    // fs parse (+ optional blocking Mouser/photo HTTP) off the async runtime.
+    match tokio::task::spawn_blocking(move || load_bom(&root, &name, price, photos)).await {
         Ok(dto) => Json(dto).into_response(),
         Err(_) => server_error("BOM task panicked"),
     }
@@ -243,7 +243,7 @@ pub async fn artifact(
 // ---------------------------------------------------------------------------
 
 /// Build the BOM from the cached netlist; optionally overlay live Mouser pricing.
-fn load_bom(root: &FsPath, name: &str, price: bool) -> BomDto {
+fn load_bom(root: &FsPath, name: &str, price: bool, photos: bool) -> BomDto {
     let netlist = root.join("out").join(name).join(format!("{name}.net"));
     let model = match parse_netlist_file(&netlist) {
         Ok(m) => m,
@@ -272,18 +272,28 @@ fn load_bom(root: &FsPath, name: &str, price: bool) -> BomDto {
     let total = priced
         .then(|| bom.lines.iter().filter_map(|l| l.ext_price).sum::<f64>())
         .filter(|t| *t > 0.0);
+    let cache = legion_of_bom_core::default_image_cache_dir();
     let lines = bom
         .lines
         .iter()
-        .map(|l| BomLineDto {
-            mpn: l.mpn.clone(),
-            value: l.value.clone(),
-            footprint: l.footprint.clone(),
-            refdes: l.refdes.clone(),
-            qty: l.qty(),
-            unit_price: l.unit_price,
-            ext_price: l.ext_price,
-            image_url: l.image_url.clone(),
+        .map(|l| {
+            let photo_src = photos.then(|| photo_source(l, &cache)).flatten();
+            let crop = photo_src
+                .as_deref()
+                .and_then(|s| read_crop(&cache, s))
+                .map(|c| [c.x, c.y, c.w, c.h]);
+            BomLineDto {
+                mpn: l.mpn.clone(),
+                value: l.value.clone(),
+                footprint: l.footprint.clone(),
+                refdes: l.refdes.clone(),
+                qty: l.qty(),
+                unit_price: l.unit_price,
+                ext_price: l.ext_price,
+                image_url: l.image_url.clone(),
+                photo_src,
+                crop,
+            }
         })
         .collect();
     BomDto {
@@ -398,6 +408,12 @@ struct RepoInfo {
 pub struct BomQuery {
     #[serde(default)]
     price: bool,
+    /// Resolve each line's photo (curated → Thonk → LCSC). Opt-in because an
+    /// unseen photo costs a network round trip per line; once cached it is a
+    /// file read. Needed by the crop editor, which cannot crop what it cannot
+    /// name.
+    #[serde(default)]
+    photos: bool,
 }
 
 #[derive(Serialize)]
@@ -432,6 +448,12 @@ struct BomLineDto {
     unit_price: Option<f64>,
     ext_price: Option<f64>,
     image_url: Option<String>,
+    /// The photo this line actually uses — curated, Thonk, or LCSC — resolved the
+    /// same way the Visual BOM resolves it, so the dashboard crops the image the
+    /// build will use rather than a different one. `None` unless `photos=true`.
+    photo_src: Option<String>,
+    /// The crop recorded for `photo_src`, as `[x, y, w, h]` fractions.
+    crop: Option<[f64; 4]>,
 }
 
 fn default_suggest_limit() -> usize {

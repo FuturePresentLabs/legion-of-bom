@@ -1098,3 +1098,101 @@ table.bom tfoot td {
   color: #c8102e;
   font-weight: 600;
 }
+
+/* Part photos in the BOM, and the crop editor they open.
+   The thumbnail is square because that is the cell the Visual BOM renders, so
+   what you see here is what the build guide gets. */
+.photo-col {
+  width: 48px;
+  padding-right: 0;
+}
+.photo-btn {
+  position: relative;
+  display: block;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid var(--hair, #d8d8d8);
+  border-radius: 4px;
+  background: #fff;
+  cursor: zoom-in;
+}
+.photo-btn img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.photo-btn:hover {
+  border-color: #888;
+}
+/* A corner tick marks a photo somebody has already framed. */
+.photo-cropped {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2f855a;
+  border: 1px solid #fff;
+}
+
+.crop-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.crop-modal {
+  width: min(92vw, 460px);
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--bg, #fff);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.crop-hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #6b7280;
+}
+.crop-frame {
+  position: relative;
+  display: block;
+  /* A chequerboard, so a transparent PNG's edges are still visible. */
+  background:
+    conic-gradient(#eee 25%, #fff 0 50%, #eee 0 75%, #fff 0) 0 0 / 16px 16px;
+  touch-action: none;
+  user-select: none;
+}
+.crop-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+/* Everything outside the box is dimmed by the box's own huge shadow, which is
+   cheaper and sharper than four overlay divs. */
+.crop-box {
+  position: absolute;
+  border: 1.5px solid #fff;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+  cursor: move;
+}
+.crop-grip {
+  position: absolute;
+  right: -7px;
+  bottom: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1.5px solid #333;
+  cursor: nwse-resize;
+}
+.crop-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}

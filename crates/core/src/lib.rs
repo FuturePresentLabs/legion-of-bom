@@ -38,6 +38,7 @@ pub mod panel;
 pub mod panel_edit;
 pub mod parts;
 pub mod pdf;
+pub mod photo;
 pub mod placement;
 pub mod project;
 pub mod resistor;
@@ -89,7 +90,10 @@ pub use guide::{
     guide_to_pdf, BoardPng, BuildGuide, BuildStep, GuideOptions, KitType, PartNote, PlacedPart,
 };
 pub use hardware::{for_footprint as hardware_for_footprint, HardwareItem};
-pub use images::{default_cache_dir as default_image_cache_dir, embed_source, fetch_data_uri};
+pub use images::{
+    cached_source_bytes, cropped_bytes, default_cache_dir as default_image_cache_dir, embed_source,
+    fetch_data_uri, read_crop, source_bytes, source_mime, write_crop, Crop,
+};
 pub use import::{
     package_is_through_hole, package_size_mm, parse_bom as parse_imported_bom,
     parse_cpl as parse_imported_cpl, read_package, ImportedBoard, ImportedPart, ImportedPlacement,
@@ -117,6 +121,7 @@ pub use parts::{
     default_parts_dir, HousePart, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
 };
+pub use photo::{photo_keyword, photo_source, thonk_keyword};
 pub use placement::{
     Column as PlacementColumn, Grid as PlacementGrid, PlacementError, PlacementFile, Point,
     Row as PlacementRow,
