@@ -27,6 +27,7 @@ pub mod images;
 pub mod import;
 pub mod jlcpcb;
 pub mod layout;
+pub mod legalize;
 pub mod logo;
 pub mod manifest;
 pub mod model;
@@ -98,6 +99,7 @@ pub use layout::{
     measure, run_layout_loop, score, CostWeights, LayoutLoop, LayoutMode, LayoutReport,
     PlacementMetrics,
 };
+pub use legalize::{legalize, Report as LegalizeReport};
 pub use logo::Logo;
 pub use manifest::{BuildCopy, CircuitEntry, Defaults, Manifest, ManifestError, RepoMeta};
 pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};

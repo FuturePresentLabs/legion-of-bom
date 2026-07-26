@@ -1232,7 +1232,7 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
             anchors,
             nudges: HashMap::new(),
         };
-        let placements = placer.place(circuit, facts);
+        let mut placements = placer.place(circuit, facts);
         // A part in the overflow lane sits below the board bottom (y > height).
         let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
         // …but "nothing overflowed" is not "buildable". The lane only catches
@@ -1247,6 +1247,11 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
                 outline: Some((0.0, 0.0, w, h)),
             },
         );
+        // Legalize first, because the build does: asking whether the *global*
+        // placement is legal reports a wider board than we would actually
+        // manufacture. Measured on slew_limiter, that was the difference
+        // between answering 5 HP and 4 HP for a 4 HP board that legalizes clean.
+        crate::legalize::legalize(&mut placements, &rules, facts);
         let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
         if !overflowed && broken[0] <= 0.0 {
             return hp;
@@ -1370,7 +1375,26 @@ pub fn generate_board_artifacts(
         loaded.push((refdes, lib_part, part.value.as_str(), fp, pads));
     }
 
-    let placements = options.placer.place(circuit, &facts);
+    let mut placements = options.placer.place(circuit, &facts);
+
+    // Legalization — the middle stage. Global placement decides roughly where
+    // things want to be; this moves whatever is physically illegal the minimum
+    // distance to make it legal, and leaves everything else alone. Only Physical
+    // rules: a part over the board edge is not a trade-off, whereas moving one
+    // to improve decoupling is, and trade-offs belong in the score.
+    //
+    // Requires a known outline, so it is a no-op on a board whose outline is the
+    // pad bounding box — there, nothing can be outside by construction.
+    if options.fixed_outline.is_some() {
+        let rules = crate::rules::derive_in(
+            circuit,
+            &crate::rules::Context {
+                facts: Some(&facts),
+                outline: options.fixed_outline,
+            },
+        );
+        crate::legalize::legalize(&mut placements, &rules, &facts);
+    }
 
     // Height/collision check (DESIGN 6.7): a sub-board stands off the main board on
     // its headers; a taller part directly under it on the same side would hit it.

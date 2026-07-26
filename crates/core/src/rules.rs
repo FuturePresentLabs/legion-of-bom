@@ -21,6 +21,13 @@
 //! electrical rule.
 //!
 //! Adding a rule means adding a variant and a deriver, not editing the placer.
+//!
+//! A caution that applies to every rule here: a rule measures what a *placement*
+//! can see, which is rarely the quantity that matters. Decoupling is the clearest
+//! case — the objective is loop inductance and we score centre-to-centre
+//! millimetres — but the same gap will open up for any electrical rule. Name the
+//! proxy in the rule's own docs so nobody mistakes a passing check for a
+//! guarantee about the circuit.
 
 use std::collections::HashMap;
 
@@ -145,6 +152,15 @@ pub struct Repair {
 /// How much clear board may sit between a decoupling capacitor's keep-out and
 /// its IC's before it stops being a decoupling capacitor. The intent is
 /// "touching, or as near as clearance allows".
+///
+/// **This is a proxy.** What actually decides whether a bypass capacitor works
+/// is the *inductance of the current loop* from the capacitor to the IC's power
+/// pin — which depends on via geometry and the return path, not on where two
+/// part centres sit. A capacitor 2 mm away through poor vias can perform worse
+/// than one 5 mm away through good ones. Distance is cheap, needs only the
+/// placement, and correlates well enough to be worth enforcing; it is not the
+/// thing we care about. Do not tighten this number expecting better decoupling.
+/// See `legion-of-bom-REFS` for the power-integrity references.
 pub const DECOUPLE_GAP_MM: f64 = 2.0;
 
 /// Fallback centre-to-centre limit, used only when part sizes are unavailable.
@@ -196,7 +212,8 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
                 b: ic,
                 max_mm,
                 tier: Tier::Electrical,
-                why: "a decoupling capacitor must sit at its IC's power pins",
+                why: "short current loop from the bypass cap to the IC's power \
+                      pins (distance stands in for loop inductance)",
             }
         })
         .collect();
