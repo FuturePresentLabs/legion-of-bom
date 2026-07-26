@@ -474,7 +474,19 @@ fn drc_on(
     board: &str,
     kicad_cli: &std::path::Path,
 ) -> Result<DrcReport, BoardError> {
-    let path = std::env::temp_dir().join(format!("lob_layout_{}.kicad_pcb", circuit.name()));
+    // Unique per board *content*, not just per circuit: the HP search writes a
+    // different board for every candidate width, and a shared path means one
+    // trial can be read as another's.
+    let stamp: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(board.as_bytes())
+            .iter()
+            .take(6)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let path =
+        std::env::temp_dir().join(format!("lob_layout_{}_{stamp}.kicad_pcb", circuit.name()));
     std::fs::write(&path, board)?;
     run_drc(&path, kicad_cli).map_err(|e| BoardError::Other(e.to_string()))
 }
@@ -519,6 +531,16 @@ pub fn eurorack_trial_build(
         anchors: anchors.clone(),
     });
     Ok((opts, SeededPlacer::new(w, h, origin, anchors)))
+}
+
+/// The panel widths a Eurorack module is actually sold in, from `floor` upward.
+///
+/// Even HP, plus 3 — that is the convention, and 5, 7 or 9 HP reads as a mistake
+/// to anyone buying a module. There is no technical reason a 7 HP panel cannot
+/// be cut; it just is not a width the format uses, so offering one as "the
+/// minimum buildable width" is offering something nobody wants.
+fn conventional_widths(floor: u16) -> impl Iterator<Item = u16> {
+    (floor..=u16::MAX).filter(|hp| *hp == 2 || *hp == 3 || hp % 2 == 0)
 }
 
 /// How far above the geometric floor to look for a width that actually builds.
@@ -599,7 +621,7 @@ where
     if out.unproven {
         return out;
     }
-    for hp in floor_hp..floor_hp.saturating_add(search.max_widths.max(1)) {
+    for hp in conventional_widths(floor_hp).take(search.max_widths.max(1) as usize) {
         let built = configure(hp)
             .and_then(|(options, template)| run_layout_loop(circuit, options, template, cfg));
         // A width that cannot even be generated is recorded and stepped past: the
@@ -711,7 +733,8 @@ mod tests {
         assert!(!out.unproven);
         assert_eq!(out.hp, None, "nothing built, so nothing is proven");
         let widths: Vec<u16> = out.tried.iter().map(|t| t.hp).collect();
-        assert_eq!(widths, vec![6, 7, 8], "every width in range was tried");
+        // 7 HP is skipped: even HP plus 3 is what modules are sold in.
+        assert_eq!(widths, vec![6, 8, 10], "every conventional width was tried");
         assert!(out.tried.iter().all(|t| t.errors.is_none()));
     }
 

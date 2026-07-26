@@ -138,6 +138,11 @@ pub fn run_drc(board: &Path, kicad_cli: &Path) -> Result<DrcReport, StageError> 
         .and_then(|s| s.to_str())
         .unwrap_or("board");
     let out_path = std::env::temp_dir().join(format!("lob-{stem}-drc.json"));
+    // Clear any previous report FIRST. This path is reused across runs, and if
+    // kicad-cli fails for any reason we would otherwise read the last run's JSON
+    // and report it as this board's result — which is how the same circuit at
+    // the same width came back with 6 errors and then 4.
+    let _ = std::fs::remove_file(&out_path);
 
     let output = Command::new(kicad_cli)
         .args([
