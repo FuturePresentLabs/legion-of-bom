@@ -73,6 +73,19 @@ impl Polarity {
             Polarity::Pin1 => "Orientation: align pin 1 (notch/dot) to the silkscreen pin-1 mark.",
         }
     }
+    /// The orientation cue as a parts-table cell — what to look for on the part
+    /// and what to line it up with, short enough to sit in a column.
+    ///
+    /// This replaces repeating [`Self::caution`] as a banner on every step: the
+    /// same sentence on four sheets in a row teaches the reader to skip banners,
+    /// and orientation belongs on the row of the part it applies to.
+    fn cue(self) -> &'static str {
+        match self {
+            Polarity::Cathode => "banded end (K) → silkscreen band",
+            Polarity::Plus => "+ / long lead → silkscreen +",
+            Polarity::Pin1 => "notch or dot → pin-1 mark",
+        }
+    }
 }
 
 /// Resolve a part's polarity from its reference designator and footprint. A
@@ -222,22 +235,37 @@ pub struct BoardPng<'a> {
     pub height: u32,
 }
 
+/// The fraction of extra room `pcb render` leaves around the board's longest
+/// dimension — measured, not documented. See [`render_scale`].
+const RENDER_FIT_MARGIN: f64 = 1.023;
+
 /// Board-mm → image-px scale for a `pcb render` frame of `w_px` × `h_px` showing a
 /// board of `w_mm` × `h_mm`, centred.
 ///
-/// KiCad renders orthographically with a camera that frames the board's **bounding
-/// circle**, so what fits the viewport is the board's *diagonal* — against the
-/// frame's smaller dimension, since the circle has to fit both ways. That makes the
-/// scale depend on the board's aspect ratio, which is why a single "fraction of the
-/// frame" constant could never be right: it was ~40% short on a tall 5 HP Eurorack
-/// board, dragging every highlight box off its part. Measured against a real render
-/// this predicts the board's pixel size to within 0.2%.
+/// KiCad's orthographic camera frames the board's **longest dimension against the
+/// image height**, with ~2.3% headroom. The board's centre always lands on the
+/// image centre, and the visible height in mm depends only on the board — not on
+/// the frame's aspect at all.
+///
+/// This was previously modelled as the board's bounding *circle* fitted to the
+/// frame's smaller dimension. That is wrong, and wrong by an amount that varies
+/// with the board: measured against real renders it under-predicted by 2.8% on a
+/// tall 5 HP Eurorack panel and 9.1% on a small landscape test board. Since the
+/// overlay is drawn at this scale, too small a scale shrinks every highlight box
+/// *and* drags it toward the image centre, which is why highlights sat inside
+/// their silkscreen outlines. Against six boards spanning aspect 0.32–2.67 and
+/// five frame sizes, this form holds to ±0.35%.
+///
+/// If a KiCad upgrade moves the camera, re-measure rather than nudging the
+/// number: `scripts/measure_render_scale.py <render.png> <board.kicad_pcb>`
+/// reports the true scale by finding the board in a real render.
 fn render_scale(w_px: f64, h_px: f64, w_mm: f64, h_mm: f64) -> f64 {
-    let diagonal = w_mm.hypot(h_mm);
-    if diagonal <= 0.0 {
+    let _ = w_px; // the frame's width does not enter the framing
+    let longest = w_mm.max(h_mm);
+    if longest <= 0.0 || h_px <= 0.0 {
         return 1.0;
     }
-    w_px.min(h_px) / diagonal
+    h_px / (RENDER_FIT_MARGIN * longest)
 }
 
 /// A build-step kind, in low-profile-first assembly order (DESIGN 7.8). Polarity
@@ -490,18 +518,27 @@ pub fn guide_from_parts_with(
     let mut steps = Vec::new();
     let mut used = vec![false; parts.len()];
 
-    // The power header goes in first, whichever side it is on: it is the one
-    // part that must be soldered while the board still lies flat.
-    let power = take_group(&parts, &mut used, is_power_header);
-    if !power.is_empty() {
+    // The power header goes in first, whichever side it is on: it is the one part
+    // that must be soldered while the board still lies flat. Split by side, back
+    // first — a step's diagram is one face, so a step that mixes faces cannot be
+    // drawn correctly (see [`step_is_back`]).
+    for back in [true, false] {
+        let power = take_group(&parts, &mut used, |p| is_power_header(p) && p.back == back);
+        if power.is_empty() {
+            continue;
+        }
+        let where_it_sits = if back {
+            "It mounts on the back, and once the front is populated the board will not sit \
+             flat to solder it."
+        } else {
+            "Once anything else stands proud of the board it will not sit flat to solder it."
+        };
         steps.push(BuildStep {
-            assembly: Some(
+            assembly: Some(format!(
                 "Fit the power header first, before anything else stands proud of the board. \
-                 It mounts on the back, and once the front is populated the board will not sit \
-                 flat to solder it. Check the -12 V stripe against the silkscreen: a reversed \
+                 {where_it_sits} Check the -12 V stripe against the silkscreen: a reversed \
                  header is the one mistake that damages the module."
-                    .to_string(),
-            ),
+            )),
             part_notes: Vec::new(),
             caution: step_caution(&power),
             title: "Power header".to_string(),
@@ -657,10 +694,18 @@ fn mirror_part_x(p: &PlacedPart, axis: f64) -> PlacedPart {
     }
 }
 
-/// Whether a step mounts entirely on the back of the board (so it's shown on the
-/// bottom-side render, and flagged so the builder flips the board).
+/// Which face a step is drawn on: `true` for the back, so it renders on the
+/// bottom-side plot (parts mirrored) and is flagged for the builder to flip.
+///
+/// Steps are built one face at a time, so this is normally unanimous. It takes a
+/// majority rather than requiring one, because the failure mode of the old
+/// all-or-nothing test was silent and wrong: a step with a single front part
+/// among back ones fell through to the top render, and every back part in it was
+/// then drawn unmirrored — highlights on the wrong side of the board, with
+/// nothing saying so.
 fn step_is_back(step: &BuildStep) -> bool {
-    !step.parts.is_empty() && step.parts.iter().all(|p| p.back)
+    let back = step.parts.iter().filter(|p| p.back).count();
+    back * 2 > step.parts.len()
 }
 
 /// A step's polarity caution — from its first polarised part (parts in a
@@ -782,6 +827,23 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
         if !bb.0.is_finite() {
             bb = (fx - 0.5, fy - 0.5, fx + 0.5, fy + 0.5);
         }
+        // Grow the box to the footprint's courtyard — its declared body extent,
+        // which is what the silkscreen outline traces on the board.
+        //
+        // The pad box alone is not the part. A 3.5 mm jack's pads span 2.1 mm
+        // across while its body is 9 mm, so a pad-box highlight covered under a
+        // third of the outline the builder is looking at, and read as "not
+        // matching the silkscreen". Union, not replacement: a chip resistor's
+        // pads reach slightly outside its courtyard, and the builder needs to see
+        // the pads the part lands on either way.
+        if let Some(cy) = courtyard_bbox(fp, (fx, fy), frot) {
+            bb = (
+                bb.0.min(cy.0),
+                bb.1.min(cy.1),
+                bb.2.max(cy.2),
+                bb.3.max(cy.3),
+            );
+        }
         parts.push(PlacedPart {
             refdes,
             value: String::new(),
@@ -796,6 +858,47 @@ fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
         });
     }
     Ok(parts)
+}
+
+/// The footprint's courtyard as a board-coordinate box, rotated and translated to
+/// where the part is placed. `None` when the footprint declares no courtyard.
+///
+/// The courtyard (`*.CrtYd`) is the footprint's own statement of how much board
+/// its body occupies, and it is what the silkscreen outline follows — so it is
+/// what a highlight has to match.
+fn courtyard_bbox(fp: &Sexpr, origin: (f64, f64), rot_deg: f64) -> Option<(f64, f64, f64, f64)> {
+    let (fx, fy) = origin;
+    let mut bb = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for kind in ["fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc"] {
+        for g in fp.get_all(kind) {
+            let on_courtyard = g
+                .get("layer")
+                .and_then(|l| l.nth_atom(1))
+                .is_some_and(|l| l.ends_with(".CrtYd"));
+            if !on_courtyard {
+                continue;
+            }
+            for point in ["start", "end", "center", "mid"] {
+                if let Some(p) = g.get(point) {
+                    let (Some(x), Some(y)) = (p.nth_atom(1).and_then(f), p.nth_atom(2).and_then(f))
+                    else {
+                        continue;
+                    };
+                    let (rx, ry) = rotate_kicad((x, y), rot_deg);
+                    bb.0 = bb.0.min(fx + rx);
+                    bb.1 = bb.1.min(fy + ry);
+                    bb.2 = bb.2.max(fx + rx);
+                    bb.3 = bb.3.max(fy + ry);
+                }
+            }
+        }
+    }
+    bb.0.is_finite().then_some(bb)
 }
 
 /// The board outline from the `Edge.Cuts` rectangle, if present.
@@ -833,9 +936,13 @@ pub fn guide_to_html(
     let total_parts: usize = guide.steps.iter().map(|s| s.parts.len()).sum();
     let any_back = guide.steps.iter().any(step_is_back);
     let cxmm = (guide.outline.0 + guide.outline.2) / 2.0;
+    let sheets = total + 1;
     let mut body = String::new();
+
+    // ---- Sheet 1: what this is, what you need, and the pull-and-sort list.
+    body.push_str("<section class=\"sheet\">");
     let sub = format!(
-        "Work low-profile → tall{}. Match every polarity / pin-1 marker to the board silkscreen.",
+        "Low-profile parts first, tall parts last{} — so nothing blocks the iron.",
         if any_back { ", back side first" } else { "" },
     );
     let eyebrow = match &guide.brand {
@@ -850,6 +957,7 @@ pub fn guide_to_html(
             guide.kit.label().to_string(),
             format!("{total} steps"),
             format!("{total_parts} parts"),
+            format!("{sheets} sheets"),
         ],
     ));
 
@@ -868,45 +976,97 @@ pub fn guide_to_html(
                 .iter()
                 .map(|t| format!("<li>{}</li>", esc(t)))
                 .collect::<String>();
-            body.push_str(&format!(
-                "<h2>Tools you'll need</h2><ul class=\"tools\">{tools}</ul>"
-            ));
+            body.push_str(&format!("<h2>Tools</h2><ul class=\"tools\">{tools}</ul>"));
         }
         body.push_str("</section>");
     }
 
-    // Prep / sort sheet — pull and sort every part up front, in build order.
-    body.push_str(
-        "<section class=\"prep\"><h2>Before you start — pull &amp; sort your parts</h2>\
-         <table><tr><th>Group</th><th>Qty</th><th>Parts</th></tr>",
-    );
-    for step in &guide.steps {
-        let side = if step_is_back(step) {
-            " <span class=\"badge\">back</span>"
-        } else {
-            ""
-        };
-        let vals = group_by_value(&step.parts)
-            .into_iter()
-            .map(|(v, refs)| {
+    // The board itself, both sides — so the builder knows which way round it goes
+    // before the first step tells them to flip it.
+    let overviews: Vec<(&'static str, Diagram)> = [("Front", &top), ("Back", &bottom)]
+        .into_iter()
+        .filter_map(|(label, r)| {
+            r.as_ref()
+                .map(|bp| (label, board_overview_svg(bp, guide.outline)))
+        })
+        .collect();
+    if !overviews.is_empty() {
+        let n = overviews.len();
+        let figs: String = overviews
+            .iter()
+            .map(|(label, d)| {
+                let (w, _h) = overview_fit(d.aspect, n);
                 format!(
-                    "{}× {} {}<span class=\"refs\">({})</span>",
-                    refs.len(),
-                    esc(&v),
-                    resistor_swatch_html(&step.parts, &refs, &v),
-                    esc(&refs.join(", "))
+                    "<figure class=\"overview\" style=\"width:{w:.1}mm\">{}\
+                     <figcaption class=\"mono\">{label}</figcaption></figure>",
+                    d.svg,
                 )
             })
-            .collect::<Vec<_>>()
-            .join("; ");
+            .collect();
+        body.push_str(&format!("<div class=\"overviews\">{figs}</div>"));
+    }
+
+    // Pull & sort list — one row per pile you actually make on the bench, which
+    // is (value, package): a 0603 47k and a 1206 47k are two piles, not one.
+    // Deduped across steps: a part that is seated in one step and soldered in
+    // another is still one part to find, and listing it twice would have the
+    // builder counting out two.
+    body.push_str(
+        "<h2 class=\"sec\">Pull &amp; sort your parts</h2>\
+         <p class=\"sec-sub\">Tick each off as you find it. Listed in build order — \
+         the step that needs it is on the right.</p>\
+         <table class=\"ptab prep\"><thead><tr><th class=\"h-chk\"></th><th>Qty</th>\
+         <th>Value</th><th>Package</th><th>Reference designators</th><th>First used</th>\
+         </tr></thead><tbody>",
+    );
+    let mut listed: HashSet<String> = HashSet::new();
+    for (i, step) in guide.steps.iter().enumerate() {
+        let side = if step_is_back(step) { " · back" } else { "" };
+        for row in part_rows(&step.parts) {
+            if !listed.insert(format!("{}\u{1}{}", row.value, row.package)) {
+                continue;
+            }
+            body.push_str(&format!(
+                "<tr><td class=\"c-chk\"><span class=\"chk\"></span></td>\
+                 <td class=\"c-qty mono\">{qty}×</td>\
+                 <td class=\"c-val\">{val}{swatch}</td>\
+                 <td class=\"c-pkg mono\">{pkg}</td>\
+                 <td class=\"c-ref mono\">{refs}</td>\
+                 <td class=\"c-step\">{no}. {title}{side}</td></tr>",
+                qty = row.refs.len(),
+                val = esc(&row.value),
+                swatch = row_swatch(&row),
+                pkg = esc(&row.package),
+                refs = esc(&row.refs.join("  ")),
+                no = i + 1,
+                title = esc(&step.title),
+            ));
+        }
+    }
+    // The nuts and washers that arrive with the panel parts and appear in no
+    // netlist. Listed with the parts they serve, because that is how you find
+    // out one is missing before the panel refuses to go on.
+    for hw in hardware_rows(&guide.steps) {
         body.push_str(&format!(
-            "<tr><td>{}{side}</td><td>{}</td><td>{vals}</td></tr>",
-            esc(&step.title),
-            step.parts.len(),
+            "<tr class=\"hw\"><td class=\"c-chk\"><span class=\"chk\"></span></td>\
+             <td class=\"c-qty mono\">{qty}×</td>\
+             <td class=\"c-val\">{name}</td>\
+             <td class=\"c-pkg\">hardware</td>\
+             <td class=\"c-ref mono\">{refs}</td>\
+             <td class=\"c-step\">with the panel hardware</td></tr>",
+            qty = hw.refs.len(),
+            name = esc(&hw.name),
+            refs = esc(&hw.refs.join("  ")),
         ));
     }
-    body.push_str("</table></section>");
+    body.push_str("</tbody></table>");
+    body.push_str(&theme::page_footer(
+        &format!("{} · build guide", guide.name),
+        &format!("Sheet 1 of {sheets}"),
+    ));
+    body.push_str("</section>");
 
+    // ---- One sheet per step: the picture, then what goes on it.
     let mut placed = 0usize;
     for (i, step) in guide.steps.iter().enumerate() {
         let n = step.parts.len();
@@ -920,24 +1080,58 @@ pub fn guide_to_html(
             step.parts.clone()
         };
         let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
-        let svg = match render {
-            Some(bp) => photoreal_board_svg(bp, guide.outline, &parts),
-            None => schematic_board_svg(guide, &highlight),
+        // Size the picture first, then draw it: the refdes labels are scaled to
+        // the printed width so they read the same on every board.
+        let (dw, _dh, beside) = diagram_fit(diagram_aspect(render.as_ref(), guide.outline));
+        let diagram = match render {
+            Some(bp) => photoreal_board_svg(bp, guide.outline, &parts, dw),
+            None => schematic_board_svg(guide, &highlight, dw),
+        };
+
+        let rows = part_rows(&step.parts);
+        let show_orient = rows.iter().any(|r| r.polarity.is_some());
+        let orient_head = if show_orient {
+            "<th>Orientation</th>"
+        } else {
+            ""
         };
         let mut list = String::new();
-        for (value, refs) in group_by_value(&step.parts) {
+        for row in &rows {
+            let ticks: String = row
+                .refs
+                .iter()
+                .map(|r| {
+                    format!(
+                        "<span class=\"tick\"><span class=\"chk\"></span>{}</span>",
+                        esc(r)
+                    )
+                })
+                .collect();
+            let orient = if show_orient {
+                format!(
+                    "<td class=\"c-or\">{}</td>",
+                    match row.polarity {
+                        Some(p) => p.cue(),
+                        None => "any way round",
+                    }
+                )
+            } else {
+                String::new()
+            };
             list.push_str(&format!(
-                "<li><b>{}×</b> {} {}— <span class=\"refs\">{}</span></li>",
-                refs.len(),
-                esc(&value),
-                resistor_swatch_html(&step.parts, &refs, &value),
-                esc(&refs.join(", "))
+                "<tr><td class=\"c-ref place\">{ticks}</td>\
+                 <td class=\"c-val\">{val}{swatch}</td>\
+                 <td class=\"c-pkg mono\">{pkg}</td>{orient}</tr>",
+                val = esc(&row.value),
+                swatch = row_swatch(row),
+                pkg = esc(&row.package),
             ));
         }
+
         let howto = step
             .assembly
             .as_deref()
-            .map(|a| format!("<p class=\"howto\">{}</p>", esc(a)))
+            .map(|a| format!("<p class=\"howto\"><b>How.</b> {}</p>", esc(a)))
             .unwrap_or_default();
         let partnotes: String = step
             .part_notes
@@ -955,27 +1149,48 @@ pub fn guide_to_html(
                 )
             })
             .collect();
+        // The generic "match pin 1 to the silkscreen" caution now lives in the
+        // table's Orientation column, per part — repeating it as a banner on
+        // every step was noise that trained the reader to skip cautions.
         let caution = step
             .caution
             .as_deref()
+            .filter(|_| !show_orient)
             .map(|c| format!("<p class=\"caution\">⚠ {}</p>", esc(c)))
             .unwrap_or_default();
-        let badge = if back_step {
-            "<span class=\"badge back\">↺ BACK side — shown from the back</span>"
+        let side_note = if back_step {
+            "<p class=\"flip\">↺ Flip the board — these mount on the <b>BACK</b>, \
+             and the picture is drawn from the back.</p>"
         } else {
             ""
         };
         body.push_str(&format!(
-            "<section class=\"step\"><header class=\"step-head\">\
-             <span class=\"step-no mono\">{stepno}<span class=\"of\"> / {total}</span></span>\
-             <div class=\"step-meta\"><h2 class=\"step-title\">{title}{badge}</h2>\
-             <p class=\"prog mono\">Place {n} part{s} · {placed} / {total_parts} placed when done</p>\
-             </div></header>\
-             <div class=\"cols\"><div class=\"diagram\">{svg}</div>\
-             <div class=\"parts\"><ul>{list}</ul>{howto}{partnotes}{caution}</div></div></section>",
+            "<section class=\"sheet step {layout}\">\
+             <header class=\"step-head\">\
+             <p class=\"step-of mono\">Step {stepno} of {total}{badge}</p>\
+             <h2 class=\"step-title\">{title}</h2>\
+             <p class=\"prog mono\">{n} part{s} to place · {placed} of {total_parts} done \
+             after this step</p></header>\
+             <div class=\"cols\">\
+             <figure class=\"diagram\" style=\"width:{dw:.1}mm\">{svg}</figure>\
+             <div class=\"parts\"><table class=\"ptab\"><thead><tr>\
+             <th>Place &amp; tick</th><th>Value</th><th>Package</th>{orient_head}</tr></thead>\
+             <tbody>{list}</tbody></table>{side_note}{howto}{partnotes}{caution}</div></div>\
+             {footer}</section>",
+            layout = if beside { "beside" } else { "stacked" },
             stepno = i + 1,
+            badge = if back_step {
+                " <span class=\"badge back\">BACK SIDE</span>"
+            } else {
+                ""
+            },
             title = esc(&step.title),
             s = if n == 1 { "" } else { "s" },
+            svg = diagram.svg,
+            footer = theme::page_footer(
+                &format!("{} · step {} — {}", guide.name, i + 1, step.title),
+                &format!("Sheet {} of {sheets}", i + 2),
+            ),
         ));
     }
     format!(
@@ -986,56 +1201,69 @@ pub fn guide_to_html(
     )
 }
 
-/// Build-guide-specific CSS, layered after [`theme::BASE_CSS`]. Numbered steps
-/// (the sequence is real), monospace part data, and a bench-note treatment for
-/// the per-kind placing copy.
+/// Build-guide-specific CSS, layered after [`theme::BASE_CSS`].
+///
+/// Laid out as sheets, not as a scrolling page: every `.sheet` is one side of
+/// paper, sized to the Letter∩A4 box, with its footer pinned to the bottom. The
+/// step's picture is sized inline in millimetres by [`diagram_fit`] — CSS never
+/// gets to squeeze it into a fraction of a text column, which is what used to
+/// leave the board occupying under a tenth of the sheet.
 const CSS: &str = "\
-.kit-copy{margin:.2rem 0 .4rem}\
-.kit-copy .intro{font-size:1.05rem;color:#3a362f;max-width:64ch;margin:.2rem 0 .9rem}\
-.kit-copy h2{font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;\
-color:var(--muted);margin:.9rem 0 .4rem}\
-.tools{margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:.4rem}\
-.tools li{font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:.82rem;background:var(--panel);\
-border:1px solid var(--line);border-radius:5px;padding:.25rem .6rem}\
-.prep{border-top:1px solid var(--line);padding:1.2rem 0;margin-top:.4rem}\
-.prep h2{font-size:1.15rem;font-weight:700;letter-spacing:-.01em;margin:.1rem 0 .7rem}\
-.prep table{border-collapse:collapse;width:100%;font-size:.9rem}\
-.prep th{text-align:left;color:var(--muted);font-weight:600;font-size:.7rem;letter-spacing:.06em;\
-text-transform:uppercase;border-bottom:1.5px solid var(--copper);padding:.4rem .5rem}\
-.prep td{border-bottom:1px solid var(--line);padding:.4rem .5rem;vertical-align:top}\
-.prep td:first-child{font-weight:600}\
-.step{border-top:1px solid var(--line);padding:1.5rem 0}\
-.step-head{display:flex;gap:.9rem;align-items:baseline}\
-.step-no{font-size:2rem;font-weight:750;color:var(--copper);line-height:1;letter-spacing:-.03em;white-space:nowrap}\
-.step-no .of{font-size:.85rem;color:var(--muted);font-weight:500;letter-spacing:0}\
-.step-title{font-size:1.2rem;font-weight:700;letter-spacing:-.01em;margin:0}\
-.prog{color:var(--muted);margin:.25rem 0 0;font-size:.8rem}\
-.badge{display:inline-block;font-size:.66rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;\
-background:var(--copper-soft);color:#8a4f22;border-radius:4px;padding:.1rem .45rem;vertical-align:middle;margin-left:.5rem}\
-.badge.back{background:#fbe6d2;color:#8a4b12}\
-.cols{display:flex;gap:1.6rem;flex-wrap:wrap;align-items:flex-start;margin-top:.9rem}\
-.diagram{flex:1 1 340px;min-width:280px}.parts{flex:1 1 250px}\
-.diagram svg{width:100%;height:auto;border:1px solid var(--line);background:#fbfbfa;border-radius:8px}\
-ul{margin:0;padding-left:0;list-style:none}\
-li{margin:.28rem 0;padding-left:1rem;position:relative}\
-li::before{content:'';position:absolute;left:0;top:.55em;width:5px;height:5px;background:var(--copper);border-radius:1px}\
-li b{font-family:ui-monospace,'SF Mono',Menlo,monospace}\
-.refs{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:.84rem}\
-.swatch{display:inline-block;vertical-align:middle;margin:0 .2rem}\
-svg.rband{width:58px;height:18px;border:0;background:none;border-radius:0;vertical-align:middle}\
-.howto{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--copper);\
-padding:.55rem .8rem;border-radius:5px;margin:.75rem 0 0;color:#4a453d;font-size:.9rem}\
-.howto::before{content:'Placing';display:block;font-family:ui-monospace,Menlo,monospace;font-size:.62rem;\
-letter-spacing:.16em;text-transform:uppercase;color:var(--copper);margin-bottom:.25rem}\
-.partnote{background:var(--copper-soft);border-radius:5px;padding:.5rem .7rem;margin:.5rem 0 0;\
-color:#5a4327;font-size:.88rem}\
-.pn-ref{font-family:ui-monospace,'SF Mono',Menlo,monospace;font-weight:700;color:#8a4f22;margin-right:.35rem}\
-.caution{background:#fdf4de;border-left:3px solid var(--flux);padding:.55rem .8rem;border-radius:5px;\
-margin:.6rem 0 0;color:#6b4e07;font-size:.9rem}\
-@media print{.prep{break-after:page}\
-.step{break-before:page;break-inside:avoid;border-top:none;padding:0}\
-.step:first-of-type{break-before:avoid}\
-.diagram,.parts{break-inside:avoid}.diagram svg{max-height:150mm}}";
+.sheet{display:flex;flex-direction:column;min-height:255mm;padding-bottom:2mm}\
+.sheet+.sheet{border-top:1px dashed var(--hair);margin-top:6mm;padding-top:6mm}\
+.kit-copy{margin:0 0 2mm}\
+.kit-copy .intro{max-width:72ch;margin:0 0 2mm}\
+.kit-copy h2{font-size:8pt;font-weight:700;text-transform:uppercase;margin:3mm 0 1mm}\
+.tools{margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:0 1.5mm;font-size:8.5pt}\
+.tools li{white-space:nowrap}\
+.tools li+li::before{content:'·  ';color:var(--hair)}\
+.sec{font-size:12pt;font-weight:700;margin:3mm 0 0;text-transform:uppercase;letter-spacing:.01em}\
+.sec-sub{font-size:8.5pt;margin:.5mm 0 2mm}\
+.ptab{border-collapse:collapse;width:100%;font-size:9pt}\
+.ptab th{text-align:left;font-weight:700;font-size:7.5pt;text-transform:uppercase;\
+border-top:.8pt solid var(--ink);border-bottom:.8pt solid var(--ink);\
+padding:.9mm 1.5mm;white-space:nowrap}\
+.ptab td{border-bottom:.4pt solid var(--hair);padding:1mm 1.5mm;vertical-align:middle}\
+.ptab tbody tr:last-child td{border-bottom:.8pt solid var(--ink)}\
+.ptab tr>*:first-child{padding-left:0}.ptab tr>*:last-child{padding-right:0}\
+.h-chk,.c-chk{width:8mm}.c-qty{width:10mm}\
+.c-val{font-weight:700;font-size:10pt}\
+.c-pkg{font-size:8.5pt}\
+.c-ref{font-size:9.5pt;font-weight:700}\
+.c-step{font-size:8.5pt;width:38mm;white-space:nowrap;color:var(--muted)}\
+.c-or{font-size:8.5pt;line-height:1.2;color:var(--warn);font-weight:700}\
+.step .c-val{width:36%}.step .c-pkg{width:18%}.step .c-or{width:26%}\
+.hw td{font-style:italic}\
+.place{display:flex;flex-wrap:wrap;gap:.5mm 4mm;padding-top:1.2mm;padding-bottom:1.2mm}\
+.tick{display:inline-flex;align-items:center;gap:1.6mm;font-family:ui-monospace,'SF Mono',Menlo,monospace;\
+font-size:11pt;font-weight:700;white-space:nowrap}\
+.overviews{display:flex;gap:6mm;align-items:flex-end;margin:2mm 0 0}\
+.overview{margin:0;flex:none;max-width:100%}\
+.overview svg{display:block;width:100%;height:auto;border:.5pt solid var(--ink)}\
+.overview figcaption{font-size:7.5pt;font-weight:700;text-transform:uppercase;margin-top:1mm}\
+.step-head{margin-bottom:2.5mm;border-bottom:1.6pt solid var(--ink);padding-bottom:1.5mm}\
+.step-of{font-size:8pt;font-weight:700;text-transform:uppercase;margin:0}\
+.step-title{font-size:20pt;font-weight:700;letter-spacing:-.02em;margin:0;line-height:1}\
+.prog{margin:.5mm 0 0;font-size:8.5pt;color:var(--muted)}\
+.badge{display:inline-block;font-size:7.5pt;font-weight:700;text-transform:uppercase;\
+background:var(--ink);color:#fff;padding:.2mm 1.2mm;margin-left:1.5mm;vertical-align:.3mm}\
+.cols{display:flex;gap:6mm;align-items:flex-start}\
+.stacked .cols{flex-direction:column;gap:3mm}\
+.diagram{margin:0;flex:none;max-width:100%}.parts{flex:1 1 auto;min-width:0;align-self:stretch}\
+.stacked .parts{width:100%}\
+.diagram svg{display:block;width:100%;height:auto;border:.5pt solid var(--ink)}\
+.swatch{display:inline-block;vertical-align:middle;margin-left:1.5mm}\
+svg.rband{width:58px;height:18px;border:0;background:none;vertical-align:middle}\
+.flip{margin:3mm 0 0;padding:1.4mm 2mm;background:var(--ink);color:#fff;font-size:9pt;font-weight:700}\
+.howto{margin:3mm 0 0;font-size:9pt}\
+.howto b{text-transform:uppercase;font-size:8pt;letter-spacing:.03em}\
+.partnote{margin:2mm 0 0;font-size:9pt;padding-left:4mm;border-left:.8pt solid var(--ink)}\
+.pn-ref{font-family:ui-monospace,'SF Mono',Menlo,monospace;font-weight:700;margin-right:1.5mm}\
+.caution{border:1pt solid var(--warn);color:var(--warn);font-weight:700;padding:1.4mm 2mm;\
+margin:3mm 0 0;font-size:9pt}\
+@media print{.sheet{break-after:page;min-height:244mm;border:none;margin:0;padding:0}\
+.sheet:last-child{break-after:auto}.sheet+.sheet{border-top:none;margin-top:0;padding-top:0}\
+.cols,.diagram,.step-head{break-inside:avoid}}";
 
 /// Draw a highlight marker for one placed part on a PDF page: a red box (filled
 /// over the schematic fallback; outlined over the real-board image so the part
@@ -1050,7 +1278,14 @@ fn pdf_marker(
     filled: bool,
 ) {
     let (cx0, cy0, cx1, cy1) = p.bbox;
-    pg.set_line_width(if filled { 0.8 } else { 1.2 });
+    // The outline is the whole signal over a photoreal render, so it thickens
+    // with the diagram's magnification rather than thinning away on a small
+    // board blown up to fill the sheet.
+    pg.set_line_width(if filled {
+        0.8
+    } else {
+        (scale * 0.25).clamp(1.0, 2.5)
+    });
     pg.set_stroke(0.63, 0.07, 0.07);
     if filled {
         pg.set_fill(0.89, 0.29, 0.29);
@@ -1072,7 +1307,9 @@ fn pdf_marker(
     }
     // Refdes on a dark chip just above the box, so it stays legible over the busy
     // photoreal board without crowding the pads.
-    let fs = (scale * 1.4).clamp(6.0, 12.0);
+    // Clamped in *points*, not board mm: the diagram's magnification varies ~5×
+    // between a 32 mm test board and a 128 mm panel, and the label should not.
+    let fs = (scale * 1.4).clamp(7.0, 11.0);
     let tw = p.refdes.len() as f64 * fs * 0.62;
     let (lx, ly) = (mapx(p.cx), mapy(cy0) + fs * 0.85);
     pg.set_fill(0.1, 0.12, 0.14);
@@ -1124,95 +1361,181 @@ pub fn guide_to_pdf(
         images.len() - 1
     });
 
-    let m = 36.0; // page margin (pt)
-    let cw = pdf::A4_W - 2.0 * m; // content width
+    // US Letter at a 12 mm margin — the same 186 mm content box the HTML guide
+    // lays out to, so the two artifacts print at the same size.
+    let m = 12.0 * pdf::MM;
+    let (page_w, page_h) = (pdf::LETTER_W, pdf::LETTER_H);
+    let cw = page_w - 2.0 * m; // content width
+    let top = page_h - m;
+    let foot_y = m + 4.0; // footer baseline
+    let body_bottom = foot_y + 14.0;
     let total = guide.steps.len();
     let total_parts: usize = guide.steps.iter().map(|s| s.parts.len()).sum();
     let any_back = guide.steps.iter().any(step_is_back);
     let (ox0, oy0, ox1, oy1) = guide.outline;
     let cxmm = (ox0 + ox1) / 2.0;
-    let (pad, top) = (2.0, pdf::A4_H - m);
+    let pad = CROP_MARGIN_MM;
     let (bx0, by0, bx1, by1) = (ox0 - pad, oy0 - pad, ox1 + pad, oy1 + pad);
     let (bw, bh) = ((bx1 - bx0).max(1.0), (by1 - by0).max(1.0));
+    let sheets = total + 1;
+    let doc_name = guide.name.clone();
 
     let mut pages = Vec::new();
 
-    // Prep / sort page — pull and sort every part first, in build order.
+    // ---- Sheet 1: what this is, what you need, and the pull-and-sort list.
     {
         let mut pg = Page::new();
-        pg.set_fill(0.1, 0.1, 0.1);
+        pg.set_fill(0.08, 0.09, 0.11);
         let title = match &guide.brand {
             Some(b) => format!("{b} — {} build guide", guide.name),
-            None => format!("{} - build guide", guide.name),
+            None => format!("{} — build guide", guide.name),
         };
-        pg.text(m, top, 20.0, Font::Bold, &title);
-        pg.set_fill(0.3, 0.3, 0.3);
+        pg.text(m, top - 14.0, 19.0, Font::Bold, &title);
+        pg.set_fill(0.36, 0.35, 0.33);
         pg.text(
             m,
-            top - 24.0,
-            11.0,
+            top - 30.0,
+            9.5,
             Font::Regular,
             &format!(
-                "{}  -  {total} steps, {total_parts} parts. Low-profile to tall{}. \
-                 Match every polarity / pin-1 mark to the silkscreen.",
+                "{} · {total} steps · {total_parts} parts · {sheets} sheets. \
+                 Low-profile parts first, tall parts last{}.",
                 guide.kit.label(),
                 if any_back { ", back side first" } else { "" }
             ),
         );
 
         // Per-circuit build copy (5uj.5): intro, tools, kit cautions.
-        let mut ly = top - 46.0;
+        let mut ly = top - 50.0;
         if let Some(intro) = &guide.intro {
-            pg.set_fill(0.2, 0.19, 0.17);
-            ly = pdf_wrapped(&mut pg, m, ly, cw, 11.0, Font::Regular, intro) - 4.0;
+            pg.set_fill(0.19, 0.19, 0.18);
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.0, Font::Regular, intro) - 3.0;
         }
         if !guide.tools.is_empty() {
-            pg.set_fill(0.35, 0.35, 0.35);
+            pg.set_fill(0.36, 0.35, 0.33);
             let tools = format!("Tools: {}", guide.tools.join("  ·  "));
-            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.5, Font::Regular, &tools) - 4.0;
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 9.5, Font::Regular, &tools) - 3.0;
         }
         for c in &guide.kit_cautions {
-            pg.set_fill(0.72, 0.45, 0.0);
-            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.5, Font::Bold, &format!("[!] {c}")) - 2.0;
+            pg.set_fill(0.54, 0.39, 0.0);
+            ly = pdf_wrapped(&mut pg, m, ly, cw, 9.5, Font::Bold, &format!("[!] {c}")) - 2.0;
         }
-        ly -= 6.0;
-        pg.set_fill(0.13, 0.13, 0.13);
+
+        // The board itself, both sides, so the builder can orient it before the
+        // first step tells them to flip it.
+        let overview: Vec<(&str, usize, &pdf::Image)> =
+            [("FRONT", top_idx, &top_img), ("BACK", bot_idx, &bot_img)]
+                .into_iter()
+                .filter_map(|(l, i, im)| Some((l, i?, im.as_ref()?)))
+                .collect();
+        if !overview.is_empty() {
+            let n = overview.len() as f64;
+            let box_w = (cw - 16.0 * (n - 1.0)) / n;
+            let box_h = 210.0;
+            let mut x = m;
+            let mut lowest = ly;
+            for (label, idx, img) in &overview {
+                let (dw, dh) = pdf_place_render(
+                    &mut pg,
+                    img,
+                    *idx,
+                    guide.outline,
+                    (x, ly - 4.0, box_w, box_h),
+                    &[],
+                );
+                pg.set_fill(0.42, 0.41, 0.38);
+                pg.text(x, ly - 12.0 - dh, 7.5, Font::Bold, label);
+                lowest = lowest.min(ly - 16.0 - dh);
+                x += dw.max(20.0) + 16.0;
+            }
+            ly = lowest - 12.0;
+        }
+
+        pg.set_fill(0.08, 0.09, 0.11);
+        pg.text(m, ly, 13.0, Font::Bold, "Pull & sort your parts");
+        ly -= 12.0;
+        pg.set_fill(0.42, 0.41, 0.38);
         pg.text(
             m,
             ly,
-            13.0,
-            Font::Bold,
-            "Before you start — pull & sort your parts:",
+            9.0,
+            Font::Regular,
+            "Tick each off as you find it. The step that needs it is on the right.",
         );
-        ly -= 22.0;
-        for step in &guide.steps {
-            let side = if step_is_back(step) { "   [BACK]" } else { "" };
-            pg.set_fill(0.13, 0.13, 0.13);
-            pg.text(
-                m,
-                ly,
-                11.5,
-                Font::Bold,
-                &format!("{}  ({}){side}", step.title, step.parts.len()),
-            );
-            ly -= 15.0;
-            for (v, refs) in group_by_value(&step.parts) {
-                pg.set_fill(0.35, 0.35, 0.35);
-                pg.text(
-                    m + 12.0,
-                    ly,
-                    10.5,
-                    Font::Regular,
-                    &format!("{}x  {}  ({})", refs.len(), v, refs.join(", ")),
-                );
-                pdf_resistor_bands(&mut pg, &step.parts, &refs, &v, pdf::A4_W - m, ly);
-                ly -= 13.0;
-            }
-            ly -= 4.0;
+        ly -= 16.0;
+        // Column rules, in the same order as the HTML sort table.
+        let (c_qty, c_val, c_pkg, c_ref, c_step) =
+            (m + 16.0, m + 44.0, m + 168.0, m + 250.0, m + 372.0);
+        pg.set_fill(0.42, 0.41, 0.38);
+        for (x, h) in [
+            (c_qty, "QTY"),
+            (c_val, "VALUE"),
+            (c_pkg, "PACKAGE"),
+            (c_ref, "REFERENCE DESIGNATORS"),
+            (c_step, "FIRST USED"),
+        ] {
+            pg.text(x, ly, 7.0, Font::Bold, h);
         }
+        ly -= 4.0;
+        pg.set_line_width(1.0);
+        pg.set_stroke(0.64, 0.36, 0.13);
+        pg.rect(m, ly, cw, 0.0, Paint::Stroke);
+        ly -= 15.0;
+
+        // One row per (value, package) pile, deduped across steps: a part seated
+        // in one step and soldered in another is still one part to go and find.
+        let mut listed: HashSet<String> = HashSet::new();
+        for (i, step) in guide.steps.iter().enumerate() {
+            let side = if step_is_back(step) { " · back" } else { "" };
+            for row in part_rows(&step.parts) {
+                if !listed.insert(format!("{}\u{1}{}", row.value, row.package)) {
+                    continue;
+                }
+                pdf_checkbox(&mut pg, m, ly - 1.5, 9.0);
+                pg.set_fill(0.42, 0.41, 0.38);
+                pg.text(
+                    c_qty,
+                    ly,
+                    9.0,
+                    Font::Regular,
+                    &format!("{}x", row.refs.len()),
+                );
+                pg.set_fill(0.08, 0.09, 0.11);
+                pg.text(c_val, ly, 10.5, Font::Bold, &row.value);
+                pg.set_fill(0.48, 0.29, 0.13);
+                pg.text(c_pkg, ly, 9.0, Font::Regular, &row.package);
+                pg.set_fill(0.08, 0.09, 0.11);
+                pg.text(c_ref, ly, 9.5, Font::Bold, &row.refs.join("  "));
+                pg.set_fill(0.42, 0.41, 0.38);
+                pg.text(
+                    c_step,
+                    ly,
+                    8.5,
+                    Font::Regular,
+                    &format!("{}. {}{side}", i + 1, step.title),
+                );
+                ly -= 6.0;
+                pg.set_line_width(0.4);
+                pg.set_stroke(0.84, 0.82, 0.78);
+                pg.rect(m, ly, cw, 0.0, Paint::Stroke);
+                ly -= 12.0;
+                if ly < body_bottom {
+                    break;
+                }
+            }
+        }
+        pdf_footer(
+            &mut pg,
+            m,
+            page_w,
+            foot_y,
+            &format!("{doc_name} · build guide"),
+            &format!("Sheet 1 of {sheets}"),
+        );
         pages.push(pg);
     }
 
+    // ---- One sheet per step: the picture at page size, then what goes on it.
     let mut placed = 0usize;
     for (i, step) in guide.steps.iter().enumerate() {
         let n = step.parts.len();
@@ -1228,153 +1551,302 @@ pub fn guide_to_pdf(
         };
 
         let mut pg = Page::new();
-        pg.set_fill(0.1, 0.1, 0.1);
+        pg.set_fill(0.64, 0.36, 0.13);
         pg.text(
             m,
-            top,
-            13.0,
-            Font::Regular,
-            &format!("{} - Step {} of {total}", guide.name, i + 1),
+            top - 9.0,
+            8.0,
+            Font::Bold,
+            &format!(
+                "STEP {} OF {total}{}",
+                i + 1,
+                if back_step { "     BACK SIDE" } else { "" }
+            ),
         );
-        let title = if back_step {
-            format!("{}  [BACK side]", step.title)
-        } else {
-            step.title.clone()
-        };
-        pg.text(m, top - 24.0, 19.0, Font::Bold, &title);
-        pg.set_fill(0.4, 0.4, 0.4);
+        pg.set_fill(0.08, 0.09, 0.11);
+        pg.text(m, top - 26.0, 19.0, Font::Bold, &step.title);
+        pg.set_fill(0.42, 0.41, 0.38);
         pg.text(
             m,
-            top - 40.0,
-            10.5,
+            top - 38.0,
+            8.5,
             Font::Regular,
             &format!(
-                "Place {n} part{} - {placed} of {total_parts} placed when done.",
+                "{n} part{} to place · {placed} of {total_parts} done after this step",
                 if n == 1 { "" } else { "s" }
             ),
         );
 
-        // Board diagram under the title/progress.
-        let diag_top = top - 58.0;
-        let highlight: HashSet<&str> = step.parts.iter().map(|p| p.refdes.as_str()).collect();
-        let diag_bottom;
-
-        if let (Some(img), Some(idx)) = (img.as_ref(), idx) {
-            // Photoreal render (W×H px, board centred, orthographic). Fit it into
-            // the diagram region; map board-mm → image-px → page point so this
-            // step's outlined markers land on the bare pads.
-            let (iw, ih) = img.size();
-            let ds = (cw / iw).min(360.0 / ih); // page pt per image px
-            let (dw, dh) = (iw * ds, ih * ds);
-            let ix = m + (cw - dw) / 2.0;
-            let sc = render_scale(iw, ih, ox1 - ox0, oy1 - oy0); // px/mm
-            let (cx, cy) = ((ox0 + ox1) / 2.0, (oy0 + oy1) / 2.0);
-            let mapx = |x: f64| ix + (iw / 2.0 + (x - cx) * sc) * ds;
-            let mapy = |y: f64| diag_top - (ih / 2.0 + (y - cy) * sc) * ds;
-            pg.draw_image(
-                [dw, 0.0, 0.0, dh, ix, diag_top - dh],
-                (ix, diag_top - dh, dw, dh),
-                idx,
-            );
-            for p in &step_parts {
-                pdf_marker(&mut pg, p, &mapx, &mapy, sc * ds, false);
+        // The picture gets the page: a tall board runs the full body height with
+        // the parts beside it, a wide one spans the full width with them below.
+        let diag_top = top - 50.0;
+        let body_h = diag_top - body_bottom;
+        let aspect = match (img.as_ref(), idx) {
+            (Some(im), Some(_)) => {
+                let (iw, ih) = im.size();
+                let win = board_window(
+                    &BoardPng {
+                        png: &[],
+                        width: iw as u32,
+                        height: ih as u32,
+                    },
+                    guide.outline,
+                );
+                win.2 / win.3
             }
-            diag_bottom = diag_top - dh;
+            _ => bw / bh,
+        };
+        let beside = aspect < 0.72;
+        let (box_w, box_h) = if beside {
+            ((body_h * aspect).min(cw * 0.55), body_h)
         } else {
-            let scale = (cw / bw).min(360.0 / bh);
-            let rx = m + (cw - bw * scale) / 2.0;
-            let mapx = |x: f64| rx + (x - bx0) * scale;
-            let mapy = |y: f64| diag_top - (y - by0) * scale;
-            pg.set_line_width(0.8);
-            pg.set_fill(0.93, 0.95, 0.93);
-            pg.set_stroke(0.2, 0.6, 0.4);
-            pg.rect(
-                mapx(ox0),
-                mapy(oy1),
-                (ox1 - ox0) * scale,
-                (oy1 - oy0) * scale,
-                Paint::FillStroke,
-            );
-            for p in guide.steps.iter().flat_map(|s| &s.parts) {
-                let (cx0, cy0, cx1, cy1) = p.bbox;
-                if highlight.contains(p.refdes.as_str()) {
-                    pdf_marker(&mut pg, p, &mapx, &mapy, scale, true);
-                } else {
-                    pg.set_line_width(0.4);
-                    pg.set_fill(0.86, 0.86, 0.86);
-                    pg.set_stroke(0.67, 0.67, 0.67);
-                    pg.rect(
-                        mapx(cx0),
-                        mapy(cy1),
-                        ((cx1 - cx0) * scale).max(1.0),
-                        ((cy1 - cy0) * scale).max(1.0),
-                        Paint::FillStroke,
-                    );
+            (cw, body_h * 0.62)
+        };
+
+        let (dw, dh) = match (img.as_ref(), idx) {
+            (Some(im), Some(idx)) => pdf_place_render(
+                &mut pg,
+                im,
+                idx,
+                guide.outline,
+                (m, diag_top, box_w, box_h),
+                &step_parts,
+            ),
+            _ => {
+                // Schematic fallback: the same box, filled the same way.
+                let highlight: HashSet<&str> =
+                    step.parts.iter().map(|p| p.refdes.as_str()).collect();
+                let scale = (box_w / bw).min(box_h / bh);
+                let mapx = |x: f64| m + (x - bx0) * scale;
+                let mapy = |y: f64| diag_top - (y - by0) * scale;
+                pg.set_line_width(0.8);
+                pg.set_fill(0.93, 0.95, 0.93);
+                pg.set_stroke(0.2, 0.6, 0.4);
+                pg.rect(
+                    mapx(ox0),
+                    mapy(oy1),
+                    (ox1 - ox0) * scale,
+                    (oy1 - oy0) * scale,
+                    Paint::FillStroke,
+                );
+                for p in guide.steps.iter().flat_map(|s| &s.parts) {
+                    let (px0, py0, px1, py1) = p.bbox;
+                    if highlight.contains(p.refdes.as_str()) {
+                        pdf_marker(&mut pg, p, &mapx, &mapy, scale, true);
+                    } else {
+                        pg.set_line_width(0.4);
+                        pg.set_fill(0.86, 0.86, 0.86);
+                        pg.set_stroke(0.67, 0.67, 0.67);
+                        pg.rect(
+                            mapx(px0),
+                            mapy(py1),
+                            ((px1 - px0) * scale).max(1.0),
+                            ((py1 - py0) * scale).max(1.0),
+                            Paint::FillStroke,
+                        );
+                    }
                 }
+                (bw * scale, bh * scale)
             }
-            diag_bottom = diag_top - bh * scale;
+        };
+
+        // Parts: beside the picture when it's tall, under it when it's wide.
+        let (tx, tw, mut ly) = if beside {
+            (m + dw + 18.0, cw - dw - 18.0, diag_top - 2.0)
+        } else {
+            (m, cw, diag_top - dh - 22.0)
+        };
+        pg.set_fill(0.42, 0.41, 0.38);
+        pg.text(tx, ly, 7.0, Font::Bold, "PLACE & TICK");
+        ly -= 4.0;
+        pg.set_line_width(1.0);
+        pg.set_stroke(0.64, 0.36, 0.13);
+        pg.rect(tx, ly, tw, 0.0, Paint::Stroke);
+        ly -= 16.0;
+        for row in part_rows(&step.parts) {
+            // Line 1: a tick box per reference designator — the thing you hunt
+            // for on the silkscreen, so it is the biggest text in the row.
+            let mut x = tx;
+            for r in &row.refs {
+                let w = 12.0 + pdf_text_w(r, 11.0, true);
+                if x > tx && x + w > tx + tw {
+                    x = tx;
+                    ly -= 15.0;
+                }
+                pdf_checkbox(&mut pg, x, ly - 1.0, 9.0);
+                pg.set_fill(0.08, 0.09, 0.11);
+                pg.text(x + 12.0, ly, 11.0, Font::Bold, r);
+                x += w + 10.0;
+            }
+            ly -= 13.0;
+            // Line 2: which part it is, and which way round.
+            pg.set_fill(0.08, 0.09, 0.11);
+            pg.text(tx, ly, 10.0, Font::Bold, &row.value);
+            let mut dx = tx + pdf_text_w(&row.value, 10.0, true) + 10.0;
+            pg.set_fill(0.48, 0.29, 0.13);
+            pg.text(dx, ly, 9.0, Font::Regular, &row.package);
+            dx += pdf_text_w(&row.package, 9.0, false) + 10.0;
+            if let Some(pol) = row.polarity {
+                pg.set_fill(0.42, 0.31, 0.02);
+                pdf_wrapped(
+                    &mut pg,
+                    dx,
+                    ly,
+                    (tx + tw - dx).max(60.0),
+                    8.5,
+                    Font::Regular,
+                    pol.cue(),
+                );
+            }
+            pdf_row_bands(&mut pg, &row, tx + tw, ly);
+            ly -= 18.0;
+            if ly < body_bottom {
+                break;
+            }
         }
 
-        // Parts list + cautions below the diagram.
-        let mut ly = diag_bottom - 30.0;
-        pg.set_fill(0.13, 0.13, 0.13);
-        pg.text(m, ly, 12.0, Font::Bold, "Parts for this step:");
-        ly -= 18.0;
-        for (value, refs) in group_by_value(&step.parts) {
-            pg.set_fill(0.13, 0.13, 0.13);
-            pg.text(
-                m + 8.0,
-                ly,
-                11.0,
-                Font::Regular,
-                &format!("{}x   {}   ({})", refs.len(), value, refs.join(", ")),
-            );
-            pdf_resistor_bands(&mut pg, &step.parts, &refs, &value, pdf::A4_W - m, ly);
-            ly -= 15.0;
-        }
-        if let Some(a) = &step.assembly {
-            ly -= 10.0;
-            pg.set_fill(0.20, 0.28, 0.40);
-            pg.text(m, ly, 11.0, Font::Bold, "Placing them:");
-            ly -= 15.0;
-            pg.set_fill(0.28, 0.32, 0.38);
-            ly = pdf_wrapped(&mut pg, m, ly, cw, 10.5, Font::Regular, a);
-        }
-        for pn in &step.part_notes {
-            ly -= 7.0;
-            pg.set_fill(0.69, 0.41, 0.18); // copper — a part-specific callout
-            pg.text(m, ly, 10.5, Font::Bold, &format!("{}:", pn.refs.join(", ")));
-            ly -= 14.0;
-            pg.set_fill(0.35, 0.27, 0.15);
+        if back_step {
+            ly -= 2.0;
+            pg.set_fill(0.23, 0.16, 0.09);
             ly = pdf_wrapped(
                 &mut pg,
-                m + 10.0,
+                tx,
                 ly,
-                cw - 10.0,
-                10.5,
+                tw,
+                9.5,
+                Font::Bold,
+                "Flip the board - these mount on the BACK, and the picture is drawn \
+                 from the back.",
+            ) - 5.0;
+        }
+        if let Some(a) = &step.assembly {
+            pg.set_fill(0.64, 0.36, 0.13);
+            pg.text(tx, ly, 9.5, Font::Bold, "How.");
+            pg.set_fill(0.27, 0.25, 0.22);
+            ly = pdf_wrapped(
+                &mut pg,
+                tx + 26.0,
+                ly,
+                (tw - 26.0).max(60.0),
+                9.5,
+                Font::Regular,
+                a,
+            ) - 4.0;
+        }
+        for pn in &step.part_notes {
+            pg.set_fill(0.64, 0.36, 0.13);
+            pg.text(tx, ly, 9.0, Font::Bold, &format!("{}:", pn.refs.join(", ")));
+            ly -= 12.0;
+            pg.set_fill(0.27, 0.25, 0.22);
+            ly = pdf_wrapped(
+                &mut pg,
+                tx + 8.0,
+                ly,
+                (tw - 8.0).max(60.0),
+                9.0,
                 Font::Regular,
                 &pn.steps.join(" "),
-            );
+            ) - 4.0;
         }
-        if let Some(c) = &step.caution {
-            ly -= 8.0;
-            pg.set_fill(0.72, 0.45, 0.0);
-            pg.text(m, ly, 11.0, Font::Bold, &format!("[!] {c}"));
-            ly -= 15.0;
+        // The generic pin-1 caution now rides on the part row it applies to; only
+        // a caution the table can't carry is still worth a banner.
+        if let Some(c) = step
+            .caution
+            .as_deref()
+            .filter(|_| !part_rows(&step.parts).iter().any(|r| r.polarity.is_some()))
+        {
+            pg.set_fill(0.54, 0.39, 0.0);
+            pdf_wrapped(&mut pg, tx, ly, tw, 9.5, Font::Bold, &format!("[!] {c}"));
         }
-        if back_step {
-            pg.set_fill(0.72, 0.45, 0.0);
-            pg.text(
-                m,
-                ly,
-                11.0,
-                Font::Bold,
-                "[back] Flip the board - this step mounts on the BACK (shown from the back).",
-            );
-        }
+
+        pdf_footer(
+            &mut pg,
+            m,
+            page_w,
+            foot_y,
+            &format!("{doc_name} · step {} — {}", i + 1, step.title),
+            &format!("Sheet {} of {sheets}", i + 2),
+        );
         pages.push(pg);
     }
-    pdf::document(&pages, &images)
+    pdf::document(&pages, &images, (page_w, page_h))
+}
+
+/// Approximate the width of a Helvetica run at `size` pt. The built-in fonts have
+/// no metrics table here, and this only has to be good enough to flow tick chips
+/// and butt a package name up against a value.
+fn pdf_text_w(s: &str, size: f64, bold: bool) -> f64 {
+    s.chars().count() as f64 * size * if bold { 0.58 } else { 0.52 }
+}
+
+/// An empty tick box with its bottom-left at `(x, y)`, side `s` pt.
+fn pdf_checkbox(pg: &mut Page, x: f64, y: f64, s: f64) {
+    pg.set_line_width(0.8);
+    pg.set_stroke(0.42, 0.40, 0.37);
+    pg.set_fill(1.0, 1.0, 1.0);
+    pg.rect(x, y, s, s, Paint::FillStroke);
+}
+
+/// The per-sheet footer: what this page is, and where it sits in the document.
+fn pdf_footer(pg: &mut Page, m: f64, page_w: f64, y: f64, left: &str, right: &str) {
+    pg.set_line_width(0.4);
+    pg.set_stroke(0.84, 0.82, 0.78);
+    pg.rect(m, y + 9.0, page_w - 2.0 * m, 0.0, Paint::Stroke);
+    pg.set_fill(0.42, 0.41, 0.38);
+    pg.text(m, y, 7.5, Font::Regular, left);
+    pg.text(
+        page_w - m - pdf_text_w(right, 7.5, false),
+        y,
+        7.5,
+        Font::Regular,
+        right,
+    );
+}
+
+/// Draw a board render **cropped to the board** ([`board_window`]) filling the box
+/// `(bx, top_y, box_w, box_h)` (page pt, `top_y` is the box's top edge), with a
+/// highlight marker on each of `parts`. Returns the drawn `(width, height)`.
+///
+/// The crop is the whole point: `pcb render` letterboxes anything that isn't
+/// square, and drawing the frame whole is what left the board a fifth of the
+/// picture and its refdes labels too small to read on paper. PDF's image operator
+/// has no crop, so the image is scaled up and clipped to the visible window.
+fn pdf_place_render(
+    pg: &mut Page,
+    img: &pdf::Image,
+    idx: usize,
+    outline: (f64, f64, f64, f64),
+    (bx, top_y, box_w, box_h): (f64, f64, f64, f64),
+    parts: &[PlacedPart],
+) -> (f64, f64) {
+    let (iw, ih) = img.size();
+    let (vx, vy, vw, vh) = board_window(
+        &BoardPng {
+            png: &[],
+            width: iw as u32,
+            height: ih as u32,
+        },
+        outline,
+    );
+    let s = (box_w / vw).min(box_h / vh); // page pt per image px
+    let (dw, dh) = (vw * s, vh * s);
+    // Place the full image so its cropped window lands in the box, then clip.
+    let ex = bx - vx * s;
+    let ey = top_y - dh - (ih - vy - vh) * s;
+    pg.draw_image(
+        [iw * s, 0.0, 0.0, ih * s, ex, ey],
+        (bx, top_y - dh, dw, dh),
+        idx,
+    );
+    let (x0, y0, x1, y1) = outline;
+    let sc = render_scale(iw, ih, x1 - x0, y1 - y0); // image px per board mm
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let mapx = |x: f64| ex + (iw / 2.0 + (x - cx) * sc) * s;
+    let mapy = |y: f64| ey + (ih - (ih / 2.0 + (y - cy) * sc)) * s;
+    for p in parts {
+        pdf_marker(pg, p, &mapx, &mapy, sc * s, false);
+    }
+    (dw, dh)
 }
 
 /// The highlight overlay for one part (SVG, board-mm coords): a rounded amber
@@ -1391,12 +1863,16 @@ fn highlight_svg(p: &PlacedPart, fs: f64, fill_opacity: f64) -> String {
         (bx1 - bx0) + 2.0 * m,
         (by1 - by0) + 2.0 * m,
     );
-    let halo = fs * 0.16;
+    let halo = fs * 0.18;
+    // Stroke scales with the label, so the frame stays visible at whatever size
+    // the diagram lands on the page rather than thinning to nothing.
+    let sw = fs * 0.2;
     // Refdes just above the box so it never crowds the pads.
     let label_y = y - fs * 0.3;
     let mut s = format!(
         "<rect x=\"{x:.3}\" y=\"{y:.3}\" width=\"{w:.3}\" height=\"{h:.3}\" rx=\"0.4\" \
-         fill=\"#ffd21f\" fill-opacity=\"{fill_opacity}\" stroke=\"#ff3b30\" stroke-width=\"0.4\"/>\
+         fill=\"#ffd21f\" fill-opacity=\"{fill_opacity}\" stroke=\"#e01b0c\" \
+         stroke-width=\"{sw:.3}\"/>\
          <text x=\"{cx:.3}\" y=\"{label_y:.3}\" font-size=\"{fs:.3}\" text-anchor=\"middle\" \
          dominant-baseline=\"baseline\" fill=\"#fff\" stroke=\"#111\" stroke-width=\"{halo:.3}\" \
          paint-order=\"stroke\" font-weight=\"bold\">{refdes}</text>",
@@ -1417,15 +1893,48 @@ fn highlight_svg(p: &PlacedPart, fs: f64, fill_opacity: f64) -> String {
     s
 }
 
-/// The board pad bounding box's short dimension → a legible label size (mm).
-fn label_size(outline: (f64, f64, f64, f64)) -> f64 {
+/// How tall a diagram refdes should be **on paper**, in mm (≈ 10 pt).
+const LABEL_PRINT_MM: f64 = 3.5;
+
+/// Refdes label size in *board* mm, chosen so it lands at [`LABEL_PRINT_MM`] once
+/// a diagram covering `crop_w_mm` of board is printed `printed_w_mm` wide.
+///
+/// Sizing the label off the board's own dimensions — what this used to do —
+/// couples it to the wrong thing. A 32 mm test board is magnified 5× to fill the
+/// sheet and a 128 mm panel only 1.6×, so one fixed board-mm size prints as 17 pt
+/// on the first and 6 pt on the second. Working back from the printed size makes
+/// every guide's labels the same size in the reader's hand.
+fn label_size_for(crop_w_mm: f64, printed_w_mm: f64) -> f64 {
+    // NaN-safe: an unmeasurable board falls back rather than emitting a NaN size.
+    if !crop_w_mm.is_finite()
+        || !printed_w_mm.is_finite()
+        || crop_w_mm <= 0.0
+        || printed_w_mm <= 0.0
+    {
+        return 1.0;
+    }
+    (LABEL_PRINT_MM * crop_w_mm / printed_w_mm).max(0.15)
+}
+
+/// How much board (in mm across) a cropped render of `board` shows.
+fn crop_width_mm(board: &BoardPng, outline: (f64, f64, f64, f64)) -> f64 {
     let (x0, y0, x1, y1) = outline;
-    ((x1 - x0).min(y1 - y0) / 30.0).clamp(0.7, 2.0)
+    let scale = render_scale(board.width as f64, board.height as f64, x1 - x0, y1 - y0);
+    let (_, _, vw, _) = board_window(board, outline);
+    if scale > 0.0 {
+        vw / scale
+    } else {
+        (x1 - x0).max(1.0)
+    }
 }
 
 /// A schematic top-down SVG: outline + every part as a box, `highlight`ed parts
 /// red, the rest greyed. The fallback when no real KiCad plot is available.
-fn schematic_board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String {
+fn schematic_board_svg(
+    guide: &BuildGuide,
+    highlight: &HashSet<&str>,
+    printed_w_mm: f64,
+) -> Diagram {
     let (x0, y0, x1, y1) = guide.outline;
     let (w, h) = (x1 - x0, y1 - y0);
     let pad = 2.0;
@@ -1438,7 +1947,7 @@ fn schematic_board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String 
         w + 2.0 * pad,
         h + 2.0 * pad
     );
-    let fs = label_size(guide.outline);
+    let fs = label_size_for(w + 2.0 * pad, printed_w_mm);
     for p in guide.steps.iter().flat_map(|s| &s.parts) {
         if highlight.contains(p.refdes.as_str()) {
             svg.push_str(&highlight_svg(p, fs, 0.85));
@@ -1453,28 +1962,74 @@ fn schematic_board_svg(guide: &BuildGuide, highlight: &HashSet<&str>) -> String 
         }
     }
     svg.push_str("</svg>");
-    svg
+    Diagram {
+        svg,
+        aspect: (w + 2.0 * pad) / (h + 2.0 * pad),
+    }
+}
+
+/// Breathing room left around the board when cropping a render, in board mm.
+const CROP_MARGIN_MM: f64 = 3.0;
+
+/// The image-pixel window `(x, y, w, h)` that tightly frames the board, with
+/// [`CROP_MARGIN_MM`] of margin, clamped to the image.
+///
+/// This is the difference between a readable diagram and an unreadable one.
+/// `pcb render` frames the board's bounding *circle* (see [`render_scale`]), so
+/// anything that isn't square is delivered letterboxed: a 40 × 128 mm Eurorack
+/// board lands as a narrow strip covering 21% of a 4:3 frame. Printing the frame
+/// whole spent four fifths of the picture on empty backdrop and shrank the part
+/// highlights below legibility. Cropping to the board costs nothing and is worth
+/// more than any amount of layout tuning.
+fn board_window(board: &BoardPng, outline: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (x0, y0, x1, y1) = outline;
+    let (iw, ih) = (board.width as f64, board.height as f64);
+    let scale = render_scale(iw, ih, x1 - x0, y1 - y0);
+    let m = CROP_MARGIN_MM * scale;
+    // Board-mm → image-px: the board's centre sits at the image's centre.
+    let half_w = (x1 - x0) / 2.0 * scale + m;
+    let half_h = (y1 - y0) / 2.0 * scale + m;
+    let (cx, cy) = (iw / 2.0, ih / 2.0);
+    let (wx0, wy0) = ((cx - half_w).max(0.0), (cy - half_h).max(0.0));
+    let (wx1, wy1) = ((cx + half_w).min(iw), (cy + half_h).min(ih));
+    (
+        wx0,
+        wy0,
+        (wx1 - wx0).max(1.0).min(iw),
+        (wy1 - wy0).max(1.0).min(ih),
+    )
+}
+
+/// A rendered step diagram: the SVG itself plus its width-over-height ratio, so
+/// the page can size it to fill the sheet ([`diagram_fit`]).
+struct Diagram {
+    svg: String,
+    aspect: f64,
 }
 
 /// The photorealistic board render (PNG, base64-embedded) with the current step's
-/// parts highlighted. `pcb render` is orthographic top-down with the board
-/// centred, so board-mm map into the image via `scale = FIT·min(W/w_mm, H/h_mm)`
-/// about the image centre (FIT calibrated to KiCad's framing). Overlays are drawn
-/// in mm inside an SVG transform group, so [`highlight_svg`] is reused unchanged.
+/// parts highlighted, **cropped to the board** ([`board_window`]). `pcb render`
+/// is orthographic top-down with the board centred, so board-mm map into the
+/// image via `scale = FIT·min(W/w_mm, H/h_mm)` about the image centre (FIT
+/// calibrated to KiCad's framing). Overlays are drawn in mm inside an SVG
+/// transform group, so [`highlight_svg`] is reused unchanged; the crop is a
+/// `viewBox` change only, so the overlay maths is untouched by it.
 fn photoreal_board_svg(
     board: &BoardPng,
     outline: (f64, f64, f64, f64),
     parts: &[PlacedPart],
-) -> String {
+    printed_w_mm: f64,
+) -> Diagram {
     let (x0, y0, x1, y1) = outline;
     let (w, h) = (board.width as f64, board.height as f64);
     let scale = render_scale(w, h, x1 - x0, y1 - y0);
     let (cxmm, cymm) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (vx, vy, vw, vh) = board_window(board, outline);
     let png = base64::engine::general_purpose::STANDARD.encode(board.png);
-    let fs = label_size(outline);
-    let overlay: String = parts.iter().map(|p| highlight_svg(p, fs, 0.30)).collect();
-    format!(
-        "<svg viewBox=\"0 0 {w:.0} {h:.0}\" xmlns=\"http://www.w3.org/2000/svg\">\
+    let fs = label_size_for(crop_width_mm(board, outline), printed_w_mm);
+    let overlay: String = parts.iter().map(|p| highlight_svg(p, fs, 0.34)).collect();
+    let svg = format!(
+        "<svg viewBox=\"{vx:.1} {vy:.1} {vw:.1} {vh:.1}\" xmlns=\"http://www.w3.org/2000/svg\">\
          <image x=\"0\" y=\"0\" width=\"{w:.0}\" height=\"{h:.0}\" \
          href=\"data:image/png;base64,{png}\"/>\
          <g transform=\"translate({tx:.3} {ty:.3}) scale({scale:.5}) translate({ntx:.3} {nty:.3})\">\
@@ -1483,7 +2038,79 @@ fn photoreal_board_svg(
         ty = h / 2.0,
         ntx = -cxmm,
         nty = -cymm,
-    )
+    );
+    Diagram {
+        svg,
+        aspect: vw / vh,
+    }
+}
+
+/// The bare board with nothing highlighted — the "what am I building, and which
+/// way round is it" picture that opens the guide. Carries no labels, so the
+/// printed width it would be sized against is irrelevant.
+fn board_overview_svg(board: &BoardPng, outline: (f64, f64, f64, f64)) -> Diagram {
+    photoreal_board_svg(board, outline, &[], theme::CONTENT_W_MM)
+}
+
+/// The aspect a step's diagram will have, known before it is drawn so
+/// [`diagram_fit`] can size it and the labels can be scaled to the result.
+fn diagram_aspect(render: Option<&BoardPng>, outline: (f64, f64, f64, f64)) -> f64 {
+    match render {
+        Some(bp) => {
+            let (_, _, vw, vh) = board_window(bp, outline);
+            vw / vh
+        }
+        None => {
+            let (x0, y0, x1, y1) = outline;
+            (x1 - x0 + 4.0) / (y1 - y0 + 4.0)
+        }
+    }
+}
+
+/// Size an overview figure so `n` of them sit side by side on the kit sheet
+/// without crowding out the sort table: `(width mm, height mm)`.
+fn overview_fit(aspect: f64, n: usize) -> (f64, f64) {
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    };
+    let max_w = (theme::CONTENT_W_MM - 8.0 * (n.max(1) - 1) as f64) / n.max(1) as f64;
+    // Capped well under the sheet so the sort table it shares a sheet with is not
+    // pushed onto a second page — the overview is orientation, not the content.
+    let h = (max_w / aspect).min(90.0);
+    (h * aspect, h)
+}
+
+/// How tall a step's diagram may be when it sits *beside* the parts table, in mm:
+/// the page body less the step header and footer.
+const STEP_BODY_H_MM: f64 = 214.0;
+/// The widest a beside-the-table diagram may be — past this the parts table has
+/// nowhere to go, so the step stacks instead.
+const SIDE_MAX_W_MM: f64 = 106.0;
+/// How tall a stacked (above-the-table) diagram may be, leaving the table room.
+const STACK_MAX_H_MM: f64 = 146.0;
+
+/// Size a step diagram to fill the sheet: `(width mm, height mm, beside)`.
+///
+/// Two shapes of board, two layouts. A tall board (Eurorack panel, pedal) runs
+/// the full page height in a column with the parts table beside it; a wide or
+/// square board spans the full page width with the table underneath. Either way
+/// the picture is sized to the paper rather than to a fraction of a text column —
+/// on a 5 HP board that is the difference between a 19 × 62 mm diagram and a
+/// 74 × 214 mm one.
+fn diagram_fit(aspect: f64) -> (f64, f64, bool) {
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    };
+    if aspect < 0.72 {
+        let h = STEP_BODY_H_MM.min(SIDE_MAX_W_MM / aspect);
+        return (h * aspect, h, true);
+    }
+    let h = (theme::CONTENT_W_MM / aspect).min(STACK_MAX_H_MM);
+    (h * aspect, h, false)
 }
 
 /// Whether a value-group is resistors (refdes prefix `R`, not `RV`/relays).
@@ -1491,48 +2118,14 @@ fn is_resistor_group(refs: &[String]) -> bool {
     refs.first().map(|r| prefix_of(r)) == Some("R")
 }
 
-/// Whether a value-group is a *through-hole* resistor group — the gate for the
-/// color-code pictogram. SMD resistors carry a printed numeric code (e.g. `513`),
-/// not color bands, so they get none; color bands are a THT sorting aid. Looks
-/// the group's parts up by refdes in the step.
-fn is_tht_resistor_group(step_parts: &[PlacedPart], refs: &[String]) -> bool {
-    is_resistor_group(refs)
-        && refs.iter().all(|rd| {
-            step_parts
-                .iter()
-                .find(|p| p.refdes.as_str() == rd.as_str())
-                .is_some_and(|p| p.through_hole)
-        })
-}
-
-/// The resistor color-code SVG for a value-group, or empty unless the group is a
-/// through-hole resistor whose value parses as a resistance (`"100n"`/`"TL072"`/
-/// SMD resistors → nothing).
-fn resistor_swatch_html(step_parts: &[PlacedPart], refs: &[String], value: &str) -> String {
-    if !is_tht_resistor_group(step_parts, refs) {
-        return String::new();
-    }
-    match crate::resistor::color_code(value) {
-        Some(cc) => format!("<span class=\"swatch\">{}</span>", cc.to_svg(58.0, 18.0)),
-        None => String::new(),
-    }
-}
-
 /// Draw a through-hole resistor's color bands as a compact vertical-stripe strip
 /// on a PDF page, right edge at `right_x`, sitting on text baseline `y` (a beige
 /// backing so light bands read). No-op for SMD / non-resistor / unparseable groups.
-fn pdf_resistor_bands(
-    pg: &mut Page,
-    step_parts: &[PlacedPart],
-    refs: &[String],
-    value: &str,
-    right_x: f64,
-    y: f64,
-) {
-    if !is_tht_resistor_group(step_parts, refs) {
+fn pdf_row_bands(pg: &mut Page, row: &PartRow, right_x: f64, y: f64) {
+    if !row.through_hole || !is_resistor_group(&row.refs) {
         return;
     }
-    let Some(cc) = crate::resistor::color_code(value) else {
+    let Some(cc) = crate::resistor::color_code(&row.value) else {
         return;
     };
     let (bw, gap, h) = (3.2, 1.3, 9.0);
@@ -1587,25 +2180,115 @@ fn pdf_wrapped(
     cy
 }
 
-/// Group a step's parts by value, preserving refdes order.
-fn group_by_value(parts: &[PlacedPart]) -> Vec<(String, Vec<String>)> {
-    let mut order: Vec<String> = Vec::new();
-    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+/// A piece of loose hardware and the reference designators it serves.
+struct HardwareRow {
+    name: String,
+    refs: Vec<String>,
+}
+
+/// The loose hardware every placed part in the guide arrives with
+/// ([`crate::hardware`]), grouped by item and carrying the refdes it belongs to.
+///
+/// Derived here rather than plumbed in from the BOM: the guide already knows
+/// every part's footprint, and the pull-and-sort sheet is the second place (with
+/// the Visual BOM) where a builder counts the kit out.
+fn hardware_rows(steps: &[BuildStep]) -> Vec<HardwareRow> {
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut serves: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+    for part in steps.iter().flat_map(|s| &s.parts) {
+        for item in crate::hardware::for_footprint(&part.footprint) {
+            // A part fitted across two steps (seated, then soldered) still needs
+            // exactly one nut.
+            if !seen.insert((item.name, part.refdes.clone())) {
+                continue;
+            }
+            if !serves.contains_key(item.name) {
+                order.push(item.name);
+            }
+            serves
+                .entry(item.name)
+                .or_default()
+                .push(part.refdes.clone());
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|name| {
+            let mut refs = serves.remove(name)?;
+            refs.sort_by_key(|r| refdes_key(r));
+            Some(HardwareRow {
+                name: name.to_string(),
+                refs,
+            })
+        })
+        .collect()
+}
+
+/// One row of a parts table: every part sharing a value *and* a package, plus the
+/// orientation cue they share.
+struct PartRow {
+    value: String,
+    package: String,
+    refs: Vec<String>,
+    polarity: Option<Polarity>,
+    through_hole: bool,
+}
+
+/// Group parts into table rows by `(value, package)`, first-seen order.
+///
+/// Grouping by value alone — what the old list did — merges a 0603 47k with a
+/// 1206 47k into one "2× 47k" line. On the bench those are two different piles
+/// and two different reels, so the table would be telling the builder something
+/// false at exactly the moment they're counting parts out.
+fn part_rows(parts: &[PlacedPart]) -> Vec<PartRow> {
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut map: BTreeMap<(String, String), PartRow> = BTreeMap::new();
     for p in parts {
-        let v = if p.value.is_empty() {
+        let value = if p.value.is_empty() {
             "(no value)".to_string()
         } else {
             p.value.clone()
         };
-        if !map.contains_key(&v) {
-            order.push(v.clone());
+        let package = crate::package::short_name(&p.footprint);
+        let key = (value.clone(), package.clone());
+        match map.get_mut(&key) {
+            Some(row) => {
+                row.refs.push(p.refdes.clone());
+                // A mixed group takes the stricter reading: if any part in it is
+                // polarised, the row has to say so.
+                row.polarity = row.polarity.or(p.polarity);
+                row.through_hole &= p.through_hole;
+            }
+            None => {
+                order.push(key.clone());
+                map.insert(
+                    key,
+                    PartRow {
+                        value,
+                        package,
+                        refs: vec![p.refdes.clone()],
+                        polarity: p.polarity,
+                        through_hole: p.through_hole,
+                    },
+                );
+            }
         }
-        map.entry(v).or_default().push(p.refdes.clone());
     }
-    order
-        .into_iter()
-        .map(|v| (v.clone(), map[&v].clone()))
-        .collect()
+    order.into_iter().filter_map(|k| map.remove(&k)).collect()
+}
+
+/// The resistor colour-code swatch for a table row, or empty for anything that
+/// isn't a through-hole resistor with a parseable value (an SMD resistor carries
+/// a printed numeric code, not bands).
+fn row_swatch(row: &PartRow) -> String {
+    if !row.through_hole || !is_resistor_group(&row.refs) {
+        return String::new();
+    }
+    match crate::resistor::color_code(&row.value) {
+        Some(cc) => format!("<span class=\"swatch\">{}</span>", cc.to_svg(58.0, 18.0)),
+        None => String::new(),
+    }
 }
 
 /// Minimal HTML/XML escaping for text content and attributes.
@@ -1669,10 +2352,36 @@ mod tests {
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<svg"));
         // Numbered steps with the resistor step titled in an <h2>.
-        assert!(html.contains("class=\"step-no"));
+        assert!(html.contains("class=\"step-of mono\">Step 1 of"));
         assert!(html.contains("class=\"step-title\">Resistors"));
-        // The IC step cautions about pin 1.
-        assert!(html.contains("pin 1"));
+        // The IC step cues pin 1 — on the part's own row, not as a banner.
+        assert!(html.contains("pin-1 mark"));
+        // Every sheet is identified and numbered: a printed guide gets shuffled.
+        assert!(html.contains("class=\"docfoot\""));
+        assert!(html.contains("Sheet 1 of"));
+        // Each part gets its own tick box, on the sort sheet and on its step.
+        assert!(html.matches("class=\"chk\"").count() >= g.steps.len());
+    }
+
+    #[test]
+    fn a_part_is_listed_once_to_pull_however_many_steps_use_it() {
+        // Panel hardware is seated in one step and soldered in another; the sort
+        // list is what you go to the parts drawer with, so it must say "3x J1 J2
+        // J4" once, not twice.
+        let g = build_guide_with(&amp(), BOARD, SMD).unwrap();
+        let html = guide_to_html(&g, None, None);
+        let sort_sheet = html
+            .split("<section class=\"sheet step")
+            .next()
+            .expect("sort sheet precedes the step sheets");
+        for p in g.steps.iter().flat_map(|s| &s.parts) {
+            assert_eq!(
+                sort_sheet.matches(&format!(">{}", p.refdes)).count(),
+                1,
+                "{} listed more than once to pull",
+                p.refdes
+            );
+        }
     }
 
     #[test]
@@ -1713,13 +2422,44 @@ mod tests {
             height: 600,
         };
         // Step 0 groups R1 + R2 — both must be marked on the single embedded render.
-        let svg = photoreal_board_svg(&board, g.outline, &g.steps[0].parts);
-        assert_eq!(svg.matches("<image").count(), 1, "one shared render");
-        assert!(svg.contains("data:image/png;base64,"));
-        assert!(svg.contains("viewBox=\"0 0 800 600\""));
-        assert!(svg.contains(">R1</text>") && svg.contains(">R2</text>"));
+        let d = photoreal_board_svg(&board, g.outline, &g.steps[0].parts, 120.0);
+        assert_eq!(d.svg.matches("<image").count(), 1, "one shared render");
+        assert!(d.svg.contains("data:image/png;base64,"));
+        assert!(d.svg.contains(">R1</text>") && d.svg.contains(">R2</text>"));
         // Overlays sit in an mm→px transform group (so highlight_svg is reused).
-        assert!(svg.contains("<g transform=\"translate("));
+        assert!(d.svg.contains("<g transform=\"translate("));
+        // The frame is cropped to the board, not the whole render: the fixture's
+        // 35 × 10mm board in a 4:3 frame would otherwise be a fifth of the picture.
+        assert!(
+            !d.svg.contains("viewBox=\"0.0 0.0 800.0 600.0\""),
+            "must not print the whole letterboxed frame"
+        );
+        // …and the cropped window has the board's aspect, plus the mm margin.
+        let want = (35.0 + 2.0 * CROP_MARGIN_MM) / (10.0 + 2.0 * CROP_MARGIN_MM);
+        assert!(
+            (d.aspect - want).abs() < 0.01,
+            "cropped aspect {} != board aspect {want}",
+            d.aspect
+        );
+    }
+
+    #[test]
+    fn a_tall_board_gets_the_page_height_and_a_wide_one_the_page_width() {
+        // A 5 HP Eurorack panel: the picture runs the full body height beside the
+        // parts table, instead of being squeezed into half a text column.
+        let (w, h, beside) = diagram_fit(46.6 / 134.5);
+        assert!(beside, "a tall board puts the table alongside");
+        assert_eq!(h, STEP_BODY_H_MM);
+        assert!(w > 70.0 && w < 80.0, "width {w} follows the aspect");
+        // A wide board spans the page instead, with the table underneath.
+        let (w, h, beside) = diagram_fit(1.6);
+        assert!(!beside);
+        assert!(w <= theme::CONTENT_W_MM && h <= STACK_MAX_H_MM);
+        // Degenerate aspects must not produce a NaN width in the inline style.
+        for bad in [0.0, f64::NAN, f64::INFINITY] {
+            let (w, h, _) = diagram_fit(bad);
+            assert!(w.is_finite() && h.is_finite(), "aspect {bad}");
+        }
     }
 
     #[test]
@@ -1948,11 +2688,111 @@ mod tests {
     /// highlight off its part).
     #[test]
     fn render_scale_matches_a_real_render() {
-        let s = render_scale(1568.0, 1176.0, 25.4, 128.5);
-        assert!((s - 8.98).abs() < 0.05, "expected ~8.98 px/mm, got {s:.3}");
-        // Square frame, square board: the diagonal governs.
-        let sq = render_scale(1000.0, 1000.0, 100.0, 100.0);
-        assert!((sq - 1000.0 / 141.42).abs() < 0.01, "got {sq}");
+        // Measured from actual `kicad-cli pcb render` output at 1568×1176 (what a
+        // 1600×1200 request yields). Tolerance is 0.5%, comfortably inside the
+        // ±0.35% the model held to across six boards.
+        for (w_mm, h_mm, want) in [
+            (40.64, 128.50, 8.9764), // slew_limiter, 5 HP Eurorack panel
+            (32.44, 16.78, 35.4274), // double_sided
+            (64.25, 29.50, 17.9319), // vbom_demo_circuit
+            (30.58, 11.45, 37.4962), // rc_ladder
+            (34.67, 14.41, 33.0989), // opamp_noninv
+        ] {
+            let s = render_scale(1568.0, 1176.0, w_mm, h_mm);
+            assert!(
+                (s / want - 1.0).abs() < 0.005,
+                "{w_mm}×{h_mm}mm: got {s:.4}, real render measured {want:.4}"
+            );
+        }
+        // The frame's *width* does not enter the framing — only its height does.
+        let a = render_scale(1568.0, 1176.0, 40.64, 128.5);
+        let b = render_scale(4000.0, 1176.0, 40.64, 128.5);
+        assert_eq!(a, b, "a wider frame must not change the scale");
+        // Degenerate inputs fall back rather than dividing by zero.
+        assert_eq!(render_scale(100.0, 100.0, 0.0, 0.0), 1.0);
+    }
+
+    /// A step's diagram is one face of the board, so a step must not mix faces —
+    /// otherwise half its highlights are drawn mirrored-wrong with nothing
+    /// saying so. Power headers used to be the one group taken from both faces.
+    #[test]
+    fn every_step_sits_on_one_face() {
+        let hdr = |refdes: &str, back: bool, x: f64| PlacedPart {
+            refdes: refdes.into(),
+            value: String::new(),
+            footprint: "Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm_Vertical".into(),
+            cx: x,
+            cy: 100.0,
+            bbox: (x - 2.0, 99.0, x + 2.0, 101.0),
+            back,
+            through_hole: true,
+            pin1: None,
+            polarity: None,
+        };
+        let g = guide_from_parts_with(
+            "t",
+            vec![hdr("J3", true, 100.0), hdr("J9", false, 120.0)],
+            (95.0, 95.0, 130.0, 105.0),
+            SMD,
+        );
+        for step in &g.steps {
+            if step.parts.is_empty() {
+                continue;
+            }
+            let backs = step.parts.iter().filter(|p| p.back).count();
+            assert!(
+                backs == 0 || backs == step.parts.len(),
+                "step {:?} mixes faces: {:?}",
+                step.title,
+                step.parts
+                    .iter()
+                    .map(|p| (&p.refdes, p.back))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Both headers still get placed, back face first.
+        let power: Vec<&BuildStep> = g
+            .steps
+            .iter()
+            .filter(|s| s.title == "Power header")
+            .collect();
+        assert_eq!(power.len(), 2, "one power-header step per face");
+        assert!(step_is_back(power[0]) && !step_is_back(power[1]));
+    }
+
+    /// The highlight has to cover what the builder sees drawn on the board, and
+    /// on a panel jack the silkscreen outline is four times the pad span.
+    #[test]
+    fn the_highlight_covers_the_footprint_body_not_just_its_pads() {
+        // Pads 2mm apart, courtyard 10mm wide — a jack-shaped mismatch.
+        let board = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 115) (layer "Edge.Cuts"))
+          (footprint "Jack" (layer "F.Cu") (at 110 105 0)
+            (property "Reference" "J1")
+            (fp_rect (start -5 -7) (end 5 7) (layer "F.CrtYd"))
+            (pad "1" thru_hole circle (at -1 0) (size 1 1))
+            (pad "2" thru_hole circle (at 1 0) (size 1 1))))"#;
+        let parts = parse_board(board).unwrap();
+        let j1 = parts.iter().find(|p| p.refdes == "J1").unwrap();
+        let (w, h) = (j1.bbox.2 - j1.bbox.0, j1.bbox.3 - j1.bbox.1);
+        assert!((w - 10.0).abs() < 0.01, "box spans the courtyard, got {w}");
+        assert!((h - 14.0).abs() < 0.01, "got {h}");
+
+        // …but a chip part whose pads reach outside its courtyard keeps them:
+        // the builder still needs to see the pads it lands on.
+        let chip = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 115) (layer "Edge.Cuts"))
+          (footprint "R" (layer "F.Cu") (at 110 105 0)
+            (property "Reference" "R1")
+            (fp_rect (start -1.48 -0.73) (end 1.48 0.73) (layer "F.CrtYd"))
+            (pad "1" smd rect (at -0.825 0) (size 0.8 0.95))
+            (pad "2" smd rect (at 0.825 0) (size 0.8 0.95))))"#;
+        let r1 = parse_board(chip).unwrap();
+        let r1 = r1.iter().find(|p| p.refdes == "R1").unwrap();
+        let w = r1.bbox.2 - r1.bbox.0;
+        assert!((w - 2.96).abs() < 0.01, "courtyard is the wider one: {w}");
+        let h = r1.bbox.3 - r1.bbox.1;
+        assert!((h - 1.46).abs() < 0.01, "got {h}");
     }
 
     #[test]

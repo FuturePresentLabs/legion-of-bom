@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::bom::{Bom, BomLine};
+use crate::bom::{Bom, BomLine, LineKind};
 use crate::guide::{detect_polarity, BuildGuide, PlacedPart};
 
 /// One line of an imported BOM.
@@ -401,6 +401,7 @@ impl ImportedBoard {
                     let mut refdes = p.refdes.clone();
                     refdes.sort();
                     BomLine {
+                        kind: LineKind::Component,
                         mpn: p.part_number.clone(),
                         value: p.value.clone(),
                         footprint: Some(p.footprint.clone()).filter(|f| !f.is_empty()),

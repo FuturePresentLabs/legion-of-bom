@@ -23,9 +23,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use legion_of_bom_core::{
-    default_image_cache_dir, export_board_svg, kicad_cli_path, layers_to_svg, panel_to_svg,
-    parse_netlist_file, read_layers, render_board_png, schematic_to_svg, strip_smd, LayerKind,
-    Logo, PanelFile,
+    board_sides, default_image_cache_dir, export_board_svg, kicad_cli_path, layers_to_svg,
+    panel_to_svg, parse_netlist_file, read_layers, render_board_png, schematic_to_svg, strip_smd,
+    LayerKind, Logo, PanelFile, Quality,
 };
 
 use crate::state::AppState;
@@ -48,6 +48,32 @@ pub struct RenderQuery {
 enum Rendered {
     Png(Vec<u8>),
     Svg(String),
+}
+
+/// `GET /api/circuits/{name}/sides` — what is mounted on each face of the built
+/// board: `{"front":{"tht":6,"smd":0},"back":{"tht":0,"smd":8}}`.
+///
+/// The viewer asks once, so its SMD filter can say what it will do before you
+/// click it. Hiding SMD on a face that has none is a no-op, and a control that
+/// silently no-ops is indistinguishable from a broken one.
+pub async fn sides(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let board = state
+        .root()
+        .join("out")
+        .join(&name)
+        .join(format!("{name}.kicad_pcb"));
+    let Ok(src) = std::fs::read_to_string(&board) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            &format!("board not built — run `lob build {name}`"),
+        );
+    };
+    let s = board_sides(&src);
+    axum::Json(json!({
+        "front": { "tht": s.front.tht, "smd": s.front.smd },
+        "back": { "tht": s.back.tht, "smd": s.back.smd },
+    }))
+    .into_response()
 }
 
 /// `GET /api/circuits/{name}/render?view=…` — a PNG (board) or SVG (panel).
@@ -196,7 +222,10 @@ fn render_view(req: &RenderReq<'_>) -> Result<Rendered, RenderErr> {
                 tht_only_board(&board, name)?
             };
             // bare=true (unpopulated, 3D models stripped) — the proven guide path.
-            let png = render_board_png(&board, &kicad, true, back)
+            // `basic` quality, not the guide's `high`: this render sits behind an
+            // interactive control, and 4.7s per click reads as a broken tool where
+            // 0.9s reads as a slow one. The printed guide still pays for `high`.
+            let png = render_board_png(&board, &kicad, true, back, Quality::Basic)
                 .map_err(|e| RenderErr::Failed(e.to_string()))?
                 .0;
             write_cache(&cache, &png);

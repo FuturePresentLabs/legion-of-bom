@@ -8,12 +8,13 @@
 //!
 //! `cargo run -p legion-of-bom-core --example visual_bom > vbom.html`
 
-use legion_of_bom_core::bom::{Bom, BomLine};
+use legion_of_bom_core::bom::{Bom, BomLine, LineKind};
 
 fn line(mpn: Option<&str>, value: &str, fp: &str, unit: Option<f64>, refs: &[&str]) -> BomLine {
     let refdes: Vec<String> = refs.iter().map(|s| s.to_string()).collect();
     let ext = unit.map(|u| u * refdes.len() as f64);
     BomLine {
+        kind: LineKind::Component,
         mpn: mpn.map(str::to_string),
         value: value.to_string(),
         footprint: Some(fp.to_string()),
@@ -92,6 +93,9 @@ fn main() {
             ),
         ],
     };
+    // The real `lob bom --visual` path derives the loose hardware too, so the
+    // preview does as well — otherwise the layout is missing four cells.
+    let bom = bom.with_hardware();
     // No thumbnails supplied → every line falls back to a swatch (THT resistors)
     // or a blank chip; exactly what a no-photo-source run produces today.
     let thumbnails = vec![None; bom.lines.len()];

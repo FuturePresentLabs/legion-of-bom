@@ -10,6 +10,10 @@ pub const MM: f64 = 72.0 / 25.4;
 /// A4 page size in points.
 pub const A4_W: f64 = 210.0 * MM;
 pub const A4_H: f64 = 297.0 * MM;
+/// US Letter page size in points — the default for the printed build guide,
+/// since that is what "standard paper" loads in the tray where these get built.
+pub const LETTER_W: f64 = 216.0 * MM;
+pub const LETTER_H: f64 = 279.0 * MM;
 
 /// Which built-in font a text run uses.
 #[derive(Clone, Copy)]
@@ -188,6 +192,13 @@ fn escape(s: &str) -> String {
             '→' => out.push_str("->"),
             '“' | '”' => out.push('"'),
             '‘' | '’' => out.push('\''),
+            // In WinAnsi these have real code points — emit the byte rather than
+            // transliterating, so a separator stays a separator on the page.
+            '·' => out.push_str("\\267"),
+            '°' => out.push_str("\\260"),
+            'µ' | 'μ' => out.push_str("\\265"),
+            '±' => out.push_str("\\261"),
+            'Ω' => out.push_str("ohm"),
             c if (c as u32) < 128 => out.push(c),
             _ => out.push('?'),
         }
@@ -195,10 +206,11 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Assemble `pages` into a complete PDF document (A4). Each image in `images` is
+/// Assemble `pages` into a complete PDF document at `(page_w, page_h)` points —
+/// [`LETTER_W`]×[`LETTER_H`] or [`A4_W`]×[`A4_H`]. Each image in `images` is
 /// embedded once as `/Im0`, `/Im1`, … (shared across pages) and referenced by a
 /// page's [`draw_image`](Page::draw_image) via its index.
-pub fn document(pages: &[Page], images: &[&Image]) -> Vec<u8> {
+pub fn document(pages: &[Page], images: &[&Image], (page_w, page_h): (f64, f64)) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &str| {
@@ -250,7 +262,7 @@ pub fn document(pages: &[Page], images: &[&Image]) -> Vec<u8> {
             &mut out,
             &mut offsets,
             &format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {A4_W:.2} {A4_H:.2}] \
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w:.2} {page_h:.2}] \
                  /Resources << /Font << /F1 3 0 R /F2 4 0 R >>{xobject} >> \
                  /Contents {content_obj} 0 R >>"
             ),
@@ -310,6 +322,9 @@ mod tests {
         assert_eq!(escape("a(b)c\\d"), "a\\(b\\)c\\\\d");
         // Common Unicode punctuation transliterates to ASCII, not '?'.
         assert_eq!(escape("2 — 3 × 4"), "2 - 3 x 4");
+        // WinAnsi has a middot; transliterating it to '?' looked like a bug.
+        assert_eq!(escape("a · b"), "a \\267 b");
+        assert_eq!(escape("\u{2603}"), "?"); // no WinAnsi slot — honest fallback
     }
 
     #[test]
@@ -318,7 +333,7 @@ mod tests {
         p.set_fill(1.0, 0.0, 0.0);
         p.rect(10.0, 10.0, 50.0, 20.0, Paint::Fill);
         p.text(10.0, 40.0, 12.0, Font::Bold, "Step 1");
-        let bytes = document(&[p], &[]);
+        let bytes = document(&[p], &[], (LETTER_W, LETTER_H));
         assert!(bytes.starts_with(b"%PDF-1.7"));
         assert!(bytes.ends_with(b"%%EOF\n"));
         let s = String::from_utf8_lossy(&bytes);

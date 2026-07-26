@@ -19,12 +19,13 @@ use legion_of_bom_core::{
     generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
     minimum_hp, package_key, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
     plan_repair, png_to_jpeg, product_image_url, render_board_png, run_drc, run_layout_loop,
-    simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
-    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, EurorackPlacer, Finding, GuideOptions, JlcpcbClient, KitType, LayoutLoop,
-    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution,
-    PartsLibrary, PipelineReport, ProjectView, Repair, ResolutionStatus, SeededPlacer, Severity,
-    SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, thonk_image_url, validate_erc,
+    value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
+    BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions, JlcpcbClient, KitType,
+    LayoutLoop, LayoutMode, LineKind, Logo, Manifest, MouserClient, PanelFile, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, ProjectView, Quality, Repair,
+    ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, SourcingClients,
+    StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -1164,6 +1165,9 @@ fn build_imported(
         );
     }
     let cache = default_image_cache_dir();
+    // The sorting sheet is what a builder counts parts onto, so it carries the
+    // loose hardware the netlist cannot know about (nuts, washers).
+    let bom = bom.with_hardware();
     let thumbs: Vec<Option<String>> = bom.lines.iter().map(|l| resolve_photo(l, &cache)).collect();
     let vpath = dir.join(format!("{name}-vbom.html"));
     std::fs::write(&vpath, bom.to_visual_html(name, &thumbs))
@@ -1395,11 +1399,11 @@ fn guide_cmd(
     let any_back = guide.steps.iter().any(|s| s.parts.iter().any(|p| p.back));
     let top = kicad_cli
         .as_ref()
-        .and_then(|k| render_board_png(&board_file, k, true, false).ok());
+        .and_then(|k| render_board_png(&board_file, k, true, false, Quality::High).ok());
     let bottom = if any_back {
         kicad_cli
             .as_ref()
-            .and_then(|k| render_board_png(&board_file, k, true, true).ok())
+            .and_then(|k| render_board_png(&board_file, k, true, true, Quality::High).ok())
     } else {
         None
     };
@@ -1534,6 +1538,9 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) ->
         // first, else an EasyEDA/LCSC auto-lookup; lines with none fall back to a
         // color swatch (THT resistors) or a blank cell.
         let cache = default_image_cache_dir();
+        // The sorting sheet is what a builder counts parts onto, so it carries
+        // the loose hardware the netlist cannot know about (nuts, washers).
+        let bom = bom.with_hardware();
         let mut fetched = 0usize;
         let thumbs: Vec<Option<String>> = bom
             .lines
@@ -1557,9 +1564,15 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) ->
     Ok(())
 }
 
-/// Resolve an embeddable thumbnail (`data:` URI) for a BOM line: a curated or
-/// priced `image_url` first, else an EasyEDA/LCSC product photo looked up by MPN
-/// or distinctive value. `None` → the Visual BOM falls back to a swatch / blank.
+/// Resolve an embeddable thumbnail (`data:` URI) for a BOM line, best source
+/// first: a curated or priced `image_url`, then Thonk for the shop goods they
+/// supply, then an EasyEDA/LCSC catalog photo. `None` → the Visual BOM falls back
+/// to a life-size swatch / package silhouette / blank.
+///
+/// Order matters. LCSC has no picture of a bag of jack nuts and a poor one of an
+/// Alpha pot; Thonk sells both and photographs them on a bench. For a jellybean
+/// op-amp it is the other way round, which is why the Thonk attempt is gated on
+/// [`thonk_keyword`] rather than tried for everything.
 fn resolve_photo(line: &BomLine, cache: &Path) -> Option<String> {
     // A curated/library image (may be a `file://` local photo) wins.
     if let Some(src) = &line.image_url {
@@ -1567,9 +1580,50 @@ fn resolve_photo(line: &BomLine, cache: &Path) -> Option<String> {
             return Some(thumb);
         }
     }
+    if let Some(keyword) = thonk_keyword(line) {
+        if let Some(thumb) = thonk_image_url(&keyword).and_then(|u| fetch_data_uri(&u, cache)) {
+            return Some(thumb);
+        }
+    }
     let keyword = photo_keyword(line)?;
     let url = product_image_url(&keyword)?;
     fetch_data_uri(&url, cache)
+}
+
+/// A Thonk-shaped search term for a line, or `None` when Thonk is the wrong shop
+/// to ask.
+///
+/// Thonk is searched by what a thing *is* ("Alpha 9mm pot"), not by MPN — they
+/// stock `WQP-PJ398SM` jacks but that string returns nothing, while "Thonkiconn
+/// 3.5mm jack" returns the product. So this maps our footprint vocabulary onto
+/// theirs, and stays silent for anything that is really a catalog part.
+fn thonk_keyword(line: &BomLine) -> Option<String> {
+    if line.kind == LineKind::Hardware {
+        // "M6 jack nut" / "Pot washer" → the bag Thonk actually sells.
+        let v = line.value.to_ascii_lowercase();
+        if v.contains("jack") {
+            return Some("jack nuts and washers".into());
+        }
+        if v.contains("pot") {
+            return Some("potentiometer nuts washers".into());
+        }
+        return None;
+    }
+    let fp = line.footprint.as_deref()?.to_ascii_lowercase();
+    let term = if fp.contains("pj398sm") || fp.contains("thonkiconn") {
+        "thonkiconn 3.5mm jack sockets"
+    } else if fp.contains("pj301") {
+        "pj301bm 3.5mm jack sockets"
+    } else if fp.contains("jack_3.5mm") || fp.contains("audiojack") {
+        "3.5mm jack sockets"
+    } else if fp.contains("rd901f") || fp.contains("potentiometer") {
+        "alpha 9mm pots vertical"
+    } else if fp.contains("pinheader_2x05") {
+        "eurorack power header shrouded"
+    } else {
+        return None;
+    };
+    Some(term.to_string())
 }
 
 /// The photo-search keyword for a line, or `None` when a photo isn't wanted:
@@ -2195,7 +2249,7 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
             println!("{stem}: {steps} step(s), {placed} part(s)");
             println!("  guide: {}", gpath.display());
 
-            let bom = board.to_bom();
+            let bom = board.to_bom().with_hardware();
             let cache = default_image_cache_dir();
             let mut fetched = 0usize;
             let thumbs: Vec<Option<String>> = bom
