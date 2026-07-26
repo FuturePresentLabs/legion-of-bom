@@ -203,6 +203,10 @@ enum PartsCmd {
         /// Only this kind (resistor, capacitor, jack, pot, ic, ...).
         #[arg(long)]
         kind: Option<String>,
+        /// Write CSV instead of a table — the reviewable export to commit, since
+        /// the Dolt store itself is local (the same split as `.beads`).
+        #[arg(long)]
+        csv: bool,
     },
     /// Show a part (pins, ratings, verification status) by MPN.
     Show {
@@ -1585,6 +1589,15 @@ fn has_letter_run(s: &str, n: usize) -> bool {
 }
 
 /// Handle `lob parts …` against the global parts library.
+/// One CSV cell, quoted only when it has to be.
+fn csv_cell(v: &str) -> String {
+    if v.contains([',', '"', '\n']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
+    }
+}
+
 /// The repo a path sits in — the nearest ancestor holding `lob.toml` or `.git`.
 fn find_repo_root(from: &std::path::Path) -> Option<PathBuf> {
     let mut dir = from.to_path_buf();
@@ -1789,12 +1802,28 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             }
         }
 
-        PartsCmd::House { kind } => {
+        PartsCmd::House { kind, csv } => {
             let all = lib.house_parts()?;
             let shown: Vec<_> = all
                 .iter()
                 .filter(|h| kind.as_deref().is_none_or(|k| h.kind == k))
                 .collect();
+            if csv {
+                println!("kind,value,package,mpn,uses,seen_on,photo");
+                for h in &shown {
+                    println!(
+                        "{},{},{},{},{},{},{}",
+                        csv_cell(&h.kind),
+                        csv_cell(&h.value),
+                        csv_cell(&h.package),
+                        csv_cell(&h.mpn),
+                        h.uses,
+                        csv_cell(&h.seen_on),
+                        csv_cell(h.photo.as_deref().unwrap_or(""))
+                    );
+                }
+                return Ok(());
+            }
             if shown.is_empty() {
                 println!("nothing learned yet — try `lob parts learn <package>...`");
                 return Ok(());
