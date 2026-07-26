@@ -2,27 +2,28 @@
 //! the fast loop for checking placement and silkscreen rules against a real
 //! circuit whose SKiDL source lives in another repo.
 //!
-//! **What this is not good for.** It derives its own panel with `derive_panel`,
-//! which stacks every control in one idealised centred column. The boards it
-//! produces carry ~69 DRC errors where the shipped slew_limiter board carries 5.
-//! So: fine for A/B-ing a placement change against *itself*, useless for judging
-//! whether a board is buildable or what a width's real DRC count is. It has
-//! misled this work twice — see `legion-of-bom` harness bead. Use a real
-//! declared panel spec before drawing DRC-level conclusions.
+//! Builds against a **real declared panel spec**, defaulting to
+//! `examples/fixtures/slew_limiter_panel.toml` — which was itself captured off
+//! the shipped board with `panel_from_board`, so it reproduces the configuration
+//! that actually got manufactured.
+//!
+//! It used to derive its own panel with `derive_panel`, stacking every control
+//! into one idealised centred column. That produced boards with ~69 DRC errors
+//! where the shipped board has 5, and it misled this work twice: once by
+//! anchoring nothing at all, and once by making 4 HP vs 5 HP DRC comparisons
+//! look meaningful when the router was flailing at both widths for unrelated
+//! reasons — the shipped board is 8 HP.
 //!
 //! ```text
 //! cargo run -p legion-of-bom-core --example board_preview -- \
-//!     out/slew_limiter/slew_limiter.net /tmp/board.kicad_pcb 5
+//!     out/slew_limiter/slew_limiter.net /tmp/board.kicad_pcb [panel.toml]
 //! ```
-//! The third argument is the panel width in HP (default 5), which sizes the
-//! board and selects the Eurorack placer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use legion_of_bom_core::{
-    derive_panel, parse_netlist_file, run_layout_loop, BoardOptions, BuiltinCutouts, LayoutLoop,
-    MstRouter, SeededPlacer,
+    parse_netlist_file, run_layout_loop, BoardOptions, LayoutLoop, PanelFile, SeededPlacer,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,31 +33,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("usage: board_preview <x.net> <out.kicad_pcb> [hp]")?,
     );
     let out = PathBuf::from(args.next().ok_or("missing output path")?);
-    let hp: f64 = args.next().unwrap_or_else(|| "5".into()).parse()?;
+    let spec_path = args
+        .next()
+        .unwrap_or_else(|| "crates/core/examples/fixtures/slew_limiter_panel.toml".into());
 
     let circuit = parse_netlist_file(&net)?;
     let dir =
         legion_of_bom_core::skidl::kicad_footprint_dir().ok_or("no KiCad footprint library")?;
-    let (w, h) = (hp * 5.08, 128.5);
-    let origin = (100.0, 40.0);
-    // Anchor the panel controls exactly as the CLI does. Without this the greedy
-    // placer has no skeleton and seeds from an arbitrary part, which is not the
-    // configuration any real board is built in — and tuning against it produces
-    // numbers that mean nothing.
-    let panel = derive_panel(&circuit, hp as u16, &BuiltinCutouts);
-    let spec = panel.to_spec().map_err(|e| format!("panel: {e}"))?;
+
+    // Anchor the panel controls exactly as the CLI does, from a real declared
+    // spec. Without this the greedy placer has no skeleton and seeds from an
+    // arbitrary part, which is not the configuration any real board is built in.
+    let file = PanelFile::from_toml(&std::fs::read_to_string(&spec_path)?)?;
+    let spec = file.to_spec().map_err(|e| format!("panel: {e}"))?;
+    let (w, h) = (spec.width_mm(), spec.height_mm());
+    let origin = (((297.0 - w) / 2.0).max(10.0), ((210.0 - h) / 2.0).max(10.0));
     let anchors: HashMap<String, (f64, f64)> = spec
         .cutouts()
         .iter()
         .filter_map(|c| c.refdes.clone().map(|r| (r, (c.x_mm, h - c.y_mm))))
         .collect();
-    eprintln!("anchored {} panel control(s)", anchors.len());
+    eprintln!(
+        "{} — {:.0} HP, {} anchored control(s)",
+        spec_path,
+        w / 5.08,
+        anchors.len()
+    );
+
+    // Everything else stays at BoardOptions::new's defaults, which is what the
+    // CLI uses — notably the router. Overriding it with MstRouter here was
+    // producing 16 crossing tracks and 25 unrouted nets against the shipped
+    // board's 5, and none of that was anything to do with placement.
     let mut opts = BoardOptions::new(dir);
-    opts.router = Some(Box::new(MstRouter));
     opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
 
-    // Through the iterative loop, not one-shot: the attempt-selection score is
-    // where a good placement used to get discarded.
     let template = SeededPlacer::new(w, h, origin, anchors);
     // Gate the winning board on real KiCad DRC — the check that says whether a
     // width is actually buildable, as opposed to geometrically plausible.

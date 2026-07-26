@@ -84,11 +84,11 @@ pub struct PartFacts {
 
 impl PartFacts {
     /// The absolute keep-out rect `(min_x, min_y, max_x, max_y)` for this part
-    /// placed with its origin at `(x, y)`. A back-side part is mirrored in X (its
+    /// placed with its origin at `(x, y)`. A back-side part is mirrored in Y (its
     /// footprint flips onto the bottom copper), so the offset mirrors too.
     fn keepout_at(&self, x: f64, y: f64, back: bool) -> Rect {
         let (ox, oy) = self.origin_offset;
-        let ox = if back { -ox } else { ox };
+        let oy = if back { -oy } else { oy };
         let (w, h) = self.extent;
         (
             x + ox - w / 2.0,
@@ -104,12 +104,12 @@ impl PartFacts {
     /// sits at pin 1, its body several mm away) lands somewhere quite different
     /// once rotated, so the offset must rotate too.
     fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
-        // Mirror the *local* X before rotating, not the rotated result. A
+        // Mirror the *local* Y before rotating, not the rotated result. A
         // back-side footprint is flipped in its own frame and then turned; doing
         // it the other way round is only harmless at 0°/180°, and put a
         // back-mounted 90° power header's keep-out ~10mm from its copper.
         let local = if back {
-            (-self.origin_offset.0, self.origin_offset.1)
+            (self.origin_offset.0, -self.origin_offset.1)
         } else {
             self.origin_offset
         };
@@ -129,7 +129,7 @@ impl PartFacts {
     }
 
     /// This part's through-hole pad keep-outs in absolute board coordinates for a
-    /// placement with origin at `(x, y)`, rotated `rot_deg` (X mirrored on the back,
+    /// placement with origin at `(x, y)`, rotated `rot_deg` (Y mirrored on the back,
     /// like the pads). Pins occupy both copper layers, so these gate what may sit
     /// opposite them — and a rotated part's pins move, so the rotation must be
     /// applied here or the placer reserves the wrong squares (a rotated pot's
@@ -141,7 +141,7 @@ impl PartFacts {
                 // Flip in the footprint's own frame first, then rotate — the
                 // same order as keepout_at_rot, so a part's pads and its
                 // keep-out stay together on the back as well as the front.
-                let r = if back { (-r.2, r.1, -r.0, r.3) } else { r };
+                let r = if back { (r.0, -r.3, r.2, -r.1) } else { r };
                 let (x0, y0, x1, y1) = rotate_rect(r, rot_deg);
                 (x + x0, y + y0, x + x1, y + y1)
             })
@@ -425,7 +425,7 @@ impl Placer for EurorackPlacer {
                 .get(refdes)
                 .map(|f| f.origin_offset)
                 .unwrap_or((0.0, 0.0));
-            let (ox, oy) = if back { (-ox, oy) } else { (ox, oy) };
+            let (ox, oy) = if back { (ox, -oy) } else { (ox, oy) };
             let (rox, roy) = rotate_local((ox, oy), rotation_deg);
             out.insert(
                 refdes.clone(),
@@ -704,12 +704,12 @@ impl Placer for SeededPlacer {
             })
         };
         let side_of = |refdes: &str| facts_of(refdes).side == Side::Back;
-        // The keep-out centre offset from the footprint origin, mirrored in X for a
+        // The keep-out centre offset from the footprint origin, mirrored in Y for a
         // back-side part. Placement works in keep-out-centre space and converts
         // back to a footprint origin on output.
         let offset_of = |f: &PartFacts, back: bool| {
             let (ox, oy) = f.origin_offset;
-            (if back { -ox } else { ox }, oy)
+            (ox, if back { -oy } else { oy })
         };
 
         let margin = EDGE_MARGIN_MM;
@@ -901,16 +901,19 @@ impl Placer for SeededPlacer {
                 } else {
                     0.0
                 };
-            let (ext, base_off) = if rot == 90.0 {
-                (
-                    (f.extent.1, f.extent.0),
-                    (f.origin_offset.1, -f.origin_offset.0),
-                )
+            // Flip in the footprint's own frame first, then turn it — the same
+            // order as `keepout_at_rot`, so this target agrees with the keep-out
+            // the placer will go on to reserve for the part.
+            let flipped = if back {
+                (f.origin_offset.0, -f.origin_offset.1)
             } else {
-                (f.extent, f.origin_offset)
+                f.origin_offset
             };
-            // A back-side part also mirrors in X.
-            let (ox, oy) = (if back { -base_off.0 } else { base_off.0 }, base_off.1);
+            let (ext, (ox, oy)) = if rot == 90.0 {
+                ((f.extent.1, f.extent.0), rotate_local(flipped, 90.0))
+            } else {
+                (f.extent, flipped)
+            };
 
             // Target: weighted centroid of already-placed neighbours, else an
             // even-spread row (the EurorackPlacer fallback) for the first parts.
@@ -1143,8 +1146,10 @@ pub struct BoardOptions {
 }
 
 impl BoardOptions {
-    /// Default options: grid placement, MST routing, a `GND` ground pour, 5 mm
-    /// outline margin, values on silk.
+    /// Default options: grid placement, **grid routing**, a `GND` ground pour,
+    /// 5 mm outline margin, values on silk. This is what the CLI builds with — a
+    /// harness that overrides any of it is measuring a board nothing ships
+    /// (`legion-of-bom-nz1`).
     pub fn new(footprint_dir: impl Into<PathBuf>) -> Self {
         BoardOptions {
             footprint_dir: footprint_dir.into(),
@@ -1236,6 +1241,17 @@ pub fn build_facts(
 /// The search starts at [`crate::panel::min_panel_hp`], never below: a width the
 /// *board* squeezes into is useless if the panel hardware it must carry doesn't
 /// physically fit there (a 3 HP panel is 15.24 mm; an Alpha pot body is 13.75 mm).
+///
+/// # This is a floor, not a buildable width
+///
+/// It answers "does the copper fit between the edges", which is a true lower
+/// bound and cheap — no routing, no KiCad. It does **not** ask whether the router
+/// can complete every net in the space left over, and a board can fit and still
+/// be unroutable. Quoting this as *the* minimum width is what produced a 3 HP
+/// slew limiter with parts hanging off the edge (`legion-of-bom-t5t`).
+///
+/// For a width that is actually proven to build, feed this in as the floor to
+/// [`crate::layout::minimum_routable_hp`], which trials each width for real.
 pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts>) -> u16 {
     use crate::panel::PanelSpec;
     const MAX_HP: u16 = 42;
@@ -1889,9 +1905,9 @@ fn pad_layer_on_board(local: PadLayer, back: bool) -> PadLayer {
 /// emits rotation 0 today, so that identity path is what ships — the formula is
 /// validated against KiCad ground truth when the layout loop introduces angles.
 fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
-    // A back-placed footprint mirrors local X (matching `flip_to_back`), then the
+    // A back-placed footprint mirrors local Y (matching `flip_to_back`), then the
     // whole footprint rotates about its origin.
-    let px = if placement.back { -px } else { px };
+    let py = if placement.back { -py } else { py };
     let (s, c) = placement.rotation_deg.to_radians().sin_cos();
     let rx = px * c + py * s;
     let ry = py * c - px * s;
@@ -2028,9 +2044,9 @@ fn transform_footprint(
     }
 
     // A back-placed footprint is flipped to the bottom: swap every child item's
-    // F./B. layer and mirror its local X (KiCad's flip-to-back). Do it on the
+    // F./B. layer and mirror its local Y (KiCad's flip-to-back). Do it on the
     // library-local geometry, before the board-level placement is inserted — and
-    // note `place_point` mirrors pad X the same way so routing matches the pads.
+    // note `place_point` mirrors pad Y the same way so routing matches the pads.
     if placement.back {
         for item in items.iter_mut().skip(2) {
             flip_to_back(item);
@@ -2155,11 +2171,27 @@ fn flip_to_back(item: &mut Sexpr) {
                 }
             }
         }
-        // Coordinate lists: mirror the X component.
+        // Coordinate lists: mirror the Y component, and reverse any angle that
+        // rides along on an `(at x y rot)` — a reflection reverses handedness, so
+        // a pad turned +90° in the library is turned −90° once flipped.
+        //
+        // Mirroring *Y* (not X) is KiCad's own storage convention for a footprint
+        // flipped to the back, verified against `pcbnew`'s `FOOTPRINT::Flip`. The
+        // two differ by a 180° turn, so getting it wrong is invisible on a
+        // symmetric part and puts the 3D body a footprint-length away from its
+        // pads on everything else: KiCad renders the model from the convention it
+        // reads the pads with, so ours has to be the same one.
         Some("at") | Some("start") | Some("end") | Some("center") | Some("mid") | Some("xy") => {
-            if let Some(x) = list.get_mut(1) {
-                if let Some(v) = x.as_atom().and_then(|s| s.parse::<f64>().ok()) {
-                    *x = Sexpr::sym(mm(-v));
+            if let Some(y) = list.get_mut(2) {
+                if let Some(v) = y.as_atom().and_then(|s| s.parse::<f64>().ok()) {
+                    *y = Sexpr::sym(mm(-v));
+                }
+            }
+            if head.as_deref() == Some("at") {
+                if let Some(a) = list.get_mut(3) {
+                    if let Some(v) = a.as_atom().and_then(|s| s.parse::<f64>().ok()) {
+                        *a = Sexpr::sym(mm(-v));
+                    }
                 }
             }
         }
@@ -2858,8 +2890,11 @@ mod tests {
         assert!(text.contains("B.SilkS"), "on the back silk: {text}");
         assert!(text.contains("mirror"), "back text reads correctly: {text}");
         assert!(!text.contains("F.SilkS"), "not on the front: {text}");
-        // Pins 1+2 sit at the low-Y rank (y = 50), pins 9+10 at y ≈ 60.2. The bar
-        // must land just off the -12 V end, not the +12 V one.
+        // Pins 1+2 are the -12 V rank and 9+10 the +12 V one; which absolute end
+        // each lands on is the flip's business, so derive it rather than pinning a
+        // side. The bar must sit beyond the -12 V rank, away from +12 V.
+        let neg_y = place_point(placement, 0.0, 0.0).1;
+        let pos_y = place_point(placement, 0.0, 4.0 * 2.54).1;
         let bar = &silk[0];
         let pt = |key: &str| -> (f64, f64) {
             let p = bar.get(key).expect(key);
@@ -2870,9 +2905,10 @@ mod tests {
         };
         let (sx, sy) = pt("start");
         let (ex, ey) = pt("end");
+        let away = (neg_y - pos_y).signum();
         assert!(
-            sy < 50.0 && ey < 50.0,
-            "bar is off the -12V end: {sy}, {ey}"
+            (sy - neg_y) * away > 0.0 && (ey - neg_y) * away > 0.0,
+            "bar is off the -12V end (neg {neg_y}, pos {pos_y}): {sy}, {ey}"
         );
         assert!((sy - ey).abs() < 1e-9, "bar runs across the end, not along");
         assert!(sx < ex, "bar spans the header's width");
@@ -3358,16 +3394,33 @@ mod tests {
     }
 
     #[test]
-    fn flip_to_back_mirrors_x_and_flips_layers_and_text() {
+    fn flip_to_back_mirrors_y_and_flips_layers_and_text() {
         let mut e = crate::sexpr::Sexpr::parse(
             r#"(fp_text user "R1" (at 1.5 2) (layer "F.SilkS") (effects (font (size 1 1))))"#,
         )
         .unwrap();
         flip_to_back(&mut e);
         let out = e.to_sexpr_string();
-        assert!(out.contains("(at -1.5 2)"), "x mirrored: {out}");
+        assert!(out.contains("(at 1.5 -2)"), "y mirrored: {out}");
         assert!(out.contains(r#"(layer "B.SilkS")"#), "layer flipped: {out}");
         assert!(out.contains("mirror"), "back text mirrored: {out}");
+    }
+
+    /// KiCad's ground truth, from `pcbnew`'s `FOOTPRINT::Flip`: flipping
+    /// `TQFP-120_14x14mm_P0.4mm` sends a pad at `(-5.8, 7.7, 90°)` to
+    /// `(-5.8, -7.7, 270°)` — X held, Y negated, angle reversed. Pin this, because
+    /// the X-mirrored convention we used before is a 180° turn away from it and
+    /// looks identical on every symmetric part.
+    #[test]
+    fn flip_to_back_matches_kicads_own_flip_of_a_rotated_pad() {
+        let mut e = crate::sexpr::Sexpr::parse(
+            r#"(pad "31" smd roundrect (at -5.8 7.7 90) (size 0.28 1.5) (layers "F.Cu" "F.Mask"))"#,
+        )
+        .unwrap();
+        flip_to_back(&mut e);
+        let out = e.to_sexpr_string();
+        assert!(out.contains("(at -5.8 -7.7 -90)"), "{out}");
+        assert!(out.contains(r#"(layers "B.Cu" "B.Mask")"#), "{out}");
     }
 
     /// Silkscreen v0 (DESIGN 6.10): a placed footprint keeps its library silk

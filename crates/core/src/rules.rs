@@ -144,7 +144,7 @@ impl Rule {
                 // order the placer uses, and the only order that agrees with
                 // where KiCad actually puts a rotated back-side part.
                 let local = if p.back {
-                    (-origin_offset.0, origin_offset.1)
+                    (origin_offset.0, -origin_offset.1)
                 } else {
                     *origin_offset
                 };
