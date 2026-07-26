@@ -91,6 +91,21 @@ pub struct Violation {
     pub by_mm: f64,
     /// Human-readable, for the layout report.
     pub what: String,
+    /// How to fix it: which part to move, and where it should head.
+    ///
+    /// A violation that cannot say this is one the loop can only price, not
+    /// repair — it will be reported and scored against, and the layout will
+    /// have to be relaxed or fixed by hand.
+    pub repair: Option<Repair>,
+}
+
+/// Where a violating part wants to be, so the loop can aim rather than shake.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Repair {
+    /// The part to move — the one that is out of place, not its reference.
+    pub refdes: String,
+    /// Board-mm the part should head toward.
+    pub toward_mm: (f64, f64),
 }
 
 /// How far apart a decoupling capacitor and its IC may sit before it stops being
@@ -140,6 +155,12 @@ pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<
                         tier: *tier,
                         by_mm: d - *max_mm,
                         what: format!("{a} is {d:.1}mm from {b} (max {max_mm:.1}mm) — {why}"),
+                        // Move the cap to its IC, not the other way round: the
+                        // IC is the anchor the rest of the circuit hangs off.
+                        repair: Some(Repair {
+                            refdes: a.clone(),
+                            toward_mm: (pb.x_mm, pb.y_mm),
+                        }),
                     });
                 }
             }
@@ -239,6 +260,7 @@ mod tests {
             tier: Tier::Electrical,
             by_mm: 1.0,
             what: String::new(),
+            repair: None,
         }]);
         let whole_board_of_wirelength = 1.0 * 500.0; // weights.wirelength * HPWL
         assert!(one_mm_electrical > whole_board_of_wirelength);
@@ -247,6 +269,7 @@ mod tests {
             tier: Tier::Physical,
             by_mm: 1.0,
             what: String::new(),
+            repair: None,
         }]);
         assert!(one_mm_physical > 100.0 * one_mm_electrical);
     }
