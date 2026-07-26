@@ -96,8 +96,8 @@ pub use import::{
 };
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use layout::{
-    measure, run_layout_loop, score, CostWeights, LayoutLoop, LayoutMode, LayoutReport,
-    PlacementMetrics,
+    eurorack_trial_build, measure, minimum_routable_hp, run_layout_loop, score, CostWeights,
+    HpSearch, HpTrial, LayoutLoop, LayoutMode, LayoutReport, PlacementMetrics, RoutableHp,
 };
 pub use legalize::{legalize, Report as LegalizeReport};
 pub use logo::Logo;

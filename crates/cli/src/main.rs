@@ -14,18 +14,19 @@ use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
-    default_panel_orders_dir, default_parts_dir, derive_panel, embed_source, export_cpl,
-    export_gerbers, fetch_data_uri, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
-    generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
-    minimum_hp, package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb,
-    parse_netlist_file, part_kind_of, plan_repair, png_to_jpeg, product_image_url,
-    render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword,
-    suggest_mpns, thonk_image_url, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus,
-    BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer,
-    Finding, GuideOptions, JlcpcbClient, KitType, LayoutLoop, LayoutMode, LineKind, Logo, Manifest,
-    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    default_panel_orders_dir, default_parts_dir, derive_panel, embed_source, eurorack_trial_build,
+    export_cpl, export_gerbers, fetch_data_uri, fetch_from_jlcpcb, fetch_from_kicad,
+    generate_board_artifacts, generate_board_report, generate_bom, guide_to_html, guide_to_pdf,
+    jlc_bom_csv, kicad_cli_path, minimum_hp, minimum_routable_hp, package_key, panel_from_board,
+    panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of, plan_repair, png_to_jpeg,
+    product_image_url, render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran,
+    suggest_by_keyword, suggest_mpns, thonk_image_url, validate_erc, value_key, zip_dir,
+    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
+    CircuitSource, EurorackPlacer, Finding, GuideOptions, HpSearch, JlcpcbClient, KitType,
+    LayoutLoop, LayoutMode, LineKind, Logo, Manifest, MouserClient, PanelFile, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
+    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -2545,14 +2546,55 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             let footprint_dir = kicad_footprint_dir()
                 .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
             let facts = build_facts(&model, &footprint_dir)?;
-            let hp = minimum_hp(&model, &facts);
-            let mm = f64::from(hp) * 5.08;
-            println!("minimum panel width: {hp} HP ({mm:.1} mm) for {stem}");
+            let floor = minimum_hp(&model, &facts);
+            println!(
+                "parts fit from: {floor} HP ({:.1} mm) for {stem}",
+                f64::from(floor) * 5.08
+            );
             println!(
                 "  {} panel-facing control(s), {} part(s) total",
-                derive_panel(&model, hp, &BuiltinCutouts).cutouts.len(),
+                derive_panel(&model, floor, &BuiltinCutouts).cutouts.len(),
                 model.parts().len()
             );
+            // Fitting is not building. Route each width for real and gate it on
+            // KiCad DRC, because a board can fit and still be unroutable — the
+            // failure that shipped a 3 HP answer for a board that needed more.
+            let cfg = LayoutLoop {
+                kicad_cli: kicad_cli_path(),
+                max_iters: 2,
+                ..LayoutLoop::default()
+            };
+            let search = HpSearch::default();
+            if cfg.kicad_cli.is_some() {
+                println!("  trialling widths (place → route → DRC), {floor} HP up…");
+            }
+            let found = minimum_routable_hp(&model, floor, &search, &cfg, |hp| {
+                eurorack_trial_build(&model, &footprint_dir, hp)
+            });
+            for t in &found.tried {
+                match t.errors {
+                    None => println!("    {:>2} HP · could not be built", t.hp),
+                    Some(0) => println!("    {:>2} HP · DRC clean", t.hp),
+                    Some(n) => {
+                        let why: Vec<String> =
+                            t.kinds.iter().map(|(k, c)| format!("{c}× {k}")).collect();
+                        println!("    {:>2} HP · {n} DRC error(s): {}", t.hp, why.join(", "));
+                    }
+                }
+            }
+            match (found.unproven, found.hp) {
+                (true, _) => println!(
+                    "  routability unchecked (no kicad-cli) — {floor} HP is a floor, not a proven width"
+                ),
+                (_, Some(hp)) => println!(
+                    "minimum BUILDABLE width: {hp} HP ({:.1} mm)",
+                    f64::from(hp) * 5.08
+                ),
+                (_, None) => println!(
+                    "  no width from {floor} to {} HP routed DRC-clean — this is a layout problem, not a width problem",
+                    floor + search.max_widths - 1
+                ),
+            }
         }
         PanelCmd::Status { module } => {
             let store = PanelOrders::open(default_panel_orders_dir())

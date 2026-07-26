@@ -479,6 +479,177 @@ fn drc_on(
     run_drc(&path, kicad_cli).map_err(|e| BoardError::Other(e.to_string()))
 }
 
+/// Options + seeded template for a **trial build** of a Eurorack module at `hp`,
+/// set up exactly as a real build is at that width: panel derived from the
+/// circuit, its cutouts anchored, outline fixed to the panel, everything else
+/// left at [`BoardOptions::new`]'s defaults.
+///
+/// This lives here, rather than in each caller, because "exactly as" is the
+/// load-bearing part and a second copy is a second chance to drift from it. A
+/// sizing trial configured differently from the build measures a board nobody
+/// ships: `examples/board_preview` overrode the router and reported ~69 DRC
+/// errors against a shipped board's 5, misleading this work twice
+/// (`legion-of-bom-nz1`).
+///
+/// A caller with a *hand-authored* panel or placement should pass its own
+/// closure to [`minimum_routable_hp`] instead — this one derives the panel, which
+/// is only right when nobody has laid the module out by hand.
+pub fn eurorack_trial_build(
+    circuit: &dyn CircuitSource,
+    footprint_dir: &std::path::Path,
+    hp: u16,
+) -> Result<(BoardOptions, SeededPlacer), BoardError> {
+    use crate::panel::{BuiltinCutouts, EurorackPanel, PanelSpec};
+    let dims = EurorackPanel::new(hp);
+    let (w, h) = (dims.width_mm(), dims.height_mm());
+    let anchors: HashMap<String, (f64, f64)> =
+        crate::panel::derive_panel(circuit, hp, &BuiltinCutouts)
+            .cutouts
+            .iter()
+            .filter_map(|c| c.refdes.clone().map(|r| (r, (c.x_mm, h - c.y_mm))))
+            .collect();
+    // Centre on KiCad's A4 sheet, as the CLI does, rather than the (0,0) corner.
+    let origin = (((297.0 - w) / 2.0).max(10.0), ((210.0 - h) / 2.0).max(10.0));
+    let mut opts = BoardOptions::new(footprint_dir);
+    opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
+    opts.placer = Box::new(crate::board::EurorackPlacer {
+        width_mm: w,
+        height_mm: h,
+        origin_mm: origin,
+        anchors: anchors.clone(),
+    });
+    Ok((opts, SeededPlacer::new(w, h, origin, anchors)))
+}
+
+/// How far above the geometric floor to look for a width that actually builds.
+#[derive(Debug, Clone)]
+pub struct HpSearch {
+    /// Widths to trial, starting at the floor, before giving up. Each one costs a
+    /// full place → route → DRC, so this is deliberately small: if a board needs
+    /// four more HP than its parts occupy, the answer is a layout problem, not a
+    /// wider search.
+    pub max_widths: u16,
+}
+
+impl Default for HpSearch {
+    fn default() -> Self {
+        HpSearch { max_widths: 4 }
+    }
+}
+
+/// What one candidate width did when actually built.
+#[derive(Debug, Clone)]
+pub struct HpTrial {
+    pub hp: u16,
+    /// DRC errors at this width; `None` if the board could not be generated.
+    pub errors: Option<usize>,
+    /// Error counts per DRC rule, so a rejection says *what* was wrong.
+    pub kinds: Vec<(String, usize)>,
+}
+
+/// The narrowest width proven buildable, and the evidence for it.
+#[derive(Debug, Clone)]
+pub struct RoutableHp {
+    /// The narrowest width that routed DRC-clean. `None` means no width in range
+    /// did — which is a real answer, not a failure to compute one.
+    pub hp: Option<u16>,
+    /// The geometric floor the search started from: the width the parts *fit* in.
+    pub floor_hp: u16,
+    /// Each width tried, narrowest first.
+    pub tried: Vec<HpTrial>,
+    /// DRC never ran (no `kicad-cli`), so nothing here is proven.
+    pub unproven: bool,
+}
+
+/// The narrowest width the circuit actually **builds** in — placed, routed, and
+/// gated on real KiCad DRC — searching upward from a geometric floor.
+///
+/// [`minimum_hp`](crate::board::minimum_hp) answers a different and weaker
+/// question: does the parts' copper *fit* between the edges. That is a genuine
+/// lower bound and a fast one, but a board can fit and still be unbuildable
+/// because the router cannot complete every net in the space left over. Reporting
+/// the fit answer as the minimum width is what produced a 3 HP slew limiter with
+/// parts hanging off the edge (`legion-of-bom-t5t`).
+///
+/// `configure` supplies the options and placer template for a given width, and it
+/// must be **the same configuration the caller will really build with**. This is
+/// the whole point of the seam: the sizing harness in `examples/board_preview`
+/// spent two rounds of this work drawing DRC conclusions from a router the CLI
+/// never uses (`legion-of-bom-nz1`), and a trial that does not match the build
+/// proves nothing about the build.
+///
+/// Degrades gracefully: with no `kicad_cli` in `cfg`, routability cannot be
+/// checked at all, so this returns `unproven` rather than guessing.
+pub fn minimum_routable_hp<F>(
+    circuit: &dyn CircuitSource,
+    floor_hp: u16,
+    search: &HpSearch,
+    cfg: &LayoutLoop,
+    mut configure: F,
+) -> RoutableHp
+where
+    F: FnMut(u16) -> Result<(BoardOptions, SeededPlacer), BoardError>,
+{
+    let mut out = RoutableHp {
+        hp: None,
+        floor_hp,
+        tried: Vec::new(),
+        unproven: cfg.kicad_cli.is_none(),
+    };
+    if out.unproven {
+        return out;
+    }
+    for hp in floor_hp..floor_hp.saturating_add(search.max_widths.max(1)) {
+        let built = configure(hp)
+            .and_then(|(options, template)| run_layout_loop(circuit, options, template, cfg));
+        // A width that cannot even be generated is recorded and stepped past: the
+        // next one up may well work, and that is the question being asked.
+        let Ok(report) = built else {
+            out.tried.push(HpTrial {
+                hp,
+                errors: None,
+                kinds: Vec::new(),
+            });
+            continue;
+        };
+        // No DRC report despite a kicad-cli means the gate could not run. Treat it
+        // as unproven rather than silently accepting the width.
+        let Some(drc) = report.drc else {
+            out.tried.push(HpTrial {
+                hp,
+                errors: None,
+                kinds: Vec::new(),
+            });
+            continue;
+        };
+        let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
+        for v in drc
+            .violations
+            .iter()
+            .chain(&drc.unconnected_items)
+            .filter(|v| v.severity == "error")
+        {
+            *by_kind.entry(v.kind.as_str()).or_default() += 1;
+        }
+        let mut kinds: Vec<(String, usize)> = by_kind
+            .into_iter()
+            .map(|(k, n)| (k.to_string(), n))
+            .collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let errors = drc.error_count();
+        out.tried.push(HpTrial {
+            hp,
+            errors: Some(errors),
+            kinds,
+        });
+        if errors == 0 {
+            out.hp = Some(hp);
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +673,46 @@ mod tests {
         fn nets(&self) -> &[Net] {
             &self.nets
         }
+    }
+
+    /// Without `kicad-cli` there is no way to check routability, so the search
+    /// must say it could not prove anything rather than hand back the floor as if
+    /// it had — quoting an unproven width as buildable is the original bug.
+    #[test]
+    fn with_no_kicad_cli_the_search_proves_nothing() {
+        let cfg = LayoutLoop {
+            kicad_cli: None,
+            ..LayoutLoop::default()
+        };
+        let mut called = 0;
+        let out = minimum_routable_hp(&toy(), 4, &HpSearch::default(), &cfg, |_| {
+            called += 1;
+            Err(BoardError::Other("should not be reached".into()))
+        });
+        assert!(out.unproven);
+        assert_eq!(out.hp, None);
+        assert_eq!(out.floor_hp, 4);
+        assert!(out.tried.is_empty());
+        assert_eq!(called, 0, "no width should be built when DRC cannot run");
+    }
+
+    /// A width that cannot even be configured is recorded and stepped past — the
+    /// next one up may well build, and that is the question being asked.
+    #[test]
+    fn a_width_that_cannot_be_built_is_recorded_and_the_search_continues() {
+        let cfg = LayoutLoop {
+            kicad_cli: Some(PathBuf::from("/nonexistent/kicad-cli")),
+            ..LayoutLoop::default()
+        };
+        let search = HpSearch { max_widths: 3 };
+        let out = minimum_routable_hp(&toy(), 6, &search, &cfg, |_| {
+            Err(BoardError::Other("no footprints".into()))
+        });
+        assert!(!out.unproven);
+        assert_eq!(out.hp, None, "nothing built, so nothing is proven");
+        let widths: Vec<u16> = out.tried.iter().map(|t| t.hp).collect();
+        assert_eq!(widths, vec![6, 7, 8], "every width in range was tried");
+        assert!(out.tried.iter().all(|t| t.errors.is_none()));
     }
 
     fn toy() -> Toy {
