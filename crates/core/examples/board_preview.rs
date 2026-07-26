@@ -2,6 +2,14 @@
 //! the fast loop for checking placement and silkscreen rules against a real
 //! circuit whose SKiDL source lives in another repo.
 //!
+//! **What this is not good for.** It derives its own panel with `derive_panel`,
+//! which stacks every control in one idealised centred column. The boards it
+//! produces carry ~69 DRC errors where the shipped slew_limiter board carries 5.
+//! So: fine for A/B-ing a placement change against *itself*, useless for judging
+//! whether a board is buildable or what a width's real DRC count is. It has
+//! misled this work twice — see `legion-of-bom` harness bead. Use a real
+//! declared panel spec before drawing DRC-level conclusions.
+//!
 //! ```text
 //! cargo run -p legion-of-bom-core --example board_preview -- \
 //!     out/slew_limiter/slew_limiter.net /tmp/board.kicad_pcb 5
