@@ -108,9 +108,18 @@ pub struct Repair {
     pub toward_mm: (f64, f64),
 }
 
-/// How far apart a decoupling capacitor and its IC may sit before it stops being
-/// a decoupling capacitor. Generous: the intent is "adjacent", and the measured
-/// failure was 96 mm.
+/// How much clear board may sit between a decoupling capacitor's keep-out and
+/// its IC's before it stops being a decoupling capacitor. The intent is
+/// "touching, or as near as clearance allows".
+pub const DECOUPLE_GAP_MM: f64 = 2.0;
+
+/// Fallback centre-to-centre limit, used only when part sizes are unavailable.
+///
+/// Kept small on purpose but **known to be wrong for large packages** — it was
+/// the original rule, and it is why the loop spent six iterations chasing a
+/// target it could not reach. Measured on slew_limiter: a 0603 cannot get closer
+/// than 6.7 mm to a SOIC-16's centre, because at 5 mm it would be inside the
+/// chip. Prefer [`derive_with_sizes`].
 pub const DECOUPLE_MAX_MM: f64 = 5.0;
 
 /// Derive the rule set a circuit implies.
@@ -118,14 +127,45 @@ pub const DECOUPLE_MAX_MM: f64 = 5.0;
 /// This is where "what matters about this circuit" is decided, once, from the
 /// netlist — rather than in whichever code path happens to touch a part.
 pub fn derive(circuit: &dyn CircuitSource) -> Vec<Rule> {
+    derive_with_sizes(circuit, None)
+}
+
+/// [`derive`], with each proximity limit sized to the two parts involved.
+///
+/// A centre-to-centre limit is the wrong shape for "put the cap against the
+/// chip", because how close two centres *can* get depends entirely on how big
+/// the parts are. A flat 5 mm is satisfiable for an SOIC-8 and physically
+/// impossible for an SOIC-16 — and an unsatisfiable rule is worse than none: it
+/// reports a violation on every attempt, so the loop burns its whole budget
+/// chasing it and the report cries wolf.
+///
+/// With `facts`, the limit becomes "the two keep-outs touching, plus
+/// [`DECOUPLE_GAP_MM`]" — always reachable, and violated only when the cap
+/// really has been pushed away from its chip.
+pub fn derive_with_sizes(
+    circuit: &dyn CircuitSource,
+    facts: Option<&HashMap<String, crate::board::PartFacts>>,
+) -> Vec<Rule> {
+    // Closest two keep-outs can approach, centre to centre, along whichever axis
+    // needs least room.
+    let floor = |a: &str, b: &str| -> Option<f64> {
+        let f = facts?;
+        let (ea, eb) = (f.get(a)?.extent, f.get(b)?.extent);
+        Some(((ea.0 + eb.0) / 2.0).min((ea.1 + eb.1) / 2.0))
+    };
     crate::board::decoupling_pairs(circuit)
         .into_iter()
-        .map(|(cap, ic)| Rule::Proximity {
-            a: cap,
-            b: ic,
-            max_mm: DECOUPLE_MAX_MM,
-            tier: Tier::Electrical,
-            why: "a decoupling capacitor must sit at its IC's power pins",
+        .map(|(cap, ic)| {
+            let max_mm = floor(&cap, &ic)
+                .map(|f| f + DECOUPLE_GAP_MM)
+                .unwrap_or(DECOUPLE_MAX_MM);
+            Rule::Proximity {
+                a: cap,
+                b: ic,
+                max_mm,
+                tier: Tier::Electrical,
+                why: "a decoupling capacitor must sit at its IC's power pins",
+            }
         })
         .collect()
 }
@@ -272,6 +312,53 @@ mod tests {
             repair: None,
         }]);
         assert!(one_mm_physical > 100.0 * one_mm_electrical);
+    }
+
+    /// A flat centre-to-centre limit is the wrong shape: how close two centres
+    /// can get depends on how big the parts are. Measured on slew_limiter, a
+    /// 0603 cannot get within 6.7mm of a SOIC-16's centre, so the old 5mm rule
+    /// reported a violation on every attempt and the loop burned its budget
+    /// chasing a target that did not exist.
+    #[test]
+    fn the_limit_is_sized_to_the_parts_so_it_can_actually_be_met() {
+        use crate::board::PartFacts;
+        use crate::model::Side;
+        let fact = |w: f64, h: f64| PartFacts {
+            extent: (w, h),
+            body_extent: (w, h),
+            origin_offset: (0.0, 0.0),
+            side: Side::Front,
+            height_mm: 1.0,
+            standoff_mm: None,
+            tht_pads: Vec::new(),
+        };
+        // A big chip and a small cap. Closest approach is beside the chip's long
+        // edge, not off its end: (7.4 + 3.0)/2 = 5.2mm, not (10.4 + 1.5)/2.
+        let facts: HashMap<String, PartFacts> = [
+            ("U1".into(), fact(7.4, 10.4)),
+            ("C2".into(), fact(3.0, 1.5)),
+        ]
+        .into();
+        let sized = derive_with_sizes(&circuit(), Some(&facts));
+        let Rule::Proximity { max_mm, .. } = &sized[0];
+        assert!(
+            (*max_mm - (5.2 + DECOUPLE_GAP_MM)).abs() < 0.01,
+            "limit is the touching distance plus the gap, got {max_mm}"
+        );
+        assert!(
+            *max_mm > DECOUPLE_MAX_MM,
+            "and it is larger than the flat rule that could not be met"
+        );
+
+        // A cap sitting right against the chip is now compliant…
+        let touching: HashMap<String, Placement> = [
+            ("U1".into(), at(100.0, 100.0)),
+            ("C2".into(), at(106.0, 100.0)),
+        ]
+        .into();
+        assert!(evaluate(&sized, &touching).is_empty());
+        // …and the flat rule would have called it a violation.
+        assert!(!evaluate(&derive(&circuit()), &touching).is_empty());
     }
 
     #[test]

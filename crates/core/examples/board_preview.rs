@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use legion_of_bom_core::{
-    parse_netlist_file, run_layout_loop, BoardOptions, LayoutLoop, MstRouter, SeededPlacer,
+    derive_panel, parse_netlist_file, run_layout_loop, BoardOptions, BuiltinCutouts, LayoutLoop,
+    MstRouter, SeededPlacer,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,13 +31,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         legion_of_bom_core::skidl::kicad_footprint_dir().ok_or("no KiCad footprint library")?;
     let (w, h) = (hp * 5.08, 128.5);
     let origin = (100.0, 40.0);
+    // Anchor the panel controls exactly as the CLI does. Without this the greedy
+    // placer has no skeleton and seeds from an arbitrary part, which is not the
+    // configuration any real board is built in — and tuning against it produces
+    // numbers that mean nothing.
+    let panel = derive_panel(&circuit, hp as u16, &BuiltinCutouts);
+    let spec = panel.to_spec().map_err(|e| format!("panel: {e}"))?;
+    let anchors: HashMap<String, (f64, f64)> = spec
+        .cutouts()
+        .iter()
+        .filter_map(|c| c.refdes.clone().map(|r| (r, (c.x_mm, h - c.y_mm))))
+        .collect();
+    eprintln!("anchored {} panel control(s)", anchors.len());
     let mut opts = BoardOptions::new(dir);
     opts.router = Some(Box::new(MstRouter));
     opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
 
     // Through the iterative loop, not one-shot: the attempt-selection score is
     // where a good placement used to get discarded.
-    let template = SeededPlacer::new(w, h, origin, HashMap::new());
+    let template = SeededPlacer::new(w, h, origin, anchors);
     let report = run_layout_loop(&circuit, opts, template, &LayoutLoop::default())?;
     std::fs::write(&out, &report.board)?;
     eprintln!(

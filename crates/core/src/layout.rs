@@ -263,7 +263,10 @@ pub fn run_layout_loop(
     }
 
     let weights = cfg.mode.weights();
-    let rules = crate::rules::derive(circuit);
+    // Size-aware rules: how close a cap *can* get to its chip depends on how big
+    // both are, and a limit smaller than that floor can never be met.
+    let facts = crate::board::build_facts(circuit, &options.footprint_dir).ok();
+    let rules = crate::rules::derive_with_sizes(circuit, facts.as_ref());
     let iters = cfg.max_iters.max(1);
 
     // Free parts (everything not anchored), sorted — the repair perturbation set.
