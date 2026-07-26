@@ -627,15 +627,49 @@ fn effective_panel(
     stem: &str,
 ) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit {
-        // A declared panel is authoritative — EXCEPT when it's stale (missing
-        // controls the circuit now has). The board can't mate a jack/pot with no
-        // cutout, so a stale spec silently produces the wrong board ("panel doesn't
-        // match the board / no holes for the pots / 8 HP keeps coming back"). Rather
-        // than faithfully rebuild a wrong panel, self-heal it: regenerate in place
-        // from the circuit at minimum HP, keeping the builder's finish/thickness.
-        refresh_declared_panel_if_stale(&path, model, footprint_dir)?;
-        return Ok(Some(path));
+        // A declared panel is the author's file and is never written to. When it
+        // has gone stale we derive a substitute NEXT TO it and build against
+        // that, saying so loudly.
+        //
+        // This used to regenerate the declared spec in place. The intent was
+        // sound — a panel missing a cutout cannot mate the board, so faithfully
+        // rebuilding a wrong panel is worse than useless — but the cost was
+        // destroying hand-authored work: comments, a deliberate two-column
+        // layout, a chosen HP. A command that reads like a read must not rewrite
+        // tracked source (`legion-of-bom-byh`).
+        let Some(reason) = declared_panel_staleness(&path, model, footprint_dir)? else {
+            return Ok(Some(path)); // fresh — authoritative, use as-is
+        };
+        let substitute = write_auto_panel(model, footprint_dir, work_dir, stem)?;
+        println!("  ⚠ declared panel {} is stale ({reason})", path.display());
+        match &substitute {
+            Some(sub) => {
+                println!(
+                    "    left untouched — building against {} instead",
+                    sub.display()
+                );
+                println!("    fix the declared spec, or drop `panel = …` to adopt the derived one");
+            }
+            None => {
+                println!("    left untouched — and the circuit has no panel controls to derive")
+            }
+        }
+        return Ok(substitute);
     }
+    let path = write_auto_panel(model, footprint_dir, work_dir, stem)?;
+    Ok(path)
+}
+
+/// Derive a panel from the circuit and write it to `<work_dir>/<stem>_auto_panel.toml`.
+///
+/// The **only** place this tool writes a panel spec. Always a generated path in
+/// the work dir, never a path the author declared.
+fn write_auto_panel(
+    model: &legion_of_bom_core::Circuit,
+    footprint_dir: &Path,
+    work_dir: &Path,
+    stem: &str,
+) -> Result<Option<PathBuf>> {
     let facts = build_facts(model, footprint_dir)?;
     let hp = minimum_hp(model, &facts);
     let panel = derive_panel(model, hp, &BuiltinCutouts);
@@ -656,21 +690,22 @@ fn effective_panel(
     Ok(Some(path))
 }
 
-/// Self-heal a declared panel that has gone stale — missing controls the circuit
-/// now has (compared by refdes: what `derive_panel` would place vs what the spec
-/// declares). When stale, regenerate the spec in place from the circuit at minimum
-/// HP, preserving the builder-owned finish/thickness. A fresh panel is left
-/// untouched. Best-effort: an unreadable/unparseable spec is left alone.
-fn refresh_declared_panel_if_stale(
+/// Why a declared panel is stale, or `None` if it is fine. **Read-only.**
+///
+/// Stale two ways: missing a control the circuit now has (nothing for the board
+/// to mate), or declared narrower than the PCB fits in (parts will not lay out).
+/// An unreadable or unparseable spec is treated as fine and left entirely alone —
+/// guessing at a file we cannot read is how you destroy one.
+fn declared_panel_staleness(
     path: &Path,
     model: &legion_of_bom_core::Circuit,
     footprint_dir: &Path,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let Some(declared) = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| PanelFile::from_toml(&t).ok())
     else {
-        return Ok(());
+        return Ok(None);
     };
     let facts = build_facts(model, footprint_dir)?;
     let min_hp = minimum_hp(model, &facts);
@@ -686,31 +721,16 @@ fn refresh_declared_panel_if_stale(
         .filter_map(|c| c.refdes.as_deref())
         .filter(|r| !have.contains(r))
         .collect();
-    // Stale two ways: missing a control the circuit now has (no cutout to mate), or
-    // declared narrower than the PCB actually fits in (parts won't lay out → DRC).
-    let too_small = declared.hp.is_some_and(|h| h < min_hp);
-    if missing.is_empty() && !too_small {
-        return Ok(()); // fresh — the declared panel is authoritative, use as-is
+    if !missing.is_empty() {
+        return Ok(Some(format!("missing {}", missing.join(", "))));
     }
-    // Rebuild it from the circuit at the minimum HP the PCB fits in.
-    let mut fresh = derive_panel(model, min_hp, &BuiltinCutouts);
-    fresh.finish = declared.finish;
-    fresh.thickness_mm = declared.thickness_mm;
-    let toml = fresh
-        .to_toml()
-        .map_err(|e| anyhow::anyhow!("serialising regenerated panel: {e}"))?;
-    std::fs::write(path, &toml).with_context(|| format!("writing {}", path.display()))?;
-    let reason = if !missing.is_empty() {
-        format!("missing {}", missing.join(", "))
-    } else {
-        format!("{} HP too small for the PCB", declared.hp.unwrap_or(0))
-    };
-    println!(
-        "  ⚠ declared panel {} was stale ({reason}) → regenerated: {min_hp} HP, {} control(s)",
-        path.display(),
-        fresh.cutouts.len()
-    );
-    Ok(())
+    if declared.hp.is_some_and(|h| h < min_hp) {
+        return Ok(Some(format!(
+            "{} HP, but the PCB needs {min_hp} HP",
+            declared.hp.unwrap_or(0)
+        )));
+    }
+    Ok(None)
 }
 
 /// spec is given: jacks/pots are anchored to the panel's cutouts and the board
@@ -2882,5 +2902,60 @@ fn load_credentials() {
     if let Some(home) = std::env::var_os("HOME") {
         let global = Path::new(&home).join(".lob").join("credentials");
         let _ = dotenvy::from_path(&global);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A declared panel is the author's file. Checking whether it has gone stale
+    /// must never write to it — the whole of `legion-of-bom-byh` was that check
+    /// regenerating the spec in place, destroying comments, a chosen HP and a
+    /// hand-built layout.
+    #[test]
+    fn checking_a_declared_panel_for_staleness_never_writes_to_it() {
+        let dir = std::env::temp_dir().join(format!("lob-byh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hand_panel.toml");
+        // A deliberately hand-shaped spec: a comment, and only one control
+        // declared while the circuit below has two — i.e. stale.
+        let original = "# HAND-AUTHORED — a comment a generator would drop.\n\
+                        format = \"eurorack\"\n\
+                        hp = 8\n\
+                        thickness_mm = 1.6\n\n\
+                        [[cutouts]]\n\
+                        x_mm = 10.0\n\
+                        y_mm = 100.0\n\
+                        rotation_deg = 0.0\n\
+                        footprint = \"Thonkiconn\"\n\
+                        refdes = \"J1\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut circuit = legion_of_bom_core::Circuit::new("t");
+        circuit.parts = vec![
+            legion_of_bom_core::Part::new("J1", "in").with_footprint(
+                "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical_CircularHoles",
+            ),
+            legion_of_bom_core::Part::new("RV1", "100k").with_footprint(
+                "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical",
+            ),
+        ];
+
+        let Some(fp_dir) = kicad_footprint_dir() else {
+            return; // no KiCad here; the write-freedom assertion below needs it
+        };
+        let reason = declared_panel_staleness(&path, &circuit, &fp_dir).unwrap();
+        assert!(
+            reason.is_some_and(|r| r.contains("RV1")),
+            "the missing control is reported"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the author's file is byte-identical after the check"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
