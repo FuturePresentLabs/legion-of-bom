@@ -37,6 +37,7 @@ pub mod panel;
 pub mod panel_edit;
 pub mod parts;
 pub mod pdf;
+pub mod placement;
 pub mod project;
 pub mod resistor;
 pub mod route;
@@ -112,6 +113,10 @@ pub use panel_edit::{apply_panel_edit_str, edit_panel, PanelEdit, PanelEditError
 pub use parts::{
     default_parts_dir, HousePart, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
+};
+pub use placement::{
+    Column as PlacementColumn, Grid as PlacementGrid, PlacementError, PlacementFile, Point,
+    Row as PlacementRow,
 };
 pub use project::{ArtifactKind, ArtifactStatus, ArtifactView, CircuitView, ProjectView, RepoView};
 pub use resistor::{color_code, parse_ohms, Band, ColorCode};

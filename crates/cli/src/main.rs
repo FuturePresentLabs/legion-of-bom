@@ -23,9 +23,9 @@ use legion_of_bom_core::{
     value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
     BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions, JlcpcbClient, KitType,
     LayoutLoop, LayoutMode, LineKind, Logo, Manifest, MouserClient, PanelFile, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, Populate, ProjectView, Quality,
-    Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, SourcingClients,
-    StageOutcome, TranAnalysis,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
+    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -700,22 +700,56 @@ fn refresh_declared_panel_if_stale(
 /// outline becomes the panel size (vertical 3U). Otherwise the default grid
 /// placement. The placer here is the one-shot [`EurorackPlacer`]; the iterative
 /// loop swaps in a [`SeededPlacer`] per attempt.
-fn board_options_with_panel(
+/// Board options, anchoring panel controls to a hand-authored placement when one
+/// exists and to the panel spec otherwise.
+///
+/// A `<circuit>.placement.toml` wins over the panel's cutouts. Both produce the
+/// same thing — a refdes→point map in the board's frame — but only one of them
+/// is a decision somebody made: the panel spec's positions come from
+/// `derive_panel`'s idealised column, and letting that override a layout you
+/// authored by hand would silently undo it.
+fn board_options_with_panel_and_placement(
     footprint_dir: PathBuf,
     panel: &Option<PathBuf>,
+    placement: Option<&Path>,
 ) -> Result<BoardOptions> {
     let mut opts = BoardOptions::new(footprint_dir);
-    if let Some(spec_path) = panel {
-        let (w, h, origin, anchors) = panel_geometry(spec_path)?;
-        opts.placer = Box::new(EurorackPlacer {
-            width_mm: w,
-            height_mm: h,
-            origin_mm: origin,
-            anchors,
-        });
-        opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
+    let Some(spec_path) = panel else {
+        return Ok(opts);
+    };
+    let (w, h, origin, mut anchors) = panel_geometry(spec_path)?;
+    if let Some(path) = placement.filter(|p| p.is_file()) {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let file = PlacementFile::from_toml(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let hand = file
+            .anchors(h)
+            .with_context(|| format!("expanding {}", path.display()))?;
+        println!(
+            "  placement: {} hand-placed control(s) from {}",
+            hand.len(),
+            path.display()
+        );
+        anchors.extend(hand);
     }
+    opts.placer = Box::new(EurorackPlacer {
+        width_mm: w,
+        height_mm: h,
+        origin_mm: origin,
+        anchors,
+    });
+    opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
     Ok(opts)
+}
+
+/// The hand-placement file that goes with a circuit, if the author wrote one:
+/// `<circuit-dir>/<stem>.placement.toml`.
+fn placement_path(circuit: &Path, stem: &str) -> PathBuf {
+    circuit
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{stem}.placement.toml"))
 }
 
 /// The seeded-placer template for the iterative layout loop, when a panel is
@@ -790,7 +824,9 @@ fn board_cmd(
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
     // Default: the PCB drives the panel — auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
-    let mut options = board_options_with_panel(footprint_dir, &panel)?;
+    let placement = placement_path(&circuit, stem);
+    let mut options =
+        board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
     options.logo = load_logo(&logo)?;
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
@@ -928,7 +964,9 @@ fn fab_cmd(
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
     // Default: the PCB drives the panel — auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
-    let mut options = board_options_with_panel(footprint_dir, &panel)?;
+    let placement = placement_path(&circuit, stem);
+    let mut options =
+        board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
     options.logo = load_logo(&logo)?;
     let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
@@ -1357,7 +1395,8 @@ fn guide_cmd(
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
     // Default: the PCB drives the panel — auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
-    let options = board_options_with_panel(footprint_dir, &panel)?;
+    let placement = placement_path(&circuit, stem);
+    let options = board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
     let (board, _) = generate_board_report(&model, &options)?;
 
     let guide_opts = GuideOptions {
