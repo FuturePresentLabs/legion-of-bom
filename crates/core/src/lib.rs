@@ -41,6 +41,7 @@ pub mod placement;
 pub mod project;
 pub mod resistor;
 pub mod route;
+pub mod rules;
 pub mod schematic;
 mod sexpr;
 pub mod skidl;
@@ -58,9 +59,9 @@ pub mod validate;
 pub mod verify;
 
 pub use board::{
-    build_facts, generate_board, generate_board_artifacts, generate_board_report, minimum_hp,
-    BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts, Placement,
-    Placer, SeededPlacer,
+    build_facts, decoupling_pairs, generate_board, generate_board_artifacts, generate_board_report,
+    minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
+    Placement, Placer, SeededPlacer,
 };
 pub use bom::{generate_bom, Bom, BomLine, LineKind};
 pub use bom_repair::{
@@ -123,6 +124,10 @@ pub use resistor::{color_code, parse_ohms, Band, ColorCode};
 pub use route::{
     GridRouter, MstRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput, Router, Track,
     Via,
+};
+pub use rules::{
+    derive as derive_rules, evaluate as evaluate_rules, penalty as rule_penalty, Rule, Tier,
+    Violation,
 };
 pub use schematic::schematic_to_svg;
 pub use skidl::{SkidlRun, SkidlRunner};

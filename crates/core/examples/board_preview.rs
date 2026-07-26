@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use legion_of_bom_core::{
-    generate_board, parse_netlist_file, BoardOptions, EurorackPlacer, MstRouter,
+    parse_netlist_file, run_layout_loop, BoardOptions, LayoutLoop, MstRouter, SeededPlacer,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,15 +32,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let origin = (100.0, 40.0);
     let mut opts = BoardOptions::new(dir);
     opts.router = Some(Box::new(MstRouter));
-    opts.placer = Box::new(EurorackPlacer {
-        width_mm: w,
-        height_mm: h,
-        origin_mm: origin,
-        anchors: HashMap::new(),
-    });
     opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
 
-    std::fs::write(&out, generate_board(&circuit, &opts)?)?;
-    eprintln!("wrote {}", out.display());
+    // Through the iterative loop, not one-shot: the attempt-selection score is
+    // where a good placement used to get discarded.
+    let template = SeededPlacer::new(w, h, origin, HashMap::new());
+    let report = run_layout_loop(&circuit, opts, template, &LayoutLoop::default())?;
+    std::fs::write(&out, &report.board)?;
+    eprintln!(
+        "wrote {} — {} iteration(s), score {:.1}, rule penalty {:.1}",
+        out.display(),
+        report.iterations,
+        report.score,
+        report.metrics.rule_penalty
+    );
+    for v in &report.metrics.violations {
+        eprintln!("  broke: {}", v.what);
+    }
     Ok(())
 }

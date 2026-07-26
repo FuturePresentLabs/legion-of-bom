@@ -97,7 +97,7 @@ pub struct CostWeights {
 
 /// What one placement+route attempt measured — all in-process, no KiCad. Lower is
 /// better on every field.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PlacementMetrics {
     /// Raw total half-perimeter wirelength across all multi-pin nets (reporting).
     pub hpwl_mm: f64,
@@ -112,6 +112,12 @@ pub struct PlacementMetrics {
     pub via_count: usize,
     /// Connections the router could not complete.
     pub unrouted: usize,
+    /// Cost of the design rules this placement broke ([`crate::rules`]), tiered
+    /// so a higher tier cannot be traded away for a lower one.
+    pub rule_penalty: f64,
+    /// What was broken, worst first — surfaced in the report rather than
+    /// silently priced in.
+    pub violations: Vec<crate::rules::Violation>,
 }
 
 /// Measure a placement+route attempt. `placements` are part centres (board
@@ -121,7 +127,20 @@ pub fn measure(
     placements: &HashMap<String, Placement>,
     route: &RouteOutput,
 ) -> PlacementMetrics {
+    measure_against(circuit, placements, route, &crate::rules::derive(circuit))
+}
+
+/// [`measure`], against a rule set derived once by the caller — the loop
+/// evaluates the same rules on every attempt and should not re-derive them.
+pub fn measure_against(
+    circuit: &dyn CircuitSource,
+    placements: &HashMap<String, Placement>,
+    route: &RouteOutput,
+    rules: &[crate::rules::Rule],
+) -> PlacementMetrics {
     let mut m = PlacementMetrics::default();
+    m.violations = crate::rules::evaluate(rules, placements);
+    m.rule_penalty = crate::rules::penalty(&m.violations);
     for net in circuit.nets() {
         // Distinct placed parts on this net, by centre.
         let mut seen: Vec<&str> = Vec::new();
@@ -165,7 +184,11 @@ pub fn measure(
 
 /// The mode-weighted cost of a placement — lower is better.
 pub fn score(m: &PlacementMetrics, w: &CostWeights) -> f64 {
-    w.wirelength * m.signal_hpwl_mm
+    // Rule violations come first and are priced decades above the preference
+    // terms. Without this the loop happily trades a decoupling cap across the
+    // board for a few millimetres of copper — which is exactly what shipped.
+    m.rule_penalty
+        + w.wirelength * m.signal_hpwl_mm
         + w.critical * m.critical_hpwl_mm
         + w.via * m.via_count as f64
         + w.routed_len * m.routed_len_mm
@@ -240,6 +263,7 @@ pub fn run_layout_loop(
     }
 
     let weights = cfg.mode.weights();
+    let rules = crate::rules::derive(circuit);
     let iters = cfg.max_iters.max(1);
 
     // Free parts (everything not anchored), sorted — the repair perturbation set.
@@ -262,7 +286,7 @@ pub fn run_layout_loop(
         options.placer = Box::new(placer);
 
         let art = generate_board_artifacts(circuit, &options)?;
-        let metrics = measure(circuit, &art.placements, &art.route);
+        let metrics = measure_against(circuit, &art.placements, &art.route, &rules);
         let mut sc = score(&metrics, &weights);
 
         // Optional per-iteration DRC (opt-in; slow). Errors add a large penalty.
@@ -276,6 +300,7 @@ pub fn run_layout_loop(
             }
         }
 
+        let (unrouted, broken) = (metrics.unrouted, metrics.rule_penalty);
         let improved = best.as_ref().is_none_or(|b| sc < b.score - 1e-6);
         if improved {
             best = Some(Attempt {
@@ -288,8 +313,11 @@ pub fn run_layout_loop(
             });
         }
 
-        // Nothing left unrouted → the seeded placement is already clean; stop.
-        if metrics.unrouted == 0 {
+        // Stop when the board is both routable *and* rule-clean. Exiting on
+        // routability alone stopped the loop while a decoupling cap was still
+        // across the board: "the router coped" is not the same as "this is the
+        // layout we want".
+        if unrouted == 0 && broken <= 0.0 {
             break;
         }
         // Last iteration — no point planning another repair.
@@ -456,7 +484,7 @@ mod tests {
         // with one connection left open must score worse than fully routed.
         let broken = PlacementMetrics {
             unrouted: 1,
-            ..tight
+            ..tight.clone()
         };
         assert!(score(&broken, &w) > score(&tight, &w));
     }

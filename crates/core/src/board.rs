@@ -562,6 +562,22 @@ const DECOUPLE_PULL: f64 = 12.0;
 /// seeded placer's adjacency; when a rail has several ICs, caps are spread across
 /// them fewest-first. Roles come from topology, so this needs no SKiDL tags.
 fn decoupling_bonus(circuit: &dyn CircuitSource) -> Vec<(String, String, f64)> {
+    decoupling_pairs(circuit)
+        .into_iter()
+        .map(|(cap, ic)| (cap, ic, DECOUPLE_PULL))
+        .collect()
+}
+
+/// Every (bypass capacitor, the IC it decouples) pair a circuit implies.
+///
+/// A decoupling cap is one bridging a power rail and ground; its IC is the one
+/// on that rail with the fewest caps claimed so far, so two caps on one rail
+/// spread across two ICs rather than piling onto the first.
+///
+/// Shared by the placer's attractor and [`rules::derive`](crate::rules::derive):
+/// the pull is a hint, the rule is the guarantee, and they must not be able to
+/// disagree about which cap belongs to which IC.
+pub fn decoupling_pairs(circuit: &dyn CircuitSource) -> Vec<(String, String)> {
     let is_gnd = |n: &str| {
         let u = n.trim().to_ascii_uppercase();
         matches!(u.as_str(), "GND" | "GNDA" | "AGND" | "DGND" | "VSS" | "0") || u.ends_with("GND")
@@ -591,7 +607,7 @@ fn decoupling_bonus(circuit: &dyn CircuitSource) -> Vec<(String, String, f64)> {
         }
     }
 
-    let mut bonuses = Vec::new();
+    let mut bonuses: Vec<(String, String)> = Vec::new();
     let mut cap_count: HashMap<String, usize> = HashMap::new();
     for part in circuit.parts() {
         let r = part.refdes.0.as_str();
@@ -617,7 +633,7 @@ fn decoupling_bonus(circuit: &dyn CircuitSource) -> Vec<(String, String, f64)> {
             continue;
         };
         *cap_count.entry(ic.to_string()).or_default() += 1;
-        bonuses.push((r.to_string(), ic.to_string(), DECOUPLE_PULL));
+        bonuses.push((r.to_string(), ic.to_string()));
     }
     bonuses
 }
