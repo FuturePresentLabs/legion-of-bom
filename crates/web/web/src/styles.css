@@ -1025,3 +1025,76 @@ table.bom tfoot td {
   text-transform: none;
   font-variant-numeric: tabular-nums;
 }
+
+/* Design-rule debug panel (avg): what the layout is held to, and where it
+   stands. Tier colour is the same language the printed guide uses — red means
+   something that can stop the board, not decoration. */
+.rules {
+  margin-top: 0.6rem;
+  border: 1px solid var(--line, #333);
+  border-radius: 4px;
+  font-size: 0.82rem;
+}
+.rules > summary {
+  cursor: pointer;
+  padding: 0.35rem 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  user-select: none;
+}
+.rules-tally {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+.rules-tally.bad {
+  color: #c8102e;
+  opacity: 1;
+  font-weight: 600;
+}
+.rule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0.6rem 0.5rem;
+}
+.rule-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-top: 1px solid var(--line, #2a2a2a);
+}
+.rule-list li.ok .rule-detail {
+  opacity: 0.6;
+}
+.tier {
+  flex: none;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 0.3rem;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+}
+.t-physical {
+  color: #c8102e;
+}
+.t-electrical {
+  color: #b5830c;
+}
+.t-preference {
+  opacity: 0.6;
+}
+.rule-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.rule-margin {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.rule-list li.broken .rule-margin {
+  color: #c8102e;
+  font-weight: 600;
+}

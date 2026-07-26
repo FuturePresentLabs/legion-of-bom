@@ -443,6 +443,7 @@ impl ImportedBoard {
                     footprint: package.to_string(),
                     cx: pl.x_mm,
                     cy: pl.y_mm,
+                    rotation_deg: pl.rotation_deg,
                     bbox: (
                         pl.x_mm - w / 2.0,
                         pl.y_mm - h / 2.0,

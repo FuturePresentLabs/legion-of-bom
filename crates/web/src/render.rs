@@ -76,6 +76,69 @@ pub async fn sides(State(state): State<Arc<AppState>>, Path(name): Path<String>)
     .into_response()
 }
 
+/// `GET /api/circuits/{name}/rules` — every design rule the built board is held
+/// to, and where it stands.
+///
+/// The layout loop already computes this to choose between attempts and to
+/// decide what it had to relax, but until now it only ever reached CLI stdout —
+/// so a board could ship with a decoupling cap 89mm from its chip and the
+/// dashboard would look perfectly happy. Reading it from the *built* board
+/// rather than re-running a placer means the panel reports what was actually
+/// manufactured.
+pub async fn rules(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let root = state.root().to_path_buf();
+    let board = root
+        .join("out")
+        .join(&name)
+        .join(format!("{name}.kicad_pcb"));
+    let netlist = root.join("out").join(&name).join(format!("{name}.net"));
+    let (Ok(pcb), Ok(circuit)) = (
+        std::fs::read_to_string(&board),
+        parse_netlist_file(&netlist),
+    ) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            &format!("circuit not built — run `lob build {name}`"),
+        );
+    };
+    let Ok(placements) = legion_of_bom_core::guide::placements_from_board(&pcb) else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "board did not parse");
+    };
+    let facts = legion_of_bom_core::skidl::kicad_footprint_dir()
+        .and_then(|dir| legion_of_bom_core::build_facts(&circuit, &dir).ok());
+    let derived = legion_of_bom_core::rules::derive_in(
+        &circuit,
+        &legion_of_bom_core::rules::Context {
+            facts: facts.as_ref(),
+            outline: legion_of_bom_core::guide::board_outline(&pcb),
+        },
+    );
+    let assessed = legion_of_bom_core::rules::assess(&derived, &placements);
+    let tier = |t: legion_of_bom_core::Tier| match t {
+        legion_of_bom_core::Tier::Physical => "physical",
+        legion_of_bom_core::Tier::Electrical => "electrical",
+        legion_of_bom_core::Tier::Preference => "preference",
+    };
+    let rules: Vec<_> = assessed
+        .iter()
+        .map(|a| {
+            json!({
+                "tier": tier(a.tier),
+                "subject": a.subject,
+                "detail": a.detail,
+                "margin_mm": a.margin_mm,
+                "ok": a.ok(),
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "rules": rules,
+        "broken": assessed.iter().filter(|a| !a.ok()).count(),
+        "checked": assessed.len(),
+    }))
+    .into_response()
+}
+
 /// `GET /api/circuits/{name}/render?view=…` — a PNG (board) or SVG (panel).
 pub async fn render(
     State(state): State<Arc<AppState>>,

@@ -181,8 +181,28 @@ export interface BoardSides {
   back: MountCounts;
 }
 
+/** One design rule's standing against the built board. */
+export interface RuleCheck {
+  tier: "physical" | "electrical" | "preference";
+  subject: string;
+  detail: string;
+  margin_mm: number;
+  ok: boolean;
+}
+/**
+ * Every rule the built board is held to. Worst first, passes included — the
+ * point of the panel is to show what is being checked, not only what failed.
+ */
+export interface RuleReport {
+  rules: RuleCheck[];
+  broken: number;
+  checked: number;
+}
+
 export const api = {
   repo: () => getJson<RepoInfo>("/api/repo"),
+  rules: (name: string) =>
+    getJson<RuleReport>(`/api/circuits/${encodeURIComponent(name)}/rules`),
   sides: (name: string) =>
     getJson<BoardSides>(`/api/circuits/${encodeURIComponent(name)}/sides`),
   circuits: () => getJson<Circuit[]>("/api/circuits"),

@@ -28,6 +28,10 @@ pub struct PlacedPart {
     pub footprint: String,
     pub cx: f64,
     pub cy: f64,
+    /// Footprint orientation in degrees, as placed. A part stood on end
+    /// occupies its extent swapped, which matters to anything measuring it
+    /// against the board ([`crate::rules`]).
+    pub rotation_deg: f64,
     pub bbox: (f64, f64, f64, f64),
     pub back: bool,
     /// Whether this part mounts through the board (has ≥1 through-hole pad) — a
@@ -862,6 +866,7 @@ pub fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
             footprint,
             cx: fx,
             cy: fy,
+            rotation_deg: frot,
             bbox: bb,
             back,
             through_hole,
@@ -911,6 +916,30 @@ fn courtyard_bbox(fp: &Sexpr, origin: (f64, f64), rot_deg: f64) -> Option<(f64, 
         }
     }
     bb.0.is_finite().then_some(bb)
+}
+
+/// Placements keyed by reference designator, as a board file records them —
+/// the input [`crate::rules`] evaluates against.
+///
+/// Reads a *built* board rather than re-running a placer, so what the rules
+/// report is what was actually manufactured.
+pub fn placements_from_board(
+    board_pcb: &str,
+) -> Result<std::collections::HashMap<String, crate::board::Placement>, String> {
+    Ok(parse_board(board_pcb)?
+        .into_iter()
+        .map(|p| {
+            (
+                p.refdes,
+                crate::board::Placement {
+                    x_mm: p.cx,
+                    y_mm: p.cy,
+                    rotation_deg: p.rotation_deg,
+                    back: p.back,
+                },
+            )
+        })
+        .collect())
 }
 
 /// The board outline from the `Edge.Cuts` rectangle, if present.
@@ -2676,6 +2705,7 @@ mod tests {
             footprint: String::new(),
             cx: 105.0,
             cy: 100.0,
+            rotation_deg: 0.0,
             bbox: (104.0, 99.0, 106.0, 101.0),
             back: true,
             through_hole: false,
@@ -2764,6 +2794,7 @@ mod tests {
             footprint: "Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm_Vertical".into(),
             cx: x,
             cy: 100.0,
+            rotation_deg: 0.0,
             bbox: (x - 2.0, 99.0, x + 2.0, 101.0),
             back,
             through_hole: true,

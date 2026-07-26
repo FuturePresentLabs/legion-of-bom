@@ -14,6 +14,7 @@ import {
   type ManifestEditPayload,
   type Orders,
   type RepoInfo,
+  type RuleReport,
   type SourceDoc,
 } from "./api.ts";
 import { ScopeSection } from "./scope.tsx";
@@ -722,7 +723,52 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
       <p class="pcb-hint muted">
         scroll to zoom · drag to pan · double-click to reset
       </p>
+      {subject === "pcb" && <RulePanel name={name} version={version} />}
     </div>
+  );
+}
+
+// What the layout is held to, and where it stands (legion-of-bom-avg). The
+// loop already computes this to choose between attempts and to decide what it
+// had to relax — but it only ever reached CLI stdout, so a board could ship
+// with a decoupling cap 89mm from its chip and the dashboard looked fine.
+//
+// Passes are shown, not just failures: the question a layout raises is "what is
+// actually being checked here", and a panel that lists only problems answers a
+// different one.
+function RulePanel({ name, version }: { name: string; version: number }) {
+  const [open, setOpen] = useState(false);
+  const report = useAsync<RuleReport>(() => api.rules(name), [name, version]);
+  const r = report.data;
+  if (report.error || !r) return null;
+  const label = r.broken > 0 ? `${r.broken} of ${r.checked} broken` : `${r.checked} met`;
+  return (
+    <details class="rules" open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
+      <summary>
+        Design rules
+        <span class={`rules-tally${r.broken > 0 ? " bad" : ""}`}>{label}</span>
+      </summary>
+      {r.rules.length === 0 ? (
+        <p class="muted">
+          No rules derived. Build the circuit, and check KiCad's footprint
+          library is available — part sizes are what most rules are measured in.
+        </p>
+      ) : (
+        <ul class="rule-list">
+          {r.rules.map((c, i) => (
+            <li key={i} class={c.ok ? "ok" : "broken"}>
+              <span class={`tier t-${c.tier}`}>{c.tier}</span>
+              <span class="rule-detail">{c.detail}</span>
+              <span class="rule-margin mono">
+                {c.margin_mm >= 0
+                  ? `+${c.margin_mm.toFixed(1)}mm`
+                  : `${c.margin_mm.toFixed(1)}mm`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </details>
   );
 }
 

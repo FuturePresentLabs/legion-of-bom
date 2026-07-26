@@ -225,12 +225,38 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
     rules
 }
 
-/// Evaluate `rules` against a placement, returning only what was broken.
+/// One rule's standing against a placement — whether it passes, and by how much.
 ///
-/// A rule naming a part that was never placed is skipped rather than counted as
-/// a violation: it is a fact about a circuit we did not lay out, and reporting
-/// it as a layout failure would be noise.
-pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<Violation> {
+/// This is the uniform interface the whole system reads through: the score wants
+/// the failures, the report wants the failures with their tier, and a human
+/// debugging a layout wants *every* rule and how close it came. Deriving all
+/// three from one evaluation means the panel cannot disagree with the score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assessment {
+    pub tier: Tier,
+    /// The part this rule is about — what to look at on the board.
+    pub subject: String,
+    /// The requirement and the measurement, in one sentence.
+    pub detail: String,
+    /// Room left before the rule breaks, in millimetres. Negative means broken
+    /// by that much.
+    pub margin_mm: f64,
+    /// How to fix it, when a fix exists.
+    pub repair: Option<Repair>,
+}
+
+impl Assessment {
+    pub fn ok(&self) -> bool {
+        self.margin_mm >= 0.0
+    }
+}
+
+/// Assess every rule against a placement — passes included.
+///
+/// A rule naming a part that was never placed is skipped rather than reported:
+/// it is a fact about a circuit we did not lay out, and calling it a failure
+/// would be noise.
+pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<Assessment> {
     let mut out = Vec::new();
     for rule in rules {
         match rule {
@@ -245,19 +271,18 @@ pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<
                     continue;
                 };
                 let d = (pa.x_mm - pb.x_mm).hypot(pa.y_mm - pb.y_mm);
-                if d > *max_mm {
-                    out.push(Violation {
-                        tier: *tier,
-                        by_mm: d - *max_mm,
-                        what: format!("{a} is {d:.1}mm from {b} (max {max_mm:.1}mm) — {why}"),
-                        // Move the cap to its IC, not the other way round: the
-                        // IC is the anchor the rest of the circuit hangs off.
-                        repair: Some(Repair {
-                            refdes: a.clone(),
-                            toward_mm: (pb.x_mm, pb.y_mm),
-                        }),
-                    });
-                }
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: a.clone(),
+                    detail: format!("{a} is {d:.1}mm from {b} (max {max_mm:.1}mm) — {why}"),
+                    margin_mm: max_mm - d,
+                    // Move the cap to its IC, not the other way round: the IC is
+                    // the anchor the rest of the circuit hangs off.
+                    repair: Some(Repair {
+                        refdes: a.clone(),
+                        toward_mm: (pb.x_mm, pb.y_mm),
+                    }),
+                });
             }
             Rule::EdgeClearance {
                 refdes,
@@ -288,41 +313,65 @@ pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<
                 // the shortfall as what it is.
                 if ax0 > ax1 || ay0 > ay1 {
                     let short = (ax0 - ax1).max(ay0 - ay1).max(0.0);
-                    out.push(Violation {
+                    out.push(Assessment {
                         tier: *tier,
-                        by_mm: short,
-                        what: format!(
+                        subject: refdes.clone(),
+                        detail: format!(
                             "{refdes} ({ew:.1}×{eh:.1}mm) does not fit inside the board with \
                              {min_mm:.1}mm edge clearance — the outline is {short:.1}mm too small"
                         ),
+                        margin_mm: -short,
                         repair: None,
                     });
                     continue;
                 }
-                let over = (ax0 - p.x_mm)
-                    .max(p.x_mm - ax1)
-                    .max(ay0 - p.y_mm)
-                    .max(p.y_mm - ay1);
-                if over > 0.0 {
-                    out.push(Violation {
-                        tier: *tier,
-                        by_mm: over,
-                        what: format!(
-                            "{refdes} hangs {over:.1}mm past the board's {min_mm:.1}mm edge \
-                             clearance"
-                        ),
-                        repair: Some(Repair {
-                            refdes: refdes.clone(),
-                            toward_mm: (p.x_mm.clamp(ax0, ax1), p.y_mm.clamp(ay0, ay1)),
-                        }),
-                    });
-                }
+                // Positive: room left on the tightest side. Negative: how far past.
+                let slack = (p.x_mm - ax0)
+                    .min(ax1 - p.x_mm)
+                    .min(p.y_mm - ay0)
+                    .min(ay1 - p.y_mm);
+                let detail = if slack < 0.0 {
+                    format!(
+                        "{refdes} hangs {:.1}mm past the board's {min_mm:.1}mm edge clearance",
+                        -slack
+                    )
+                } else {
+                    format!("{refdes} clears the board edge by {slack:.1}mm (min {min_mm:.1}mm)")
+                };
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: refdes.clone(),
+                    detail,
+                    margin_mm: slack,
+                    repair: Some(Repair {
+                        refdes: refdes.clone(),
+                        toward_mm: (p.x_mm.clamp(ax0, ax1), p.y_mm.clamp(ay0, ay1)),
+                    }),
+                });
             }
         }
     }
     // Worst first: a report should lead with what actually stops the board.
-    out.sort_by(|x, y| y.tier.cmp(&x.tier).then(y.by_mm.total_cmp(&x.by_mm)));
+    out.sort_by(|x, y| {
+        y.tier
+            .cmp(&x.tier)
+            .then(x.margin_mm.total_cmp(&y.margin_mm))
+    });
     out
+}
+
+/// Evaluate `rules` against a placement, returning only what was broken.
+pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<Violation> {
+    assess(rules, placements)
+        .into_iter()
+        .filter(|a| !a.ok())
+        .map(|a| Violation {
+            tier: a.tier,
+            by_mm: -a.margin_mm,
+            what: a.detail,
+            repair: a.repair,
+        })
+        .collect()
 }
 
 /// The total cost of a violation set, for [`score`](crate::layout::score).
