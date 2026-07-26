@@ -916,6 +916,23 @@ table.bom tfoot td {
   accent-color: var(--accent);
   cursor: pointer;
 }
+/* How many parts this filter would hide on the face you are looking at. */
+.smd-toggle .count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.7rem;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  background: var(--panel, rgba(127, 127, 127, 0.16));
+}
+/* Nothing to hide on this face — say so rather than accept a click that
+   changes nothing. The tooltip names the face the SMD is actually on. */
+.smd-toggle.inert {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.smd-toggle.inert input {
+  cursor: not-allowed;
+}
 
 /* Gerber layer checklist (02b) — colours match the render's conventions */
 .layer-list {

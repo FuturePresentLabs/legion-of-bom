@@ -166,8 +166,25 @@ export interface SimPayload {
   probe?: string;
 }
 
+/** How many footprints of each mounting style sit on one face of a board. */
+export interface MountCounts {
+  tht: number;
+  smd: number;
+}
+/**
+ * What is mounted on each face of the built board. The viewer uses it so its SMD
+ * filter can say what it will do: hiding SMD on a face that has none is a no-op,
+ * and a control that silently no-ops looks broken.
+ */
+export interface BoardSides {
+  front: MountCounts;
+  back: MountCounts;
+}
+
 export const api = {
   repo: () => getJson<RepoInfo>("/api/repo"),
+  sides: (name: string) =>
+    getJson<BoardSides>(`/api/circuits/${encodeURIComponent(name)}/sides`),
   circuits: () => getJson<Circuit[]>("/api/circuits"),
   build: (name: string) =>
     postJson<BuildResult>(

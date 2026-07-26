@@ -6,6 +6,7 @@ import {
   api,
   artifactUrl,
   type Artifact,
+  type BoardSides,
   type Bom,
   type BuildResult,
   type Circuit,
@@ -575,21 +576,36 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
   const [mode, setMode] = useState("render");
   const [side, setSide] = useState("top");
   const [smd, setSmd] = useState(true);
-  const [flip, setFlip] = useState(false);
   const [resetKey, setResetKey] = useState(0);
   const [layers, setLayers] = useState<string[]>(
     GERBER_LAYERS.filter((l) => l.on).map((l) => l.key),
   );
+  // What is actually mounted on each face, so the SMD filter can say what it
+  // will do rather than no-op silently on a face with no SMD.
+  const sides = useAsync<BoardSides>(() => api.sides(name), [name, version]);
 
   const allowed = modesFor(subject);
   // Keep the mode legal when the subject changes — a panel has no layout.
   const activeMode = allowed.includes(mode) ? mode : (allowed[0] ?? "render");
   const view = viewName(subject, activeMode, side);
   const isGerber = activeMode === "gerber" && subject !== "schematic";
-  // A side only means something on a photoreal board render: on a gerber you
-  // pick layers instead, and a panel has one face.
-  const hasSide = subject === "pcb" && activeMode === "render";
+  // Side applies to every view of a board, not just the photoreal render. On a
+  // render the server draws the other face; on a layout or gerber — both drawn
+  // top-down — "bottom" means mirrored, which is how the board reads when you
+  // turn it over. That one control replaced a Flip button that duplicated it
+  // here and was the only way to mirror anywhere else.
+  const hasSide = subject === "pcb";
+  const mirrored = hasSide && side === "bottom" && activeMode !== "render";
   const hasSmd = subject === "pcb" && activeMode !== "gerber";
+  // The layout is a single top-down plot of both faces, so its SMD filter acts
+  // on the whole board; a render only shows the face you are looking at.
+  const faceSmd =
+    activeMode === "render"
+      ? side === "bottom"
+        ? sides.data?.back.smd
+        : sides.data?.front.smd
+      : (sides.data?.front.smd ?? 0) + (sides.data?.back.smd ?? 0);
+  const smdActs = faceSmd === undefined || faceSmd > 0;
 
   const src =
     `/api/circuits/${encodeURIComponent(name)}/render?view=${view}&v=${version}` +
@@ -634,6 +650,13 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
                 key={sd}
                 aria-pressed={side === sd}
                 onClick={() => setSide(sd)}
+                title={
+                  activeMode === "render"
+                    ? `Render the ${sd} face`
+                    : sd === "bottom"
+                      ? "Mirror the drawing — how it reads with the board turned over"
+                      : "Drawn top-down, as the fab sees it"
+                }
               >
                 {sd === "top" ? "Top" : "Bottom"}
               </button>
@@ -642,26 +665,29 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
         )}
         {hasSmd && (
           <label
-            class="smd-toggle"
-            title="Hide surface-mount parts — the through-hole board you solder"
+            class={`smd-toggle${smdActs ? "" : " inert"}`}
+            title={
+              smdActs
+                ? "Hide surface-mount parts — the through-hole board you solder"
+                : `Nothing to hide: no surface-mount parts on the ${side} face` +
+                  (sides.data && sides.data.back.smd + sides.data.front.smd > 0
+                    ? ` (they are on the ${sides.data.back.smd > 0 ? "back" : "front"})`
+                    : "")
+            }
           >
             <input
               type="checkbox"
               checked={smd}
+              disabled={!smdActs}
               onChange={(e) => setSmd((e.target as HTMLInputElement).checked)}
             />
             SMD
+            {faceSmd !== undefined && faceSmd > 0 && (
+              <span class="count">{faceSmd}</span>
+            )}
           </label>
         )}
         <span class="spacer" />
-        <button
-          class="btn tiny"
-          aria-pressed={flip}
-          onClick={() => setFlip((f) => !f)}
-          title="Mirror the view — how it reads from the other side"
-        >
-          Flip
-        </button>
         <button
           class="btn tiny"
           onClick={() => setResetKey((k) => k + 1)}
@@ -691,7 +717,7 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
         key={`${view}-${smd}-${resetKey}`}
         src={src}
         alt={`${subject} ${activeMode}`}
-        flip={flip}
+        flip={mirrored}
       />
       <p class="pcb-hint muted">
         scroll to zoom · drag to pan · double-click to reset
