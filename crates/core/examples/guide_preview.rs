@@ -26,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let circuit = legion_of_bom_core::parse_netlist_file(&net)?;
     let board = std::fs::read_to_string(&pcb)?;
-    let guide = build_guide_with(&circuit, &board, GuideOptions { include_smd: true })?;
+    // The shipping default: SMD is fab-assembled, so the guide is about the
+    // through-hole parts a builder actually fits. Forcing it on here was why
+    // the preview showed hand-solder steps for reflowed parts.
+    let guide = build_guide_with(&circuit, &board, GuideOptions::default())?;
 
     let kicad = kicad_cli_path();
     let top = kicad

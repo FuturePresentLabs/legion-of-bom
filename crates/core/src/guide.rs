@@ -136,11 +136,18 @@ impl KitType {
     }
 
     /// The framing label shown at the top of the guide.
+    ///
+    /// `Mixed` reads as "through-hole kit, SMD pre-assembled" rather than
+    /// "mixed build" because that is what the builder is holding: the fab
+    /// reflows the surface-mount side and the kit is the through-hole work.
+    /// Calling it a mixed build implies hand-soldering 0603s that are already
+    /// on the board. A board where the SMD genuinely is hand-work turns
+    /// [`GuideOptions::include_smd`] back on, which also brings back its steps.
     fn label(self) -> &'static str {
         match self {
             KitType::Tht => "Through-hole kit",
             KitType::Smd => "Surface-mount board",
-            KitType::Mixed => "Mixed through-hole + SMD build",
+            KitType::Mixed => "Through-hole kit · SMD pre-assembled",
         }
     }
 }
@@ -507,6 +514,11 @@ pub fn guide_from_parts_with(
     opts: GuideOptions,
 ) -> BuildGuide {
     parts.sort_by_key(|p| refdes_key(&p.refdes));
+    // Read the kit type from *every* placed part, before the surface-mount ones
+    // are filtered out of the steps. A builder holding a fab-reflowed board
+    // should be told the SMD is meant to be there — detecting after the filter
+    // reports a plain through-hole kit and leaves them wondering.
+    let kit = detect_kit(&parts);
     if !opts.include_smd {
         parts.retain(|p| p.through_hole);
     }
@@ -627,7 +639,7 @@ pub fn guide_from_parts_with(
     BuildGuide {
         name: name.to_string(),
         outline,
-        kit: detect_kit(&parts),
+        kit,
         brand: None,
         intro: None,
         tools: Vec::new(),
@@ -2549,6 +2561,35 @@ mod tests {
             g.steps[1].parts.iter().all(|p| !p.back),
             "resistor is front"
         );
+    }
+
+    #[test]
+    fn a_fab_reflowed_board_still_reads_as_having_smd_on_it() {
+        // The steps are through-hole only (the fab did the SMD), but the kit
+        // line must still say the board arrives with parts on it — otherwise a
+        // builder sees soldered 0603s and wonders what went wrong.
+        // R1/R2 reflowed by the fab, U1 through-hole for the builder.
+        let mixed = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 105) (layer "Edge.Cuts"))
+          (footprint "R" (layer "F.Cu") (at 100 100 0)
+            (property "Reference" "R1") (pad "1" smd rect (at -1 0) (size 1 1)) (pad "2" smd rect (at 1 0) (size 1 1)))
+          (footprint "R" (layer "F.Cu") (at 110 100 0)
+            (property "Reference" "R2") (pad "1" smd rect (at -1 0) (size 1 1)) (pad "2" smd rect (at 1 0) (size 1 1)))
+          (footprint "U" (layer "F.Cu") (at 120 100 0)
+            (property "Reference" "U1") (pad "1" thru_hole circle (at -2 0) (size 1 1)) (pad "8" thru_hole circle (at 2 0) (size 1 1))))"#;
+        let g = build_guide(&amp(), mixed).unwrap();
+        assert_eq!(
+            g.kit,
+            KitType::Mixed,
+            "board is mixed even if the kit isn't"
+        );
+        assert!(g.kit.label().contains("pre-assembled"), "{}", g.kit.label());
+        // …and none of those SMD parts became a hand-solder step.
+        assert!(g
+            .steps
+            .iter()
+            .flat_map(|s| &s.parts)
+            .all(|p| p.through_hole));
     }
 
     #[test]
