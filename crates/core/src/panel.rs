@@ -63,6 +63,9 @@ pub enum CutoutRole {
     Cv,
     /// A plain knob: unipolar sweep, dial dots from min to max.
     Knob,
+    /// A toggle. No dial art — a lever has positions, not a sweep, and drawing a
+    /// 270-degree arc of dots round one would be a lie about how it moves.
+    Switch,
     /// A knob whose centre is zero. Gets a centre detent mark, and â/+ at the
     /// extremes, because "12 o'clock is silence" is the whole point of the
     /// control and a player has to be able to see it.
@@ -76,6 +79,7 @@ impl CutoutRole {
             CutoutRole::Io => "io",
             CutoutRole::Cv => "cv",
             CutoutRole::Knob => "knob",
+            CutoutRole::Switch => "switch",
             CutoutRole::Attenuverter => "attenuverter",
         }
     }
@@ -84,6 +88,7 @@ impl CutoutRole {
             "io" => Some(CutoutRole::Io),
             "cv" => Some(CutoutRole::Cv),
             "knob" | "pot" => Some(CutoutRole::Knob),
+            "switch" | "toggle" => Some(CutoutRole::Switch),
             "attenuverter" | "attenuvertor" | "bipolar" => Some(CutoutRole::Attenuverter),
             _ => None,
         }
@@ -117,7 +122,14 @@ const JACK_BARREL_MM: f64 = 6.0;
 /// Alpha 9 mm pot bushing hole diameter (mm).
 const POT_BUSHING_MM: f64 = 7.0;
 /// Toggle switch bushing hole diameter (mm).
-const TOGGLE_MM: f64 = 6.5;
+/// Sub-miniature toggle bushing hole. From the Dailywell 2M series drawing
+/// (2MS3/2MD6 etc, what Thonk sell as DW1/DW2/DW5): panel hole 4.95mm with a
+/// 4.55mm flat for anti-rotation, 10-48 UNS bushing.
+///
+/// Was 6.5mm — a plausible number rather than a measured one, which left the
+/// switch 1.55mm loose in its hole (`legion-of-bom-tvs`). The flat is still not
+/// represented; `CutoutShape` has no circle-with-flat.
+const TOGGLE_MM: f64 = 4.95;
 const LED_5MM_MM: f64 = 5.0;
 const LED_3MM_MM: f64 = 3.0;
 
@@ -220,7 +232,26 @@ pub trait CutoutSource {
 pub struct BuiltinCutouts;
 
 impl CutoutSource for BuiltinCutouts {
-    fn cutout(&self, _mpn: Option<&str>, footprint: &str) -> Option<CutoutSpec> {
+    fn cutout(&self, mpn: Option<&str>, footprint: &str) -> Option<CutoutSpec> {
+        // MPN first. A panel control's *footprint* often says nothing about the
+        // panel — a sub-mini toggle has no KiCad THT footprint at all, so it
+        // carries a 1x03 pin header and would never keyword-match "switch".
+        // The MPN is what actually identifies the hardware, which is why this
+        // trait takes one; until the parts library carries verified mechanical
+        // data this is a small table of what we build with.
+        if let Some(mpn) = mpn {
+            let m = mpn.to_ascii_uppercase();
+            // Dailywell 1M/2M sub-miniature toggles (Thonk DW1/DW2/DW5 …).
+            if m.starts_with("1M") || m.starts_with("2M") {
+                return Some(CutoutSpec {
+                    kind: ControlKind::Switch,
+                    shape: CutoutShape::Circle {
+                        diameter_mm: TOGGLE_MM,
+                    },
+                    envelope_mm: kind_envelope(ControlKind::Switch),
+                });
+            }
+        }
         let name = footprint
             .rsplit_once(':')
             .map(|(_, r)| r)
@@ -920,6 +951,9 @@ fn cutout_role(circuit: &dyn CircuitSource, refdes: &str, kind: ControlKind) -> 
             CutoutRole::Io
         };
     }
+    if matches!(kind, ControlKind::Switch) {
+        return CutoutRole::Switch;
+    }
     if !matches!(kind, ControlKind::Pot) {
         return CutoutRole::Knob;
     }
@@ -1170,6 +1204,21 @@ pub fn derive_panel_for(
 /// A short panel label for a control, from the most signal-like net it touches
 /// (excluding power/ground). `SIG_IN` → "IN", `RATE_CV` → "RATE".
 fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
+    // A switch names itself. Its nets are wiring detail — which cap a throw
+    // selects — and say nothing a player needs, so a net-derived label reads as
+    // noise ("N$2", "RANGE GLIDE"). By convention a switch's *value* field
+    // carries its function: RANGE, MODE, SHAPE. Prefer that.
+    if let Some(part) = circuit.parts().iter().find(|p| p.refdes.0 == refdes) {
+        let is_switch = part
+            .footprint
+            .as_deref()
+            .is_some_and(|f| f.to_ascii_lowercase().contains("sw"))
+            || part.refdes.0.starts_with("SW");
+        let v = part.value.trim();
+        if is_switch && !v.is_empty() && v.chars().any(|c| c.is_ascii_alphabetic()) {
+            return Some(v.to_uppercase());
+        }
+    }
     let mut sig: Vec<&str> = circuit
         .nets()
         .iter()
