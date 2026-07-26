@@ -401,6 +401,14 @@ pub struct SymPin {
     /// audio jack's pins are `T`, `S`, `TN` — and the netlist uses the same token,
     /// so the two match directly.
     pub number: String,
+    /// The pin's human name as the symbol declares it — `IABC`, `+`, `-`, `OUT`.
+    /// Empty when the symbol gives none, or names it `~`, KiCad's "no name".
+    ///
+    /// This is the only source for it: netlists carry no `pinfunction`, so a
+    /// dropped name here cannot be recovered downstream. On an LM13700 it is the
+    /// difference between a rectangle labelled 1,3,4,5 and one that shows the
+    /// reader that pin 4 is In− and pin 5 the output.
+    pub name: String,
     /// The connection point: where a wire attaches.
     pub x: f64,
     pub y: f64,
@@ -437,6 +445,19 @@ pub struct SymbolGraphics {
     /// LM2904 is two amplifiers plus a power unit), which needs pin-to-unit
     /// splitting the caller may not want to attempt.
     pub units: usize,
+    /// Every pin's name, keyed by number, harvested across **all** units — not
+    /// just the one drawn in [`pins`](Self::pins).
+    ///
+    /// A multi-unit part keeps most of its pins in units 2+, which are declined
+    /// for drawing; those are precisely the parts that fall back to a labelled box
+    /// and most need their names. Reading names only from unit 1 left an LM13700
+    /// box showing 1,3,4,5,7,8 and nothing else. Pins the symbol leaves unnamed
+    /// (`~`, as KiCad names most op-amp outputs) are absent rather than empty.
+    pub pin_names: HashMap<String, String>,
+    /// The symbol asks for its pin names not to be drawn — `(pin_names … hide)`.
+    /// Honour it: a resistor whose pins are labelled is noise, and the symbol
+    /// author already made that call.
+    pub hide_pin_names: bool,
 }
 
 impl SymbolGraphics {
@@ -522,6 +543,16 @@ pub fn read_symbol_graphics(symbol_dir: &Path, lib: &str, part: &str) -> Option<
     let mut shapes = Vec::new();
     let mut pins: Vec<SymPin> = Vec::new();
     let mut units = 1usize;
+    let mut pin_names: HashMap<String, String> = HashMap::new();
+    // `(pin_names (offset 0) hide)` — the `hide` may be a bare atom or `(hide yes)`.
+    let hide_pin_names = sym.get("pin_names").is_some_and(|p| {
+        p.as_list().is_some_and(|l| {
+            l.iter().any(|c| {
+                c.as_atom() == Some("hide")
+                    || (c.head() == Some("hide") && c.nth_atom(1) != Some("no"))
+            })
+        })
+    });
 
     // Body graphics live in nested unit sub-symbols named `<NAME>_<unit>_<style>`.
     // Unit 0 is common to every unit; unit 1 is the first real one.
@@ -533,6 +564,23 @@ pub fn read_symbol_graphics(symbol_dir: &Path, lib: &str, part: &str) -> Option<
             .and_then(|n| n.parse().ok())
             .unwrap_or(1);
         units = units.max(idx);
+
+        // Names come from every unit, including the ones below that we decline to
+        // draw — a boxed multi-unit part still shows all its pins, so it still
+        // needs all their names.
+        for p in unit.get_all("pin") {
+            let Some(number) = p.get("number").and_then(|n| n.nth_atom(1)) else {
+                continue;
+            };
+            if let Some(name) = p
+                .get("name")
+                .and_then(|n| n.nth_atom(1))
+                .filter(|n| *n != "~" && !n.is_empty())
+            {
+                pin_names.insert(number.to_string(), name.to_string());
+            }
+        }
+
         if idx > 1 {
             continue; // additional units are drawn separately on a real schematic
         }
@@ -593,8 +641,17 @@ pub fn read_symbol_graphics(symbol_dir: &Path, lib: &str, part: &str) -> Option<
             if number.is_empty() {
                 continue;
             }
+            // `~` is KiCad's explicit "this pin has no name" — treat it as absent
+            // rather than drawing a tilde on the schematic.
+            let name = p
+                .get("name")
+                .and_then(|n| n.nth_atom(1))
+                .filter(|n| *n != "~")
+                .unwrap_or_default()
+                .to_string();
             pins.push(SymPin {
                 number,
+                name,
                 x,
                 y,
                 angle: num(at, 3).unwrap_or(0.0),
@@ -614,6 +671,8 @@ pub fn read_symbol_graphics(symbol_dir: &Path, lib: &str, part: &str) -> Option<
         shapes,
         pins,
         units,
+        pin_names,
+        hide_pin_names,
     })
 }
 
@@ -722,6 +781,54 @@ mod tests {
         assert_eq!(g.units, 3, "three units detected");
         // Only unit 1 is drawn; the rest belong to separate placements.
         assert_eq!(g.pins.len(), 1);
+    }
+
+    /// Pin *names* come from every unit, not just the drawn one. A multi-unit part
+    /// keeps most of its pins in units 2+ and is exactly the part that falls back
+    /// to a labelled box, so harvesting only unit 1 left an LM13700 box showing
+    /// bare numbers (`legion-of-bom-sto`).
+    #[test]
+    fn pin_names_are_read_from_every_unit_not_just_the_drawn_one() {
+        let lib = temp_lib(
+            "names",
+            r#"(kicad_symbol_lib (symbol "OTA"
+                 (symbol "OTA_1_1" (pin input line (at 0 2 270) (length 1)
+                    (name "+") (number "3")))
+                 (symbol "OTA_2_1" (pin input line (at 0 2 270) (length 1)
+                    (name "DIODE_BIAS") (number "2")))
+                 (symbol "OTA_3_1" (pin output line (at 0 2 270) (length 1)
+                    (name "~") (number "5")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "OTA").expect("graphics");
+        assert_eq!(g.units, 3);
+        assert_eq!(g.pins.len(), 1, "still only unit 1 is drawn");
+        assert_eq!(g.pin_names.get("3").map(String::as_str), Some("+"));
+        assert_eq!(
+            g.pin_names.get("2").map(String::as_str),
+            Some("DIODE_BIAS"),
+            "a name from unit 2 is kept even though the unit is not drawn"
+        );
+        assert!(
+            !g.pin_names.contains_key("5"),
+            "`~` is KiCad's explicit no-name and must not become a label"
+        );
+        assert!(!g.hide_pin_names);
+    }
+
+    /// `(pin_names … hide)` is the symbol author saying "do not label these" —
+    /// what keeps a resistor from growing two labels.
+    #[test]
+    fn a_symbol_can_ask_for_its_pin_names_not_to_be_drawn() {
+        let lib = temp_lib(
+            "hidden",
+            r#"(kicad_symbol_lib (symbol "R" (pin_names (offset 0) hide)
+                 (symbol "R_1_1" (pin passive line (at 0 2 270) (length 1)
+                    (name "A") (number "1")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "R").expect("graphics");
+        assert!(g.hide_pin_names);
+        // The name is still *read* — hiding is a drawing decision, not a data one.
+        assert_eq!(g.pin_names.get("1").map(String::as_str), Some("A"));
     }
 
     #[test]

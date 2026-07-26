@@ -50,12 +50,14 @@ mod sheet {
     pub const TITLE_H: f64 = 64.0;
 }
 
-/// A part awaiting placement: refdes, value, and its resolved symbol.
+/// A part awaiting placement: refdes, value, its resolved symbol, the pins the
+/// box fallback must lay out, that part's pin number→name map, and its orientation.
 type PendingPart<'a> = (
     &'a str,
     &'a str,
     Option<SymbolGraphics>,
     Vec<String>,
+    HashMap<String, String>,
     (bool, bool),
 );
 
@@ -75,6 +77,17 @@ struct Placed {
     /// Pin identifiers used by the box fallback, in netlist order, so a symbol-less
     /// part still has one distinct attach point per pin.
     box_pins: Vec<String>,
+    /// Pin number → the symbol's name for it (`5` → `OUT`, `1` → `IABC`), for the
+    /// pins that have one.
+    ///
+    /// Read from the symbol library even for parts whose symbol we decline to
+    /// *draw*, because those are exactly the parts that need it: a multi-unit IC
+    /// falls back to a box, and a box labelled 1,3,4,5 hides the topology. On the
+    /// slew limiter, pins 4 and 5 both landing on SLEW_NODE *is* the circuit — the
+    /// OTA output charging C1 and the cap feeding back to the inverting input —
+    /// and nothing on the page said which was which. The netlist carries no
+    /// `pinfunction`, so the symbol is the only source.
+    pin_names: HashMap<String, String>,
     /// Quarter-turn the symbol, so a part wired in series along the signal path
     /// lies across it instead of standing on end and making the router detour.
     rot90: bool,
@@ -297,6 +310,11 @@ fn rank_parts(circuit: &dyn CircuitSource) -> HashMap<String, usize> {
 }
 
 /// Lay parts out in columns by rank, stacked in refdes order within a column.
+/// A symbol's pin number → name map, across every unit.
+fn pin_names_of(g: Option<&SymbolGraphics>) -> HashMap<String, String> {
+    g.map(|g| g.pin_names.clone()).unwrap_or_default()
+}
+
 fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     let rank = rank_parts(circuit);
     // Resolve each part's KiCad symbol once, cached by `lib:part` since a circuit
@@ -305,13 +323,16 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     // pins across separately-placed units, so they fall back to a box.
     let dir = crate::skidl::kicad_symbol_dir();
     let mut cache: HashMap<String, Option<SymbolGraphics>> = HashMap::new();
-    let mut symbol_for = |lib_part: Option<&str>| -> Option<SymbolGraphics> {
+    // The *unfiltered* read. Multi-unit parts are declined for drawing below, but
+    // their pin names are still wanted — they are the parts that fall back to a
+    // box, and a box is where a name matters most.
+    let mut graphics_for = |lib_part: Option<&str>| -> Option<SymbolGraphics> {
         let dir = dir.as_ref()?;
         let key = lib_part?;
         let (lib, part) = key.split_once(':')?;
         cache
             .entry(key.to_string())
-            .or_insert_with(|| read_symbol_graphics(dir.path(), lib, part).filter(|g| g.units == 1))
+            .or_insert_with(|| read_symbol_graphics(dir.path(), lib, part))
             .clone()
     };
 
@@ -368,7 +389,7 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
                 signal_pins.push((p.pin.as_str(), toward));
             }
         }
-        let sym = symbol_for(part.library_part.as_deref());
+        let sym = graphics_for(part.library_part.as_deref()).filter(|g| g.units == 1);
         let Some(g) = sym.as_ref() else {
             orient.insert(r, (false, false));
             continue;
@@ -396,7 +417,9 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     let mut by_col: HashMap<usize, Vec<PendingPart>> = HashMap::new();
     for p in circuit.parts() {
         let c = rank.get(&p.refdes.0).copied().unwrap_or(0);
-        let sym = symbol_for(p.library_part.as_deref());
+        let g = graphics_for(p.library_part.as_deref());
+        let pin_names = pin_names_of(g.as_ref());
+        let sym = g.filter(|g| g.units == 1);
         let pins = used_pins
             .get(p.refdes.0.as_str())
             .cloned()
@@ -406,6 +429,7 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
             p.value.as_str(),
             sym,
             pins,
+            pin_names,
             orient
                 .get(p.refdes.0.as_str())
                 .copied()
@@ -418,7 +442,9 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     for (ci, c) in cols.iter().enumerate() {
         let mut parts = by_col.remove(c).unwrap_or_default();
         parts.sort_by(|a, b| a.0.cmp(b.0));
-        for (ri, (refdes, value, sym, box_pins, (rot90, flip))) in parts.into_iter().enumerate() {
+        for (ri, (refdes, value, sym, box_pins, pin_names, (rot90, flip))) in
+            parts.into_iter().enumerate()
+        {
             out.push(Placed {
                 refdes: refdes.to_string(),
                 value: value.to_string(),
@@ -426,6 +452,7 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
                 row: ri,
                 sym,
                 box_pins,
+                pin_names,
                 rot90,
                 flip,
             });
@@ -714,16 +741,28 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
                     let Some(((ax, ay), (dx, _))) = p.pin_anchor(pin) else {
                         continue;
                     };
+                    // "5 OUT", not "5". The number stays because it is what the
+                    // netlist and the datasheet's pinout both key on; the name is
+                    // what makes the connection mean something. Pins alternate
+                    // sides of a 108-wide box, so each label has ~11 monospace
+                    // characters before it would meet the one opposite.
+                    let label = match p.pin_names.get(pin) {
+                        Some(name) => ellipsize(&format!("{pin} {name}"), 11),
+                        None => pin.clone(),
+                    };
+                    // Centred on its own lead rather than sitting above it: the
+                    // topmost pin is only ~8px below the box edge, so a raised
+                    // baseline put the label's cap height through the border.
                     s.push_str(&format!(
                         "<path d=\"M{ax:.1} {ay:.1} L{:.1} {ay:.1}\" stroke=\"{ink}\" \
                          stroke-width=\"1.2\"/>\
-                         <text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
-                         font-size=\"8\" fill=\"#6b7280\" text-anchor=\"{}\">{}</text>",
+                         <text x=\"{:.1}\" y=\"{ay:.1}\" font-family=\"ui-monospace,monospace\" \
+                         font-size=\"8\" fill=\"#6b7280\" text-anchor=\"{}\" \
+                         dominant-baseline=\"middle\">{}</text>",
                         ax + dx * 6.0,
                         ax - dx * 4.0,
-                        ay - 3.0,
                         if dx < 0.0 { "start" } else { "end" },
-                        xml_escape(pin)
+                        xml_escape(&label)
                     ));
                 }
             }
@@ -913,6 +952,21 @@ fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
             "<path d=\"M{rx:.1} {ry:.1} L{tx:.1} {ty:.1}\" stroke=\"{ink}\" \
              stroke-width=\"1.2\" fill=\"none\"/>"
         ));
+        // A named pin gets its name just inside the body, KiCad's own convention.
+        // Symbols that ask for names to be hidden don't get them — that is how a
+        // resistor stays a resistor instead of growing two labels — and most
+        // passives name their pins `~` anyway, so this draws nothing for them.
+        if g.hide_pin_names || pin.name.is_empty() {
+            continue;
+        }
+        let (ox, _) = p.orient_dir(pin.outward());
+        s.push_str(&format!(
+            "<text x=\"{:.1}\" y=\"{ty:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"8\" fill=\"#6b7280\" text-anchor=\"{}\" dominant-baseline=\"middle\">{}</text>",
+            tx - ox * 3.0,
+            if ox < 0.0 { "start" } else { "end" },
+            xml_escape(&ellipsize(&pin.name, 8))
+        ));
     }
     s
 }
@@ -956,6 +1010,56 @@ mod tests {
             Net::new("GND", vec![PinRef::new("J1", "S"), PinRef::new("C1", "2")]),
         ];
         c
+    }
+
+    /// A drawn symbol labels its named pins, and honours a symbol that asks for
+    /// its names to be hidden — the difference between an op-amp that says which
+    /// input is which and a resistor cluttered with two labels it never wanted.
+    #[test]
+    fn a_drawn_symbol_labels_named_pins_unless_the_symbol_hides_them() {
+        use crate::symbols::{SymPin, SymbolGraphics};
+        fn pin(number: &str, name: &str) -> SymPin {
+            SymPin {
+                number: number.into(),
+                name: name.into(),
+                x: -5.08,
+                y: 2.54,
+                angle: 0.0,
+                length: 2.54,
+            }
+        }
+        let mut g = SymbolGraphics {
+            shapes: Vec::new(),
+            pins: vec![pin("2", "-"), pin("3", "")],
+            units: 1,
+            pin_names: HashMap::new(),
+            hide_pin_names: false,
+        };
+        let p = Placed {
+            refdes: "U1".into(),
+            value: "TL072".into(),
+            col: 0,
+            row: 0,
+            sym: Some(g.clone()),
+            box_pins: Vec::new(),
+            pin_names: HashMap::new(),
+            rot90: false,
+            flip: false,
+        };
+        let out = symbol_svg(&p, &g, "#000");
+        assert!(out.contains(">-<"), "named pin is labelled: {out}");
+        assert_eq!(
+            out.matches("<text").count(),
+            1,
+            "the unnamed pin gets no label: {out}"
+        );
+
+        g.hide_pin_names = true;
+        let hidden = symbol_svg(&p, &g, "#000");
+        assert!(
+            !hidden.contains("<text"),
+            "a symbol that hides names gets none: {hidden}"
+        );
     }
 
     /// Orientation is decided from the netlist: a part bridging two *signal* nets
