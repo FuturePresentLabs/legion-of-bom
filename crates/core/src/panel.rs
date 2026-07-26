@@ -861,13 +861,42 @@ fn relative_luminance(hex: &str) -> f64 {
 /// even-spacing hit (a jack body is ~13 mm, so 12.8 mm spacing overlapped).
 mod derive_rules {
     /// Minimum control pitch (mm) — realistic Eurorack spacings.
-    pub const JACK_PITCH_MM: f64 = 16.0;
+    ///
+    /// Jacks at 14mm is deliberately dense — plenty of shipping modules run
+    /// 12-13mm and Doepfer sits near 15. Pots stay at 20: a knob needs finger
+    /// room to *turn*, which is a different constraint from a plug needing room
+    /// to grip, and it is the one you feel while playing.
+    ///
+    /// Note this is a *floor*, and for a Thonkiconn it does not bind: pitch is
+    /// `max(body + GAP, class)` and the body is 14.4mm, so the jack sits at
+    /// 16.4mm regardless. Reaching 14mm needs the jack rotated 90 degrees, which
+    /// makes its body 10mm tall — and that needs cutout rotation threaded
+    /// through to the board placer's anchors, which today carry position only.
+    pub const JACK_PITCH_MM: f64 = 14.0;
     pub const POT_PITCH_MM: f64 = 20.0;
     pub const SWITCH_PITCH_MM: f64 = 14.0;
     pub const LED_PITCH_MM: f64 = 9.0;
     /// Clear zones: below the top-edge title, above the bottom logo + holes.
     pub const TOP_MARGIN_MM: f64 = 14.0;
     pub const BOTTOM_MARGIN_MM: f64 = 16.0;
+    /// …and the same on a panel too narrow to spend them.
+    ///
+    /// 30mm of the 128.5 goes to these two bands. That is right on a wide panel,
+    /// where the logo has real presence; on 4 HP the logo band is a sliver
+    /// (LOGO_WIDTH_FRAC of 20mm) and is not worth four controls' worth of
+    /// column. The title is the same height either way, so the top band only
+    /// gives back what the title does not use.
+    pub const NARROW_HP: u16 = 5;
+    pub const NARROW_TOP_MARGIN_MM: f64 = 11.0;
+    pub const NARROW_BOTTOM_MARGIN_MM: f64 = 12.0;
+
+    /// The clear zones for a panel of this width.
+    pub fn margins_mm(hp: u16) -> (f64, f64) {
+        match hp <= NARROW_HP {
+            true => (NARROW_TOP_MARGIN_MM, NARROW_BOTTOM_MARGIN_MM),
+            false => (TOP_MARGIN_MM, BOTTOM_MARGIN_MM),
+        }
+    }
     /// Default Eurorack panel-PCB thickness (mm).
     pub const THICKNESS_MM: f64 = 1.6;
     /// Where a 1U tile's control row sits, as a fraction of panel height.
@@ -1171,8 +1200,8 @@ pub fn derive_panel_for(
         .map(|(_, k, env)| (env.1 + envelope::GAP_MM).max(control_pitch(*k)))
         .collect();
     let total: f64 = pitches.iter().sum();
-    let avail_top = h - derive_rules::TOP_MARGIN_MM;
-    let avail_bot = derive_rules::BOTTOM_MARGIN_MM;
+    let (top_margin, avail_bot) = derive_rules::margins_mm(hp);
+    let avail_top = h - top_margin;
     let avail = avail_top - avail_bot;
     // Centre the stack; if it overflows the panel height it still lays out (tightly
     // packed) — a signal the module has more controls than the height comfortably
