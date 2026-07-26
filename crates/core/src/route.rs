@@ -150,7 +150,14 @@ impl Default for RouteOptions {
             clearance_mm: 0.2,
             edge_clearance_mm: 0.5,
             grid_mm: 0.2,
-            via_cost_mm: 2.0,
+            // A via is worth about this much detour. 2.0mm was far too cheap:
+            // at 0.2mm grid it bought a layer change for ten steps, so the
+            // router hopped layers rather than looking for a way round. Swept
+            // against the slew limiter, 10mm halves the vias (41 -> 21) AND
+            // shortens total copper 12% (736 -> 647mm) — the lazy layer-hops
+            // were the long routes too. Past ~16mm it starts buying via
+            // avoidance with detours that cost more than the via did.
+            via_cost_mm: 10.0,
             // Small per-cell surcharge on the back layer: it accumulates so a long
             // back run loses to a front detour (keeping the ground plane intact),
             // but stays under one via's cost so a short same-layer hop still beats
@@ -274,6 +281,12 @@ pub struct GridRouter;
 /// net must route before whatever boxed it in), so the constraint set only grows —
 /// convergence is bounded and a handful resolves the common mutual-conflict cases.
 const RIPUP_MAX_ITERS: usize = 16;
+
+/// SQRT(2) as a fraction, for diagonal step cost on the 8-connected grid. Integer
+/// arithmetic keeps the A* costs exact, so ties break the same way every run and
+/// the same board comes out twice.
+const DIAG_NUM: i64 = 1414;
+const DENOM: i64 = 1000;
 
 impl Router for GridRouter {
     /// Route all nets with **rip-up-and-reroute**: route in an order; any net that
@@ -671,19 +684,26 @@ impl Grid {
         let cr = self.cols * self.rows;
         let mut dist = vec![i64::MAX; n];
         let mut prev = vec![usize::MAX; n];
-        // A* heuristic: cost-scaled Manhattan distance to the nearest target.
-        // Admissible + consistent on this 4-connected grid, so the least-cost path
-        // is still found — but the search heads for the target instead of flooding
-        // the whole board (routing a wide board in ms instead of not finishing).
+        // A* heuristic: cost-scaled **octile** distance to the nearest target.
+        //
+        // Manhattan was right for a 4-connected grid and is inadmissible here: a
+        // diagonal covers one column AND one row for SQRT2 steps, so Manhattan
+        // overestimates by up to 41% and A* would stop finding the least-cost
+        // path. Octile is the exact free-space distance with diagonals, so it
+        // stays admissible and consistent while still aiming the search.
         let heuristic = |i: usize| -> i64 {
             let rem = i % cr;
             let (c, r) = ((rem % self.cols) as isize, (rem / self.cols) as isize);
             targets
                 .iter()
-                .map(|&(tc, tr, _)| (c - tc as isize).abs() + (r - tr as isize).abs())
+                .map(|&(tc, tr, _)| {
+                    let (dc, dr) = ((c - tc as isize).abs(), (r - tr as isize).abs());
+                    let (lo, hi) = (dc.min(dr) as i64, dc.max(dr) as i64);
+                    // hi straight steps, of which `lo` are upgraded to diagonals.
+                    hi * step + lo * (DIAG_NUM - DENOM) * step / DENOM
+                })
                 .min()
-                .unwrap_or(0) as i64
-                * step
+                .unwrap_or(0)
         };
         // Heap of (f = g + h, g, cell); `dist` tracks g (the actual cost so far).
         let mut heap: BinaryHeap<Reverse<(i64, i64, usize)>> = BinaryHeap::new();
@@ -715,8 +735,21 @@ impl Grid {
             let layer = i / (self.cols * self.rows);
             let rem = i % (self.cols * self.rows);
             let (c, r) = (rem % self.cols, rem / self.cols);
-            // 4-connected neighbours on this layer.
-            let neigh = [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)];
+            // 8-connected: the four orthogonals plus the four diagonals, which is
+            // what puts 45-degree copper on the board. A Manhattan-only router
+            // turns every corner at 90 degrees, and that staircasing is most of
+            // what makes generated boards look like spaghetti next to hand
+            // routing (`legion-of-bom-drk`).
+            let neigh = [
+                (-1isize, 0isize),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (-1, 1),
+                (1, -1),
+                (1, 1),
+            ];
             for (dc, dr) in neigh {
                 let (nc, nr) = (c as isize + dc, r as isize + dr);
                 if nc < 0 || nr < 0 || nc >= self.cols as isize || nr >= self.rows as isize {
@@ -726,9 +759,24 @@ impl Grid {
                 if !self.passable(nc, nr, layer, net) {
                     continue;
                 }
+                let diagonal = dc != 0 && dr != 0;
+                // No corner cutting. A diagonal squeezing between two blocked
+                // cells would clip both their corners — legal on a grid, not in
+                // copper, where the track has width.
+                if diagonal
+                    && (!self.passable((c as isize + dc) as usize, r, layer, net)
+                        || !self.passable(c, (r as isize + dr) as usize, layer, net))
+                {
+                    continue;
+                }
                 // Bias signals to the front: routing on the back (pour layer)
                 // costs extra, so the back stays a mostly-intact ground plane.
-                let move_cost = step + if layer == BACK { back_penalty } else { 0 };
+                let straight = if diagonal {
+                    step * DIAG_NUM / DENOM
+                } else {
+                    step
+                };
+                let move_cost = straight + if layer == BACK { back_penalty } else { 0 };
                 let j = self.idx(nc, nr, layer);
                 relax(
                     j,
