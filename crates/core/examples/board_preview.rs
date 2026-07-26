@@ -59,8 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.score,
         report.metrics.rule_penalty
     );
-    for v in &report.metrics.violations {
-        eprintln!("  broke: {}", v.what);
+    for f in &report.findings {
+        eprintln!("  [{:?}] {}", f.severity, f.message);
     }
     Ok(())
 }

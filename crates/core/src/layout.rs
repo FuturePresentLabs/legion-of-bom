@@ -254,6 +254,11 @@ pub fn run_layout_loop(
 ) -> Result<LayoutReport, BoardError> {
     // One placement attempt's result, so the loop can keep the best by score.
     struct Attempt {
+        /// Millimetres broken per tier, worst tier first — the relaxation key.
+        broken: [f64; 3],
+        /// Preference cost with the rule penalty removed, so the tiers above are
+        /// not counted twice.
+        preference: f64,
         score: f64,
         board: String,
         metrics: PlacementMetrics,
@@ -303,10 +308,20 @@ pub fn run_layout_loop(
             }
         }
 
-        let (unrouted, broken) = (metrics.unrouted, metrics.rule_penalty);
-        let improved = best.as_ref().is_none_or(|b| sc < b.score - 1e-6);
+        let (unrouted, penalty) = (metrics.unrouted, metrics.rule_penalty);
+        let broken = crate::rules::by_tier(&metrics.violations);
+        let preference = sc - penalty;
+        // Ordered relaxation: physical damage decides first, then electrical,
+        // and only when those tie does the preference cost break it. An attempt
+        // is never allowed to buy wirelength with a rule.
+        let key = relax_key(broken, preference);
+        let improved = best
+            .as_ref()
+            .is_none_or(|b| key < relax_key(b.broken, b.preference));
         if improved {
             best = Some(Attempt {
+                broken,
+                preference,
                 score: sc,
                 board: art.pcb,
                 metrics,
@@ -320,7 +335,7 @@ pub fn run_layout_loop(
         // routability alone stopped the loop while a decoupling cap was still
         // across the board: "the router coped" is not the same as "this is the
         // layout we want".
-        if unrouted == 0 && broken <= 0.0 {
+        if unrouted == 0 && penalty <= 0.0 {
             break;
         }
         // Last iteration — no point planning another repair.
@@ -334,6 +349,8 @@ pub fn run_layout_loop(
     }
 
     let Attempt {
+        broken: _,
+        preference: _,
         score,
         board,
         metrics,
@@ -377,6 +394,23 @@ pub fn run_layout_loop(
     for c in &collisions {
         findings.push(Finding::warning(format!("mechanical clearance: {c}")));
     }
+    // What the winning layout had to break to fit, and by how much. Reported at
+    // the severity of the tier it broke: a physical rule means the board cannot
+    // be built, an electrical one means it will work worse than intended. This
+    // used to be absorbed silently into the score, which is how a decoupling cap
+    // shipped 89mm from its chip without anything saying so.
+    if metrics.violations.is_empty() {
+        findings.push(Finding::info("all design rules met"));
+    } else {
+        for v in &metrics.violations {
+            let msg = format!("relaxed by {:.1}mm — {}", v.by_mm, v.what);
+            findings.push(match v.tier {
+                crate::rules::Tier::Physical => Finding::error(msg),
+                crate::rules::Tier::Electrical => Finding::warning(msg),
+                crate::rules::Tier::Preference => Finding::info(msg),
+            });
+        }
+    }
     if let Some(report) = &drc {
         if report.error_count() > 0 {
             findings.push(Finding::error(format!(
@@ -403,6 +437,17 @@ pub fn run_layout_loop(
 /// Deterministic repair perturbation: nudge each free part by a golden-angle
 /// offset that varies with the attempt, so successive attempts explore different
 /// arrangements without any RNG. Magnitude grows with the attempt number.
+/// The ordering key for one attempt: millimetres broken per tier, worst tier
+/// first, then the preference cost. Lower is better, compared lexicographically.
+///
+/// This is what "relax the lowest tier first" means mechanically. A lower tier
+/// is only ever traded once every higher tier ties, so no amount of wirelength
+/// can buy back an electrical rule and nothing can buy back a physical one —
+/// exactly, rather than the [`crate::rules::penalty`] weights' approximation.
+fn relax_key(broken: [f64; 3], preference: f64) -> (f64, f64, f64, f64) {
+    (broken[0], broken[1], broken[2], preference)
+}
+
 fn repair_nudges(free: &[String], attempt: usize) -> HashMap<String, (f64, f64)> {
     const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653; // radians
     let mag = 2.0 + 1.5 * attempt as f64;
@@ -555,6 +600,45 @@ mod tests {
         // C1 seeds next to U1 (its only neighbour), not sprayed to the top row.
         let dist = (u1.x_mm - c1.x_mm).hypot(u1.y_mm - c1.y_mm);
         assert!(dist < 20.0, "C1 should seed near U1, got {dist}mm");
+    }
+
+    /// Ordered relaxation: break the cheapest thing that lets the board fit,
+    /// and never buy a higher tier with a lower one.
+    #[test]
+    fn a_lower_tier_is_only_traded_once_the_higher_ones_tie() {
+        // An attempt that breaks a physical rule loses to one that breaks a much
+        // larger electrical one, however good its wirelength.
+        let physical = relax_key([0.1, 0.0, 0.0], 0.0);
+        let electrical = relax_key([0.0, 50.0, 0.0], 9_999.0);
+        assert!(electrical < physical);
+
+        // Likewise electrical over preference…
+        let elec = relax_key([0.0, 0.1, 0.0], 0.0);
+        let pref = relax_key([0.0, 0.0, 50.0], 9_999.0);
+        assert!(pref < elec);
+
+        // …and only when every tier ties does wirelength decide.
+        let tidy = relax_key([0.0, 2.0, 0.0], 100.0);
+        let untidy = relax_key([0.0, 2.0, 0.0], 200.0);
+        assert!(tidy < untidy);
+    }
+
+    #[test]
+    fn violations_total_by_tier() {
+        use crate::rules::{by_tier, Tier, Violation};
+        let v = |tier, by_mm| Violation {
+            tier,
+            by_mm,
+            what: String::new(),
+            repair: None,
+        };
+        let got = by_tier(&[
+            v(Tier::Electrical, 1.5),
+            v(Tier::Electrical, 2.0),
+            v(Tier::Physical, 0.25),
+        ]);
+        assert_eq!(got, [0.25, 3.5, 0.0]);
+        assert_eq!(by_tier(&[]), [0.0; 3]);
     }
 
     #[test]

@@ -216,6 +216,28 @@ pub fn penalty(violations: &[Violation]) -> f64 {
     violations.iter().map(|v| v.tier.weight() * v.by_mm).sum()
 }
 
+/// Total millimetres broken in each tier, worst tier first:
+/// `[physical, electrical, preference]`.
+///
+/// The ordering key for **relaxation**. Comparing attempts on this
+/// lexicographically means a lower tier is only ever traded once every higher
+/// tier ties — you break the cheapest thing that lets the board fit, and never
+/// buy a millimetre of tidiness with a millimetre of electrical intent. The
+/// single-`f64` [`penalty`] approximates the same order with weights; this is
+/// the exact version, for choosing between attempts.
+pub fn by_tier(violations: &[Violation]) -> [f64; 3] {
+    let mut out = [0.0; 3];
+    for v in violations {
+        let i = match v.tier {
+            Tier::Physical => 0,
+            Tier::Electrical => 1,
+            Tier::Preference => 2,
+        };
+        out[i] += v.by_mm;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
