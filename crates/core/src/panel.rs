@@ -1616,6 +1616,79 @@ mod panel_from_board_tests {
         assert_eq!(j.label.as_deref(), Some("OUT")); // label_from_net drops the prefix
     }
 
+    /// The round trip the whole "board is master" design rests on: hand-place a
+    /// control in panel space, let the board follow, derive the panel back from
+    /// the built board, and land on the position that was authored.
+    ///
+    /// If this drifts, a panel gets cut that the board will not mate with — and
+    /// the three artifacts stop describing one layout.
+    #[test]
+    fn a_hand_placement_survives_the_trip_through_the_board_and_back() {
+        use crate::board::{generate_board, BoardOptions, EurorackPlacer};
+        use crate::placement::PlacementFile;
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        let file = PlacementFile::from_toml(
+            r#"
+[[patterns.column]]
+refdes = ["J1", "J2"]
+x      = 7.0
+from_y = 12.0
+pitch  = 20.0
+"#,
+        )
+        .unwrap();
+        let (hp, h) = (3u16, EURORACK_HEIGHT_MM);
+        let w = f64::from(hp) * HP_MM;
+        let origin = (100.0, 40.0);
+        let anchors = file.anchors(h).unwrap();
+        let want = file.positions().unwrap();
+
+        let circuit = Circuit {
+            name: "rt".into(),
+            parts: vec![
+                Part::new("J1", "jack")
+                    .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+                Part::new("J2", "jack")
+                    .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+            ],
+            nets: vec![],
+        };
+        let mut opts = BoardOptions::new(dir);
+        opts.placer = Box::new(EurorackPlacer {
+            width_mm: w,
+            height_mm: h,
+            origin_mm: origin,
+            anchors,
+        });
+        opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
+        let Ok(board) = generate_board(&circuit, &opts) else {
+            return; // library layout differs; don't fail the unit suite
+        };
+
+        let derived = panel_from_board(&board, &circuit, &BuiltinCutouts).unwrap();
+        assert_eq!(derived.hp, Some(hp), "board width decides the panel width");
+        for (refdes, p) in &want {
+            let c = derived
+                .cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(refdes.as_str()))
+                .unwrap_or_else(|| panic!("{refdes} missing from the derived panel"));
+            // Within a placement grid step: the placer settles a part on its
+            // clear-spot search, so this asserts the layout survived, not that
+            // nothing may ever move.
+            assert!(
+                (c.x_mm - p.x).abs() < 1.0 && (c.y_mm - p.y).abs() < 1.0,
+                "{refdes}: authored ({:.1},{:.1}) came back as ({:.1},{:.1})",
+                p.x,
+                p.y,
+                c.x_mm,
+                c.y_mm
+            );
+        }
+    }
+
     /// A board we cannot frame gets an error, not a panel measured from nothing.
     #[test]
     fn a_board_with_no_outline_is_an_error() {

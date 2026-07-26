@@ -17,15 +17,15 @@ use legion_of_bom_core::{
     default_panel_orders_dir, default_parts_dir, derive_panel, embed_source, export_cpl,
     export_gerbers, fetch_data_uri, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
     generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
-    minimum_hp, package_key, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
-    plan_repair, png_to_jpeg, product_image_url, render_board_png, run_drc, run_layout_loop,
-    simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, thonk_image_url, validate_erc,
-    value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
-    BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions, JlcpcbClient, KitType,
-    LayoutLoop, LayoutMode, LineKind, Logo, Manifest, MouserClient, PanelFile, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
-    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis,
+    minimum_hp, package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb,
+    parse_netlist_file, part_kind_of, plan_repair, png_to_jpeg, product_image_url,
+    render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword,
+    suggest_mpns, thonk_image_url, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus,
+    BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer,
+    Finding, GuideOptions, JlcpcbClient, KitType, LayoutLoop, LayoutMode, LineKind, Logo, Manifest,
+    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -364,6 +364,14 @@ enum PanelCmd {
         /// Output TOML path (default: <circuit>_panel.toml next to the circuit).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Ignore the built board and lay the controls out from scratch.
+        ///
+        /// The default reads `out/<name>/<name>.kicad_pcb` when it exists and
+        /// puts each cutout where that part actually sits, because the board is
+        /// what gets manufactured. Use this for a circuit with no board yet, or
+        /// to start a fresh arrangement the board will then follow.
+        #[arg(long)]
+        idealised: bool,
     },
     /// Compute the minimum Eurorack HP that fits a circuit — the PCB drives the
     /// panel width (DESIGN 6.1).
@@ -2419,7 +2427,12 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 }
             }
         }
-        PanelCmd::Derive { circuit, hp, out } => {
+        PanelCmd::Derive {
+            circuit,
+            hp,
+            out,
+            idealised,
+        } => {
             let circuit = circuit
                 .canonicalize()
                 .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -2447,9 +2460,38 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             // Cutout dims resolve through the CutoutSource seam; BuiltinCutouts is
             // the fallback until the parts library carries verified mechanical data.
             let requested_hp = hp;
-            let mut panel = derive_panel(&model, hp, &BuiltinCutouts);
-            // derive_panel widens a panel too narrow for its own hardware, so report
-            // what was actually emitted, not what was asked for.
+            // The board is master. A panel derived from an idealised column
+            // matches the board only when the board was placed FROM that panel;
+            // for an imported board, or one whose layout moved, it is fiction
+            // that will not fit the hardware soldered to it. So when a built
+            // board exists, read the cutouts off where the parts actually are.
+            let board_path = work_dir.join(format!("{stem}.kicad_pcb"));
+            let from_board = (!idealised)
+                .then(|| std::fs::read_to_string(&board_path).ok())
+                .flatten()
+                .and_then(|pcb| panel_from_board(&pcb, &model, &BuiltinCutouts).ok());
+            let mut panel = match from_board {
+                Some(p) => {
+                    println!(
+                        "  from the built board ({}) — {} cutout(s) at their real positions",
+                        board_path.display(),
+                        p.cutouts.len()
+                    );
+                    p
+                }
+                None => {
+                    if !idealised {
+                        println!(
+                            "  no built board at {} — laying out from scratch; \
+                             the board will follow this panel",
+                            board_path.display()
+                        );
+                    }
+                    derive_panel(&model, hp, &BuiltinCutouts)
+                }
+            };
+            // A derived panel widens itself when too narrow for its own hardware,
+            // so report what was emitted, not what was asked for.
             let hp = panel.hp.unwrap_or(hp);
             if hp > requested_hp {
                 println!("  widened to {hp} HP — {requested_hp} HP can't fit the control hardware");
