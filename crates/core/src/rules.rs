@@ -125,6 +125,42 @@ pub enum Rule {
 }
 
 impl Rule {
+    /// The board-space box this rule measures for a part placed at `p`, if it
+    /// measures one.
+    ///
+    /// Exposed, and used by [`assess`] itself, so there is exactly one place
+    /// that knows how a footprint's keep-out lands once rotated. Duplicating
+    /// that transform is how the codebase ended up with two rotation senses
+    /// disagreeing with each other for months.
+    pub fn measured_box(&self, p: &Placement) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            Rule::Proximity { .. } => None,
+            Rule::EdgeClearance {
+                extent,
+                origin_offset,
+                ..
+            } => {
+                // Flip in the footprint's own frame first, then rotate — the
+                // order the placer uses, and the only order that agrees with
+                // where KiCad actually puts a rotated back-side part.
+                let local = if p.back {
+                    (-origin_offset.0, origin_offset.1)
+                } else {
+                    *origin_offset
+                };
+                let (ox, oy) = crate::board::rotate_local(local, p.rotation_deg);
+                let quarter_turns = (p.rotation_deg / 90.0).round() as i64;
+                let (ew, eh) = if quarter_turns % 2 == 0 {
+                    (extent.0, extent.1)
+                } else {
+                    (extent.1, extent.0)
+                };
+                let (cx, cy) = (p.x_mm + ox, p.y_mm + oy);
+                Some((cx - ew / 2.0, cy - eh / 2.0, cx + ew / 2.0, cy + eh / 2.0))
+            }
+        }
+    }
+
     pub fn tier(&self) -> Tier {
         match self {
             Rule::Proximity { tier, .. } | Rule::EdgeClearance { tier, .. } => *tier,
@@ -312,33 +348,20 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
             }
             Rule::EdgeClearance {
                 refdes,
-                extent,
-                origin_offset,
                 bounds,
                 min_mm,
                 tier,
+                ..
             } => {
                 let Some(p) = placements.get(refdes) else {
                     continue;
                 };
                 let (x0, y0, x1, y1) = *bounds;
-                // Where the keep-out actually sits: the offset rotates with the
-                // part, and mirrors in X on the back, exactly as the placer's
-                // own keepout_at_rot does. Reading the placement origin as the
-                // box centre is what let a pot's pad reach the board edge while
-                // this rule called it clear.
-                let (ox, oy) = crate::board::rotate_local(*origin_offset, p.rotation_deg);
-                let ox = if p.back { -ox } else { ox };
-                let (px, py) = (p.x_mm + ox, p.y_mm + oy);
-                // A part the placer stood on end occupies its extent swapped.
-                // Measuring the unrotated box against the board reports a
-                // 90°-rotated header as hanging off when it fits perfectly.
-                let quarter_turns = (p.rotation_deg / 90.0).round() as i64;
-                let (ew, eh) = if quarter_turns % 2 == 0 {
-                    (extent.0, extent.1)
-                } else {
-                    (extent.1, extent.0)
+                let Some((bx0, by0, bx1, by1)) = rule.measured_box(p) else {
+                    continue;
                 };
+                let (ew, eh) = (bx1 - bx0, by1 - by0);
+                let (px, py) = ((bx0 + bx1) / 2.0, (by0 + by1) / 2.0);
                 let (hw, hh) = (ew / 2.0, eh / 2.0);
                 // The band the part's *centre* may occupy.
                 let (ax0, ay0) = (x0 + min_mm + hw, y0 + min_mm + hh);
@@ -376,11 +399,15 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                     detail,
                     margin_mm: slack,
                     // The repair target is a *placement origin*, so undo the
-                    // offset: clamp where the keep-out must end up, then convert
-                    // back to where the origin has to be for that to happen.
+                    // offset between the origin and the measured box: clamp
+                    // where the box must end up, then convert back to where the
+                    // origin has to be for that to happen.
                     repair: Some(Repair {
                         refdes: refdes.clone(),
-                        toward_mm: (px.clamp(ax0, ax1) - ox, py.clamp(ay0, ay1) - oy),
+                        toward_mm: (
+                            p.x_mm + (px.clamp(ax0, ax1) - px),
+                            p.y_mm + (py.clamp(ay0, ay1) - py),
+                        ),
                     }),
                 });
             }

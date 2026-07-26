@@ -104,8 +104,16 @@ impl PartFacts {
     /// sits at pin 1, its body several mm away) lands somewhere quite different
     /// once rotated, so the offset must rotate too.
     fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
-        let (ox, oy) = rotate_local(self.origin_offset, rot_deg);
-        let ox = if back { -ox } else { ox };
+        // Mirror the *local* X before rotating, not the rotated result. A
+        // back-side footprint is flipped in its own frame and then turned; doing
+        // it the other way round is only harmless at 0°/180°, and put a
+        // back-mounted 90° power header's keep-out ~10mm from its copper.
+        let local = if back {
+            (-self.origin_offset.0, self.origin_offset.1)
+        } else {
+            self.origin_offset
+        };
+        let (ox, oy) = rotate_local(local, rot_deg);
         let (w, h) = self.extent;
         let (ew, eh) = if (rot_deg / 90.0).round() as i64 % 2 != 0 {
             (h, w)
@@ -130,9 +138,12 @@ impl PartFacts {
         self.tht_pads
             .iter()
             .map(|&r| {
-                let (a, b, c, d) = rotate_rect(r, rot_deg);
-                let (x0, x1) = if back { (-c, -a) } else { (a, c) };
-                (x + x0, y + b, x + x1, y + d)
+                // Flip in the footprint's own frame first, then rotate — the
+                // same order as keepout_at_rot, so a part's pads and its
+                // keep-out stay together on the back as well as the front.
+                let r = if back { (-r.2, r.1, -r.0, r.3) } else { r };
+                let (x0, y0, x1, y1) = rotate_rect(r, rot_deg);
+                (x + x0, y + y0, x + x1, y + y1)
             })
             .collect()
     }
@@ -1249,7 +1260,7 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
             anchors,
             nudges: HashMap::new(),
         };
-        let placements = placer.place(circuit, facts);
+        let mut placements = placer.place(circuit, facts);
         // A part in the overflow lane sits below the board bottom (y > height).
         let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
         // …but "nothing overflowed" is not "buildable". The lane only catches
@@ -1264,23 +1275,17 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
                 outline: Some((0.0, 0.0, w, h)),
             },
         );
-        // NOT legalized, deliberately, and this is a judgement call worth
-        // knowing about.
+        // Legalize before judging, because the build does. Asking whether the
+        // *global* placement is legal reports a wider board than we would
+        // actually manufacture.
         //
-        // The build legalizes, so judging the *global* placement here reports a
-        // wider board than we would manufacture — on slew_limiter, 5 HP where
-        // the legalized board fits 4 HP. That argues for legalizing here too,
-        // and it was done that way briefly.
-        //
-        // It was reverted because the physical rules do not yet bound all the
-        // copper: at 4 HP, KiCad finds PTH lugs of RV1/RV2 0.36mm from the board
-        // edge (limit 0.5mm) that EdgeClearance does not see, because
-        // PartFacts.tht_pads does not appear to contain them. Legalizing before
-        // judging therefore made minimum_hp answer 4 for a width that fails DRC
-        // — exactly the optimism legion-of-bom-t5t is about, and a number
-        // somebody could order a panel against.
-        //
-        // Restore the legalize() call once the facts bound the copper.
+        // This was reverted once, when the rules did not yet bound the copper
+        // and it made minimum_hp answer a width that failed DRC. Two coordinate
+        // bugs later — keep-outs rotated against KiCad's sense, and back-side
+        // parts mirrored after rotation instead of before — the rule's box now
+        // contains the real copper with the expected clearance, and
+        // copper_edge_clearance errors at 4 HP went from 5 to 0. Restored.
+        crate::legalize::legalize(&mut placements, &rules, facts);
         let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
         if !overflowed && broken[0] <= 0.0 {
             return hp;
@@ -2665,19 +2670,28 @@ mod tests {
         // extent swaps to (4,10); the +X offset swings to -Y, like the lug.
         assert_eq!(box_rot, (-2.0, -8.0, 2.0, 2.0));
 
-        // The invariant, stated directly: a part's keep-out and its pads rotate
-        // the same way. A lug on +X and an offset on +X must both end on -Y.
+        // The invariant, stated directly: a part's keep-out and its pads move
+        // together, on both faces and at every rotation. A lug on +X and an
+        // offset on +X must always land in the same place.
+        //
+        // The back-side cases are the ones that bit: flipping AFTER rotating is
+        // only harmless at 0°/180°, and put a back-mounted 90° power header's
+        // keep-out ~10mm from its own copper. KiCad flips a footprint in its own
+        // frame and then turns it.
         let both = a_fact((4.0, 4.0), (5.0, 0.0), vec![(4.5, -0.5, 5.5, 0.5)]);
-        let (kx, ky) = {
-            let b = both.keepout_at_rot(0.0, 0.0, false, 90.0);
-            ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0)
-        };
-        let pad = both.tht_pads_at(0.0, 0.0, false, 90.0)[0];
-        let (px, py) = ((pad.0 + pad.2) / 2.0, (pad.1 + pad.3) / 2.0);
-        assert!(
-            (kx - px).abs() < 1e-9 && (ky - py).abs() < 1e-9,
-            "keep-out {kx},{ky} and pad {px},{py} must rotate together"
-        );
+        for back in [false, true] {
+            for rot in [0.0, 90.0, 180.0, 270.0] {
+                let b = both.keepout_at_rot(0.0, 0.0, back, rot);
+                let (kx, ky) = ((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0);
+                let pad = both.tht_pads_at(0.0, 0.0, back, rot)[0];
+                let (px, py) = ((pad.0 + pad.2) / 2.0, (pad.1 + pad.3) / 2.0);
+                assert!(
+                    (kx - px).abs() < 1e-9 && (ky - py).abs() < 1e-9,
+                    "back={back} rot={rot}: keep-out ({kx},{ky}) and pad ({px},{py}) \
+                     must move together"
+                );
+            }
+        }
     }
 
     #[test]
