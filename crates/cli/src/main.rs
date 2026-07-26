@@ -14,18 +14,19 @@ use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
-    default_panel_orders_dir, default_parts_dir, derive_panel, embed_source, eurorack_trial_build,
-    export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
-    generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
-    minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
-    render_board_png, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword,
-    suggest_mpns, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
-    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding,
-    GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest,
-    MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
+    eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
+    generate_board_artifacts, generate_board_report, generate_bom, guide_to_html, guide_to_pdf,
+    jlc_bom_csv, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key,
+    panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
+    photo_source, plan_repair, png_to_jpeg, render_board_png, run_drc, run_layout_loop,
+    simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
+    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
+    CircuitSource, EurorackPlacer, Finding, GuideOptions, HpSearch, JlcpcbClient, KitType,
+    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
+    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -361,6 +362,14 @@ enum PanelCmd {
         /// the PCB drives the panel (DESIGN 6.1), which is the default.
         #[arg(long)]
         hp: Option<u16>,
+        /// Height class: `eurorack` (3U, default), `intellijel-1u`, or
+        /// `pulplogic-1u`. Bare `1u` means Intellijel.
+        ///
+        /// The two 1U standards are mutually incompatible — a case railed for
+        /// one will not take the other — so this is a property of the case the
+        /// module goes into, not a preference.
+        #[arg(long)]
+        format: Option<String>,
         /// Output TOML path (default: <circuit>_panel.toml next to the circuit).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -2332,9 +2341,16 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
         PanelCmd::Derive {
             circuit,
             hp,
+            format,
             out,
             idealised,
         } => {
+            let format = match format.as_deref() {
+                Some(f) => PanelFormat::parse(f).with_context(|| {
+                    format!("unknown panel format '{f}' (eurorack | intellijel-1u | pulplogic-1u)")
+                })?,
+                None => PanelFormat::Eurorack3U,
+            };
             let circuit = circuit
                 .canonicalize()
                 .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -2354,8 +2370,14 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                     let footprint_dir = kicad_footprint_dir()
                         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
                     let facts = build_facts(&model, &footprint_dir)?;
-                    let min = minimum_hp(&model, &facts);
-                    println!("auto width: minimum {min} HP");
+                    // A tile lays its controls in a row, so the panel-side
+                    // minimum can exceed what the PCB needs by a long way.
+                    let min = minimum_hp(&model, &facts).max(min_panel_hp_for(
+                        &model,
+                        format,
+                        &BuiltinCutouts,
+                    ));
+                    println!("auto width: minimum {min} HP ({})", format.as_str());
                     min
                 }
             };
@@ -2389,7 +2411,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                             board_path.display()
                         );
                     }
-                    derive_panel(&model, hp, &BuiltinCutouts)
+                    derive_panel_for(&model, format, hp, &BuiltinCutouts)
                 }
             };
             // A derived panel widens itself when too narrow for its own hardware,

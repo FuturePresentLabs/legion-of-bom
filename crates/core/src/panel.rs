@@ -280,6 +280,18 @@ mod silk {
     /// whisper.
     pub const TITLE_FONT_MM: f64 = 3.6;
     pub const TITLE_TOP_MARGIN_MM: f64 = 8.0;
+    /// On a 1U tile the name sits in the band below the control row, this far
+    /// up from the bottom edge, and smaller — there is 39.65 mm to share.
+    pub const TILE_TITLE_BOTTOM_MM: f64 = 4.6;
+    pub const TILE_TITLE_FONT_MM: f64 = 2.6;
+
+    /// Title height for a format.
+    pub fn title_font_mm(format: super::PanelFormat) -> f64 {
+        match format.is_tile() {
+            true => TILE_TITLE_FONT_MM,
+            false => TITLE_FONT_MM,
+        }
+    }
     /// Control-label text height and its offset above the cutout centre (clears a
     /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
     pub const LABEL_FONT_MM: f64 = 2.4;
@@ -372,6 +384,12 @@ pub trait PanelSpec {
     fn mounting_holes(&self) -> &[MountingHole];
     /// Anchored cutouts (jacks, pots, switches, LEDs, etc.).
     fn cutouts(&self) -> &[Cutout];
+    /// The height class. Renderers use it to place the title, which sits above
+    /// the controls on a 3U panel and below them on a tile — a 1U tile has no
+    /// clear band at the top, because the controls are already using it.
+    fn format(&self) -> PanelFormat {
+        PanelFormat::Eurorack3U
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,12 +402,76 @@ const EURORACK_HOLE_DIAMETER_MM: f64 = 3.2;
 const EURORACK_HOLE_INSET_X_MM: f64 = 7.5;
 const EURORACK_HOLE_INSET_Y_MM: f64 = 3.0;
 
+/// Panel height class. Width is always HP; only the height and the row/column
+/// habit change.
+///
+/// The two 1U standards are **mutually incompatible** and both are in wide use:
+/// a case railed for one will not take the other. Pulp Logic could afford the
+/// taller tile because Vector rails have no lip; Intellijel's shorter tile fits
+/// the lipped rails a standard Eurorack case uses. So this is a property of the
+/// case the module is going into, and the spec has to name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelFormat {
+    /// Standard Eurorack 3U — 128.5 mm.
+    #[default]
+    Eurorack3U,
+    /// Intellijel 1U tile — 39.65 mm. Fits lipped rails.
+    Intellijel1U,
+    /// Pulp Logic 1U tile — 43.18 mm (1.700"). Needs lipless (Vector) rails.
+    PulpLogic1U,
+}
+
+impl PanelFormat {
+    pub fn height_mm(self) -> f64 {
+        match self {
+            PanelFormat::Eurorack3U => EURORACK_HEIGHT_MM,
+            PanelFormat::Intellijel1U => 39.65,
+            PanelFormat::PulpLogic1U => 43.18,
+        }
+    }
+
+    /// The `format` token in a panel TOML.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PanelFormat::Eurorack3U => "eurorack",
+            PanelFormat::Intellijel1U => "intellijel-1u",
+            PanelFormat::PulpLogic1U => "pulplogic-1u",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PanelFormat> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "eurorack" | "eurorack-3u" | "3u" => Some(PanelFormat::Eurorack3U),
+            "intellijel-1u" | "intellijel" | "1u" => Some(PanelFormat::Intellijel1U),
+            "pulplogic-1u" | "pulplogic" | "pulp-logic-1u" => Some(PanelFormat::PulpLogic1U),
+            _ => None,
+        }
+    }
+
+    /// A 1U tile: too short to stack controls, so they lay out in a row.
+    pub fn is_tile(self) -> bool {
+        !matches!(self, PanelFormat::Eurorack3U)
+    }
+
+    /// Vertical inset of the mounting holes from the top and bottom edges.
+    ///
+    /// UNVERIFIED for the 1U formats. Intellijel state only that "the 1U panel
+    /// size is based on the 3U size scaled down", and publish the hole spacing
+    /// as a diagram image rather than as figures, so this reuses the 3U inset.
+    /// The height is confirmed; this number is a derivation. Check it against
+    /// the vendor drawing before cutting metal — it is one constant to change.
+    fn hole_inset_y_mm(self) -> f64 {
+        EURORACK_HOLE_INSET_Y_MM
+    }
+}
+
 /// A Eurorack panel.
 ///
 /// Constructed in HP (horizontal pitch) internally, but exposes only mm
 /// through the [`PanelSpec`] trait.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EurorackPanel {
+    format: PanelFormat,
     hp: u16,
     thickness_mm: f64,
     extra_holes: Vec<MountingHole>,
@@ -402,7 +484,14 @@ impl EurorackPanel {
     /// Standard height (128.5 mm) and thickness (2.0 mm) are applied.
     /// Default mounting holes are added automatically based on HP width.
     pub fn new(hp: u16) -> Self {
+        Self::with_format(PanelFormat::Eurorack3U, hp)
+    }
+
+    /// A panel of the given height class and HP width. `1U` here means the
+    /// Intellijel tile unless the Pulp Logic variant is named explicitly.
+    pub fn with_format(format: PanelFormat, hp: u16) -> Self {
         let mut panel = EurorackPanel {
+            format,
             hp,
             thickness_mm: 2.0,
             extra_holes: Vec::new(),
@@ -472,30 +561,36 @@ impl EurorackPanel {
         self.hp
     }
 
+    /// The height class this panel is built to.
+    pub fn format(&self) -> PanelFormat {
+        self.format
+    }
+
     fn rebuild_default_holes(&mut self) {
         let w = self.width_mm_value();
-        let h = EURORACK_HEIGHT_MM;
+        let h = self.format.height_mm();
+        let inset_y = self.format.hole_inset_y_mm();
         // Left side holes (always present).
         self.extra_holes.push(MountingHole {
             x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: h - EURORACK_HOLE_INSET_Y_MM,
+            y_mm: h - inset_y,
             diameter_mm: EURORACK_HOLE_DIAMETER_MM,
         });
         self.extra_holes.push(MountingHole {
             x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: EURORACK_HOLE_INSET_Y_MM,
+            y_mm: inset_y,
             diameter_mm: EURORACK_HOLE_DIAMETER_MM,
         });
         // Right side holes for panels ≥ 8 HP.
         if self.hp >= 8 {
             self.extra_holes.push(MountingHole {
                 x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: h - EURORACK_HOLE_INSET_Y_MM,
+                y_mm: h - inset_y,
                 diameter_mm: EURORACK_HOLE_DIAMETER_MM,
             });
             self.extra_holes.push(MountingHole {
                 x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: EURORACK_HOLE_INSET_Y_MM,
+                y_mm: inset_y,
                 diameter_mm: EURORACK_HOLE_DIAMETER_MM,
             });
         }
@@ -503,12 +598,16 @@ impl EurorackPanel {
 }
 
 impl PanelSpec for EurorackPanel {
+    fn format(&self) -> PanelFormat {
+        self.format
+    }
+
     fn width_mm(&self) -> f64 {
         self.width_mm_value()
     }
 
     fn height_mm(&self) -> f64 {
-        EURORACK_HEIGHT_MM
+        self.format.height_mm()
     }
 
     fn thickness_mm(&self) -> f64 {
@@ -590,10 +689,13 @@ impl PanelFile {
     ///
     /// Returns `Err` if the format is unknown or required fields are missing.
     pub fn to_spec(&self) -> Result<Box<dyn PanelSpec>, String> {
-        match self.format.as_str() {
-            "eurorack" => {
-                let hp = self.hp.ok_or("eurorack panel requires `hp`")?;
-                let mut panel = EurorackPanel::new(hp).with_thickness(self.thickness_mm);
+        match PanelFormat::parse(&self.format) {
+            Some(format) => {
+                let hp = self
+                    .hp
+                    .ok_or_else(|| format!("{} panel requires `hp`", format.as_str()))?;
+                let mut panel =
+                    EurorackPanel::with_format(format, hp).with_thickness(self.thickness_mm);
                 for c in &self.cutouts {
                     panel = panel.with_cutout_spec(Cutout {
                         x_mm: c.x_mm,
@@ -607,7 +709,7 @@ impl PanelFile {
                 }
                 Ok(Box::new(panel))
             }
-            other => Err(format!("unsupported panel format: {other}")),
+            None => Err(format!("unsupported panel format: {}", self.format)),
         }
     }
 
@@ -737,6 +839,10 @@ mod derive_rules {
     pub const BOTTOM_MARGIN_MM: f64 = 16.0;
     /// Default Eurorack panel-PCB thickness (mm).
     pub const THICKNESS_MM: f64 = 1.6;
+    /// Where a 1U tile's control row sits, as a fraction of panel height.
+    /// Above centre: each control labels upward, and the module name takes the
+    /// band left along the bottom.
+    pub const TILE_ROW_FRAC: f64 = 0.56;
 }
 
 /// Minimum centre-to-centre pitch for a control kind.
@@ -846,14 +952,42 @@ fn cutout_role(circuit: &dyn CircuitSource, refdes: &str, kind: ControlKind) -> 
 /// it a derivation happily emits, say, a 3 HP panel (15.24 mm) carrying a 13.75 mm
 /// pot body, which cannot be built.
 pub fn min_panel_hp(circuit: &dyn CircuitSource, cutouts: &dyn CutoutSource) -> u16 {
-    let widest = panel_controls(circuit, cutouts)
-        .iter()
-        .map(|(_, _, env)| env.0)
-        .fold(0.0f64, f64::max);
-    if widest <= 0.0 {
-        return 1;
-    }
-    let needed = widest + 2.0 * envelope::EDGE_MM;
+    min_panel_hp_for(circuit, PanelFormat::Eurorack3U, cutouts)
+}
+
+/// [`min_panel_hp`] for a given height class.
+///
+/// The constraint flips with the format. A 3U panel stacks its controls, so the
+/// width only has to clear the *widest* one. A 1U tile is 39.65 mm tall — there
+/// is no room to stack — so its controls sit in a row and the width has to hold
+/// the **sum** of them. A tile is therefore far wider than a 3U panel carrying
+/// the same hardware, and sizing it by the widest control would emit a spec that
+/// cannot be built.
+pub fn min_panel_hp_for(
+    circuit: &dyn CircuitSource,
+    format: PanelFormat,
+    cutouts: &dyn CutoutSource,
+) -> u16 {
+    let controls = panel_controls(circuit, cutouts);
+    let needed = if format.is_tile() {
+        let row: f64 = controls
+            .iter()
+            .map(|(_, k, env)| (env.0 + envelope::GAP_MM).max(control_pitch(*k)))
+            .sum();
+        if row <= 0.0 {
+            return 1;
+        }
+        row + 2.0 * envelope::EDGE_MM
+    } else {
+        let widest = controls
+            .iter()
+            .map(|(_, _, env)| env.0)
+            .fold(0.0f64, f64::max);
+        if widest <= 0.0 {
+            return 1;
+        }
+        widest + 2.0 * envelope::EDGE_MM
+    };
     (needed / HP_MM).ceil().max(1.0) as u16
 }
 
@@ -936,15 +1070,64 @@ pub fn panel_from_board(
 }
 
 pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
+    derive_panel_for(circuit, PanelFormat::Eurorack3U, hp, cutouts)
+}
+
+/// [`derive_panel`] for a given height class.
+///
+/// A 3U panel stacks controls in a centred column; a 1U tile lays them in a
+/// centred row, because 39.65 mm of height has nowhere to stack. The row sits a
+/// little above centre so each control's label clears it and the module name
+/// still has a band along the bottom.
+pub fn derive_panel_for(
+    circuit: &dyn CircuitSource,
+    format: PanelFormat,
+    hp: u16,
+    cutouts: &dyn CutoutSource,
+) -> PanelFile {
     let ordered = panel_controls(circuit, cutouts);
 
     // Never emit a panel too narrow for its own hardware — a derived spec that
     // can't be built is worse than a wider one.
-    let hp = hp.max(min_panel_hp(circuit, cutouts));
+    let hp = hp.max(min_panel_hp_for(circuit, format, cutouts));
 
     let w = f64::from(hp) * HP_MM;
     let cx = w / 2.0;
-    let h = EURORACK_HEIGHT_MM;
+    let h = format.height_mm();
+
+    if format.is_tile() {
+        // One row, left to right, in the same order the column would have used:
+        // knobs first, then CV, then audio I/O — so a tile reads like the top of
+        // a 3U panel rather than in refdes order.
+        let pitches: Vec<f64> = ordered
+            .iter()
+            .map(|(_, k, env)| (env.0 + envelope::GAP_MM).max(control_pitch(*k)))
+            .collect();
+        let total: f64 = pitches.iter().sum();
+        let mut x = ((w - total) / 2.0).max(envelope::EDGE_MM);
+        // Above centre: labels go above each control, the name band goes below.
+        let row_y = h * derive_rules::TILE_ROW_FRAC;
+        let mut out: Vec<CutoutFile> = Vec::new();
+        for ((refdes, kind, _), pitch) in ordered.iter().zip(&pitches) {
+            out.push(CutoutFile {
+                x_mm: x + pitch / 2.0,
+                y_mm: row_y,
+                rotation_deg: 0.0,
+                footprint: kind.cutout_name().to_string(),
+                refdes: Some(refdes.clone()),
+                label: control_label(circuit, refdes),
+                role: Some(cutout_role(circuit, refdes, *kind).as_str().to_string()),
+            });
+            x += pitch;
+        }
+        return PanelFile {
+            format: format.as_str().into(),
+            hp: Some(hp),
+            thickness_mm: derive_rules::THICKNESS_MM,
+            finish: None,
+            cutouts: out,
+        };
+    }
 
     // Stack controls top→bottom (knobs above jacks), spaced by the real envelope
     // each one needs plus a gap — never closer than the class minimum — and centre
@@ -976,7 +1159,7 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
     }
 
     PanelFile {
-        format: "eurorack".into(),
+        format: format.as_str().into(),
         hp: Some(hp),
         thickness_mm: derive_rules::THICKNESS_MM,
         finish: None,
@@ -1279,10 +1462,15 @@ pub fn panel_to_svg(
     }
     // Title, top-centre.
     if !title.is_empty() {
+        // On a tile the controls own the top; the name goes in the bottom band.
+        let title_y = match panel.format().is_tile() {
+            true => h - silk::TILE_TITLE_BOTTOM_MM,
+            false => silk::TITLE_TOP_MARGIN_MM,
+        };
         s.push_str(&svg_text(
             w / 2.0,
-            silk::TITLE_TOP_MARGIN_MM,
-            silk::TITLE_FONT_MM,
+            title_y,
+            silk::title_font_mm(panel.format()),
             &finish.legend,
             title,
         ));
@@ -1516,15 +1704,20 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
     }
     // Title, horizontal, along the top edge (below the top mounting holes) so it
     // never crosses a centred control column — a vertical centre title collides
-    // with the knobs/jacks (the "writing hitting a jack" failure, j54-6f8).
+    // with the knobs/jacks (the "writing hitting a jack" failure, j54-6f8). On a
+    // 1U tile the controls already own the top, so it goes in the bottom band.
+    let title_y = match panel.format().is_tile() {
+        true => oy + h - silk::TILE_TITLE_BOTTOM_MM,
+        false => oy + silk::TITLE_TOP_MARGIN_MM,
+    };
     s.push_str(&format!(
         "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
          (effects (font (size {f} {f}) (thickness 0.3))))\n",
         title,
         mm(ox + w / 2.0),
-        mm(oy + silk::TITLE_TOP_MARGIN_MM),
+        mm(title_y),
         det_uuid("panel.title"),
-        f = silk::TITLE_FONT_MM,
+        f = silk::title_font_mm(panel.format()),
     ));
     // Brand logo on the front silk (DESIGN §7.9), placed in the clear band below
     // the lowest cutout (above the bottom mounting holes) so it doesn't land on a
@@ -1930,6 +2123,89 @@ mod panel_from_board_tests {
                 net("CV_AMT", &[("RV2", "2")]),
             ],
         }
+    }
+
+    /// The two 1U standards are incompatible and both are real. Heights are the
+    /// load-bearing numbers: Intellijel 39.65 mm fits lipped rails, Pulp Logic
+    /// 43.18 mm (1.700") needs lipless ones.
+    #[test]
+    fn one_u_formats_have_their_published_heights() {
+        assert_eq!(PanelFormat::Eurorack3U.height_mm(), 128.5);
+        assert_eq!(PanelFormat::Intellijel1U.height_mm(), 39.65);
+        assert_eq!(PanelFormat::PulpLogic1U.height_mm(), 43.18);
+        // Bare "1u" means Intellijel — the one in wide use.
+        assert_eq!(PanelFormat::parse("1u"), Some(PanelFormat::Intellijel1U));
+        assert_eq!(
+            PanelFormat::parse("pulplogic-1u"),
+            Some(PanelFormat::PulpLogic1U)
+        );
+        assert_eq!(
+            PanelFormat::parse("eurorack"),
+            Some(PanelFormat::Eurorack3U)
+        );
+        assert_eq!(PanelFormat::parse("nonsense"), None);
+        assert!(!PanelFormat::Eurorack3U.is_tile());
+        assert!(PanelFormat::Intellijel1U.is_tile());
+    }
+
+    /// A tile has nowhere to stack, so its controls sit in a row and its width
+    /// has to hold the *sum* of them — sizing by the widest, as 3U does, emits a
+    /// tile that cannot be built.
+    #[test]
+    fn a_tile_lays_controls_in_a_row_and_sizes_by_their_sum() {
+        let c = module();
+        let tall = min_panel_hp_for(&c, PanelFormat::Eurorack3U, &BuiltinCutouts);
+        let wide = min_panel_hp_for(&c, PanelFormat::Intellijel1U, &BuiltinCutouts);
+        assert!(
+            wide > tall * 3,
+            "five controls in a row: {wide} HP vs {tall}"
+        );
+
+        let p = derive_panel_for(&c, PanelFormat::Intellijel1U, 1, &BuiltinCutouts);
+        assert_eq!(p.format, "intellijel-1u");
+        // All on one line…
+        let ys: Vec<f64> = p.cutouts.iter().map(|c| c.y_mm).collect();
+        assert!(ys.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9), "{ys:?}");
+        assert!(ys[0] < PanelFormat::Intellijel1U.height_mm());
+        // …spread across the width, in the same order the column would use.
+        let mut xs: Vec<f64> = p.cutouts.iter().map(|c| c.x_mm).collect();
+        let sorted = {
+            let mut v = xs.clone();
+            v.sort_by(f64::total_cmp);
+            v
+        };
+        assert_eq!(xs, sorted, "laid out left to right");
+        xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        assert_eq!(xs.len(), p.cutouts.len(), "no two controls share a slot");
+    }
+
+    /// On a tile the controls own the top, so the module name goes below them
+    /// rather than into a title band that does not exist.
+    #[test]
+    fn a_tiles_name_sits_below_its_controls() {
+        let p = derive_panel_for(&module(), PanelFormat::Intellijel1U, 1, &BuiltinCutouts);
+        let spec = p.to_spec().unwrap();
+        assert_eq!(spec.height_mm(), 39.65);
+        let svg = panel_to_svg(spec.as_ref(), "tile", &PanelFinish::named("black"), None);
+        // SVG y runs down, so "below the controls" is a larger y than the row.
+        let row_y_svg = 39.65 - p.cutouts[0].y_mm;
+        let title_y: f64 = regex_y(&svg, "tile");
+        assert!(title_y > row_y_svg, "name at {title_y}, row at {row_y_svg}");
+        assert!(title_y < 39.65, "and still on the panel");
+    }
+
+    /// Pull the y of the `<text>` element containing `needle`.
+    fn regex_y(svg: &str, needle: &str) -> f64 {
+        let at = svg.find(&format!(">{needle}<")).expect("text present");
+        let head = &svg[..at];
+        // A leading space, so this does not match `font-family="`.
+        let y_at = head.rfind(" y=\"").expect("y attr");
+        head[y_at + 4..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("y number")
     }
 
     /// CV inputs sit above the audio I/O: a player scans down for the signal
