@@ -306,6 +306,23 @@ fn pad_span(f: &PartFacts) -> Option<(f64, f64)> {
     (x1 > x0).then_some((x1 - x0, y1 - y0))
 }
 
+/// Whether a footprint id is a Eurorack power header — a 2×N pin header.
+fn is_power_header_footprint(footprint: &str) -> bool {
+    footprint.contains("PinHeader_2x")
+}
+
+/// A Eurorack power header mounts on the **back** of a module board.
+///
+/// The front face carries the panel controls and sits against the panel, so a
+/// shrouded header there would foul it and the ribbon would have nowhere to go.
+/// Mounting it on the back also puts its silkscreen — refdes and the −12 V mark
+/// from [`power_polarity_silk`] — on the face the builder is looking at while
+/// they install it. This is a house rule for [`EurorackPlacer`] specifically, and
+/// it overrides the circuit's declared side: SKiDL writes `Side = front` by
+/// default on every part, so honouring that declaration here would mean no
+/// Eurorack board ever gets it right.
+const POWER_HEADER_ON_BACK: bool = true;
+
 /// Refdes of the free (non-anchored) Eurorack power headers — a 2×N pin header
 /// that exits the board (not the panel), which both placers lay horizontal
 /// against the top edge, clear of the control field.
@@ -320,7 +337,7 @@ fn power_header_refdes(
         .filter(|p| {
             p.footprint
                 .as_deref()
-                .is_some_and(|f| f.contains("PinHeader_2x"))
+                .is_some_and(is_power_header_footprint)
         })
         .map(|p| p.refdes.0.clone())
         .collect()
@@ -427,7 +444,7 @@ impl Placer for EurorackPlacer {
                     x_mm: self.origin_mm.0 + cx,
                     y_mm: self.origin_mm.1 + cy,
                     rotation_deg,
-                    back: side_of(r),
+                    back: POWER_HEADER_ON_BACK || side_of(r),
                 },
             );
             boxes.push(box_of(cx, cy, (w, h)));
@@ -709,7 +726,7 @@ impl Placer for SeededPlacer {
         let power_headers = power_header_refdes(circuit, &self.anchors);
         let mut header_x = margin;
         for refdes in &power_headers {
-            let back = side_of(refdes);
+            let back = POWER_HEADER_ON_BACK || side_of(refdes);
             let f = facts_of(refdes);
             let (ew, eh) = f.extent;
             // Horizontal = long axis along X; rotate a portrait header 90°.
@@ -1351,6 +1368,9 @@ pub fn generate_board_artifacts(
     // real pad bounding box (for the outline — a big part's pads must not spill
     // past the board edge).
     let mut footprints = Vec::new();
+    // Power headers, as placed — board-level silk is drawn from these once the
+    // outline is known (the −12 V mark is clamped inside it).
+    let mut power_headers_placed: Vec<(String, Vec<FpPad>, Option<Rect>, Placement)> = Vec::new();
     let mut net_pads: HashMap<usize, RouteNet> = HashMap::new();
     // Pads carrying no net (unused IC pins, jack switch contacts, spare header
     // pins) are still physical copper — the router must route *around* them or it
@@ -1414,6 +1434,18 @@ pub fn generate_board_artifacts(
                 // No net: keep it as a route-around obstacle, not a connection.
                 None => obstacle_pads.push(point),
             }
+        }
+        // A power header gets its −12 V end marked on the silk of the face it
+        // mounts on, so the ribbon's red stripe has something to line up against.
+        // Deferred: the mark is clamped inside the outline, which isn't known
+        // until every pad has been seen.
+        if is_power_header_footprint(lib_part) {
+            power_headers_placed.push((
+                refdes.to_string(),
+                pads.clone(),
+                courtyard_extent(&fp),
+                placement,
+            ));
         }
         footprints.push(transform_footprint(
             fp,
@@ -1511,6 +1543,11 @@ pub fn generate_board_artifacts(
             }
         }
     }
+    for (refdes, pads, courtyard, placement) in &power_headers_placed {
+        board.extend(power_polarity_silk(
+            refdes, pads, *courtyard, *placement, &pin_net, outline,
+        ));
+    }
     board.extend(footprints);
 
     // Route the nets into copper tracks (DESIGN 6.5). Ground still gets the pour;
@@ -1593,6 +1630,7 @@ pub fn generate_board_artifacts(
 }
 
 /// A footprint pad's local geometry, for routing.
+#[derive(Clone)]
 struct FpPad {
     num: String,
     px: f64,
@@ -2070,6 +2108,32 @@ fn kv(key: &str, value: Sexpr) -> Sexpr {
 /// A front-silkscreen `gr_text` centred at `(x, y)`, rotated `rot` degrees.
 /// `seed` makes the uuid deterministic (clean layout-attempt diffs).
 fn silk_text(text: &str, x: f64, y: f64, rot: f64, seed: &str) -> Sexpr {
+    silk_text_on(text, x, y, rot, seed, "F.SilkS", 1.5)
+}
+
+/// A silkscreen `gr_text` on a named layer at a chosen size. Back silk gets
+/// `(justify mirror)` so the text reads the right way round when you are looking
+/// at the back of the board — which, for a back-mounted part, is the only time
+/// anybody reads it.
+fn silk_text_on(text: &str, x: f64, y: f64, rot: f64, seed: &str, layer: &str, size: f64) -> Sexpr {
+    let font = Sexpr::list(vec![
+        Sexpr::sym("font"),
+        Sexpr::list(vec![
+            Sexpr::sym("size"),
+            Sexpr::sym(mm(size)),
+            Sexpr::sym(mm(size)),
+        ]),
+        kv("thickness", Sexpr::sym(mm(size / 6.0))),
+    ]);
+    // `justify` is a sibling of `font` inside `effects`, not a child of it —
+    // nested, KiCad refuses to load the board at all.
+    let mut effects = vec![Sexpr::sym("effects"), font];
+    if layer.starts_with("B.") {
+        effects.push(Sexpr::list(vec![
+            Sexpr::sym("justify"),
+            Sexpr::sym("mirror"),
+        ]));
+    }
     Sexpr::list(vec![
         Sexpr::sym("gr_text"),
         Sexpr::string(text),
@@ -2079,21 +2143,140 @@ fn silk_text(text: &str, x: f64, y: f64, rot: f64, seed: &str) -> Sexpr {
             Sexpr::sym(mm(y)),
             Sexpr::sym(mm(rot)),
         ]),
-        kv("layer", Sexpr::string("F.SilkS")),
+        kv("layer", Sexpr::string(layer)),
         kv("uuid", Sexpr::string(det_uuid(seed))),
-        Sexpr::list(vec![
-            Sexpr::sym("effects"),
-            Sexpr::list(vec![
-                Sexpr::sym("font"),
-                Sexpr::list(vec![
-                    Sexpr::sym("size"),
-                    Sexpr::sym("1.5"),
-                    Sexpr::sym("1.5"),
-                ]),
-                kv("thickness", Sexpr::sym("0.25")),
-            ]),
-        ]),
+        Sexpr::list(effects),
     ])
+}
+
+/// A silkscreen `gr_line` from `(x1, y1)` to `(x2, y2)`.
+fn silk_line(x1: f64, y1: f64, x2: f64, y2: f64, width: f64, layer: &str, seed: &str) -> Sexpr {
+    Sexpr::list(vec![
+        Sexpr::sym("gr_line"),
+        Sexpr::list(vec![
+            Sexpr::sym("start"),
+            Sexpr::sym(mm(x1)),
+            Sexpr::sym(mm(y1)),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("end"),
+            Sexpr::sym(mm(x2)),
+            Sexpr::sym(mm(y2)),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("stroke"),
+            kv("width", Sexpr::sym(mm(width))),
+            kv("type", Sexpr::sym("solid")),
+        ]),
+        kv("layer", Sexpr::string(layer)),
+        kv("uuid", Sexpr::string(det_uuid(seed))),
+    ])
+}
+
+/// Net names that mean "the negative rail" on a Eurorack power connector.
+const NEG_RAIL_NETS: &[&str] = &["-12V", "-12", "VEE", "V-", "-15V", "-15"];
+
+/// Silk marking the **−12 V end** of a power header: a bar across that end plus a
+/// `-12V` label, on whichever face the header mounts.
+///
+/// Reversing a Eurorack power header is the one assembly mistake that destroys
+/// the module, and the build guide already tells the builder to "check the −12 V
+/// stripe against the silkscreen" — so the board has to actually draw one. The
+/// end is read from the netlist (which pads sit on [`NEG_RAIL_NETS`]), not from a
+/// hardcoded pinout: a board that wires its header differently gets its own
+/// answer, and a header we can't read gets no mark rather than a wrong one.
+fn power_polarity_silk(
+    refdes: &str,
+    pads: &[FpPad],
+    courtyard: Option<Rect>,
+    placement: Placement,
+    pin_net: &HashMap<(String, String), &str>,
+    outline: Option<Rect>,
+) -> Vec<Sexpr> {
+    let placed = |p: &FpPad| place_point(placement, p.px, p.py);
+    let is_neg = |p: &FpPad| {
+        pin_net
+            .get(&(refdes.to_string(), p.num.clone()))
+            .is_some_and(|n| NEG_RAIL_NETS.iter().any(|r| n.eq_ignore_ascii_case(r)))
+    };
+    let neg: Vec<(f64, f64)> = pads.iter().filter(|p| is_neg(p)).map(placed).collect();
+    if neg.is_empty() || neg.len() == pads.len() {
+        return Vec::new(); // nothing to distinguish — say nothing
+    }
+    let all: Vec<(f64, f64)> = pads.iter().map(placed).collect();
+    let pad_bb = all.iter().fold(
+        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+        |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+    );
+    // Clear the *body*, not just the pads. A shrouded IDC power header overhangs
+    // its pad box by millimetres, and a mark printed under the plastic is a mark
+    // you can only read before you fit the connector — i.e. never, when it
+    // matters. The courtyard is the footprint's own statement of its body size.
+    let bb = match courtyard {
+        Some((cx0, cy0, cx1, cy1)) => {
+            let (a, b) = (
+                place_point(placement, cx0, cy0),
+                place_point(placement, cx1, cy1),
+            );
+            (
+                pad_bb.0.min(a.0).min(b.0),
+                pad_bb.1.min(a.1).min(b.1),
+                pad_bb.2.max(a.0).max(b.0),
+                pad_bb.3.max(a.1).max(b.1),
+            )
+        }
+        None => pad_bb,
+    };
+    let mean =
+        |v: &[(f64, f64)], f: fn(&(f64, f64)) -> f64| v.iter().map(f).sum::<f64>() / v.len() as f64;
+    let (ncx, ncy) = (mean(&neg, |p| p.0), mean(&neg, |p| p.1));
+    let (acx, acy) = (mean(&all, |p| p.0), mean(&all, |p| p.1));
+
+    // Which end is it? The axis along which the −12 V pads sit furthest off the
+    // header's centre — for a 2×N header that is the long axis.
+    let (dx, dy) = (ncx - acx, ncy - acy);
+    let gap = 1.4; // clear of the pads, still visibly "this end"
+    let layer = if placement.back { "B.SilkS" } else { "F.SilkS" };
+    let seed = |what: &str| format!("board.power.{refdes}.{what}");
+    let (bar, label_at, rot) = if dx.abs() >= dy.abs() {
+        let x = if dx < 0.0 { bb.0 - gap } else { bb.2 + gap };
+        (
+            (x, bb.1 - gap, x, bb.3 + gap),
+            (
+                if dx < 0.0 { x - 1.6 } else { x + 1.6 },
+                (bb.1 + bb.3) / 2.0,
+            ),
+            90.0,
+        )
+    } else {
+        let y = if dy < 0.0 { bb.1 - gap } else { bb.3 + gap };
+        (
+            (bb.0 - gap, y, bb.2 + gap, y),
+            (
+                (bb.0 + bb.2) / 2.0,
+                if dy < 0.0 { y - 1.6 } else { y + 1.6 },
+            ),
+            0.0,
+        )
+    };
+    // The bar sits hard against the pads and always fits; the label hangs past
+    // it and, on a narrow board with the header at the edge, can hang off the
+    // board entirely. Pull it back inside — a mark printed past the edge is a
+    // mark nobody sees.
+    let (lx, ly) = match outline {
+        Some((x0, y0, x1, y1)) => {
+            let m = 3.0;
+            (
+                label_at.0.clamp(x0 + m, (x1 - m).max(x0 + m)),
+                label_at.1.clamp(y0 + m, (y1 - m).max(y0 + m)),
+            )
+        }
+        None => label_at,
+    };
+    vec![
+        silk_line(bar.0, bar.1, bar.2, bar.3, 0.5, layer, &seed("bar")),
+        silk_text_on("-12V", lx, ly, rot, &seed("label"), layer, 1.1),
+    ]
 }
 
 /// `(min_x, min_y, max_x, max_y)`.
@@ -2476,6 +2659,89 @@ mod tests {
         // An anchored header is not a free power header.
         let anchored: HashMap<String, (f64, f64)> = [("J3".to_string(), (0.0, 0.0))].into();
         assert!(power_header_refdes(&c, &anchored).is_empty());
+    }
+
+    /// A 2×5 Eurorack header, KiCad odd/even numbering: pins 1+2 are one rank,
+    /// 9+10 the other. Pads carry no net until `nets` says so.
+    fn header_pads() -> Vec<FpPad> {
+        (1..=10)
+            .map(|n: u32| FpPad {
+                num: n.to_string(),
+                px: if n % 2 == 1 { 0.0 } else { 2.54 },
+                py: ((n - 1) / 2) as f64 * 2.54,
+                w: 1.7,
+                h: 1.7,
+                layer: PadLayer::Both,
+            })
+            .collect()
+    }
+
+    /// The −12 V mark goes on the silk of the face the header mounts on, at the
+    /// end whose pads are actually on the negative rail — read from the netlist,
+    /// not from an assumed pinout.
+    #[test]
+    fn power_header_gets_a_minus_12v_mark_at_the_end_the_netlist_says() {
+        let pads = header_pads();
+        let nets: HashMap<(String, String), &str> = [
+            (("J3".to_string(), "1".to_string()), "-12V"),
+            (("J3".to_string(), "2".to_string()), "-12V"),
+            (("J3".to_string(), "9".to_string()), "+12V"),
+            (("J3".to_string(), "10".to_string()), "+12V"),
+        ]
+        .into();
+        let placement = Placement {
+            x_mm: 100.0,
+            y_mm: 50.0,
+            rotation_deg: 0.0,
+            back: true,
+        };
+        let silk = power_polarity_silk("J3", &pads, None, placement, &nets, None);
+        let text: String = silk.iter().map(|s| s.to_sexpr_string()).collect();
+        assert!(text.contains("-12V"), "labelled: {text}");
+        // Back-mounted, so the mark belongs on the back silk — the face the
+        // builder is looking at while installing it — and mirrored to read.
+        assert!(text.contains("B.SilkS"), "on the back silk: {text}");
+        assert!(text.contains("mirror"), "back text reads correctly: {text}");
+        assert!(!text.contains("F.SilkS"), "not on the front: {text}");
+        // Pins 1+2 sit at the low-Y rank (y = 50), pins 9+10 at y ≈ 60.2. The bar
+        // must land just off the -12 V end, not the +12 V one.
+        let bar = &silk[0];
+        let pt = |key: &str| -> (f64, f64) {
+            let p = bar.get(key).expect(key);
+            (
+                p.nth_atom(1).unwrap().parse().unwrap(),
+                p.nth_atom(2).unwrap().parse().unwrap(),
+            )
+        };
+        let (sx, sy) = pt("start");
+        let (ex, ey) = pt("end");
+        assert!(
+            sy < 50.0 && ey < 50.0,
+            "bar is off the -12V end: {sy}, {ey}"
+        );
+        assert!((sy - ey).abs() < 1e-9, "bar runs across the end, not along");
+        assert!(sx < ex, "bar spans the header's width");
+    }
+
+    /// No readable negative rail → no mark. An orientation stripe in the wrong
+    /// place is worse than none: it is the mistake that destroys the module.
+    #[test]
+    fn power_header_with_no_readable_negative_rail_gets_no_mark() {
+        let pads = header_pads();
+        let placement = Placement {
+            x_mm: 100.0,
+            y_mm: 50.0,
+            rotation_deg: 0.0,
+            back: true,
+        };
+        assert!(
+            power_polarity_silk("J3", &pads, None, placement, &HashMap::new(), None).is_empty()
+        );
+        // Every pad on the negative rail distinguishes no end either.
+        let all_neg: HashMap<(String, String), &str> = (1..=10)
+            .map(|n: u32| (("J3".to_string(), n.to_string()), "-12V"))
+            .collect();
+        assert!(power_polarity_silk("J3", &pads, None, placement, &all_neg, None).is_empty());
     }
 
     fn facts(entries: &[(&str, (f64, f64), Side)]) -> HashMap<String, PartFacts> {
@@ -3181,6 +3447,97 @@ mod tests {
         assert!(
             board.contains("(segment"),
             "the multi-pad OUT net must be routed as a track"
+        );
+    }
+
+    /// End to end over the real KiCad library: a Eurorack power header lands on
+    /// the back copper, and its −12 V end is marked on the back silk.
+    #[test]
+    fn a_generated_board_puts_the_power_header_on_the_back_and_marks_minus_12v() {
+        use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        let header = Part {
+            refdes: RefDes("J3".into()),
+            value: "Conn_02x05_Odd_Even".into(),
+            footprint: Some("Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm_Vertical".into()),
+            library_part: None,
+            mpn: None,
+            sim: None,
+            // Declared front, exactly as SKiDL writes it — the house rule for a
+            // Eurorack power header still has to win, or no board gets it right.
+            side: Some(Side::Front),
+        };
+        let pin = |p: &str| PinRef {
+            refdes: RefDes("J3".into()),
+            pin: p.into(),
+        };
+        let circuit = Circuit {
+            name: "pwr".into(),
+            parts: vec![
+                header,
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+            ],
+            nets: vec![
+                Net {
+                    name: "-12V".into(),
+                    pins: vec![pin("1"), pin("2")],
+                    net_class: None,
+                },
+                Net {
+                    name: "+12V".into(),
+                    pins: vec![pin("9"), pin("10")],
+                    net_class: None,
+                },
+            ],
+        };
+        // The rule belongs to Eurorack module boards, so place it like one — a
+        // grid-placed bench board is not a module and keeps its parts on top.
+        let mut opts = BoardOptions::new(dir);
+        opts.placer = Box::new(EurorackPlacer {
+            width_mm: 40.0,
+            height_mm: 128.5,
+            origin_mm: (100.0, 100.0),
+            anchors: HashMap::new(),
+        });
+        let board = match generate_board(&circuit, &opts) {
+            Ok(b) => b,
+            Err(_) => return, // library layout differs; don't fail the unit suite
+        };
+        assert!(crate::sexpr::Sexpr::parse(&board).is_ok(), "must parse");
+        // The header's own footprint sits on the back copper…
+        let j3 = board
+            .split("(footprint ")
+            .find(|b| b.contains(r#""Reference" "J3""#))
+            .expect("J3 emitted");
+        assert!(
+            j3.contains(r#"(layer "B.Cu")"#),
+            "power header mounts on the back: {}",
+            &j3[..j3.len().min(200)]
+        );
+        // …and the orientation mark the build guide promises is on the back silk.
+        assert!(board.contains(r#""-12V""#), "-12V label drawn");
+        let mark = board
+            .split("(gr_text ")
+            .find(|b| b.starts_with(r#""-12V""#))
+            .expect("-12V gr_text");
+        assert!(
+            mark.contains(r#"(layer "B.SilkS")"#),
+            "the mark is on the face the header mounts on: {}",
+            &mark[..mark.len().min(200)]
+        );
+        // `justify` must sit beside `font` inside `effects`, not inside `font`.
+        // Nested, KiCad refuses to load the whole board — which our own parser
+        // accepts happily, so only this shape check catches it.
+        let effects = mark.split("(effects").nth(1).expect("effects block");
+        let font_end = effects.find("(justify").expect("mirrored");
+        // Balanced before `justify` means `font` already closed, so `justify` is
+        // its sibling; unbalanced would mean it is nested inside.
+        assert_eq!(
+            effects[..font_end].matches('(').count(),
+            effects[..font_end].matches(')').count(),
+            "justify is a sibling of font, not a child: {effects:.200}"
         );
     }
 
