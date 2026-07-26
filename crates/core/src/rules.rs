@@ -580,6 +580,7 @@ mod tests {
             height_mm: 1.0,
             standoff_mm: None,
             tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
         };
         // A big chip and a small cap. Closest approach is beside the chip's long
         // edge, not off its end: (7.4 + 3.0)/2 = 5.2mm, not (10.4 + 1.5)/2.

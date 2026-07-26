@@ -178,6 +178,7 @@ mod tests {
             height_mm: 1.0,
             standoff_mm: None,
             tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
         }
     }
 

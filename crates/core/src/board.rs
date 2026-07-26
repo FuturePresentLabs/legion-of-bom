@@ -80,6 +80,15 @@ pub struct PartFacts {
     /// hard keep-outs every body avoids regardless of side — while the part's body
     /// itself is only on its own side.
     pub tht_pads: Vec<Rect>,
+    /// Each pad's centre in footprint-local mm, by pad number.
+    ///
+    /// Decoupling is the reason this exists. "Put the bypass cap near the IC" is
+    /// the wrong instruction — the loop that matters runs from the cap to the
+    /// chip's *power pin*, and on a 16-pin package that pin is at the end, not
+    /// the middle. Measuring part centres let a cap pass the rule at 8.7mm while
+    /// sitting 10mm from the pin it was supposed to bypass, or on the far side of
+    /// the chip entirely.
+    pub pin_offsets: HashMap<String, (f64, f64)>,
 }
 
 impl PartFacts {
@@ -701,6 +710,7 @@ impl Placer for SeededPlacer {
                 height_mm: 2.0,
                 standoff_mm: None,
                 tht_pads: Vec::new(),
+                pin_offsets: HashMap::new(),
             })
         };
         let side_of = |refdes: &str| facts_of(refdes).side == Side::Back;
@@ -1216,6 +1226,8 @@ pub fn build_facts(
                 (p.px - m, p.py - m, p.px + m, p.py + m)
             })
             .collect();
+        let pin_offsets: HashMap<String, (f64, f64)> =
+            pads.iter().map(|p| (p.num.clone(), (p.px, p.py))).collect();
         facts.insert(
             refdes.to_string(),
             PartFacts {
@@ -1226,6 +1238,7 @@ pub fn build_facts(
                 height_mm: part_height_mm(lib_part),
                 standoff_mm: subboard_standoff(lib_part),
                 tht_pads,
+                pin_offsets,
             },
         );
     }
@@ -1410,6 +1423,8 @@ pub fn generate_board_artifacts(
                 (p.px - m, p.py - m, p.px + m, p.py + m)
             })
             .collect();
+        let pin_offsets: HashMap<String, (f64, f64)> =
+            pads.iter().map(|p| (p.num.clone(), (p.px, p.py))).collect();
         facts.insert(
             refdes.to_string(),
             PartFacts {
@@ -1420,12 +1435,20 @@ pub fn generate_board_artifacts(
                 height_mm: part_height_mm(lib_part),
                 standoff_mm: subboard_standoff(lib_part),
                 tht_pads,
+                pin_offsets,
             },
         );
         loaded.push((refdes, lib_part, part.value.as_str(), fp, pads));
     }
 
     let mut placements = options.placer.place(circuit, &facts);
+
+    // Bypass caps go against the power pin they bypass, before anything else
+    // gets a say. The placer's decoupling pull is one attractor among many and
+    // lands them "near the IC", which on a 16-pin package can still be 10mm of
+    // copper from the pin that matters — see `crate::decouple`. There is no
+    // competing claim on that exact spot, so this is set, not scored.
+    crate::decouple::snap(&mut placements, circuit, &facts);
 
     // Legalization — the middle stage. Global placement decides roughly where
     // things want to be; this moves whatever is physically illegal the minimum
@@ -1904,7 +1927,7 @@ fn pad_layer_on_board(local: PadLayer, back: bool) -> PadLayer {
 /// (`x' = px·cosθ + py·sinθ`, `y' = py·cosθ − px·sinθ`); the grid placer only
 /// emits rotation 0 today, so that identity path is what ships — the formula is
 /// validated against KiCad ground truth when the layout loop introduces angles.
-fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
+pub fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
     // A back-placed footprint mirrors local Y (matching `flip_to_back`), then the
     // whole footprint rotates about its origin.
     let py = if placement.back { -py } else { py };
@@ -2662,6 +2685,7 @@ mod tests {
             height_mm: 5.0,
             standoff_mm: None,
             tht_pads: tht,
+            pin_offsets: HashMap::new(),
         }
     }
 
@@ -2949,6 +2973,7 @@ mod tests {
                         height_mm: 2.0,
                         standoff_mm: None,
                         tht_pads: Vec::new(),
+                        pin_offsets: HashMap::new(),
                     },
                 )
             })
@@ -3204,7 +3229,8 @@ mod tests {
             side: Side::Front,
             height_mm: height,
             standoff_mm: standoff,
-            tht_pads: Vec::new(), // no pins → the whole body is packable space
+            tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(), // no pins → the whole body is packable space
         };
         let mut facts = HashMap::new();
         facts.insert("A1".to_string(), mk(18.0, 51.0, 8.5, Some(11.0)));

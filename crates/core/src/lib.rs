@@ -13,6 +13,7 @@
 pub mod board;
 pub mod bom;
 pub mod bom_repair;
+pub mod decouple;
 pub mod drc;
 pub mod eagle;
 pub mod easyeda;
@@ -70,6 +71,7 @@ pub use bom_repair::{
     classify as classify_comment, fill_mpns, package_key, part_kind_of, plan as plan_repair,
     search_keyword, value_key, Comment, FillReport, Repair,
 };
+pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use eagle::{
     map_footprint, map_footprint_for, parse_board as parse_eagle_board,

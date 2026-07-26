@@ -808,6 +808,7 @@ mod tests {
             height_mm: 2.0,
             standoff_mm: None,
             tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
         };
         facts.insert("C1".to_string(), f(5.0, 5.0));
         facts.insert("U1".to_string(), f(8.0, 8.0));
