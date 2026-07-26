@@ -2057,13 +2057,33 @@ fn load_footprint(dir: &Path, lib_part: &str) -> Result<Sexpr, BoardError> {
             msg,
         });
     }
-    let path = dir
-        .join(format!("{lib}.pretty"))
-        .join(format!("{name}.kicad_mod"));
-    let text = std::fs::read_to_string(&path).map_err(|_| BoardError::FootprintNotFound {
-        lib_part: lib_part.to_string(),
-        path: path.display().to_string(),
-    })?;
+    // House library first, so a project can carry footprints KiCad does not ship
+    // (a sub-mini toggle, a PCB-mount RCA, a slide pot) and can override a stock
+    // one. It lives beside the part metadata and photos, because a footprint is
+    // part data like a pinout or a product shot — see `crate::parts`.
+    let house = crate::parts::house_footprint_dir();
+    let candidates: Vec<std::path::PathBuf> = house
+        .iter()
+        .chain(std::iter::once(&dir.to_path_buf()))
+        .map(|root| {
+            root.join(format!("{lib}.pretty"))
+                .join(format!("{name}.kicad_mod"))
+        })
+        .collect();
+    let Some((path, text)) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|t| (p, t)))
+    else {
+        return Err(BoardError::FootprintNotFound {
+            lib_part: lib_part.to_string(),
+            path: candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        });
+    };
+    let _ = path;
     Sexpr::parse(&text).map_err(|msg| BoardError::FootprintParse {
         lib_part: lib_part.to_string(),
         msg,

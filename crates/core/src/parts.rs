@@ -661,6 +661,22 @@ pub fn default_parts_dir() -> PathBuf {
     base.join("legion-of-bom").join("parts")
 }
 
+/// The house footprint library: `<parts dir>/footprints`, holding
+/// `<Lib>.pretty/<Name>.kicad_mod` for parts KiCad does not ship.
+///
+/// Beside the part metadata and photos on purpose. A footprint is part data in
+/// exactly the way a pinout or a product photo is, and the alternative — a
+/// per-project `.pretty` — means the Dailywell toggle gets redrawn for every
+/// module that uses it. `None` when the directory does not exist, so a repo
+/// without one behaves exactly as before.
+///
+/// Generated boards *embed* their footprints, so a board still opens in KiCad
+/// with no library attached; this is only needed at generation time.
+pub fn house_footprint_dir() -> Option<PathBuf> {
+    let dir = default_parts_dir().join("footprints");
+    dir.is_dir().then_some(dir)
+}
+
 /// The nearest ancestor of the working directory holding a `lob.toml`.
 ///
 /// A repo that already has a parts store counts too, so a library keeps
