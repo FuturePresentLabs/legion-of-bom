@@ -163,6 +163,47 @@ pub fn short_name(fp: &str) -> String {
     short.join(" ")
 }
 
+/// Whether a footprint is surface-mount, or `None` when the name doesn't say.
+///
+/// Read from the library prefix first (`Resistor_SMD:` / `Resistor_THT:` — KiCad
+/// is consistent about this), then from the package family, then from a metric
+/// chip code, which only ever appears on a chip part. `None` for anything that
+/// leaves it genuinely ambiguous, so a caller filtering SMD out of a hand-build
+/// sheet keeps the part rather than silently dropping something the builder has
+/// to fit.
+pub fn is_surface_mount(fp: &str) -> Option<bool> {
+    let lower = fp.to_ascii_lowercase();
+    let (lib, t) = lower.split_once(':').unwrap_or(("", lower.as_str()));
+    if lib.contains("_smd") || lib.contains("_sm:") {
+        return Some(true);
+    }
+    if lib.contains("_tht") || lib.contains("thruhole") || lib.contains("through") {
+        return Some(false);
+    }
+    // Package families that are only ever one or the other.
+    const SMD: &[&str] = &[
+        "soic", "sop", "tssop", "msop", "ssop", "qfn", "dfn", "qfp", "lqfp", "tqfp", "bga", "son",
+        "melf", "chip", "sod", "smd",
+    ];
+    const THT: &[&str] = &[
+        "dip-",
+        "pinheader",
+        "pinsocket",
+        "to-92",
+        "to-220",
+        "axial",
+        "radial",
+    ];
+    if THT.iter().any(|k| t.contains(k)) {
+        return Some(false);
+    }
+    if SMD.iter().any(|k| t.contains(k)) {
+        return Some(true);
+    }
+    // A metric chip code (`1608Metric`) only appears on a chip package.
+    metric_code(t).map(|_| true)
+}
+
 /// Body size `(width, height)` in mm, top-down, or `None` when the footprint name
 /// carries no size we can trust. Used to draw a life-size silhouette, so a wrong
 /// answer is worse than none.
@@ -304,6 +345,34 @@ mod tests {
         // Nothing measurable in the name — better blank than invented.
         assert_eq!(body_mm("Weird_Lib:Totally_Unknown_Thing"), None);
         assert!(silhouette_svg("Weird_Lib:Totally_Unknown_Thing").is_none());
+    }
+
+    #[test]
+    fn surface_mount_is_read_from_the_library_then_the_family() {
+        // KiCad's library prefix is the most reliable signal.
+        assert_eq!(
+            is_surface_mount("Resistor_SMD:R_0603_1608Metric"),
+            Some(true)
+        );
+        assert_eq!(
+            is_surface_mount("Resistor_THT:R_Axial_DIN0207_L6.3mm"),
+            Some(false)
+        );
+        // Then the package family.
+        assert_eq!(is_surface_mount("Package_SO:SOIC-16_3.9x9.9mm"), Some(true));
+        assert_eq!(is_surface_mount("Package_DIP:DIP-16_W7.62mm"), Some(false));
+        assert_eq!(
+            is_surface_mount("Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm"),
+            Some(false)
+        );
+        // Panel hardware is hand-fitted whatever else it is.
+        assert_eq!(
+            is_surface_mount("Potentiometer_THT:Alpha_RD901F"),
+            Some(false)
+        );
+        // Genuinely ambiguous stays ambiguous: dropping a part the builder has
+        // to fit is worse than showing one they don't.
+        assert_eq!(is_surface_mount("MyLib:Mystery_Thing"), None);
     }
 
     #[test]

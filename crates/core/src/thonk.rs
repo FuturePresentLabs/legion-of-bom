@@ -98,6 +98,12 @@ fn parse_products(value: &Value, keyword: &str, limit: usize) -> Vec<ThonkProduc
 /// for "eurorack power header shrouded" — it shares the two generic words and
 /// none of the specific ones. A missing photo costs the builder a blank cell; a
 /// wrong photo costs them the wrong part.
+///
+/// "Substantial" is a matched word of four characters **or** a clean sweep of at
+/// least two words. The length test alone is not enough: the whole vocabulary of
+/// an LED is `3mm` and `led`, both three characters, so requiring a longer word
+/// rejected every LED in the catalog. A query where every word lands is evidence
+/// regardless of how short the words are.
 fn title_matches(keyword: &str, title: &str) -> bool {
     let title = title.to_ascii_lowercase();
     let words: Vec<String> = keyword
@@ -110,10 +116,11 @@ fn title_matches(keyword: &str, title: &str) -> bool {
         return false;
     }
     let hits = words.iter().filter(|w| title.contains(w.as_str())).count();
-    let strong = words
+    let long_hit = words
         .iter()
         .any(|w| w.len() >= 4 && title.contains(w.as_str()));
-    strong && hits * 3 >= words.len() * 2
+    let clean_sweep = hits == words.len() && words.len() >= 2;
+    (long_hit || clean_sweep) && hits * 3 >= words.len() * 2
 }
 
 /// Words too common in part descriptions to count as evidence of a match.
@@ -207,6 +214,21 @@ mod tests {
         assert!(title_matches(
             "eurorack power header shrouded",
             "Eurorack 10pin Power Headers – Shrouded (x10)"
+        ));
+        // An LED's whole vocabulary is three-letter words, so a clean sweep has
+        // to count as evidence or no LED in the catalog ever matches.
+        assert!(title_matches("3mm led", "Flat top 3mm LEDs – L-424SURDTK"));
+        assert!(title_matches("5mm led", "Red Square LED – 5mm"));
+        // …but a sweep is still a sweep: a 3mm query must not take a 5mm part.
+        assert!(!title_matches("3mm led", "Red Square LED – 5mm"));
+        assert!(!title_matches(
+            "5mm led",
+            "Music Thing Modular Workshop System"
+        ));
+        // One short word landing is not a clean sweep.
+        assert!(!title_matches(
+            "led",
+            "Mutable Instruments – Original Spare Parts"
         ));
     }
 

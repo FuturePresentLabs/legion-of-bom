@@ -133,7 +133,7 @@ impl Quality {
 pub fn render_board_png(
     board: &Path,
     kicad_cli: &Path,
-    bare: bool,
+    populate: Populate,
     back: bool,
     quality: Quality,
 ) -> Result<(Vec<u8>, u32, u32), StageError> {
@@ -142,19 +142,24 @@ pub fn render_board_png(
         .and_then(|s| s.to_str())
         .unwrap_or("board");
     let tmp = std::env::temp_dir();
-    // For an unpopulated board, render a copy with the 3D component models removed.
-    let input = if bare {
-        let stripped = strip_models(&std::fs::read_to_string(board)?);
-        let p = tmp.join(format!("lob-{stem}-bare.kicad_pcb"));
-        std::fs::write(&p, stripped)?;
-        p
-    } else {
+    // Hiding a body is a model-reference edit on a scratch copy; the pads, silk
+    // and copper are always the real board's.
+    let input = if populate == Populate::All {
         board.to_path_buf()
+    } else {
+        let edited = apply_populate(&std::fs::read_to_string(board)?, populate);
+        let p = tmp.join(format!("lob-{stem}-{}.kicad_pcb", populate.tag()));
+        std::fs::write(&p, edited)?;
+        p
     };
     let side = if back { "bottom" } else { "top" };
-    // Quality is in the filename: the dashboard renders `basic` while a build
-    // renders `high`, and the two must not clobber each other's scratch file.
-    let out = tmp.join(format!("lob-{stem}-render-{side}-{}.png", quality.flag()));
+    // Quality and population are in the filename: the dashboard and a build
+    // render different views and must not clobber each other's scratch file.
+    let out = tmp.join(format!(
+        "lob-{stem}-render-{side}-{}-{}.png",
+        populate.tag(),
+        quality.flag()
+    ));
     run_kicad(
         kicad_cli,
         &[
@@ -200,6 +205,75 @@ pub fn png_to_jpeg(png: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     std::fs::read(&pout).ok()
+}
+
+/// Which component bodies a render shows.
+///
+/// This is a *render* choice, not a board edit. Hiding a part means dropping its
+/// `(model …)` reference so nothing is drawn standing on the pads; the pads,
+/// silk and copper stay exactly as fabricated. Deleting whole footprints — what
+/// the SMD filter used to do — changes the PCB to change the picture, which is
+/// both a lie about the board and less useful, since the pads are what you are
+/// looking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Populate {
+    /// Every component body — the board as it arrives assembled.
+    All,
+    /// Surface-mount bodies only. For a mixed kit this is the board the builder
+    /// actually holds: the fab has reflowed the SMD, and the through-hole pads
+    /// are still empty and waiting.
+    SmdOnly,
+    /// Through-hole bodies only — the SMD filter's "hide surface-mount" view.
+    ThtOnly,
+    /// Bare board, no bodies at all.
+    Bare,
+}
+
+impl Populate {
+    /// Short slug for scratch filenames.
+    fn tag(self) -> &'static str {
+        match self {
+            Populate::All => "all",
+            Populate::SmdOnly => "smd",
+            Populate::ThtOnly => "tht",
+            Populate::Bare => "bare",
+        }
+    }
+
+    /// Whether a footprint block's body should be drawn.
+    fn shows(self, block: &str) -> bool {
+        let tht = is_tht_block(block);
+        match self {
+            Populate::All => true,
+            Populate::SmdOnly => !tht,
+            Populate::ThtOnly => tht,
+            Populate::Bare => false,
+        }
+    }
+}
+
+/// Drop the `(model …)` reference from every footprint whose body `populate`
+/// hides, leaving the board itself untouched.
+fn apply_populate(src: &str, populate: Populate) -> String {
+    if populate == Populate::All {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(pos) = rest.find("(footprint ") {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        let end = sexpr_len(tail);
+        let block = &tail[..end];
+        if populate.shows(block) {
+            out.push_str(block);
+        } else {
+            out.push_str(&strip_models(block));
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Remove every `(model …)` block from a board's S-expression (paren-balanced),
@@ -709,6 +783,42 @@ mod tests {
         let s = board_sides(src);
         assert_eq!(s.front.smd, 1, "front-mounted despite a B.Cu pad layer");
         assert_eq!(s.back.smd, 0);
+    }
+
+    /// Hiding a component must not touch the board. The old SMD filter deleted
+    /// whole footprints, so the pads vanished with the part — which both lies
+    /// about the fabricated board and hides the thing you are looking for.
+    #[test]
+    fn hiding_a_body_drops_its_model_and_keeps_its_pads() {
+        let src = concat!(
+            r#"(kicad_pcb"#,
+            r#"(footprint "R_0603" (layer "B.Cu") (property "Reference" "R1")"#,
+            r#" (pad "1" smd roundrect (at 0 0) (size 1 1))"#,
+            r#" (model "R_0603.step" (offset (xyz 0 0 0))))"#,
+            r#"(footprint "Jack" (layer "F.Cu") (property "Reference" "J1")"#,
+            r#" (pad "T" thru_hole circle (at 0 0) (size 2 2))"#,
+            r#" (model "Jack.step" (offset (xyz 0 0 0))))"#,
+            r#"(zone (net 1)))"#,
+        );
+        // SmdOnly: the fab-reflowed chip keeps its body, the jack the builder
+        // still has to fit shows as empty pads.
+        let smd = apply_populate(src, Populate::SmdOnly);
+        assert!(smd.contains("R_0603.step"), "SMD body kept: {smd}");
+        assert!(!smd.contains("Jack.step"), "THT body hidden: {smd}");
+        // ThtOnly is the viewer's "hide SMD".
+        let tht = apply_populate(src, Populate::ThtOnly);
+        assert!(!tht.contains("R_0603.step"));
+        assert!(tht.contains("Jack.step"));
+        // Whatever is hidden, the board is untouched: both footprints, both
+        // pads, the zone.
+        for out in [&smd, &tht, &apply_populate(src, Populate::Bare)] {
+            assert_eq!(out.matches("(footprint ").count(), 2, "{out}");
+            assert!(out.contains(r#""Reference" "R1""#) && out.contains(r#""Reference" "J1""#));
+            assert!(out.contains(r#"(pad "1" smd"#) && out.contains(r#"(pad "T" thru_hole"#));
+            assert!(out.contains("(zone"));
+        }
+        // All is a passthrough.
+        assert_eq!(apply_populate(src, Populate::All), src);
     }
 
     #[test]

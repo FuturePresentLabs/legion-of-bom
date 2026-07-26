@@ -23,8 +23,8 @@ use legion_of_bom_core::{
     value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
     BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions, JlcpcbClient, KitType,
     LayoutLoop, LayoutMode, LineKind, Logo, Manifest, MouserClient, PanelFile, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, ProjectView, Quality, Repair,
-    ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, SourcingClients,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, Populate, ProjectView, Quality,
+    Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner, SourcingClients,
     StageOutcome, TranAnalysis,
 };
 
@@ -82,10 +82,16 @@ enum Command {
         /// Also write the BOM CSV to this path.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Also write a Visual BOM (HTML): a part photo per line (EasyEDA/LCSC,
-        /// keyless), with through-hole resistors shown as their color code.
+        /// Also write a Visual BOM (HTML): a part photo per line (Thonk, then
+        /// EasyEDA/LCSC — both keyless), with through-hole resistors shown as
+        /// their color code.
         #[arg(long)]
         visual: bool,
+        /// Keep surface-mount parts on the sorting sheet. Off by default: on a
+        /// mixed kit the fab has already reflowed them, so a cell for one is a
+        /// cell the builder never uses.
+        #[arg(long)]
+        smd: bool,
     },
     /// Generate a .kicad_pcb board file (footprints placed + routed) from a circuit.
     Board {
@@ -402,7 +408,8 @@ fn main() -> ExitCode {
             price,
             out,
             visual,
-        } => bom_cmd(circuit, price, out, visual),
+            smd,
+        } => bom_cmd(circuit, price, out, visual, smd),
         Command::Board {
             circuit,
             out,
@@ -1165,9 +1172,10 @@ fn build_imported(
         );
     }
     let cache = default_image_cache_dir();
-    // The sorting sheet is what a builder counts parts onto, so it carries the
-    // loose hardware the netlist cannot know about (nuts, washers).
-    let bom = bom.with_hardware();
+    // The sorting sheet is a builder's worklist: it carries the loose hardware
+    // the netlist cannot know about, and drops the surface-mount parts the fab
+    // already soldered.
+    let bom = bom.without_smd().with_hardware();
     let thumbs: Vec<Option<String>> = bom.lines.iter().map(|l| resolve_photo(l, &cache)).collect();
     let vpath = dir.join(format!("{name}-vbom.html"));
     std::fs::write(&vpath, bom.to_visual_html(name, &thumbs))
@@ -1227,7 +1235,7 @@ fn build_cmd(name: Option<String>) -> Result<()> {
         let arg = || PathBuf::from(name);
         let steps: [(&str, Result<()>); 3] = [
             ("guide", guide_cmd(arg(), None, None, "auto".into())),
-            ("bom", bom_cmd(arg(), false, None, true)),
+            ("bom", bom_cmd(arg(), false, None, true, false)),
             (
                 "fab",
                 fab_cmd(arg(), None, None, "analog".into(), 6, false, None),
@@ -1397,13 +1405,13 @@ fn guide_cmd(
     std::fs::write(&board_file, &board)?;
     let kicad_cli = kicad_cli_path();
     let any_back = guide.steps.iter().any(|s| s.parts.iter().any(|p| p.back));
-    let top = kicad_cli
-        .as_ref()
-        .and_then(|k| render_board_png(&board_file, k, true, false, Quality::High).ok());
+    let top = kicad_cli.as_ref().and_then(|k| {
+        render_board_png(&board_file, k, Populate::SmdOnly, false, Quality::High).ok()
+    });
     let bottom = if any_back {
-        kicad_cli
-            .as_ref()
-            .and_then(|k| render_board_png(&board_file, k, true, true, Quality::High).ok())
+        kicad_cli.as_ref().and_then(|k| {
+            render_board_png(&board_file, k, Populate::SmdOnly, true, Quality::High).ok()
+        })
     } else {
         None
     };
@@ -1458,8 +1466,14 @@ fn guide_cmd(
     Ok(())
 }
 
-/// Handle `lob bom <circuit> [--price] [--out] [--visual]`.
-fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) -> Result<()> {
+/// Handle `lob bom <circuit> [--price] [--out] [--visual] [--smd]`.
+fn bom_cmd(
+    circuit: PathBuf,
+    price: bool,
+    out: Option<PathBuf>,
+    visual: bool,
+    smd: bool,
+) -> Result<()> {
     let resolved = resolve_circuit(&circuit)?;
     let stem = resolved.name.clone();
     let circuit = resolved
@@ -1538,9 +1552,14 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) ->
         // first, else an EasyEDA/LCSC auto-lookup; lines with none fall back to a
         // color swatch (THT resistors) or a blank cell.
         let cache = default_image_cache_dir();
-        // The sorting sheet is what a builder counts parts onto, so it carries
-        // the loose hardware the netlist cannot know about (nuts, washers).
-        let bom = bom.with_hardware();
+        // The sorting sheet is a builder's worklist: it carries the loose
+        // hardware the netlist cannot know about, and by default drops the
+        // surface-mount parts the fab already soldered.
+        let bom = if smd {
+            bom.clone().with_hardware()
+        } else {
+            bom.clone().without_smd().with_hardware()
+        };
         let mut fetched = 0usize;
         let thumbs: Vec<Option<String>> = bom
             .lines
@@ -1618,6 +1637,11 @@ fn thonk_keyword(line: &BomLine) -> Option<String> {
         "3.5mm jack sockets"
     } else if fp.contains("rd901f") || fp.contains("potentiometer") {
         "alpha 9mm pots vertical"
+    // Panel LEDs, by the size that decides which bag they came from.
+    } else if fp.contains("led_d3") || fp.contains("led_d3.0") {
+        "3mm led"
+    } else if fp.contains("led_d5") || fp.contains("led_d5.0") {
+        "5mm led"
     } else if fp.contains("pinheader_2x05") {
         "eurorack power header shrouded"
     } else {
@@ -2249,7 +2273,7 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
             println!("{stem}: {steps} step(s), {placed} part(s)");
             println!("  guide: {}", gpath.display());
 
-            let bom = board.to_bom().with_hardware();
+            let bom = board.to_bom().without_smd().with_hardware();
             let cache = default_image_cache_dir();
             let mut fetched = 0usize;
             let thumbs: Vec<Option<String>> = bom

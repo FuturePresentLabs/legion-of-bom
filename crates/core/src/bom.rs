@@ -107,6 +107,28 @@ impl Bom {
         self.lines.iter().filter(|l| l.kind == LineKind::Component)
     }
 
+    /// Drop the surface-mount lines — the parts a mixed kit arrives with already
+    /// reflowed, which the builder never picks up.
+    ///
+    /// A sorting sheet is a worklist: a cell for a part that is already soldered
+    /// to the board is a cell that wastes a builder's time and paper. Only lines
+    /// [`package::is_surface_mount`] is *sure* about are removed; an ambiguous
+    /// footprint stays, because dropping a part somebody has to fit is the
+    /// expensive mistake.
+    ///
+    /// No-op when it would empty the sheet — an all-SMD board's sorting sheet is
+    /// still better than nothing.
+    pub fn without_smd(mut self) -> Self {
+        let keeps = |l: &BomLine| {
+            l.kind == LineKind::Hardware
+                || l.footprint.as_deref().and_then(package::is_surface_mount) != Some(true)
+        };
+        if self.lines.iter().any(keeps) {
+            self.lines.retain(keeps);
+        }
+        self
+    }
+
     /// Append the loose hardware the placed parts arrive with — a nut per jack, a
     /// nut and washer per pot ([`crate::hardware`]) — as [`LineKind::Hardware`]
     /// lines carrying the reference designators they serve.
@@ -722,6 +744,51 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    /// A sorting sheet is a worklist, and a mixed kit's SMD arrives reflowed.
+    #[test]
+    fn the_sorting_sheet_can_drop_what_the_fab_already_soldered() {
+        let bom = generate_bom(&circuit()).with_hardware();
+        // The fixture is 0805 chips plus an MPN-only IC with no footprint.
+        let smd_before = bom
+            .lines
+            .iter()
+            .filter(|l| {
+                l.footprint
+                    .as_deref()
+                    .and_then(crate::package::is_surface_mount)
+                    == Some(true)
+            })
+            .count();
+        assert!(smd_before > 0, "fixture needs SMD to be a test");
+        let hand = bom.clone().without_smd();
+        assert!(hand.lines.iter().all(|l| l
+            .footprint
+            .as_deref()
+            .and_then(crate::package::is_surface_mount)
+            != Some(true)));
+        // The footprint-less IC is ambiguous, so it survives — better a cell for
+        // a part you already have than a missing one you need.
+        assert!(hand.lines.iter().any(|l| l.footprint.is_none()));
+    }
+
+    /// An all-SMD board would otherwise get a blank sorting sheet.
+    #[test]
+    fn dropping_smd_is_a_no_op_when_it_would_empty_the_sheet() {
+        let all_smd = Bom {
+            lines: vec![BomLine {
+                kind: LineKind::Component,
+                mpn: None,
+                value: "1k".into(),
+                footprint: Some("Resistor_SMD:R_0603_1608Metric".into()),
+                refdes: vec!["R1".into()],
+                unit_price: None,
+                ext_price: None,
+                image_url: None,
+            }],
+        };
+        assert_eq!(all_smd.clone().without_smd().lines.len(), 1);
     }
 
     /// Hardware belongs in the kit, not in the fab package.

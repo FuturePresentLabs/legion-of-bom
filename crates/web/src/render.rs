@@ -25,7 +25,7 @@ use serde_json::json;
 use legion_of_bom_core::{
     board_sides, default_image_cache_dir, export_board_svg, kicad_cli_path, layers_to_svg,
     panel_to_svg, parse_netlist_file, read_layers, render_board_png, schematic_to_svg, strip_smd,
-    LayerKind, Logo, PanelFile, Quality,
+    LayerKind, Logo, PanelFile, Populate, Quality,
 };
 
 use crate::state::AppState;
@@ -216,16 +216,19 @@ fn render_view(req: &RenderReq<'_>) -> Result<Rendered, RenderErr> {
                 return Ok(Rendered::Png(bytes));
             }
             let kicad = kicad_cli_path().ok_or(RenderErr::NoKicad)?;
-            let board = if show_smd {
-                board
+            // Populated: seeing the parts standing on the board is most of the
+            // value of a photoreal render. The SMD filter hides surface-mount
+            // *bodies* and leaves their pads — it is a view of the board, not an
+            // edit of it.
+            let populate = if show_smd {
+                Populate::All
             } else {
-                tht_only_board(&board, name)?
+                Populate::ThtOnly
             };
-            // bare=true (unpopulated, 3D models stripped) — the proven guide path.
             // `basic` quality, not the guide's `high`: this render sits behind an
             // interactive control, and 4.7s per click reads as a broken tool where
             // 0.9s reads as a slow one. The printed guide still pays for `high`.
-            let png = render_board_png(&board, &kicad, true, back, Quality::Basic)
+            let png = render_board_png(&board, &kicad, populate, back, Quality::Basic)
                 .map_err(|e| RenderErr::Failed(e.to_string()))?
                 .0;
             write_cache(&cache, &png);

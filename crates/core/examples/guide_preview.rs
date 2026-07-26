@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use legion_of_bom_core::{
     build_guide_with, guide_to_html, guide_to_pdf, kicad_cli_path, png_to_jpeg, render_board_png,
-    BoardPng, GuideOptions, Quality,
+    BoardPng, GuideOptions, Populate, Quality,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,10 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kicad = kicad_cli_path();
     let top = kicad
         .as_ref()
-        .and_then(|k| render_board_png(&pcb, k, true, false, Quality::High).ok());
+        .and_then(|k| render_board_png(&pcb, k, Populate::SmdOnly, false, Quality::High).ok());
     let bottom = kicad
         .as_ref()
-        .and_then(|k| render_board_png(&pcb, k, true, true, Quality::High).ok());
+        .and_then(|k| render_board_png(&pcb, k, Populate::SmdOnly, true, Quality::High).ok());
     match &top {
         Some((_, w, h)) => eprintln!("render {w}×{h}"),
         None => eprintln!("no kicad-cli — schematic fallback diagram"),

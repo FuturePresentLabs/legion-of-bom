@@ -6,6 +6,8 @@ fn main() {
         "alpha 9mm pots vertical",
         "jack nuts and washers",
         "eurorack power header shrouded",
+        "3mm led",
+        "5mm led",
         "LM13700",
     ] {
         let hits = legion_of_bom_core::thonk_search(q, 3);
