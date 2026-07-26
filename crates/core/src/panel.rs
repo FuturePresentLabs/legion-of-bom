@@ -43,6 +43,58 @@ pub struct Cutout {
     /// A silkscreen/engraving label for this control (e.g. `"IN"`, `"OUT"`,
     /// `"RATE"`), rendered next to the cutout. `None` omits it.
     pub label: Option<String>,
+    /// What this control is, for styling. `None` renders plain.
+    pub role: Option<CutoutRole>,
+}
+
+/// What a cutout *is*, for panel styling — distinct from its shape, which is
+/// only how big a hole to cut.
+///
+/// Panels read faster when the signal path and the modulation inputs look
+/// different, so the role drives a badge on the label and the dial art around a
+/// knob. Derived from circuit topology rather than from the label text, so it
+/// cannot drift from what the module actually does: a knob whose track ends both
+/// sit on live nets is bipolar, one with an end on ground is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoutRole {
+    /// Audio in/out — the signal path.
+    Io,
+    /// A control-voltage jack. Labels get the inverted badge.
+    Cv,
+    /// A plain knob: unipolar sweep, dial dots from min to max.
+    Knob,
+    /// A knob whose centre is zero. Gets a centre detent mark, and â/+ at the
+    /// extremes, because "12 o'clock is silence" is the whole point of the
+    /// control and a player has to be able to see it.
+    Attenuverter,
+}
+
+impl CutoutRole {
+    /// The token used in a panel TOML (`role = "cv"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CutoutRole::Io => "io",
+            CutoutRole::Cv => "cv",
+            CutoutRole::Knob => "knob",
+            CutoutRole::Attenuverter => "attenuverter",
+        }
+    }
+    pub fn parse(s: &str) -> Option<CutoutRole> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "io" => Some(CutoutRole::Io),
+            "cv" => Some(CutoutRole::Cv),
+            "knob" | "pot" => Some(CutoutRole::Knob),
+            "attenuverter" | "attenuvertor" | "bipolar" => Some(CutoutRole::Attenuverter),
+            _ => None,
+        }
+    }
+    /// Whether this role's label is drawn as knocked-out text in a filled badge.
+    fn badged(self) -> bool {
+        self == CutoutRole::Cv
+    }
+    fn is_knob(self) -> bool {
+        matches!(self, CutoutRole::Knob | CutoutRole::Attenuverter)
+    }
 }
 
 /// The shape of a cutout, derived from its footprint name.
@@ -232,6 +284,9 @@ mod silk {
     /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
     pub const LABEL_FONT_MM: f64 = 2.4;
     pub const LABEL_OFFSET_MM: f64 = 6.5;
+    /// A knob's label has to clear its dial art, not just its body — at the
+    /// jack offset the 12 o'clock dot lands inside the lettering.
+    pub const KNOB_LABEL_OFFSET_MM: f64 = 10.4;
     /// Brand logo: fraction of panel width, the minimum width worth drawing, and
     /// the clearances keeping it off the lowest cutout and the bottom edge/holes.
     /// The logo is the maker's mark — give it real presence in the bottom band.
@@ -239,6 +294,58 @@ mod silk {
     pub const LOGO_MIN_WIDTH_MM: f64 = 4.0;
     pub const LOGO_CUTOUT_GAP_MM: f64 = 2.5;
     pub const BOTTOM_MARGIN_MM: f64 = 6.0;
+    /// Dial art around a knob: how far the dots sit from the shaft centre, how
+    /// big each dot is, and how many across the sweep.
+    ///
+    /// A pot turns 270 degrees, so the dots run from -135 to +135 measured from
+    /// straight up. Seven reads as a scale without becoming a ruler; an even
+    /// count would put a gap where a bipolar control's zero belongs.
+    pub const DIAL_RADIUS_MM: f64 = 7.4;
+    pub const DIAL_DOT_MM: f64 = 0.45;
+    pub const DIAL_DOTS: usize = 7;
+    pub const DIAL_SWEEP_DEG: f64 = 270.0;
+    /// The centre dot on a bipolar control, drawn larger because "12 o'clock is
+    /// zero" is the one position a player needs to find without looking.
+    pub const DIAL_CENTRE_DOT_MM: f64 = 0.85;
+    /// Height of the minus/plus glyphs at a bipolar control's extremes.
+    pub const DIAL_SIGN_MM: f64 = 1.7;
+    /// Padding around a badged label, and its corner radius.
+    pub const BADGE_PAD_X_MM: f64 = 1.3;
+    pub const BADGE_PAD_Y_MM: f64 = 0.75;
+    pub const BADGE_RADIUS_MM: f64 = 0.6;
+}
+
+/// How far a control's label sits above its centre — further for a knob, whose
+/// dial art reaches past the body.
+fn label_offset(role: Option<CutoutRole>) -> f64 {
+    match role.is_some_and(CutoutRole::is_knob) {
+        true => silk::KNOB_LABEL_OFFSET_MM,
+        false => silk::LABEL_OFFSET_MM,
+    }
+}
+
+/// The dot positions for a knob's dial art, as `(dx, dy)` offsets from the shaft
+/// centre in **panel** coordinates (y up), plus whether each is the centre one.
+///
+/// Shared by both renderers so the SVG preview and the fabricated silkscreen
+/// cannot disagree about where the marks are.
+fn dial_dots() -> Vec<(f64, f64, bool)> {
+    let n = silk::DIAL_DOTS;
+    let mid = n / 2;
+    (0..n)
+        .map(|i| {
+            // 0 at full counter-clockwise, 1 at full clockwise.
+            let t = i as f64 / (n - 1) as f64;
+            let deg = -silk::DIAL_SWEEP_DEG / 2.0 + t * silk::DIAL_SWEEP_DEG;
+            let rad = deg.to_radians();
+            // Measured from straight up, turning clockwise.
+            (
+                silk::DIAL_RADIUS_MM * rad.sin(),
+                silk::DIAL_RADIUS_MM * rad.cos(),
+                n % 2 == 1 && i == mid,
+            )
+        })
+        .collect()
 }
 
 /// The cutout **geometry** for a cutout footprint/name — the render-time lookup,
@@ -320,30 +427,39 @@ impl EurorackPanel {
             footprint: footprint.into(),
             refdes: None,
             label: None,
+            role: None,
         });
         self
     }
 
     /// Add a cutout with explicit rotation, an optional anchored refdes, and an
     /// optional silkscreen/engraving label.
-    pub fn with_cutout_rotated(
-        mut self,
+    pub fn with_cutout_spec(mut self, cutout: Cutout) -> Self {
+        self.cutouts.push(cutout);
+        self
+    }
+
+    /// Add a cutout from its parts. Kept for the common case; anything carrying
+    /// a role or a label is clearer built as a [`Cutout`] and passed to
+    /// [`with_cutout_spec`](Self::with_cutout_spec).
+    pub fn with_cutout_labelled(
+        self,
         x_mm: f64,
         y_mm: f64,
-        rotation_deg: f64,
         footprint: impl Into<String>,
         refdes: Option<String>,
         label: Option<String>,
+        role: Option<CutoutRole>,
     ) -> Self {
-        self.cutouts.push(Cutout {
+        self.with_cutout_spec(Cutout {
             x_mm,
             y_mm,
-            rotation_deg,
+            rotation_deg: 0.0,
             footprint: footprint.into(),
             refdes,
             label,
-        });
-        self
+            role,
+        })
     }
 
     /// Width in mm (HP × 5.08).
@@ -458,6 +574,10 @@ pub struct CutoutFile {
     /// Silkscreen/engraving label for this control (e.g. `"IN"`, `"RATE"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `io` | `cv` | `knob` | `attenuverter` — drives the label badge and the
+    /// dial art. Absent renders plain, so older specs are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl PanelFile {
@@ -475,14 +595,15 @@ impl PanelFile {
                 let hp = self.hp.ok_or("eurorack panel requires `hp`")?;
                 let mut panel = EurorackPanel::new(hp).with_thickness(self.thickness_mm);
                 for c in &self.cutouts {
-                    panel = panel.with_cutout_rotated(
-                        c.x_mm,
-                        c.y_mm,
-                        c.rotation_deg,
-                        c.footprint.clone(),
-                        c.refdes.clone(),
-                        c.label.clone(),
-                    );
+                    panel = panel.with_cutout_spec(Cutout {
+                        x_mm: c.x_mm,
+                        y_mm: c.y_mm,
+                        rotation_deg: c.rotation_deg,
+                        footprint: c.footprint.clone(),
+                        refdes: c.refdes.clone(),
+                        label: c.label.clone(),
+                        role: c.role.as_deref().and_then(CutoutRole::parse),
+                    });
                 }
                 Ok(Box::new(panel))
             }
@@ -655,7 +776,66 @@ fn panel_controls(
     }
     controls.sort_by(|a, b| a.0.cmp(&b.0));
     jacks.sort_by(|a, b| a.0.cmp(&b.0));
-    controls.into_iter().chain(jacks).collect()
+    // CV jacks sit above the audio I/O. A player reads a panel top-down looking
+    // for where the signal goes, and the signal path wants to be the last thing
+    // on the way to the bottom edge — modulation lives with the knobs it feeds.
+    let (cv, io): (Vec<_>, Vec<_>) = jacks
+        .into_iter()
+        .partition(|(r, _, _)| carries_cv(circuit, r));
+    controls.into_iter().chain(cv).chain(io).collect()
+}
+
+/// Whether a part sits on a control-voltage net rather than the audio path.
+///
+/// Read from net names, which is where the circuit author states intent: a jack
+/// on `CV_IN` is modulation, one on `SIG_IN`/`SIG_OUT` is the signal path.
+fn carries_cv(circuit: &dyn CircuitSource, refdes: &str) -> bool {
+    circuit
+        .nets()
+        .iter()
+        .filter(|n| n.pins.iter().any(|p| p.refdes.0 == refdes))
+        .any(|n| {
+            let u = n.name.to_ascii_uppercase();
+            !is_power_net(&u) && (u.contains("CV") || u.contains("GATE") || u.contains("TRIG"))
+        })
+}
+
+/// What a control is, for panel styling — from topology, never from the label.
+///
+/// A knob is bipolar when **both** ends of its track sit on live nets: that is
+/// what makes its centre a true zero. A knob with an end on ground is a plain
+/// attenuator or a bias control, whose centre is 50% of something and must not
+/// be marked as silence.
+fn cutout_role(circuit: &dyn CircuitSource, refdes: &str, kind: ControlKind) -> CutoutRole {
+    if kind.is_jack() {
+        return if carries_cv(circuit, refdes) {
+            CutoutRole::Cv
+        } else {
+            CutoutRole::Io
+        };
+    }
+    if !matches!(kind, ControlKind::Pot) {
+        return CutoutRole::Knob;
+    }
+    // Pins 1 and 3 are the track ends; 2 is the wiper. Bipolar iff neither end
+    // is tied to ground.
+    let end_net = |pin: &str| -> Option<String> {
+        circuit
+            .nets()
+            .iter()
+            .find(|n| n.pins.iter().any(|p| p.refdes.0 == refdes && p.pin == pin))
+            .map(|n| n.name.to_ascii_uppercase())
+    };
+    // Both ends must sit on *signal* nets. A pot strung across the supply rails
+    // is a bias control — RATE on the slew limiter runs +12V to -12V — and its
+    // centre is not silence, so it must not get the detent mark. Only a track
+    // whose two ends are live signals has a true zero in the middle.
+    let signal_end = |pin: &str| -> bool { end_net(pin).is_some_and(|u| !is_power_net(&u)) };
+    if signal_end("1") && signal_end("3") {
+        CutoutRole::Attenuverter
+    } else {
+        CutoutRole::Knob
+    }
 }
 
 /// The narrowest panel (HP) whose **hardware actually fits** — the widest control
@@ -729,6 +909,11 @@ pub fn panel_from_board(
             footprint: spec.kind.cutout_name().to_string(),
             refdes: Some(p.refdes.clone()),
             label: control_label(circuit, &p.refdes),
+            role: Some(
+                cutout_role(circuit, &p.refdes, spec.kind)
+                    .as_str()
+                    .to_string(),
+            ),
         });
     }
     out.sort_by(|a, b| a.refdes.cmp(&b.refdes));
@@ -778,6 +963,7 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
             footprint: kind.cutout_name().to_string(),
             refdes: Some(refdes.clone()),
             label: control_label(circuit, refdes),
+            role: Some(cutout_role(circuit, refdes, *kind).as_str().to_string()),
         });
         y -= pitch;
     }
@@ -1010,14 +1196,78 @@ pub fn panel_to_svg(
             }
             None => s.push_str(&svg_hole_circle(cx, cy, 1.5)),
         }
+        // Dial art around a knob: dots across the sweep, and for a bipolar
+        // control a bigger centre dot with minus/plus at the extremes.
+        let role = c.role;
+        if role.is_some_and(CutoutRole::is_knob) {
+            let bipolar = role == Some(CutoutRole::Attenuverter);
+            for (dx, dy, is_centre) in dial_dots() {
+                let r = if bipolar && is_centre {
+                    silk::DIAL_CENTRE_DOT_MM
+                } else {
+                    silk::DIAL_DOT_MM
+                };
+                s.push_str(&format!(
+                    "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\"/>",
+                    cx + dx,
+                    cy - dy,
+                    r,
+                    finish.legend
+                ));
+            }
+            if bipolar {
+                let ends = dial_dots();
+                if let (Some(a), Some(b)) = (ends.first(), ends.last()) {
+                    let out = 2.0;
+                    let scale = (silk::DIAL_RADIUS_MM + out) / silk::DIAL_RADIUS_MM;
+                    s.push_str(&svg_text(
+                        cx + a.0 * scale,
+                        cy - a.1 * scale,
+                        silk::DIAL_SIGN_MM,
+                        &finish.legend,
+                        "\u{2212}",
+                    ));
+                    s.push_str(&svg_text(
+                        cx + b.0 * scale,
+                        cy - b.1 * scale,
+                        silk::DIAL_SIGN_MM,
+                        &finish.legend,
+                        "+",
+                    ));
+                }
+            }
+        }
         if let Some(label) = &c.label {
-            s.push_str(&svg_text(
-                cx,
-                cy - silk::LABEL_OFFSET_MM,
-                silk::LABEL_FONT_MM,
-                &finish.legend,
-                label,
-            ));
+            let ly = cy - label_offset(role);
+            if role.is_some_and(CutoutRole::badged) {
+                // Inverted label: a filled badge with the text knocked out, so a
+                // CV input reads as a different *kind* of thing at a glance
+                // rather than as more small text.
+                let tw = label.chars().count() as f64 * silk::LABEL_FONT_MM * 0.62;
+                let (bw, bh) = (
+                    tw + 2.0 * silk::BADGE_PAD_X_MM,
+                    silk::LABEL_FONT_MM + 2.0 * silk::BADGE_PAD_Y_MM,
+                );
+                s.push_str(&format!(
+                    "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" \
+                     rx=\"{:.2}\" fill=\"{}\"/>",
+                    cx - bw / 2.0,
+                    ly - bh / 2.0,
+                    bw,
+                    bh,
+                    silk::BADGE_RADIUS_MM,
+                    finish.legend
+                ));
+                s.push_str(&svg_text(cx, ly, silk::LABEL_FONT_MM, &finish.face, label));
+            } else {
+                s.push_str(&svg_text(
+                    cx,
+                    ly,
+                    silk::LABEL_FONT_MM,
+                    &finish.legend,
+                    label,
+                ));
+            }
         }
     }
     // Title, top-centre.
@@ -1192,13 +1442,66 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
         }
         // Control label (IN / OUT / RATE), horizontal, just above the cutout so
         // it reads with the module upright (DESIGN 6.10 / j54.21).
+        // Dial art: silk dots across the knob's sweep, bigger at centre for a
+        // bipolar control, with minus/plus at the extremes.
+        if c.role.is_some_and(CutoutRole::is_knob) {
+            let bipolar = c.role == Some(CutoutRole::Attenuverter);
+            for (j, (dx, dy, is_centre)) in dial_dots().into_iter().enumerate() {
+                let r = if bipolar && is_centre {
+                    silk::DIAL_CENTRE_DOT_MM
+                } else {
+                    silk::DIAL_DOT_MM
+                };
+                // A filled dot is a zero-length line with a round cap of the
+                // right width — one primitive, and it plots cleanly.
+                s.push_str(&format!(
+                    "  (gr_line (start {} {}) (end {} {}) (stroke (width {}) (type solid)) \
+                     (layer \"F.SilkS\") (uuid \"{}\"))\n",
+                    mm(cx + dx),
+                    mm(cy - dy),
+                    mm(cx + dx),
+                    mm(cy - dy),
+                    mm(r * 2.0),
+                    det_uuid(&format!("panel.dial.{i}.{j}")),
+                ));
+            }
+            if bipolar {
+                let ends = dial_dots();
+                let scale = (silk::DIAL_RADIUS_MM + 2.0) / silk::DIAL_RADIUS_MM;
+                for (k, (glyph, e)) in [("-", ends.first()), ("+", ends.last())]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let Some((dx, dy, _)) = e else { continue };
+                    s.push_str(&format!(
+                        "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
+                         (effects (font (size {f} {f}) (thickness 0.3))))\n",
+                        glyph,
+                        mm(cx + dx * scale),
+                        mm(cy - dy * scale),
+                        det_uuid(&format!("panel.sign.{i}.{k}")),
+                        f = silk::DIAL_SIGN_MM,
+                    ));
+                }
+            }
+        }
         if let Some(label) = &c.label {
+            // A badged label is KiCad `knockout` text: the silkscreen prints a
+            // filled block with the glyphs left unprinted, which is exactly the
+            // negative-text look, and it is a native property rather than a
+            // rectangle we would have to punch letters out of ourselves.
+            let layer = if c.role.is_some_and(CutoutRole::badged) {
+                "\"F.SilkS\" knockout"
+            } else {
+                "\"F.SilkS\""
+            };
             s.push_str(&format!(
-                "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
+                "  (gr_text \"{}\" (at {} {} 0) (layer {}) (uuid \"{}\") \
                  (effects (font (size {f} {f}) (thickness 0.3))))\n",
                 label,
                 mm(cx),
-                mm(cy - silk::LABEL_OFFSET_MM),
+                mm(cy - label_offset(c.role)),
+                layer,
                 det_uuid(&format!("panel.label.{i}")),
                 f = silk::LABEL_FONT_MM,
             ));
@@ -1582,6 +1885,126 @@ mod panel_from_board_tests {
         }
     }
 
+    /// A module with two knobs, a CV jack and audio I/O — enough to exercise
+    /// ordering, roles and badging together.
+    fn module() -> Circuit {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let pot = "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
+        let net = |name: &str, pins: &[(&str, &str)]| Net {
+            name: name.into(),
+            pins: pins
+                .iter()
+                .map(|(r, p)| PinRef {
+                    refdes: RefDes((*r).into()),
+                    pin: (*p).into(),
+                })
+                .collect(),
+            net_class: None,
+        };
+        Circuit {
+            name: "m".into(),
+            parts: vec![
+                Part::new("J1", "in").with_footprint(jack),
+                Part::new("J2", "out").with_footprint(jack),
+                Part::new("J4", "cv").with_footprint(jack),
+                Part::new("RV1", "100k").with_footprint(pot),
+                Part::new("RV2", "100k").with_footprint(pot),
+            ],
+            nets: vec![
+                net("SIG_IN", &[("J1", "1")]),
+                net("SIG_OUT", &[("J2", "1")]),
+                net("CV_IN", &[("J4", "1"), ("RV2", "1")]),
+                // RATE: a bias control strung across the supply rails.
+                net("+12V", &[("RV1", "1")]),
+                net("-12V", &[("RV1", "3")]),
+                net("RATE_CV", &[("RV1", "2")]),
+                // CV AMT: an attenuator — bottom of the track on ground.
+                net("GND", &[("RV2", "3")]),
+                net("CV_AMT", &[("RV2", "2")]),
+            ],
+        }
+    }
+
+    /// CV inputs sit above the audio I/O: a player scans down for the signal
+    /// path, so modulation belongs up with the knobs it feeds.
+    #[test]
+    fn cv_jacks_sit_above_the_audio_io() {
+        let p = derive_panel(&module(), 8, &BuiltinCutouts);
+        let y = |r: &str| {
+            p.cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(r))
+                .unwrap()
+                .y_mm
+        };
+        // Panel y is measured up from the bottom.
+        assert!(y("J4") > y("J1"), "CV IN above IN");
+        assert!(y("J4") > y("J2"), "CV IN above OUT");
+        // …and the knobs stay above the jacks.
+        assert!(y("RV1") > y("J4") && y("RV2") > y("J4"));
+    }
+
+    /// Roles come from topology. A pot across the supply rails is a bias control
+    /// whose centre is *not* silence, so it must not get the bipolar detent — and
+    /// an attenuator with its track end on ground is not an attenuverter either.
+    #[test]
+    fn only_a_pot_with_both_track_ends_live_is_bipolar() {
+        let p = derive_panel(&module(), 8, &BuiltinCutouts);
+        let role = |r: &str| {
+            p.cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(r))
+                .unwrap()
+                .role
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(role("RV1"), "knob", "RATE spans +12V/-12V: a bias control");
+        assert_eq!(role("RV2"), "knob", "CV AMT's track end is grounded");
+        assert_eq!(role("J4"), "cv");
+        assert_eq!(role("J1"), "io");
+        assert_eq!(role("J2"), "io");
+
+        // Re-wire CV AMT's bottom onto an inverted rail and it becomes bipolar,
+        // with no panel edit — the art follows the circuit.
+        let mut c = module();
+        c.nets.retain(|n| n.name != "GND");
+        c.nets.push(Net {
+            name: "CV_IN_INV".into(),
+            pins: vec![PinRef {
+                refdes: RefDes("RV2".into()),
+                pin: "3".into(),
+            }],
+            net_class: None,
+        });
+        let p2 = derive_panel(&c, 8, &BuiltinCutouts);
+        let rv2 = p2
+            .cutouts
+            .iter()
+            .find(|x| x.refdes.as_deref() == Some("RV2"))
+            .unwrap();
+        assert_eq!(rv2.role.as_deref(), Some("attenuverter"));
+    }
+
+    /// A CV label is knocked out of a filled badge; audio I/O stays plain. On the
+    /// panel PCB that is KiCad's native `knockout`, so the silkscreen prints a
+    /// block with the glyphs unprinted rather than us punching letters out.
+    #[test]
+    fn cv_labels_are_badged_and_io_labels_are_not() {
+        let p = derive_panel(&module(), 8, &BuiltinCutouts);
+        let spec = p.to_spec().unwrap();
+        let pcb = panel_to_kicad_pcb(spec.as_ref(), "m", None);
+        assert!(
+            pcb.contains(r#"(gr_text "CV IN" (at"#) && pcb.contains(r#"knockout)"#),
+            "CV IN is knocked out: {pcb}"
+        );
+        // Exactly one knockout — the audio jacks and the knobs are plain.
+        assert_eq!(pcb.matches("knockout").count(), 1);
+
+        // Dial art: seven dots per knob, two knobs.
+        assert_eq!(pcb.matches("(gr_line").count(), 2 * silk::DIAL_DOTS);
+    }
+
     /// The whole point: a cutout lands where the part actually is, not where an
     /// idealised column would have put it.
     #[test]
@@ -1728,21 +2151,21 @@ mod tests {
     #[test]
     fn panel_svg_uses_finish_color_labels_and_cutouts() {
         let panel = EurorackPanel::new(8)
-            .with_cutout_rotated(
+            .with_cutout_labelled(
                 20.32,
                 100.0,
-                0.0,
                 "Alpha9mm",
                 None,
                 Some("RATE".to_string()),
+                Some(CutoutRole::Knob),
             )
-            .with_cutout_rotated(
+            .with_cutout_labelled(
                 20.32,
                 14.0,
-                0.0,
                 "Thonkiconn",
                 None,
                 Some("OUT".to_string()),
+                Some(CutoutRole::Io),
             );
         let svg = panel_to_svg(&panel, "Slew Limiter", &PanelFinish::named("black"), None);
         assert!(svg.starts_with("<svg"));
@@ -1781,13 +2204,13 @@ mod tests {
     #[test]
     fn cutout_label_renders_on_panel_silk() {
         let panel = EurorackPanel::new(4)
-            .with_cutout_rotated(
+            .with_cutout_labelled(
                 10.0,
                 20.0,
-                0.0,
                 "Thonkiconn",
                 Some("J1".into()),
                 Some("IN".into()),
+                Some(CutoutRole::Io),
             )
             .with_cutout(10.0, 60.0, "Alpha9mm"); // no label → no extra gr_text
         let pcb = panel_to_kicad_pcb(&panel, "Demo", None);
