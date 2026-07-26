@@ -103,10 +103,10 @@ pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use package::{body_mm as package_body_mm, short_name as package_short_name};
 pub use panel::{
-    default_panel_orders_dir, derive_panel, footprint_shape, panel_to_dxf, panel_to_kicad_pcb,
-    panel_to_svg, BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec,
-    EurorackPanel, MountingHole, PanelFile, PanelFinish, PanelOrder, PanelOrderStatus, PanelOrders,
-    PanelSpec,
+    default_panel_orders_dir, derive_panel, footprint_shape, panel_from_board, panel_to_dxf,
+    panel_to_kicad_pcb, panel_to_svg, BuiltinCutouts, ControlKind, Cutout, CutoutShape,
+    CutoutSource, CutoutSpec, EurorackPanel, MountingHole, PanelFile, PanelFinish, PanelOrder,
+    PanelOrderStatus, PanelOrders, PanelSpec,
 };
 pub use panel_edit::{apply_panel_edit_str, edit_panel, PanelEdit, PanelEditError};
 pub use parts::{

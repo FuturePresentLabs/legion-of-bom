@@ -677,6 +677,72 @@ pub fn min_panel_hp(circuit: &dyn CircuitSource, cutouts: &dyn CutoutSource) -> 
     (needed / HP_MM).ceil().max(1.0) as u16
 }
 
+/// Derive a panel from a **built board**: one cutout per panel-mounted part, at
+/// the position that part actually occupies.
+///
+/// This is the direction that holds once a board exists. [`derive_panel`] lays
+/// controls out in an idealised centred column and knows nothing about the PCB,
+/// which is only ever right because the board was then placed *from* that panel
+/// — the panel was master and the board followed. The moment a board is imported,
+/// hand-placed or simply re-laid-out, that idealised panel is fiction and will
+/// not fit the hardware soldered to the board.
+///
+/// The mapping is the exact inverse of the one the placer uses: a panel's
+/// cutouts are measured from its bottom-left, a KiCad board from its top-left, so
+/// `panel_y = height − (board_y − top)`. Working from the board's own
+/// `Edge.Cuts` rather than the KiCad sheet origin means this also works for a
+/// board that was never generated here.
+///
+/// Parts with no cutout in `cutouts` are skipped — a panel hole invented for a
+/// part we can't classify is a hole in the wrong place.
+pub fn panel_from_board(
+    board_pcb: &str,
+    circuit: &dyn CircuitSource,
+    cutouts: &dyn CutoutSource,
+) -> Result<PanelFile, String> {
+    let placed = crate::guide::parse_board(board_pcb)?;
+    let (x0, y0, x1, y1) =
+        crate::guide::board_outline(board_pcb).ok_or("board has no Edge.Cuts outline")?;
+    let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
+    if w <= 0.0 || h <= 0.0 {
+        return Err("board outline has no area".into());
+    }
+    // Look each part's footprint up through the circuit, which is where the MPN
+    // lives; the board only carries the footprint id.
+    let mpn_of = |refdes: &str| {
+        circuit
+            .parts()
+            .iter()
+            .find(|p| p.refdes.0 == refdes)
+            .and_then(|p| p.mpn.clone())
+    };
+
+    let mut out: Vec<CutoutFile> = Vec::new();
+    for p in placed.iter().filter(|p| crate::guide::is_panel_mounted(p)) {
+        let Some(spec) = cutouts.cutout(mpn_of(&p.refdes).as_deref(), &p.footprint) else {
+            continue;
+        };
+        out.push(CutoutFile {
+            x_mm: p.cx - x0,
+            y_mm: h - (p.cy - y0),
+            rotation_deg: 0.0,
+            footprint: spec.kind.cutout_name().to_string(),
+            refdes: Some(p.refdes.clone()),
+            label: control_label(circuit, &p.refdes),
+        });
+    }
+    out.sort_by(|a, b| a.refdes.cmp(&b.refdes));
+
+    Ok(PanelFile {
+        format: "eurorack".into(),
+        // The board width decides the panel width, not the other way round.
+        hp: Some(((w / HP_MM).round() as u16).max(1)),
+        thickness_mm: derive_rules::THICKNESS_MM,
+        finish: None,
+        cutouts: out,
+    })
+}
+
 pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
     let ordered = panel_controls(circuit, cutouts);
 
@@ -1478,6 +1544,86 @@ fn sql_opt(s: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 //  Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod panel_from_board_tests {
+    use super::*;
+    use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+
+    /// 5 HP board, jack near the bottom-left, pot near the top-right.
+    const BOARD: &str = r#"(kicad_pcb
+      (gr_rect (start 100 40) (end 125.4 168.5) (layer "Edge.Cuts"))
+      (footprint "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical" (layer "F.Cu") (at 106 158 0)
+        (property "Reference" "J1") (pad "1" thru_hole circle (at 0 0) (size 2 2)))
+      (footprint "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical" (layer "F.Cu") (at 118 55 0)
+        (property "Reference" "RV1") (pad "1" thru_hole circle (at 0 0) (size 2 2)))
+      (footprint "Resistor_SMD:R_0603_1608Metric" (layer "F.Cu") (at 110 100 0)
+        (property "Reference" "R1") (pad "1" smd rect (at 0 0) (size 1 1))))"#;
+
+    fn circuit() -> Circuit {
+        Circuit {
+            name: "t".into(),
+            parts: vec![
+                Part::new("J1", "AudioJack2_SwitchT")
+                    .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+                Part::new("RV1", "100k").with_footprint(
+                    "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical",
+                ),
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0603_1608Metric"),
+            ],
+            nets: vec![Net {
+                name: "SIG_OUT".into(),
+                pins: vec![PinRef {
+                    refdes: RefDes("J1".into()),
+                    pin: "1".into(),
+                }],
+                net_class: None,
+            }],
+        }
+    }
+
+    /// The whole point: a cutout lands where the part actually is, not where an
+    /// idealised column would have put it.
+    #[test]
+    fn cutouts_land_on_the_parts_real_positions() {
+        let p = panel_from_board(BOARD, &circuit(), &BuiltinCutouts).unwrap();
+        assert_eq!(p.hp, Some(5), "board width decides the panel width");
+        // Only panel-facing parts: the 0603 is board-only.
+        assert_eq!(p.cutouts.len(), 2);
+        let by = |r: &str| {
+            p.cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(r))
+                .unwrap()
+        };
+
+        // Board is x 100..125.4, y 40..168.5 (25.4 x 128.5mm).
+        // J1 at board (106, 158): 6mm from the left edge, and 128.5-118 = 10.5mm
+        // up from the bottom — a jack near the bottom, as placed.
+        let j = by("J1");
+        assert!((j.x_mm - 6.0).abs() < 0.01, "x {}", j.x_mm);
+        assert!((j.y_mm - 10.5).abs() < 0.01, "y {}", j.y_mm);
+        // RV1 at board (118, 55): 18mm across, 113.5mm up — near the top.
+        let rv = by("RV1");
+        assert!((rv.x_mm - 18.0).abs() < 0.01, "x {}", rv.x_mm);
+        assert!((rv.y_mm - 113.5).abs() < 0.01, "y {}", rv.y_mm);
+        // Y really is flipped: the jack low on the panel is high in KiCad's frame.
+        assert!(j.y_mm < rv.y_mm);
+
+        // Classified, and labelled from the signal it carries.
+        assert_eq!(j.footprint, "Thonkiconn");
+        assert_eq!(rv.footprint, "Alpha9mm");
+        assert_eq!(j.label.as_deref(), Some("OUT")); // label_from_net drops the prefix
+    }
+
+    /// A board we cannot frame gets an error, not a panel measured from nothing.
+    #[test]
+    fn a_board_with_no_outline_is_an_error() {
+        let no_edge = r#"(kicad_pcb (footprint "X" (layer "F.Cu") (at 1 1 0)
+          (property "Reference" "J1") (pad "1" thru_hole circle (at 0 0) (size 2 2))))"#;
+        assert!(panel_from_board(no_edge, &circuit(), &BuiltinCutouts).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

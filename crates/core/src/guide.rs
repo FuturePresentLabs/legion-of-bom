@@ -473,7 +473,7 @@ fn is_power_header(p: &PlacedPart) -> bool {
 
 /// Hardware that mates to the front panel: it is seated, then aligned by the
 /// panel itself, and only soldered once the nuts are tight.
-fn is_panel_mounted(p: &PlacedPart) -> bool {
+pub fn is_panel_mounted(p: &PlacedPart) -> bool {
     let f = p.footprint.to_ascii_uppercase();
     let prefix = prefix_of(&p.refdes);
     if is_power_header(p) {
@@ -763,7 +763,7 @@ fn rotate_kicad((x, y): (f64, f64), deg: f64) -> (f64, f64) {
 }
 
 /// Parse footprints from a `.kicad_pcb`: refdes, centre, pad bounding box, side.
-fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
+pub fn parse_board(board_pcb: &str) -> Result<Vec<PlacedPart>, String> {
     let root = Sexpr::parse(board_pcb)?;
     let mut parts = Vec::new();
     for fp in root.get_all("footprint") {
@@ -914,7 +914,7 @@ fn courtyard_bbox(fp: &Sexpr, origin: (f64, f64), rot_deg: f64) -> Option<(f64, 
 }
 
 /// The board outline from the `Edge.Cuts` rectangle, if present.
-fn board_outline(board_pcb: &str) -> Option<(f64, f64, f64, f64)> {
+pub fn board_outline(board_pcb: &str) -> Option<(f64, f64, f64, f64)> {
     let root = Sexpr::parse(board_pcb).ok()?;
     let rect = root
         .get_all("gr_rect")
