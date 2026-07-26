@@ -13,18 +13,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_facts, build_guide, default_image_cache_dir, default_panel_orders_dir,
-    default_parts_dir, derive_panel, embed_source, export_cpl, export_gerbers, fetch_data_uri,
-    fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts, generate_board_report,
-    generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path, minimum_hp,
-    package_key, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of, plan_repair,
-    png_to_jpeg, product_image_url, render_board_png, run_drc, run_layout_loop, simulate_ac,
-    simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
+    analytic_check, build_facts, build_guide_with, default_image_cache_dir,
+    default_panel_orders_dir, default_parts_dir, derive_panel, embed_source, export_cpl,
+    export_gerbers, fetch_data_uri, fetch_from_jlcpcb, fetch_from_kicad, generate_board_artifacts,
+    generate_board_report, generate_bom, guide_to_html, guide_to_pdf, jlc_bom_csv, kicad_cli_path,
+    minimum_hp, package_key, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
+    plan_repair, png_to_jpeg, product_image_url, render_board_png, run_drc, run_layout_loop,
+    simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
     ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, EurorackPlacer, Finding, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo,
-    Manifest, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution, PartsLibrary,
-    PipelineReport, ProjectView, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig,
-    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    CircuitSource, EurorackPlacer, Finding, GuideOptions, JlcpcbClient, KitType, LayoutLoop,
+    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelOrders, PartRecord, PartResolution,
+    PartsLibrary, PipelineReport, ProjectView, Repair, ResolutionStatus, SeededPlacer, Severity,
+    SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -1017,6 +1017,10 @@ struct ResolvedCircuit {
     source: PathBuf,
     panel: Option<PathBuf>,
     kit: Option<String>,
+    /// Whether the build guide steps through surface-mount parts (manifest
+    /// `guide_smd`, circuit override first). A bare path argument gets the
+    /// default, since there is no manifest to read it from.
+    guide_smd: bool,
     build: Option<BuildCopy>,
     brand: Option<String>,
 }
@@ -1037,6 +1041,7 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
             source: arg.to_path_buf(),
             panel: None,
             kit: None,
+            guide_smd: false,
             build: None,
             brand: None,
         });
@@ -1073,6 +1078,7 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
         source,
         panel: entry.panel_path(&root),
         kit: entry.effective_kit(&manifest.defaults).map(str::to_string),
+        guide_smd: entry.effective_guide_smd(&manifest.defaults),
         build: entry.build.clone(),
         brand: manifest.repo.brand.clone(),
     })
@@ -1126,7 +1132,12 @@ fn circuits_cmd() -> Result<()> {
 /// states what goes where, which is everything the guide and the Visual BOM
 /// need. Writing them under `out/<name>/` is what puts an imported board on
 /// the dashboard beside the ones we designed.
-fn build_imported(root: &Path, name: &str, package: &Path) -> Result<Vec<&'static str>> {
+fn build_imported(
+    root: &Path,
+    name: &str,
+    package: &Path,
+    opts: GuideOptions,
+) -> Result<Vec<&'static str>> {
     let board = legion_of_bom_core::read_package(package)
         .with_context(|| format!("reading {}", package.display()))?;
     let dir = root.join("out").join(name);
@@ -1134,7 +1145,7 @@ fn build_imported(root: &Path, name: &str, package: &Path) -> Result<Vec<&'stati
 
     // No photoreal render: an imported board has gerbers, not a KiCad board we
     // can ask kicad-cli to draw.
-    let guide = board.to_guide(name);
+    let guide = board.to_guide_with(name, opts);
     let gpath = dir.join(format!("{name}-guide.html"));
     std::fs::write(&gpath, guide_to_html(&guide, None, None))
         .with_context(|| format!("writing {}", gpath.display()))?;
@@ -1194,7 +1205,12 @@ fn build_cmd(name: Option<String>) -> Result<()> {
             .filter(|c| c.is_imported())
             .and_then(|c| c.import_path(&root))
         {
-            match build_imported(&root, name, &pkg) {
+            let opts = GuideOptions {
+                include_smd: manifest
+                    .circuit(name)
+                    .is_some_and(|c| c.effective_guide_smd(&manifest.defaults)),
+            };
+            match build_imported(&root, name, &pkg, opts) {
                 Ok(done) => println!("✓ {name}: {} (imported)", done.join(" + ")),
                 Err(e) => {
                     eprintln!("  ✗ {e:#}");
@@ -1332,7 +1348,13 @@ fn guide_cmd(
     let options = board_options_with_panel(footprint_dir, &panel)?;
     let (board, _) = generate_board_report(&model, &options)?;
 
-    let mut guide = build_guide(&model, &board).map_err(|e| anyhow::anyhow!(e))?;
+    let guide_opts = GuideOptions {
+        include_smd: resolved.guide_smd,
+    };
+    let mut guide = build_guide_with(&model, &board, guide_opts).map_err(|e| anyhow::anyhow!(e))?;
+    if !guide_opts.include_smd {
+        println!("  guide: through-hole parts only (set guide_smd = true to include SMD)");
+    }
     if let Some(kit) = kit_override {
         guide.kit = kit;
     }

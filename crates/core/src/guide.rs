@@ -345,6 +345,15 @@ fn kind_note(kind: &Kind, parts: &[PlacedPart]) -> String {
 /// Build the guide from a circuit (values, types) and its generated board
 /// (positions). Parts default to the front; back parts are noted per step.
 pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<BuildGuide, String> {
+    build_guide_with(circuit, board_pcb, GuideOptions::default())
+}
+
+/// [`build_guide`], with control over what the guide covers.
+pub fn build_guide_with(
+    circuit: &dyn CircuitSource,
+    board_pcb: &str,
+    opts: GuideOptions,
+) -> Result<BuildGuide, String> {
     let placed = parse_board(board_pcb)?;
     let values: BTreeMap<&str, &str> = circuit
         .parts()
@@ -363,10 +372,11 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
             p
         })
         .collect();
-    Ok(guide_from_parts(
+    Ok(guide_from_parts_with(
         circuit.name(),
         parts,
         board_outline(board_pcb).unwrap_or((0.0, 0.0, 10.0, 10.0)),
+        opts,
     ))
 }
 
@@ -376,12 +386,102 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
 /// `.kicad_pcb`) and one that was imported, where position and side come from a
 /// pick-and-place file and there is no footprint library behind them. The
 /// sequencing is a property of the parts, not of where they were read from.
+/// Copy for the seating step: how to seat panel hardware, followed by the
+/// per-kind notes for the kinds actually present.
+///
+/// Those notes carry the detail that matters (a pot's locating tab, a jack's
+/// nut and washer order) and would otherwise be lost by grouping every panel
+/// part into one step.
+fn seat_copy(parts: &[PlacedPart]) -> String {
+    let mut copy = String::from(
+        "Seat every pot, jack and switch in its holes — but solder nothing yet. Push each one \
+         fully down against the board and leave it loose.",
+    );
+    for kind in KINDS {
+        let group: Vec<PlacedPart> = parts
+            .iter()
+            .filter(|p| prefix_of(&p.refdes) == kind.prefix)
+            .cloned()
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        copy.push_str("\n\n");
+        copy.push_str(&kind_note(kind, &group));
+    }
+    copy
+}
+
+/// What to put in a build guide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuideOptions {
+    /// Include surface-mount parts as build steps.
+    ///
+    /// Off by default: an SMD board is assembled by the fab house, so the
+    /// builder's guide is about the through-hole parts they actually fit. On a
+    /// board where the SMD *is* hand-work, turn it back on.
+    pub include_smd: bool,
+}
+
+/// The power header — fitted first because it is on the back, and once the
+/// front is populated the board will not sit flat to solder it.
+fn is_power_header(p: &PlacedPart) -> bool {
+    let f = p.footprint.to_ascii_uppercase();
+    // Both spellings of a 2x5 shrouded header appear in the wild: KiCad writes
+    // `PinHeader_2x05`, fab packages write `2x5`.
+    [
+        "EURO", "IDC", "SHROUD", "POWER", "2X5", "2X05", "10P", "16P",
+    ]
+    .iter()
+    .any(|k| f.contains(k))
+}
+
+/// Hardware that mates to the front panel: it is seated, then aligned by the
+/// panel itself, and only soldered once the nuts are tight.
+fn is_panel_mounted(p: &PlacedPart) -> bool {
+    let f = p.footprint.to_ascii_uppercase();
+    let prefix = prefix_of(&p.refdes);
+    if is_power_header(p) {
+        return false;
+    }
+    // `LED1` as well as `D1`: an indicator shines through the panel either way.
+    matches!(prefix, "RV" | "SW" | "J" | "LED")
+        || (prefix == "D" && f.contains("LED"))
+        || ["THONKICONN", "JACK", "POT", "ENCODER"]
+            .iter()
+            .any(|k| f.contains(k))
+}
+
 pub fn guide_from_parts(
+    name: &str,
+    parts: Vec<PlacedPart>,
+    outline: (f64, f64, f64, f64),
+) -> BuildGuide {
+    guide_from_parts_with(name, parts, outline, GuideOptions::default())
+}
+
+/// [`guide_from_parts`], with control over what the guide covers.
+///
+/// The order is the one a builder actually works in, which is not the order the
+/// parts appear on the board:
+///
+/// 1. the power header, on the back, while the board still sits flat;
+/// 2. everything else on the back, then the front, low-profile first;
+/// 3. panel hardware seated but *not* soldered;
+/// 4. the panel fitted and its nuts tightened, which aligns that hardware;
+/// 5. only then, soldering it.
+///
+/// Soldering a jack before the panel is on is how a panel ends up not fitting.
+pub fn guide_from_parts_with(
     name: &str,
     mut parts: Vec<PlacedPart>,
     outline: (f64, f64, f64, f64),
+    opts: GuideOptions,
 ) -> BuildGuide {
     parts.sort_by_key(|p| refdes_key(&p.refdes));
+    if !opts.include_smd {
+        parts.retain(|p| p.through_hole);
+    }
 
     // Group into ordered steps by side then kind: the BACK side first (mostly SMD
     // + the power header on our boards), then the front — each side low-profile →
@@ -389,14 +489,36 @@ pub fn guide_from_parts(
     // so nothing is silently dropped.
     let mut steps = Vec::new();
     let mut used = vec![false; parts.len()];
+
+    // The power header goes in first, whichever side it is on: it is the one
+    // part that must be soldered while the board still lies flat.
+    let power = take_group(&parts, &mut used, is_power_header);
+    if !power.is_empty() {
+        steps.push(BuildStep {
+            assembly: Some(
+                "Fit the power header first, before anything else stands proud of the board. \
+                 It mounts on the back, and once the front is populated the board will not sit \
+                 flat to solder it. Check the -12 V stripe against the silkscreen: a reversed \
+                 header is the one mistake that damages the module."
+                    .to_string(),
+            ),
+            part_notes: Vec::new(),
+            caution: step_caution(&power),
+            title: "Power header".to_string(),
+            parts: power,
+        });
+    }
+
     for back in [true, false] {
         let side_has = parts.iter().any(|p| p.back == back);
         if !side_has {
             continue;
         }
         for kind in KINDS {
+            // Panel hardware is held back: it is fitted with the panel on, not
+            // in board order.
             let group = take_group(&parts, &mut used, |p| {
-                p.back == back && prefix_of(&p.refdes) == kind.prefix
+                p.back == back && prefix_of(&p.refdes) == kind.prefix && !is_panel_mounted(p)
             });
             if group.is_empty() {
                 continue;
@@ -409,7 +531,9 @@ pub fn guide_from_parts(
                 parts: group,
             });
         }
-        let remaining = take_group(&parts, &mut used, |p| p.back == back);
+        let remaining = take_group(&parts, &mut used, |p| {
+            p.back == back && !is_panel_mounted(p)
+        });
         if !remaining.is_empty() {
             steps.push(BuildStep {
                 assembly: None,
@@ -419,6 +543,48 @@ pub fn guide_from_parts(
                 parts: remaining,
             });
         }
+    }
+
+    // Seat → fit the panel → tighten → solder. The panel is the jig that aligns
+    // every jack and pot; soldering first is how a panel ends up not fitting.
+    let panel_parts = take_group(&parts, &mut used, is_panel_mounted);
+    if !panel_parts.is_empty() {
+        steps.push(BuildStep {
+            assembly: Some(seat_copy(&panel_parts)),
+            part_notes: Vec::new(),
+            caution: Some(
+                "Do not solder these until the panel is on. A jack soldered square to the \
+                 board, but not to the panel, will hold the panel off at an angle."
+                    .to_string(),
+            ),
+            title: "Seat the panel hardware".to_string(),
+            parts: panel_parts.clone(),
+        });
+        steps.push(BuildStep {
+            assembly: Some(
+                "Drop the front panel over the seated hardware and start every nut by hand: \
+                 the jack nuts, the pot nuts, and any washers that go under them. Tighten them \
+                 down snug. This pulls each part square to the panel rather than to the board, \
+                 which is what makes the finished module line up."
+                    .to_string(),
+            ),
+            part_notes: Vec::new(),
+            caution: None,
+            title: "Fit the panel and tighten the nuts".to_string(),
+            parts: Vec::new(),
+        });
+        steps.push(BuildStep {
+            assembly: Some(
+                "Now solder the panel hardware, with the panel still bolted on. Work around \
+                 the board rather than finishing one part at a time, so nothing is pulled out \
+                 of alignment by heat. Then check every nut is still tight."
+                    .to_string(),
+            ),
+            part_notes: Vec::new(),
+            caution: None,
+            title: "Solder the panel hardware".to_string(),
+            parts: panel_parts,
+        });
     }
 
     BuildGuide {
@@ -1453,6 +1619,12 @@ fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Most fixtures below are surface-mount and exercise ordering, grouping and
+    /// rendering — none of which is about SMD policy. They opt in explicitly so
+    /// the default (through-hole only) stays testable on its own.
+    const SMD: GuideOptions = GuideOptions { include_smd: true };
+
     use crate::model::{Circuit, Net, Part, PinRef};
 
     const BOARD: &str = r#"(kicad_pcb
@@ -1478,7 +1650,7 @@ mod tests {
 
     #[test]
     fn orders_steps_low_profile_first_with_values() {
-        let g = build_guide(&amp(), BOARD).unwrap();
+        let g = build_guide_with(&amp(), BOARD, SMD).unwrap();
         // Resistors before ICs.
         assert_eq!(g.steps.len(), 2);
         assert_eq!(g.steps[0].title, "Resistors");
@@ -1492,7 +1664,7 @@ mod tests {
 
     #[test]
     fn html_highlights_and_is_self_contained() {
-        let g = build_guide(&amp(), BOARD).unwrap();
+        let g = build_guide_with(&amp(), BOARD, SMD).unwrap();
         let html = guide_to_html(&g, None, None);
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<svg"));
@@ -1527,13 +1699,13 @@ mod tests {
 
         // The SMD fixture (BOARD, smd pads) gets NO color bands — SMD resistors are
         // marked with a printed numeric code, not bands.
-        let smd = build_guide(&amp(), BOARD).unwrap();
+        let smd = build_guide_with(&amp(), BOARD, SMD).unwrap();
         assert!(!guide_to_html(&smd, None, None).contains("class=\"rband\""));
     }
 
     #[test]
     fn photoreal_step_highlights_every_grouped_part_on_one_render() {
-        let g = build_guide(&amp(), BOARD).unwrap();
+        let g = build_guide_with(&amp(), BOARD, SMD).unwrap();
         let png = b"PNGBYTES"; // opaque to photoreal_board_svg (it just base64s it)
         let board = BoardPng {
             png,
@@ -1551,6 +1723,70 @@ mod tests {
     }
 
     #[test]
+    fn power_header_opens_and_the_panel_closes_the_build() {
+        // A Eurorack board as it is actually built: SMD parts the fab assembles,
+        // a power header on the back, and panel hardware on the front.
+        let board = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 130 105) (layer "Edge.Cuts"))
+          (footprint "R" (layer "F.Cu") (at 100 100 0)
+            (property "Reference" "R1") (pad "1" smd rect (at -1 0) (size 1 1)))
+          (footprint "PinHeader_2x05_P2.54mm_Vertical" (layer "B.Cu") (at 98 100 0)
+            (property "Reference" "J1") (pad "1" thru_hole circle (at -1 0) (size 1 1)))
+          (footprint "Jack_3.5mm_QingPu" (layer "F.Cu") (at 110 100 0)
+            (property "Reference" "J2") (pad "1" thru_hole circle (at -1 0) (size 1 1)))
+          (footprint "Potentiometer" (layer "F.Cu") (at 120 100 0)
+            (property "Reference" "RV1") (pad "1" thru_hole circle (at -2 0) (size 1 1))))"#;
+        let circ = Circuit {
+            name: "euro".into(),
+            parts: vec![
+                Part::new("R1", "10k"),
+                Part::new("J1", "power"),
+                Part::new("J2", "out"),
+                Part::new("RV1", "A100k"),
+            ],
+            nets: vec![],
+        };
+        let g = build_guide(&circ, board).unwrap();
+
+        // The surface-mount resistor is not the builder's work by default.
+        assert!(
+            !g.steps
+                .iter()
+                .any(|s| s.parts.iter().any(|p| p.refdes == "R1")),
+            "SMD is skipped unless asked for"
+        );
+        // The power header is soldered while the board still lies flat, so it
+        // opens the build whichever side it is on.
+        assert_eq!(g.steps[0].title, "Power header");
+        assert!(g.steps[0].parts.iter().any(|p| p.refdes == "J1"));
+
+        // The panel is the jig that aligns the jacks and pots: seat, fit,
+        // tighten, and only then solder.
+        let titles: Vec<&str> = g.steps.iter().map(|s| s.title.as_str()).collect();
+        let seat = titles.iter().position(|t| *t == "Seat the panel hardware");
+        let fit = titles
+            .iter()
+            .position(|t| *t == "Fit the panel and tighten the nuts");
+        let solder = titles
+            .iter()
+            .position(|t| *t == "Solder the panel hardware");
+        assert!(seat < fit && fit < solder, "{titles:?}");
+        // The jack and the pot are both held for that sequence — and the power
+        // header is not, since it is not panel hardware.
+        let seated = &g.steps[seat.unwrap()].parts;
+        assert!(seated.iter().any(|p| p.refdes == "J2"));
+        assert!(seated.iter().any(|p| p.refdes == "RV1"));
+        assert!(!seated.iter().any(|p| p.refdes == "J1"));
+
+        // Opting in brings the surface-mount work back.
+        let with_smd = build_guide_with(&circ, board, SMD).unwrap();
+        assert!(with_smd
+            .steps
+            .iter()
+            .any(|s| s.parts.iter().any(|p| p.refdes == "R1")));
+    }
+
+    #[test]
     fn back_side_steps_come_first_across_kinds() {
         // R1 on the front, C1 on the back. Side grouping is outer, so the back
         // capacitor is built before the front resistor even though R precedes C.
@@ -1565,7 +1801,7 @@ mod tests {
             parts: vec![Part::new("R1", "1k"), Part::new("C1", "10u")],
             nets: vec![],
         };
-        let g = build_guide(&circ, board).unwrap();
+        let g = build_guide_with(&circ, board, SMD).unwrap();
         assert_eq!(g.steps[0].title, "Capacitors");
         assert!(g.steps[0].parts.iter().all(|p| p.back), "cap step is back");
         assert_eq!(g.steps[1].title, "Resistors");
@@ -1594,16 +1830,17 @@ mod tests {
         // Resistor step carries THT resistor copy (flush-cut the leads)...
         let r = g.steps.iter().find(|s| s.title == "Resistors").unwrap();
         assert!(r.assembly.as_deref().unwrap().contains("flush-cut"));
-        // ...and the pot step names the locating tab — the per-part-note seam (5uj.3).
-        let pot = g
+        // ...and the pot's per-kind copy survives being grouped into the panel
+        // sequence: the locating tab is exactly the detail that grouping loses.
+        let seat = g
             .steps
             .iter()
-            .find(|s| s.title.starts_with("Potentiometers"))
+            .find(|s| s.title == "Seat the panel hardware")
             .unwrap();
-        assert!(pot.assembly.as_deref().unwrap().contains("locating tab"));
+        assert!(seat.assembly.as_deref().unwrap().contains("locating tab"));
 
         // The all-SMD fixture (BOARD, smd pads) → detected SMD, SMD copy variant.
-        let g2 = build_guide(&amp(), BOARD).unwrap();
+        let g2 = build_guide_with(&amp(), BOARD, SMD).unwrap();
         assert_eq!(g2.kit, KitType::Smd);
         let r2 = g2.steps.iter().find(|s| s.title == "Resistors").unwrap();
         assert!(r2.assembly.as_deref().unwrap().contains("reflow"));
@@ -1621,7 +1858,7 @@ mod tests {
     #[test]
     fn attach_part_notes_groups_and_renders_under_the_step() {
         // amp(): R1, R2 (Resistors step), U1 (ICs step).
-        let mut g = build_guide(&amp(), BOARD).unwrap();
+        let mut g = build_guide_with(&amp(), BOARD, SMD).unwrap();
         let mut notes = BTreeMap::new();
         // R1 and R2 share a note → one grouped callout; U1 gets its own.
         let trim = vec!["Trim the leads flush after soldering.".to_string()];

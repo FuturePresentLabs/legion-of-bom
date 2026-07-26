@@ -78,8 +78,8 @@ pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use gerber::{layers_to_svg, read_layers, Layer as GerberLayer, LayerKind};
 pub use git::{stage as git_stage, staged_paths, GitError};
 pub use guide::{
-    build_guide, guide_from_parts, guide_to_html, guide_to_pdf, BoardPng, BuildGuide, BuildStep,
-    KitType, PartNote, PlacedPart,
+    build_guide, build_guide_with, guide_from_parts, guide_from_parts_with, guide_to_html,
+    guide_to_pdf, BoardPng, BuildGuide, BuildStep, GuideOptions, KitType, PartNote, PlacedPart,
 };
 pub use images::{default_cache_dir as default_image_cache_dir, embed_source, fetch_data_uri};
 pub use import::{

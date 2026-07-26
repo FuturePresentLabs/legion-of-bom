@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::bom::{Bom, BomLine};
-use crate::guide::{detect_polarity, guide_from_parts, BuildGuide, PlacedPart};
+use crate::guide::{detect_polarity, BuildGuide, PlacedPart};
 
 /// One line of an imported BOM.
 #[derive(Debug, Clone, PartialEq)]
@@ -329,6 +329,15 @@ pub fn package_is_through_hole(package: &str) -> bool {
         "2X5",
         "1X2",
         "1X3",
+        // Eurorack power. A shrouded 2x5 IDC header is always through-hole, and
+        // calling it surface-mount drops the one part the build guide must open
+        // with — it is soldered while the board still lies flat.
+        "EURO",
+        "IDC",
+        "SHROUD",
+        "POWER",
+        "10P",
+        "16P",
     ];
     THT.iter().any(|k| p.contains(k))
 }
@@ -458,7 +467,12 @@ impl ImportedBoard {
     /// side come from the pick-and-place, and everything the guide would normally
     /// take from a footprint library is inferred from the package name.
     pub fn to_guide(&self, name: &str) -> BuildGuide {
-        guide_from_parts(name, self.to_placed_parts(), self.outline())
+        self.to_guide_with(name, crate::guide::GuideOptions::default())
+    }
+
+    /// [`Self::to_guide`], with control over what the guide covers.
+    pub fn to_guide_with(&self, name: &str, opts: crate::guide::GuideOptions) -> BuildGuide {
+        crate::guide::guide_from_parts_with(name, self.to_placed_parts(), self.outline(), opts)
     }
 
     /// Board extent from the placements, as the guide's outline.

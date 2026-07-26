@@ -75,6 +75,11 @@ pub struct Defaults {
     /// Assembly kit type default (`tht`/`smd`/`mixed`/`auto`).
     #[serde(default)]
     pub kit: Option<String>,
+    /// Whether build guides step through surface-mount parts. Defaults to false:
+    /// an SMD board arrives assembled, so the guide covers what the builder
+    /// actually fits. Per-circuit `guide_smd` overrides this.
+    #[serde(default)]
+    pub guide_smd: Option<bool>,
 }
 
 /// One lob-managed circuit, declared as a `[[circuit]]` table.
@@ -101,6 +106,10 @@ pub struct CircuitEntry {
     /// Kit-type override (`tht`/`smd`/`mixed`/`auto`); falls back to `defaults.kit`.
     #[serde(default)]
     pub kit: Option<String>,
+    /// Whether this circuit's build guide steps through surface-mount parts.
+    /// Overrides `[defaults] guide_smd`.
+    #[serde(default)]
+    pub guide_smd: Option<bool>,
     /// A human design-notes doc (reference only), relative to the repo root.
     #[serde(default)]
     pub notes: Option<String>,
@@ -210,6 +219,12 @@ impl CircuitEntry {
     /// The effective kit type: the circuit's own override, else the repo default.
     pub fn effective_kit<'a>(&'a self, defaults: &'a Defaults) -> Option<&'a str> {
         self.kit.as_deref().or(defaults.kit.as_deref())
+    }
+
+    /// Whether this circuit's build guide steps through surface-mount parts:
+    /// the circuit's own setting, else the repo default, else off.
+    pub fn effective_guide_smd(&self, defaults: &Defaults) -> bool {
+        self.guide_smd.or(defaults.guide_smd).unwrap_or(false)
     }
 }
 
