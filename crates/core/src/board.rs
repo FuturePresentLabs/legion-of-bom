@@ -1235,7 +1235,20 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
         let placements = placer.place(circuit, facts);
         // A part in the overflow lane sits below the board bottom (y > height).
         let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
-        if !overflowed {
+        // …but "nothing overflowed" is not "buildable". The lane only catches
+        // parts the packer gave up on; it says nothing about a part hanging off
+        // the side, or one simply wider than the panel. That is what reported
+        // 3 HP for a board whose pots do not fit in 3 HP, and produced copper
+        // edge-clearance errors at 4 HP. Ask the physical rules instead.
+        let rules = crate::rules::derive_in(
+            circuit,
+            &crate::rules::Context {
+                facts: Some(facts),
+                outline: Some((0.0, 0.0, w, h)),
+            },
+        );
+        let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
+        if !overflowed && broken[0] <= 0.0 {
             return hp;
         }
     }
@@ -2648,6 +2661,45 @@ mod tests {
         // C2 bridges +12V↔GND → bonded to U1; C1 is a signal cap → no bond.
         assert!(bonus.iter().any(|(cap, ic, _)| cap == "C2" && ic == "U1"));
         assert!(!bonus.iter().any(|(cap, _, _)| cap == "C1"));
+    }
+
+    /// legion-of-bom-t5t: minimum_hp reported 3 HP for a board whose 9mm pots
+    /// need more than 3 HP of width, because it only checked the overflow lane.
+    /// It now asks the physical rules, which say the outline is too small.
+    #[test]
+    fn minimum_hp_rejects_a_width_where_a_part_does_not_fit() {
+        use crate::model::{Circuit, Part, RefDes};
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        // One Alpha 9mm pot: its keep-out is ~14.5mm wide, so it cannot sit in
+        // a 3 HP panel (15.24mm) with edge clearance on both sides.
+        let circuit = Circuit {
+            name: "t".into(),
+            parts: vec![Part {
+                refdes: RefDes("RV1".into()),
+                value: "100k".into(),
+                footprint: Some(
+                    "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical".into(),
+                ),
+                library_part: None,
+                mpn: None,
+                sim: None,
+                side: None,
+            }],
+            nets: vec![],
+        };
+        let Ok(facts) = build_facts(&circuit, &dir) else {
+            return; // library layout differs; don't fail the unit suite
+        };
+        let pot = facts["RV1"].extent.0;
+        let hp = minimum_hp(&circuit, &facts);
+        use crate::panel::PanelSpec;
+        let width = crate::panel::EurorackPanel::new(hp).width_mm();
+        assert!(
+            width >= pot + 2.0 * crate::rules::EDGE_CLEARANCE_MM,
+            "min {hp} HP = {width:.1}mm cannot hold a {pot:.1}mm part with edge clearance"
+        );
     }
 
     #[test]
