@@ -58,6 +58,31 @@ impl Tier {
     }
 }
 
+/// What the derivers need to know about the board being laid out.
+///
+/// Rules are records that carry everything their evaluation needs, so
+/// [`evaluate`] takes only a placement. That means the board facts a rule
+/// depends on — part sizes, the outline — are resolved once, here, at derive
+/// time. A deriver given nothing still produces rules; it produces weaker ones.
+#[derive(Default, Clone, Copy)]
+pub struct Context<'a> {
+    /// Measured part keep-outs, for rules whose limit depends on part size.
+    pub facts: Option<&'a HashMap<String, crate::board::PartFacts>>,
+    /// The board outline, when it is fixed up front (a panel-sized board).
+    ///
+    /// `None` for a board whose outline is the pad bounding box, where an
+    /// edge-clearance rule would be circular: the outline is derived from the
+    /// very placement the rule would constrain, so nothing can ever overhang.
+    pub outline: Option<(f64, f64, f64, f64)>,
+}
+
+/// House inset from the board edge, in millimetres.
+///
+/// Matches the placer's own edge margin and sits comfortably above KiCad's
+/// 0.5 mm `copper_edge_clearance`, so a board that satisfies this rule does not
+/// then fail DRC on the thing the rule was about.
+pub const EDGE_CLEARANCE_MM: f64 = 1.5;
+
 /// One declarative design rule.
 ///
 /// Deliberately a small closed set: every variant here is enforced, and a rule
@@ -73,12 +98,21 @@ pub enum Rule {
         /// Why, for the report — a violation should explain itself.
         why: &'static str,
     },
+    /// `refdes`'s keep-out (`extent`, w×h) must sit at least `min_mm` inside
+    /// `bounds`. A part hanging over the edge is not a board.
+    EdgeClearance {
+        refdes: String,
+        extent: (f64, f64),
+        bounds: (f64, f64, f64, f64),
+        min_mm: f64,
+        tier: Tier,
+    },
 }
 
 impl Rule {
     pub fn tier(&self) -> Tier {
         match self {
-            Rule::Proximity { tier, .. } => *tier,
+            Rule::Proximity { tier, .. } | Rule::EdgeClearance { tier, .. } => *tier,
         }
     }
 }
@@ -127,7 +161,7 @@ pub const DECOUPLE_MAX_MM: f64 = 5.0;
 /// This is where "what matters about this circuit" is decided, once, from the
 /// netlist — rather than in whichever code path happens to touch a part.
 pub fn derive(circuit: &dyn CircuitSource) -> Vec<Rule> {
-    derive_with_sizes(circuit, None)
+    derive_in(circuit, &Context::default())
 }
 
 /// [`derive`], with each proximity limit sized to the two parts involved.
@@ -142,10 +176,8 @@ pub fn derive(circuit: &dyn CircuitSource) -> Vec<Rule> {
 /// With `facts`, the limit becomes "the two keep-outs touching, plus
 /// [`DECOUPLE_GAP_MM`]" — always reachable, and violated only when the cap
 /// really has been pushed away from its chip.
-pub fn derive_with_sizes(
-    circuit: &dyn CircuitSource,
-    facts: Option<&HashMap<String, crate::board::PartFacts>>,
-) -> Vec<Rule> {
+pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
+    let facts = ctx.facts;
     // Closest two keep-outs can approach, centre to centre, along whichever axis
     // needs least room.
     let floor = |a: &str, b: &str| -> Option<f64> {
@@ -153,7 +185,7 @@ pub fn derive_with_sizes(
         let (ea, eb) = (f.get(a)?.extent, f.get(b)?.extent);
         Some(((ea.0 + eb.0) / 2.0).min((ea.1 + eb.1) / 2.0))
     };
-    crate::board::decoupling_pairs(circuit)
+    let mut rules: Vec<Rule> = crate::board::decoupling_pairs(circuit)
         .into_iter()
         .map(|(cap, ic)| {
             let max_mm = floor(&cap, &ic)
@@ -167,7 +199,30 @@ pub fn derive_with_sizes(
                 why: "a decoupling capacitor must sit at its IC's power pins",
             }
         })
-        .collect()
+        .collect();
+
+    // Nothing may hang over the edge. Only derivable when the outline is fixed
+    // up front; on a board whose outline is the pad bounding box the rule would
+    // be circular and could never fire.
+    if let (Some(bounds), Some(f)) = (ctx.outline, facts) {
+        let mut refs: Vec<&str> = circuit
+            .parts()
+            .iter()
+            .map(|p| p.refdes.0.as_str())
+            .collect();
+        refs.sort_unstable();
+        for r in refs {
+            let Some(fact) = f.get(r) else { continue };
+            rules.push(Rule::EdgeClearance {
+                refdes: r.to_string(),
+                extent: fact.extent,
+                bounds,
+                min_mm: EDGE_CLEARANCE_MM,
+                tier: Tier::Physical,
+            });
+        }
+    }
+    rules
 }
 
 /// Evaluate `rules` against a placement, returning only what was broken.
@@ -200,6 +255,65 @@ pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<
                         repair: Some(Repair {
                             refdes: a.clone(),
                             toward_mm: (pb.x_mm, pb.y_mm),
+                        }),
+                    });
+                }
+            }
+            Rule::EdgeClearance {
+                refdes,
+                extent,
+                bounds,
+                min_mm,
+                tier,
+            } => {
+                let Some(p) = placements.get(refdes) else {
+                    continue;
+                };
+                let (x0, y0, x1, y1) = *bounds;
+                // A part the placer stood on end occupies its extent swapped.
+                // Measuring the unrotated box against the board reports a
+                // 90°-rotated header as hanging off when it fits perfectly.
+                let quarter_turns = (p.rotation_deg / 90.0).round() as i64;
+                let (ew, eh) = if quarter_turns % 2 == 0 {
+                    (extent.0, extent.1)
+                } else {
+                    (extent.1, extent.0)
+                };
+                let (hw, hh) = (ew / 2.0, eh / 2.0);
+                // The band the part's *centre* may occupy.
+                let (ax0, ay0) = (x0 + min_mm + hw, y0 + min_mm + hh);
+                let (ax1, ay1) = (x1 - min_mm - hw, y1 - min_mm - hh);
+                // A part wider than the board can never satisfy this, and saying
+                // "move it 4mm" would be a lie — the board is too small. Report
+                // the shortfall as what it is.
+                if ax0 > ax1 || ay0 > ay1 {
+                    let short = (ax0 - ax1).max(ay0 - ay1).max(0.0);
+                    out.push(Violation {
+                        tier: *tier,
+                        by_mm: short,
+                        what: format!(
+                            "{refdes} ({ew:.1}×{eh:.1}mm) does not fit inside the board with \
+                             {min_mm:.1}mm edge clearance — the outline is {short:.1}mm too small"
+                        ),
+                        repair: None,
+                    });
+                    continue;
+                }
+                let over = (ax0 - p.x_mm)
+                    .max(p.x_mm - ax1)
+                    .max(ay0 - p.y_mm)
+                    .max(p.y_mm - ay1);
+                if over > 0.0 {
+                    out.push(Violation {
+                        tier: *tier,
+                        by_mm: over,
+                        what: format!(
+                            "{refdes} hangs {over:.1}mm past the board's {min_mm:.1}mm edge \
+                             clearance"
+                        ),
+                        repair: Some(Repair {
+                            refdes: refdes.clone(),
+                            toward_mm: (p.x_mm.clamp(ax0, ax1), p.y_mm.clamp(ay0, ay1)),
                         }),
                     });
                 }
@@ -286,7 +400,9 @@ mod tests {
     fn a_bypass_cap_derives_a_proximity_rule_to_its_ic() {
         let rules = derive(&circuit());
         assert_eq!(rules.len(), 1);
-        let Rule::Proximity { a, b, tier, .. } = &rules[0];
+        let Rule::Proximity { a, b, tier, .. } = &rules[0] else {
+            panic!("expected a proximity rule, got {:?}", rules[0])
+        };
         assert_eq!((a.as_str(), b.as_str()), ("C2", "U1"));
         assert_eq!(*tier, Tier::Electrical);
     }
@@ -361,8 +477,16 @@ mod tests {
             ("C2".into(), fact(3.0, 1.5)),
         ]
         .into();
-        let sized = derive_with_sizes(&circuit(), Some(&facts));
-        let Rule::Proximity { max_mm, .. } = &sized[0];
+        let sized = derive_in(
+            &circuit(),
+            &Context {
+                facts: Some(&facts),
+                outline: None,
+            },
+        );
+        let Rule::Proximity { max_mm, .. } = &sized[0] else {
+            panic!("expected a proximity rule, got {:?}", sized[0])
+        };
         assert!(
             (*max_mm - (5.2 + DECOUPLE_GAP_MM)).abs() < 0.01,
             "limit is the touching distance plus the gap, got {max_mm}"
@@ -381,6 +505,85 @@ mod tests {
         assert!(evaluate(&sized, &touching).is_empty());
         // …and the flat rule would have called it a violation.
         assert!(!evaluate(&derive(&circuit()), &touching).is_empty());
+    }
+
+    /// Nothing may hang over the edge — the Physical-tier rule behind
+    /// legion-of-bom-t5t, where a 3 HP board reported buildable and came back
+    /// with copper-edge-clearance errors and parts off the outline.
+    #[test]
+    fn a_part_over_the_edge_is_a_physical_violation_with_a_way_back() {
+        let bounds = (0.0, 0.0, 20.0, 100.0);
+        let rule = Rule::EdgeClearance {
+            refdes: "J1".into(),
+            extent: (10.0, 6.0),
+            bounds,
+            min_mm: 1.5,
+            tier: Tier::Physical,
+        };
+        // Centre may live in x 6.5..13.5. At 16.0 it is 2.5mm past.
+        let over: HashMap<String, Placement> = [("J1".into(), at(16.0, 50.0))].into();
+        let v = evaluate(std::slice::from_ref(&rule), &over);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].tier, Tier::Physical);
+        assert!((v[0].by_mm - 2.5).abs() < 0.01, "{:?}", v[0]);
+        // …and the repair says exactly where it has to go.
+        let r = v[0].repair.as_ref().unwrap();
+        assert!((r.toward_mm.0 - 13.5).abs() < 0.01, "{:?}", r);
+        // Comfortably inside is no violation.
+        let ok: HashMap<String, Placement> = [("J1".into(), at(10.0, 50.0))].into();
+        assert!(evaluate(std::slice::from_ref(&rule), &ok).is_empty());
+    }
+
+    /// A part the placer stood on end occupies its extent swapped. Measuring
+    /// the unrotated box reported a 90° power header as hanging 3.8mm off a
+    /// board it fits perfectly.
+    #[test]
+    fn a_rotated_part_is_measured_on_the_side_it_actually_occupies() {
+        let rule = Rule::EdgeClearance {
+            refdes: "J3".into(),
+            extent: (7.0, 14.7),
+            bounds: (0.0, 0.0, 25.4, 128.5),
+            min_mm: 1.5,
+            tier: Tier::Physical,
+        };
+        // Laid horizontal: 14.7 across, 7 tall, so a centre 5mm from the top
+        // edge fits. Unrotated it would look 3.85mm over.
+        let laid = Placement {
+            x_mm: 12.0,
+            y_mm: 5.0,
+            rotation_deg: 90.0,
+            back: false,
+        };
+        let p: HashMap<String, Placement> = [("J3".into(), laid)].into();
+        assert!(evaluate(std::slice::from_ref(&rule), &p).is_empty());
+        // Upright at the same spot genuinely does hang off.
+        let upright = Placement {
+            rotation_deg: 0.0,
+            ..laid
+        };
+        let p: HashMap<String, Placement> = [("J3".into(), upright)].into();
+        assert!(!evaluate(std::slice::from_ref(&rule), &p).is_empty());
+    }
+
+    /// A part wider than the board can never be moved into compliance, and
+    /// "shift it 2.3mm" would be a lie. Say the outline is too small.
+    #[test]
+    fn a_part_that_cannot_fit_reports_the_board_not_the_placement() {
+        let rule = Rule::EdgeClearance {
+            refdes: "RV1".into(),
+            extent: (14.5, 14.3),
+            bounds: (0.0, 0.0, 15.24, 128.5), // 3 HP
+            min_mm: 1.5,
+            tier: Tier::Physical,
+        };
+        let p: HashMap<String, Placement> = [("RV1".into(), at(7.6, 60.0))].into();
+        let v = evaluate(std::slice::from_ref(&rule), &p);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].what.contains("too small"), "{}", v[0].what);
+        assert!(
+            v[0].repair.is_none(),
+            "no placement fixes a board this narrow"
+        );
     }
 
     #[test]
