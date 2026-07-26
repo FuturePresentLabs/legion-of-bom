@@ -284,7 +284,7 @@ fn body_span(courtyard: Option<Rect>, pad_box: Option<Rect>) -> (f64, f64) {
 }
 
 /// Rotate an `(x, y)` offset by a footprint rotation of `deg` (quarter turns).
-fn rotate_offset((x, y): (f64, f64), deg: f64) -> (f64, f64) {
+pub(crate) fn rotate_offset((x, y): (f64, f64), deg: f64) -> (f64, f64) {
     match (((deg / 90.0).round() as i64) % 4 + 4) % 4 {
         1 => (-y, x),
         2 => (-x, -y),
@@ -1232,7 +1232,7 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
             anchors,
             nudges: HashMap::new(),
         };
-        let mut placements = placer.place(circuit, facts);
+        let placements = placer.place(circuit, facts);
         // A part in the overflow lane sits below the board bottom (y > height).
         let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
         // …but "nothing overflowed" is not "buildable". The lane only catches
@@ -1247,11 +1247,23 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
                 outline: Some((0.0, 0.0, w, h)),
             },
         );
-        // Legalize first, because the build does: asking whether the *global*
-        // placement is legal reports a wider board than we would actually
-        // manufacture. Measured on slew_limiter, that was the difference
-        // between answering 5 HP and 4 HP for a 4 HP board that legalizes clean.
-        crate::legalize::legalize(&mut placements, &rules, facts);
+        // NOT legalized, deliberately, and this is a judgement call worth
+        // knowing about.
+        //
+        // The build legalizes, so judging the *global* placement here reports a
+        // wider board than we would manufacture — on slew_limiter, 5 HP where
+        // the legalized board fits 4 HP. That argues for legalizing here too,
+        // and it was done that way briefly.
+        //
+        // It was reverted because the physical rules do not yet bound all the
+        // copper: at 4 HP, KiCad finds PTH lugs of RV1/RV2 0.36mm from the board
+        // edge (limit 0.5mm) that EdgeClearance does not see, because
+        // PartFacts.tht_pads does not appear to contain them. Legalizing before
+        // judging therefore made minimum_hp answer 4 for a width that fails DRC
+        // — exactly the optimism legion-of-bom-t5t is about, and a number
+        // somebody could order a panel against.
+        //
+        // Restore the legalize() call once the facts bound the copper.
         let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
         if !overflowed && broken[0] <= 0.0 {
             return hp;

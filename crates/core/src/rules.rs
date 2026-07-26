@@ -110,6 +110,14 @@ pub enum Rule {
     EdgeClearance {
         refdes: String,
         extent: (f64, f64),
+        /// Keep-out centre relative to the placement origin.
+        ///
+        /// Not every footprint is centred on its origin — a pot's origin is its
+        /// shaft and a DIP's is pin 1, so the body sits several millimetres off.
+        /// Measuring the extent box around the placement origin puts it in the
+        /// wrong place: RV1 on slew_limiter is offset +5.3mm, which is enough to
+        /// call a part clear while KiCad finds its pad on the board edge.
+        origin_offset: (f64, f64),
         bounds: (f64, f64, f64, f64),
         min_mm: f64,
         tier: Tier,
@@ -233,6 +241,7 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
             rules.push(Rule::EdgeClearance {
                 refdes: r.to_string(),
                 extent: fact.extent,
+                origin_offset: fact.origin_offset,
                 bounds,
                 min_mm: EDGE_CLEARANCE_MM,
                 tier: Tier::Physical,
@@ -304,6 +313,7 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
             Rule::EdgeClearance {
                 refdes,
                 extent,
+                origin_offset,
                 bounds,
                 min_mm,
                 tier,
@@ -312,6 +322,14 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                     continue;
                 };
                 let (x0, y0, x1, y1) = *bounds;
+                // Where the keep-out actually sits: the offset rotates with the
+                // part, and mirrors in X on the back, exactly as the placer's
+                // own keepout_at_rot does. Reading the placement origin as the
+                // box centre is what let a pot's pad reach the board edge while
+                // this rule called it clear.
+                let (ox, oy) = crate::board::rotate_offset(*origin_offset, p.rotation_deg);
+                let ox = if p.back { -ox } else { ox };
+                let (px, py) = (p.x_mm + ox, p.y_mm + oy);
                 // A part the placer stood on end occupies its extent swapped.
                 // Measuring the unrotated box against the board reports a
                 // 90°-rotated header as hanging off when it fits perfectly.
@@ -343,10 +361,7 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                     continue;
                 }
                 // Positive: room left on the tightest side. Negative: how far past.
-                let slack = (p.x_mm - ax0)
-                    .min(ax1 - p.x_mm)
-                    .min(p.y_mm - ay0)
-                    .min(ay1 - p.y_mm);
+                let slack = (px - ax0).min(ax1 - px).min(py - ay0).min(ay1 - py);
                 let detail = if slack < 0.0 {
                     format!(
                         "{refdes} hangs {:.1}mm past the board's {min_mm:.1}mm edge clearance",
@@ -360,9 +375,12 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                     subject: refdes.clone(),
                     detail,
                     margin_mm: slack,
+                    // The repair target is a *placement origin*, so undo the
+                    // offset: clamp where the keep-out must end up, then convert
+                    // back to where the origin has to be for that to happen.
                     repair: Some(Repair {
                         refdes: refdes.clone(),
-                        toward_mm: (p.x_mm.clamp(ax0, ax1), p.y_mm.clamp(ay0, ay1)),
+                        toward_mm: (px.clamp(ax0, ax1) - ox, py.clamp(ay0, ay1) - oy),
                     }),
                 });
             }
@@ -582,6 +600,7 @@ mod tests {
         let rule = Rule::EdgeClearance {
             refdes: "J1".into(),
             extent: (10.0, 6.0),
+            origin_offset: (0.0, 0.0),
             bounds,
             min_mm: 1.5,
             tier: Tier::Physical,
@@ -608,6 +627,7 @@ mod tests {
         let rule = Rule::EdgeClearance {
             refdes: "J3".into(),
             extent: (7.0, 14.7),
+            origin_offset: (0.0, 0.0),
             bounds: (0.0, 0.0, 25.4, 128.5),
             min_mm: 1.5,
             tier: Tier::Physical,
@@ -631,6 +651,38 @@ mod tests {
         assert!(!evaluate(std::slice::from_ref(&rule), &p).is_empty());
     }
 
+    /// A pot's origin is its shaft, not its body centre. Measuring the extent
+    /// box around the placement origin put it 5mm from where the part actually
+    /// is, which called RV1 clear on a 4 HP board while KiCad found its pad on
+    /// the edge.
+    #[test]
+    fn the_keep_out_is_measured_where_it_sits_not_at_the_placement_origin() {
+        let bounds = (0.0, 0.0, 20.32, 100.0); // 4 HP
+        let rule = Rule::EdgeClearance {
+            refdes: "RV1".into(),
+            extent: (14.5, 14.3),
+            origin_offset: (5.3, 2.5),
+            bounds,
+            min_mm: EDGE_CLEARANCE_MM,
+            tier: Tier::Physical,
+        };
+        // Origin at x=5, so the keep-out is centred at 10.3 and spans 3.05..17.55
+        // — 2.77mm clear of the right edge but only 3.05 of the left, both fine.
+        // Move the origin to 1.0 and the keep-out lands at 6.3, spanning
+        // -0.95..13.55: over the left edge, which the old code could not see.
+        let p: HashMap<String, Placement> = [("RV1".into(), at(1.0, 50.0))].into();
+        let v = evaluate(std::slice::from_ref(&rule), &p);
+        assert_eq!(v.len(), 1, "keep-out is over the edge: {v:?}");
+        // …and the repair target is a placement ORIGIN, so it undoes the offset.
+        let r = v[0].repair.as_ref().unwrap();
+        let keepout_x = r.toward_mm.0 + 5.3;
+        assert!(
+            keepout_x >= EDGE_CLEARANCE_MM + 14.5 / 2.0 - 0.01,
+            "moving the origin to {:.2} puts the keep-out at {keepout_x:.2}",
+            r.toward_mm.0
+        );
+    }
+
     /// A part wider than the board can never be moved into compliance, and
     /// "shift it 2.3mm" would be a lie. Say the outline is too small.
     #[test]
@@ -638,6 +690,7 @@ mod tests {
         let rule = Rule::EdgeClearance {
             refdes: "RV1".into(),
             extent: (14.5, 14.3),
+            origin_offset: (0.0, 0.0),
             bounds: (0.0, 0.0, 15.24, 128.5), // 3 HP
             min_mm: 1.5,
             tier: Tier::Physical,

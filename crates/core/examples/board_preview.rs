@@ -50,7 +50,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Through the iterative loop, not one-shot: the attempt-selection score is
     // where a good placement used to get discarded.
     let template = SeededPlacer::new(w, h, origin, anchors);
-    let report = run_layout_loop(&circuit, opts, template, &LayoutLoop::default())?;
+    // Gate the winning board on real KiCad DRC — the check that says whether a
+    // width is actually buildable, as opposed to geometrically plausible.
+    let cfg = LayoutLoop {
+        kicad_cli: legion_of_bom_core::kicad_cli_path(),
+        ..LayoutLoop::default()
+    };
+    let report = run_layout_loop(&circuit, opts, template, &cfg)?;
     std::fs::write(&out, &report.board)?;
     eprintln!(
         "wrote {} — {} iteration(s), score {:.1}, rule penalty {:.1}",
@@ -61,6 +67,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for f in &report.findings {
         eprintln!("  [{:?}] {}", f.severity, f.message);
+    }
+    if let Some(drc) = &report.drc {
+        let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
+        for v in drc
+            .violations
+            .iter()
+            .chain(&drc.unconnected_items)
+            .filter(|v| v.severity == "error")
+        {
+            *by_kind.entry(v.kind.as_str()).or_default() += 1;
+        }
+        eprintln!("  DRC: {} error(s)", drc.error_count());
+        for (k, n) in by_kind {
+            eprintln!("       {n}x {k}");
+        }
+    } else {
+        eprintln!("  DRC: not run (no kicad-cli)");
     }
     Ok(())
 }

@@ -194,6 +194,7 @@ mod tests {
         Rule::EdgeClearance {
             refdes: refdes.into(),
             extent,
+            origin_offset: (0.0, 0.0),
             bounds,
             min_mm: EDGE_CLEARANCE_MM,
             tier: Tier::Physical,
