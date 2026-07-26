@@ -185,6 +185,17 @@ pub trait Placer {
         circuit: &dyn CircuitSource,
         facts: &HashMap<String, PartFacts>,
     ) -> HashMap<String, Placement>;
+
+    /// Parts pinned to a panel cutout, which downstream passes must not move.
+    ///
+    /// A jack's position is not this placer's opinion — it is where the hole is.
+    /// Legalization repairs physical violations by moving parts, and moving a
+    /// panel control off its cutout silently produces a board that will not mate
+    /// its own panel. So a violation involving one of these is *reported*, not
+    /// quietly fixed: the panel is what needs changing.
+    fn anchored(&self) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 }
 
 /// Extra gap (mm) left between adjacent grid cells, on top of each part's extent.
@@ -395,6 +406,10 @@ pub struct EurorackPlacer {
 }
 
 impl Placer for EurorackPlacer {
+    fn anchored(&self) -> std::collections::HashSet<String> {
+        self.anchors.keys().cloned().collect()
+    }
+
     fn place(
         &self,
         circuit: &dyn CircuitSource,
@@ -694,6 +709,10 @@ impl SeededPlacer {
 }
 
 impl Placer for SeededPlacer {
+    fn anchored(&self) -> std::collections::HashSet<String> {
+        self.anchors.keys().cloned().collect()
+    }
+
     fn place(
         &self,
         circuit: &dyn CircuitSource,
@@ -1290,6 +1309,7 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
             nudges: HashMap::new(),
         };
         let mut placements = placer.place(circuit, facts);
+        let pinned = placer.anchored();
         // A part in the overflow lane sits below the board bottom (y > height).
         let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
         // …but "nothing overflowed" is not "buildable". The lane only catches
@@ -1314,7 +1334,7 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
         // parts mirrored after rotation instead of before — the rule's box now
         // contains the real copper with the expected clearance, and
         // copper_edge_clearance errors at 4 HP went from 5 to 0. Restored.
-        crate::legalize::legalize(&mut placements, &rules, facts);
+        crate::legalize::legalize_pinning(&mut placements, &rules, facts, &pinned);
         let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
         if !overflowed && broken[0] <= 0.0 {
             return hp;
@@ -1442,6 +1462,9 @@ pub fn generate_board_artifacts(
     }
 
     let mut placements = options.placer.place(circuit, &facts);
+    // Panel controls are pinned to their cutouts; nothing downstream may slide
+    // them off, or the board stops mating its own panel.
+    let pinned = options.placer.anchored();
 
     // Bypass caps go against the power pin they bypass, before anything else
     // gets a say. The placer's decoupling pull is one attractor among many and
@@ -1466,7 +1489,7 @@ pub fn generate_board_artifacts(
                 outline: options.fixed_outline,
             },
         );
-        crate::legalize::legalize(&mut placements, &rules, &facts);
+        crate::legalize::legalize_pinning(&mut placements, &rules, &facts, &pinned);
     }
 
     // Height/collision check (DESIGN 6.7): a sub-board stands off the main board on

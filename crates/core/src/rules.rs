@@ -105,6 +105,27 @@ pub enum Rule {
         /// Why, for the report — a violation should explain itself.
         why: &'static str,
     },
+    /// `a` and `b` must sit at least `min_mm` apart, centre to centre.
+    ///
+    /// The panel-hardware rule. Two panel-mounted controls collide by their
+    /// *panel* envelope — the knob, the nut, the finger room — not by their PCB
+    /// courtyard, and the panel envelope is much the larger. A board can be
+    /// perfectly legal in copper and still carry a pot and a jack 6.9mm apart,
+    /// which is a panel nobody can assemble (`legion-of-bom-za4`).
+    Separation {
+        a: String,
+        /// Where `a`'s panel hardware sits relative to its placement origin.
+        ///
+        /// Not optional detail: an Alpha pot's origin is pin 1 and its shaft is
+        /// ~5.3mm away, so comparing placement origins misjudges the gap by half
+        /// a knob. What collides is the hardware, so that is what is measured.
+        a_offset: (f64, f64),
+        b: String,
+        b_offset: (f64, f64),
+        min_mm: f64,
+        tier: Tier,
+        why: &'static str,
+    },
     /// `refdes`'s keep-out (`extent`, w×h) must sit at least `min_mm` inside
     /// `bounds`. A part hanging over the edge is not a board.
     EdgeClearance {
@@ -134,7 +155,7 @@ impl Rule {
     /// disagreeing with each other for months.
     pub fn measured_box(&self, p: &Placement) -> Option<(f64, f64, f64, f64)> {
         match self {
-            Rule::Proximity { .. } => None,
+            Rule::Proximity { .. } | Rule::Separation { .. } => None,
             Rule::EdgeClearance {
                 extent,
                 origin_offset,
@@ -163,7 +184,9 @@ impl Rule {
 
     pub fn tier(&self) -> Tier {
         match self {
-            Rule::Proximity { tier, .. } | Rule::EdgeClearance { tier, .. } => *tier,
+            Rule::Proximity { tier, .. }
+            | Rule::Separation { tier, .. }
+            | Rule::EdgeClearance { tier, .. } => *tier,
         }
     }
 }
@@ -262,6 +285,52 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
         })
         .collect();
 
+    // Panel hardware must not collide with panel hardware. Judged on the *panel*
+    // envelope — knob, nut, finger room — because that is what a builder's hands
+    // meet, and it is far bigger than the PCB courtyard the placer otherwise
+    // reserves. Physical tier: two knobs in the same hole is not a trade-off.
+    //
+    // Only pairs where BOTH parts are panel-mounted. A board part happily lives
+    // under a knob; it is on the other side of the panel.
+    // A part's hardware centre relative to its placement origin: the courtyard
+    // centre, which for a pot is the shaft rather than pin 1.
+    let off = |r: &str| -> (f64, f64) {
+        facts
+            .and_then(|f| f.get(r))
+            .map(|f| f.origin_offset)
+            .unwrap_or((0.0, 0.0))
+    };
+    let panel_parts: Vec<(&str, (f64, f64))> = {
+        use crate::panel::{BuiltinCutouts, CutoutSource};
+        let mut v: Vec<(&str, (f64, f64))> = circuit
+            .parts()
+            .iter()
+            .filter_map(|p| {
+                let spec = BuiltinCutouts
+                    .cutout(p.mpn.as_deref(), p.footprint.as_deref().unwrap_or(""))?;
+                Some((p.refdes.0.as_str(), spec.envelope_mm))
+            })
+            .collect();
+        v.sort_by_key(|(r, _)| *r);
+        v
+    };
+    for (i, (a, ea)) in panel_parts.iter().enumerate() {
+        for (b, eb) in &panel_parts[i + 1..] {
+            // Centre spacing that clears both envelopes whichever way they sit.
+            let min_mm = ((ea.0 + eb.0) / 2.0).max((ea.1 + eb.1) / 2.0);
+            rules.push(Rule::Separation {
+                a: (*a).to_string(),
+                a_offset: off(a),
+                b: (*b).to_string(),
+                b_offset: off(b),
+                min_mm,
+                tier: Tier::Physical,
+                why: "panel hardware overlaps — knobs and nuts are bigger than \
+                      the footprints under them",
+            });
+        }
+    }
+
     // Nothing may hang over the edge. Only derivable when the outline is fixed
     // up front; on a board whose outline is the pad bounding box the rule would
     // be circular and could never fire.
@@ -343,6 +412,47 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                     repair: Some(Repair {
                         refdes: a.clone(),
                         toward_mm: (pb.x_mm, pb.y_mm),
+                    }),
+                });
+            }
+            Rule::Separation {
+                a,
+                a_offset,
+                b,
+                b_offset,
+                min_mm,
+                tier,
+                why,
+            } => {
+                let (Some(pa), Some(pb)) = (placements.get(a), placements.get(b)) else {
+                    continue;
+                };
+                // Hardware centres, not placement origins.
+                let ca = crate::board::place_point(*pa, a_offset.0, a_offset.1);
+                let cb = crate::board::place_point(*pb, b_offset.0, b_offset.1);
+                let (dx, dy) = (ca.0 - cb.0, ca.1 - cb.1);
+                let d = dx.hypot(dy);
+                // Push `a` straight away from `b` to exactly the minimum. Two
+                // controls on the same centreline give dx = 0, so this becomes a
+                // pure vertical move — which is the shape of a Eurorack column.
+                let (ux, uy) = if d > 1e-6 {
+                    (dx / d, dy / d)
+                } else {
+                    (0.0, 1.0)
+                };
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: a.clone(),
+                    detail: format!("{a} is {d:.1}mm from {b} (min {min_mm:.1}mm) — {why}"),
+                    margin_mm: d - min_mm,
+                    // Target the *origin* that puts a's hardware at the right
+                    // distance, since that is what a placement stores.
+                    repair: Some(Repair {
+                        refdes: a.clone(),
+                        toward_mm: (
+                            cb.0 + ux * min_mm - (ca.0 - pa.x_mm),
+                            cb.1 + uy * min_mm - (ca.1 - pa.y_mm),
+                        ),
                     }),
                 });
             }
@@ -475,6 +585,53 @@ mod tests {
             rotation_deg: 0.0,
             back: false,
         }
+    }
+
+    /// The za4 case, in miniature: a 9mm pot and a jack 6.9mm apart on the board.
+    /// Legal in copper, impossible on a panel — the knob and the nut occupy far
+    /// more room than the footprints under them.
+    #[test]
+    fn panel_hardware_that_overlaps_is_a_physical_violation_and_gets_repaired() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let pot = "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
+        let circuit = Circuit {
+            name: "za4".into(),
+            parts: vec![
+                Part::new("J1", "in").with_footprint(jack),
+                Part::new("RV2", "100k").with_footprint(pot),
+            ],
+            nets: Vec::new(),
+        };
+        let rules = derive(&circuit);
+        let sep = rules
+            .iter()
+            .find(|r| matches!(r, Rule::Separation { .. }))
+            .expect("a separation rule between two panel controls");
+        let Rule::Separation { min_mm, tier, .. } = sep else {
+            unreachable!()
+        };
+        // Jack envelope 14.4 tall, pot 14.0 → 14.2mm centre to centre.
+        assert!((min_mm - 14.2).abs() < 0.01, "{min_mm}");
+        assert_eq!(*tier, Tier::Physical, "a panel that cannot be built");
+
+        // As placed on the shipped board: 6.87mm apart, same x.
+        let mut p: HashMap<String, Placement> = [
+            ("RV2".to_string(), at(146.0, 95.35)),
+            ("J1".to_string(), at(146.0, 102.22)),
+        ]
+        .into();
+        let broken = evaluate(&rules, &p);
+        assert!(
+            broken.iter().any(|v| v.tier == Tier::Physical),
+            "the overlap is reported: {broken:?}"
+        );
+
+        // Legalization is what fixes it, since it repairs physical rules.
+        let facts = HashMap::new();
+        crate::legalize::legalize(&mut p, &rules, &facts);
+        let d = (p["J1"].x_mm - p["RV2"].x_mm).hypot(p["J1"].y_mm - p["RV2"].y_mm);
+        assert!(d >= 14.2 - 0.01, "pushed apart to {d:.2}mm");
+        assert!(evaluate(&rules, &p).is_empty(), "and nothing left broken");
     }
 
     fn pin(r: &str, p: &str) -> PinRef {

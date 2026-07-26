@@ -61,6 +61,21 @@ pub fn legalize(
     rules: &[Rule],
     facts: &HashMap<String, PartFacts>,
 ) -> Report {
+    legalize_pinning(placements, rules, facts, &std::collections::HashSet::new())
+}
+
+/// [`legalize`], leaving `pinned` parts exactly where they are.
+///
+/// A part anchored to a panel cutout is not the placer's to move — its position
+/// is where the hole is. Repairing such a violation by sliding the part would
+/// hand back a board that cannot mate its own panel, so it is left broken and
+/// reported in [`Report::stuck`], where it reads as "the panel needs changing".
+pub fn legalize_pinning(
+    placements: &mut HashMap<String, Placement>,
+    rules: &[Rule],
+    facts: &HashMap<String, PartFacts>,
+    pinned: &std::collections::HashSet<String>,
+) -> Report {
     let mut report = Report::default();
     let mut travelled: HashMap<String, f64> = HashMap::new();
 
@@ -69,6 +84,7 @@ pub fn legalize(
             .into_iter()
             .filter(|a| a.tier == Tier::Physical && !a.ok())
             .filter_map(|a| a.repair.map(|r| (r.refdes, r.toward_mm)))
+            .filter(|(refdes, _)| !pinned.contains(refdes))
             .collect();
         if broken.is_empty() {
             break;
@@ -255,6 +271,29 @@ mod tests {
         );
         // …but still near where it was asked to go, not across the board.
         assert!((j1.x_mm - 33.5).hypot(j1.y_mm - 50.0) < 12.0, "{j1:?}");
+    }
+
+    /// A part anchored to a panel cutout is never moved, however illegal it is.
+    /// Sliding a jack off its hole to satisfy a rule hands back a board that
+    /// cannot mate its own panel — the panel is what needs changing, so the
+    /// violation is reported instead.
+    #[test]
+    fn a_pinned_part_is_reported_not_moved() {
+        let bounds = (0.0, 0.0, 40.0, 100.0);
+        let rules = vec![edge_rule("J1", (10.0, 6.0), bounds)];
+        let facts: HashMap<String, PartFacts> = [("J1".to_string(), fact(10.0, 6.0))].into();
+        let mut p: HashMap<String, Placement> = [("J1".to_string(), at(38.0, 50.0))].into();
+        let pinned: std::collections::HashSet<String> = ["J1".to_string()].into();
+
+        let r = legalize_pinning(&mut p, &rules, &facts, &pinned);
+        assert_eq!(p["J1"], at(38.0, 50.0), "left on its cutout");
+        assert!(r.moved.is_empty());
+        assert_eq!(r.stuck, vec!["J1".to_string()], "and reported as stuck");
+
+        // Unpinned, the same part is repaired — so the pin is what changed it.
+        let mut q: HashMap<String, Placement> = [("J1".to_string(), at(38.0, 50.0))].into();
+        legalize(&mut q, &rules, &facts);
+        assert!((q["J1"].x_mm - 33.5).abs() < 0.01);
     }
 
     /// A board too small for the part has no legal position, and legalization

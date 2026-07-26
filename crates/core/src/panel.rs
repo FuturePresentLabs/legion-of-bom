@@ -902,9 +902,16 @@ pub fn panel_from_board(
         let Some(spec) = cutouts.cutout(mpn_of(&p.refdes).as_deref(), &p.footprint) else {
             continue;
         };
+        // The cutout goes where the *hardware* is, not where the footprint's
+        // origin is. An Alpha pot's origin is pin 1 and its shaft sits several
+        // millimetres away, so mapping the origin drills the hole off the shaft
+        // — and the reverse trip (cutout -> placement) already subtracts that
+        // offset, so origin-mapping made the two directions disagree and a part
+        // drift by one offset per round trip (`legion-of-bom-za4`).
+        let (hx, hy) = ((p.bbox.0 + p.bbox.2) / 2.0, (p.bbox.1 + p.bbox.3) / 2.0);
         out.push(CutoutFile {
-            x_mm: p.cx - x0,
-            y_mm: h - (p.cy - y0),
+            x_mm: hx - x0,
+            y_mm: h - (hy - y0),
             rotation_deg: 0.0,
             footprint: spec.kind.cutout_name().to_string(),
             refdes: Some(p.refdes.clone()),
