@@ -113,6 +113,15 @@ pub struct CircuitEntry {
     /// A human design-notes doc (reference only), relative to the repo root.
     #[serde(default)]
     pub notes: Option<String>,
+    /// Board revision printed on the silkscreen, e.g. "v1.2". A board with no
+    /// revision on it is one nobody can identify in a support thread.
+    #[serde(default)]
+    pub rev: Option<String>,
+    /// A short design note printed on the silkscreen under the title —
+    /// topology, a licence, a URL. Keep it short; it competes for the bottom
+    /// edge with the title and the logo.
+    #[serde(default)]
+    pub silk_note: Option<String>,
     /// Per-circuit build copy shown in the guide (5uj.5).
     #[serde(default)]
     pub build: Option<BuildCopy>,

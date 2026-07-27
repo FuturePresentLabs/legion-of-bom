@@ -325,8 +325,30 @@ impl Router for GridRouter {
                 best = Some(out);
             }
             // Rip up: each boxed-in net must precede the nets that boxed it in.
+            //
+            // Sorted, because `blame` is a hash map of hash sets and this loop is
+            // order-sensitive: a constraint is skipped when its reverse is already
+            // present, so visiting the same blame in a different order accumulates
+            // a *different* constraint set and routes a different board. Rust
+            // reseeds hash iteration per process, so that made the pipeline
+            // nondeterministic across runs — on a 13-part demo board, 311.5 or
+            // 412.4 depending on the run — for any board dense enough to need
+            // rip-up at all.
+            let blamed: Vec<(usize, Vec<usize>)> = {
+                let mut v: Vec<(usize, Vec<usize>)> = blame
+                    .iter()
+                    .map(|(&victim, blockers)| {
+                        let mut b: Vec<usize> = blockers.iter().copied().collect();
+                        b.sort_unstable();
+                        (victim, b)
+                    })
+                    .collect();
+                v.sort_by_key(|(victim, _)| *victim);
+                v
+            };
             let mut added = false;
-            for (&victim, blockers) in &blame {
+            for (victim, blockers) in &blamed {
+                let victim = *victim;
                 for &b in blockers {
                     if victim != b
                         && !before.contains(&(victim, b))

@@ -1163,22 +1163,82 @@ pub struct BoardOptions {
     /// board so the outline is the panel size, not the parts' bounding box. When
     /// `None`, the outline is the pad bounding box + [`outline_margin_mm`].
     pub fixed_outline: Option<(f64, f64, f64, f64)>,
-    /// Show each component's value ("47nF", "TL072") on silk, next to its refdes —
-    /// useful for hand assembly (DESIGN 6.10). On by default.
-    pub silk_values: bool,
-    /// A silkscreen title (board name + revision, e.g. "Slew · v1") placed at the
-    /// bottom edge. `None` omits it.
+    /// Which components get their value ("47nF", "TL072") on silk next to the
+    /// refdes (DESIGN 6.10). Defaults to [`SilkValues::HandSoldered`].
+    pub silk_values: SilkValues,
+    /// A silkscreen title (the board's name) placed at the bottom edge. `None`
+    /// omits it.
     pub title: Option<String>,
+    /// Maker, revision and a free-form note, stacked under the title.
+    pub legend: SilkLegend,
     /// A brand logo, rendered on the **back** silk (B.SilkS) bottom-centre so it
     /// doesn't fight the front component legend (DESIGN §7.9). `None` omits it.
     pub logo: Option<Logo>,
 }
 
+/// Which parts get their value printed on silk beside the refdes.
+///
+/// Values are for the person holding the soldering iron. On a kit where JLCPCB
+/// assembles the SMD and the buyer fits the through-hole panel hardware, "100nF"
+/// on a 0603 is read by nobody — and it is not free: a value string is wider
+/// than the 0603 it labels, so on a dense board it collides with the neighbours.
+/// Measured on the slew limiter, printing values for every part cost 4
+/// silkscreen overlaps and 4 silk-over-pad violations; printing them only for
+/// hand-soldered parts costs 1 and 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SilkValues {
+    /// Every part's value — a fully hand-assembled board, where the builder
+    /// places the passives too.
+    All,
+    /// Only parts a person solders: through-hole. The default, because that is
+    /// the kit this project ships (`kit = "mixed"`).
+    #[default]
+    HandSoldered,
+    /// No values anywhere; refdes only.
+    None,
+}
+
+/// Maker, revision and a design note, printed under the board title.
+///
+/// A board is a product, and an unmarked one is hard to identify on a bench, in
+/// a photo, or in a support thread six months later. Each line is optional and
+/// omitted entirely when `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SilkLegend {
+    /// Maker or brand, e.g. "Puget Audio".
+    pub brand: Option<String>,
+    /// Revision, e.g. "v1.2" — what a support request needs to quote.
+    pub rev: Option<String>,
+    /// A free-form design note: topology, licence, a URL.
+    pub note: Option<String>,
+}
+
+impl SilkLegend {
+    /// The lines to print, top to bottom. Brand and revision share a line —
+    /// they are read together and the bottom edge is scarce.
+    fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let head = [self.brand.as_deref(), self.rev.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if !head.is_empty() {
+            out.push(head);
+        }
+        if let Some(note) = self.note.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push(note.to_string());
+        }
+        out
+    }
+}
+
 impl BoardOptions {
     /// Default options: grid placement, **grid routing**, a `GND` ground pour,
-    /// 5 mm outline margin, values on silk. This is what the CLI builds with — a
-    /// harness that overrides any of it is measuring a board nothing ships
-    /// (`legion-of-bom-nz1`).
+    /// 5 mm outline margin, values on silk for hand-soldered parts. This is what
+    /// the CLI builds with — a harness that overrides any of it is measuring a
+    /// board nothing ships (`legion-of-bom-nz1`).
     pub fn new(footprint_dir: impl Into<PathBuf>) -> Self {
         BoardOptions {
             footprint_dir: footprint_dir.into(),
@@ -1188,8 +1248,9 @@ impl BoardOptions {
             ground_net: Some("GND".into()),
             outline_margin_mm: 5.0,
             fixed_outline: None,
-            silk_values: true,
+            silk_values: SilkValues::default(),
             title: None,
+            legend: SilkLegend::default(),
             logo: None,
         }
     }
@@ -1676,6 +1737,21 @@ pub fn generate_board_artifacts(
                 "board.title",
             ));
         }
+        // Maker / revision / note, stacked upward from the title. Smaller than
+        // the title but never below the fab's silk minimum (1.0mm high, and
+        // `silk_text_on` strokes at size/6, so 1.0mm gives 0.167mm — clear of
+        // JLCPCB's 0.15mm). Front silk: the back is the logo's.
+        for (i, line) in options.legend.lines().iter().enumerate() {
+            board.push(silk_text_on(
+                line,
+                (minx + maxx) / 2.0,
+                maxy - 4.6 - 1.7 * i as f64,
+                0.0,
+                &format!("board.legend.{i}"),
+                "F.SilkS",
+                1.0,
+            ));
+        }
         // Brand logo on the back silk (DESIGN §7.9), placed by rule: centred,
         // ~55% of the board width, just above the title. On B.Cu's silk it's
         // mirrored so it reads when you look at the back.
@@ -1704,6 +1780,15 @@ pub fn generate_board_artifacts(
     let mut route = RouteOutput::default();
     if let Some(router) = &options.router {
         let mut nets: Vec<RouteNet> = net_pads.into_values().collect();
+        // By net index, because `into_values` hands them over in hash order and
+        // the router paints every net's clearance halo in the order it is given:
+        // where two halos overlap, the last one written owns the cell. Rust
+        // reseeds hash iteration per process, so this was a board that changed
+        // between identical runs — measured on a 13-part demo, 179 tracks and 0
+        // conflicts or 191 and 2, depending on the run. Routing *order* was
+        // already deterministic (`GridRouter::route` sorts by net index); the
+        // obstacle painting that happens before it was not (`legion-of-bom-gns`).
+        nets.sort_by_key(|n| n.net_idx);
         // Each no-net pad as its own single-pad net: painted as an obstacle (with
         // clearance halo) so traces route around it, but never itself routed
         // (the router only connects nets with ≥2 pads).
@@ -2099,7 +2184,7 @@ fn transform_footprint(
     lib_part: &str,
     refdes: &str,
     value: &str,
-    silk_values: bool,
+    silk_values: SilkValues,
     placement: Placement,
     pin_net: &HashMap<(String, String), &str>,
     net_index: &HashMap<&str, usize>,
@@ -2138,6 +2223,13 @@ fn transform_footprint(
     items.insert(layer_pos + 1, at);
     items.insert(layer_pos + 2, fp_uuid);
 
+    // A through-hole pad is the marker of a part somebody fits by hand; SMD
+    // arrives on the board from the assembler. `np_thru_hole` counts too — a
+    // mounting post is still something a human puts through the panel.
+    let hand_soldered = items.iter().any(|c| {
+        c.head() == Some("pad") && matches!(c.nth_atom(2), Some("thru_hole") | Some("np_thru_hole"))
+    });
+
     for item in items.iter_mut() {
         match item.head() {
             Some("property") if item.nth_atom(1) == Some("Reference") => {
@@ -2165,7 +2257,15 @@ fn transform_footprint(
                     // just clutter the legend. The refdes + panel label cover those.
                     let presentable =
                         !value.is_empty() && !value.contains('_') && value.len() <= 12;
-                    if silk_values && presentable {
+                    // Whether a person will ever solder this part, and so whether
+                    // its value is worth the silk it costs: a through-hole pad
+                    // means hand assembly (the SMD arrives pre-populated).
+                    let wanted = match silk_values {
+                        SilkValues::All => true,
+                        SilkValues::HandSoldered => hand_soldered,
+                        SilkValues::None => false,
+                    };
+                    if wanted && presentable {
                         let silk = if placement.back { "B.SilkS" } else { "F.SilkS" };
                         for c in l.iter_mut() {
                             if c.head() == Some("layer") {
@@ -3511,7 +3611,7 @@ mod tests {
             "lib:CP",
             "C7",
             "100nF",
-            true,
+            SilkValues::All,
             Placement {
                 x_mm: 10.0,
                 y_mm: 10.0,
@@ -3530,6 +3630,81 @@ mod tests {
         );
     }
 
+    /// The kit this project ships has JLCPCB place the SMD and the buyer fit the
+    /// through-hole panel hardware, so a value on a 0603 is silk nobody reads —
+    /// and it collides with its neighbours. Through-hole parts keep theirs.
+    #[test]
+    fn values_go_on_silk_only_for_the_parts_a_person_solders() {
+        let render = |pad_kind: &str, mode| {
+            let fp = Sexpr::parse(&format!(
+                r#"(footprint "X" (layer "F.Cu")
+                     (property "Reference" "REF**" (at 0 0) (layer "F.SilkS"))
+                     (property "Value" "X" (at 0 0) (layer "F.Fab") (hide yes))
+                     (pad "1" {pad_kind} rect (at 0 0) (size 1 1) (layers "F.Cu")))"#
+            ))
+            .unwrap();
+            transform_footprint(
+                fp,
+                "lib:X",
+                "C7",
+                "100nF",
+                mode,
+                Placement {
+                    x_mm: 10.0,
+                    y_mm: 10.0,
+                    rotation_deg: 0.0,
+                    back: false,
+                },
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .to_sexpr_string()
+        };
+        // SMD: only the refdes reaches silk — the assembler fits this one.
+        let smd = render("smd", SilkValues::HandSoldered);
+        assert_eq!(
+            smd.matches("F.SilkS").count(),
+            1,
+            "an SMD part should keep its value off the silk:\n{smd}"
+        );
+        // The same part through-hole: a person solders it, so label it.
+        let tht = render("thru_hole", SilkValues::HandSoldered);
+        assert!(
+            tht.matches("F.SilkS").count() >= 2,
+            "a hand-soldered part keeps its value on silk:\n{tht}"
+        );
+        // Both escape hatches still work.
+        assert!(render("smd", SilkValues::All).matches("F.SilkS").count() >= 2);
+        assert_eq!(
+            render("thru_hole", SilkValues::None)
+                .matches("F.SilkS")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_legend_joins_brand_and_rev_and_drops_what_is_missing() {
+        let l = SilkLegend {
+            brand: Some("Puget Audio".into()),
+            rev: Some("v1.2".into()),
+            note: Some("VC slew limiter".into()),
+        };
+        assert_eq!(l.lines(), vec!["Puget Audio · v1.2", "VC slew limiter"]);
+        // A missing piece vanishes rather than leaving a stray separator.
+        let brand_only = SilkLegend {
+            brand: Some("Puget Audio".into()),
+            ..Default::default()
+        };
+        assert_eq!(brand_only.lines(), vec!["Puget Audio"]);
+        // Whitespace is not content.
+        let blank = SilkLegend {
+            rev: Some("  ".into()),
+            ..Default::default()
+        };
+        assert!(blank.lines().is_empty());
+        assert!(SilkLegend::default().lines().is_empty());
+    }
     /// A presentable value (a passive value / IC part number) is set and moved
     /// onto silk for hand assembly; a connector's symbol-name value is set but
     /// left off silk (on F.Fab) so it doesn't clutter the legend.
@@ -3548,7 +3723,7 @@ mod tests {
                 "lib:R",
                 refdes,
                 value,
-                true,
+                SilkValues::All,
                 Placement {
                     x_mm: 0.0,
                     y_mm: 0.0,
@@ -3597,7 +3772,7 @@ mod tests {
             "lib:CP",
             "C7",
             "100nF",
-            true,
+            SilkValues::All,
             Placement {
                 x_mm: 10.0,
                 y_mm: 10.0,

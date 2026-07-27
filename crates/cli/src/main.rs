@@ -16,17 +16,17 @@ use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
-    generate_board_artifacts, generate_board_report, generate_bom, guide_to_html, guide_to_pdf,
-    jlc_bom_csv, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key,
-    panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
-    photo_source, plan_repair, png_to_jpeg, render_board_png, run_drc, run_layout_loop,
-    simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
-    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, EurorackPlacer, Finding, GuideOptions, HpSearch, JlcpcbClient, KitType,
-    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
-    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis,
+    generate_board_artifacts, generate_board_report, generate_bom, guide, guide_to_html,
+    guide_to_pdf, jlc_bom_csv, jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp,
+    minimum_routable_hp, package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb,
+    parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png,
+    rules, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns,
+    validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng,
+    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions,
+    HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient,
+    PanelFile, PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -817,6 +817,24 @@ fn pretty_title(stem: &str) -> String {
         .join(" ")
 }
 
+/// The silkscreen legend for a circuit, read from the repo's manifest when one
+/// is discoverable. A bare-path build outside a circuits repo simply gets no
+/// legend rather than an error — the board is still a board.
+fn legend_for(stem: &str) -> SilkLegend {
+    let Ok(cwd) = std::env::current_dir() else {
+        return SilkLegend::default();
+    };
+    let Some((_root, manifest)) = Manifest::discover(&cwd).ok() else {
+        return SilkLegend::default();
+    };
+    let entry = manifest.circuit(stem);
+    SilkLegend {
+        brand: manifest.repo.brand.clone(),
+        rev: entry.and_then(|c| c.rev.clone()),
+        note: entry.and_then(|c| c.silk_note.clone()),
+    }
+}
+
 /// Load a brand logo SVG, if a path is given.
 fn load_logo(path: &Option<PathBuf>) -> Result<Option<Logo>> {
     match path {
@@ -863,8 +881,11 @@ fn board_cmd(
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
     let mut options =
-        board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
+        board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
+    // `lob board` takes a bare path, so there is no resolved manifest entry —
+    // look one up by stem when this repo has a lob.toml, else print no legend.
+    options.legend = legend_for(stem);
     options.logo = load_logo(&logo)?;
     let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.kicad_pcb")));
 
@@ -1003,8 +1024,13 @@ fn fab_cmd(
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
     let mut options =
-        board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
+        board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
+    options.legend = SilkLegend {
+        brand: resolved.brand.clone(),
+        rev: resolved.rev.clone(),
+        note: resolved.silk_note.clone(),
+    };
     options.logo = load_logo(&logo)?;
     let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
 
@@ -1041,6 +1067,52 @@ fn fab_cmd(
         eprintln!("  ⚠ {} connection(s) left unrouted:", conflicts.len());
         for c in &conflicts {
             eprintln!("      - {c}");
+        }
+    }
+
+    // Fab capability, beside the board: kicad-cli reads <board>.kicad_dru from
+    // the board's own directory, so writing it here is what makes the DRC gate
+    // below judge against what JLCPCB can make rather than KiCad's defaults.
+    let dru_path = pkg.join(format!("{stem}.kicad_dru"));
+    std::fs::write(&dru_path, jlcpcb_design_rules())
+        .with_context(|| format!("writing {}", dru_path.display()))?;
+
+    // Physical-rule gate, ahead of DRC because KiCad cannot do this one.
+    //
+    // KiCad has no "footprint outside the board outline" rule. Measured: a part
+    // moved 15.8mm clear of the edge produces ZERO geometric DRC violations —
+    // the only errors are the unconnected nets it drags with it, and a part
+    // with no connections (a mounting hole, an unpopulated position) drags
+    // none. So a board with a component floating in space can be DRC-clean, and
+    // this gate used to ship it: gerbers plotted, CPL written, part placed at a
+    // coordinate off the board.
+    //
+    // `crate::rules` Tier::Physical does catch it, exactly and with the
+    // magnitude — it is what the placer's own overflow lane is measured against.
+    // It just was not consulted here. It is now.
+    if let Ok(facts) = build_facts(&model, &footprint_dir) {
+        let derived = rules::derive_in(
+            &model,
+            &rules::Context {
+                facts: Some(&facts),
+                outline: guide::board_outline(&board),
+            },
+        );
+        let placed = guide::placements_from_board(&board)
+            .map_err(|e| anyhow::anyhow!("reading placements back from the board: {e}"))?;
+        let broken = rules::evaluate(&derived, &placed);
+        let physical: Vec<_> = broken
+            .iter()
+            .filter(|v| v.tier == rules::Tier::Physical)
+            .collect();
+        if !physical.is_empty() {
+            for v in &physical {
+                eprintln!("  ✗ [physical] {}", v.what);
+            }
+            anyhow::bail!(
+                "board breaks {} physical rule(s) KiCad DRC does not check — refusing to build a fab package",
+                physical.len()
+            );
         }
     }
 
@@ -1106,6 +1178,9 @@ struct ResolvedCircuit {
     guide_smd: bool,
     build: Option<BuildCopy>,
     brand: Option<String>,
+    /// Silkscreen legend: revision + design note, from the manifest.
+    rev: Option<String>,
+    silk_note: Option<String>,
 }
 
 /// Resolve a `lob <cmd> <arg>` circuit argument. An existing file is used
@@ -1127,6 +1202,8 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
             guide_smd: false,
             build: None,
             brand: None,
+            rev: None,
+            silk_note: None,
         });
     }
     let cwd = std::env::current_dir()?;
@@ -1164,6 +1241,8 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
         guide_smd: entry.effective_guide_smd(&manifest.defaults),
         build: entry.build.clone(),
         brand: manifest.repo.brand.clone(),
+        rev: entry.rev.clone(),
+        silk_note: entry.silk_note.clone(),
     })
 }
 

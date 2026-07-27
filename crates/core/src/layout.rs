@@ -195,6 +195,14 @@ pub fn score(m: &PlacementMetrics, w: &CostWeights) -> f64 {
         + w.unrouted * m.unrouted as f64
 }
 
+/// Consecutive non-improving attempts before the loop calls it done.
+///
+/// The cost of raising this is a full place+route per extra attempt; the cost of
+/// lowering it to 1 is stopping one short of a candidate that would have helped,
+/// since the spreading trajectory a placer offers is not monotonic — on
+/// `daisy_panel_demo` the useful arrangement sits *after* a worse one.
+const PATIENCE: usize = 2;
+
 /// Loop configuration.
 #[derive(Debug, Clone)]
 pub struct LayoutLoop {
@@ -256,6 +264,8 @@ pub fn run_layout_loop(
     struct Attempt {
         /// Millimetres broken per tier, worst tier first — the relaxation key.
         broken: [f64; 3],
+        /// Connections the router could not make. Ranks above every preference.
+        unrouted: usize,
         /// Preference cost with the rule penalty removed, so the tiers above are
         /// not counted twice.
         preference: f64,
@@ -292,6 +302,8 @@ pub fn run_layout_loop(
     let mut best: Option<Attempt> = None;
     let mut nudges: HashMap<String, (f64, f64)> = HashMap::new();
     let mut ran = 0;
+    // Consecutive attempts that did not improve on the best so far.
+    let mut stale = 0usize;
 
     for i in 0..iters {
         ran += 1;
@@ -318,15 +330,18 @@ pub fn run_layout_loop(
         let broken = crate::rules::by_tier(&metrics.violations);
         let preference = sc - penalty;
         // Ordered relaxation: physical damage decides first, then electrical,
-        // and only when those tie does the preference cost break it. An attempt
-        // is never allowed to buy wirelength with a rule.
-        let key = relax_key(broken, preference);
+        // then whether the board is even connected, and only when those tie does
+        // the preference cost break it. An attempt is never allowed to buy
+        // wirelength with a rule, or with a net.
+        let key = relax_key(broken, unrouted, preference);
         let improved = best
             .as_ref()
-            .is_none_or(|b| key < relax_key(b.broken, b.preference));
+            .is_none_or(|b| key < relax_key(b.broken, b.unrouted, b.preference));
+        stale = if improved { 0 } else { stale + 1 };
         if improved {
             best = Some(Attempt {
                 broken,
+                unrouted,
                 preference,
                 score: sc,
                 board: art.pcb,
@@ -337,11 +352,31 @@ pub fn run_layout_loop(
             });
         }
 
-        // Stop when the board is both routable *and* rule-clean. Exiting on
-        // routability alone stopped the loop while a decoupling cap was still
-        // across the board: "the router coped" is not the same as "this is the
-        // layout we want".
-        if unrouted == 0 && penalty <= 0.0 {
+        // Stop when attempts stop helping — not when one merely comes out clean.
+        //
+        // This used to exit the moment `unrouted == 0 && penalty <= 0.0`, on the
+        // reasoning that a clean board is a finished board. It is not: it is the
+        // *first* acceptable board, and the loop's whole purpose is to be a
+        // fine-tuning stage. Two ways that bit. Under analytical placement the
+        // first attempt is usually already clean, so fine-tuning never ran at
+        // all. And on `daisy_panel_demo` the first *routable* attempt was a badly
+        // spread one scoring 739.6, which the loop then returned while a 307.8
+        // was two candidates further down the list (`legion-of-bom-lso`).
+        //
+        // Clean is now the floor, not the finish line: keep going while attempts
+        // improve, and give up after [`PATIENCE`] consecutive ones that do not.
+        //
+        // Giving up early is only allowed once there is something worth keeping.
+        // Patience is a stop rule for *polishing*, and applying it to a board
+        // that is still broken is just quitting: on the real 5 HP slew limiter it
+        // ended the search after 3 attempts holding a board with a physical rule
+        // violation, where spending the full budget finds a clean one. While the
+        // best attempt so far still breaks a rule or leaves a net unrouted, the
+        // whole iteration budget is on the table.
+        let acceptable = best
+            .as_ref()
+            .is_some_and(|b| b.unrouted == 0 && b.broken.iter().all(|&mm| mm <= 0.0));
+        if acceptable && stale >= PATIENCE {
             break;
         }
         // Last iteration — no point planning another repair.
@@ -356,6 +391,7 @@ pub fn run_layout_loop(
 
     let Attempt {
         broken: _,
+        unrouted: _,
         preference: _,
         score,
         board,
@@ -444,14 +480,25 @@ pub fn run_layout_loop(
 /// offset that varies with the attempt, so successive attempts explore different
 /// arrangements without any RNG. Magnitude grows with the attempt number.
 /// The ordering key for one attempt: millimetres broken per tier, worst tier
-/// first, then the preference cost. Lower is better, compared lexicographically.
+/// first, then connections the router could not make, then the preference cost.
+/// Lower is better, compared lexicographically.
 ///
 /// This is what "relax the lowest tier first" means mechanically. A lower tier
 /// is only ever traded once every higher tier ties, so no amount of wirelength
 /// can buy back an electrical rule and nothing can buy back a physical one —
 /// exactly, rather than the [`crate::rules::penalty`] weights' approximation.
-fn relax_key(broken: [f64; 3], preference: f64) -> (f64, f64, f64, f64) {
-    (broken[0], broken[1], broken[2], preference)
+///
+/// `unrouted` sits above the preference cost for the same reason, and used not
+/// to. [`CostWeights::unrouted`] prices a missing connection at 50, which reads
+/// like a lot until an attempt is 327 mm of wirelength tighter — then two
+/// unconnected nets are a bargain, and the loop took that trade on
+/// `daisy_panel_demo` and returned the broken board (`legion-of-bom-7a7`). A net
+/// the router could not finish is not a preference: `lob fab` refuses the board,
+/// so it is not a board. The module docs already claimed "unrouted dominates so
+/// a routable board always beats a tighter-but-broken one" — this is what makes
+/// that true.
+fn relax_key(broken: [f64; 3], unrouted: usize, preference: f64) -> (f64, f64, f64, f64, f64) {
+    (broken[0], broken[1], broken[2], unrouted as f64, preference)
 }
 
 fn repair_nudges(free: &[String], attempt: usize) -> HashMap<String, (f64, f64)> {
@@ -849,19 +896,39 @@ mod tests {
     fn a_lower_tier_is_only_traded_once_the_higher_ones_tie() {
         // An attempt that breaks a physical rule loses to one that breaks a much
         // larger electrical one, however good its wirelength.
-        let physical = relax_key([0.1, 0.0, 0.0], 0.0);
-        let electrical = relax_key([0.0, 50.0, 0.0], 9_999.0);
+        let physical = relax_key([0.1, 0.0, 0.0], 0, 0.0);
+        let electrical = relax_key([0.0, 50.0, 0.0], 0, 9_999.0);
         assert!(electrical < physical);
 
         // Likewise electrical over preference…
-        let elec = relax_key([0.0, 0.1, 0.0], 0.0);
-        let pref = relax_key([0.0, 0.0, 50.0], 9_999.0);
+        let elec = relax_key([0.0, 0.1, 0.0], 0, 0.0);
+        let pref = relax_key([0.0, 0.0, 50.0], 0, 9_999.0);
         assert!(pref < elec);
 
         // …and only when every tier ties does wirelength decide.
-        let tidy = relax_key([0.0, 2.0, 0.0], 100.0);
-        let untidy = relax_key([0.0, 2.0, 0.0], 200.0);
+        let tidy = relax_key([0.0, 2.0, 0.0], 0, 100.0);
+        let untidy = relax_key([0.0, 2.0, 0.0], 0, 200.0);
         assert!(tidy < untidy);
+    }
+
+    /// legion-of-bom-7a7: the loop returned a board with two unconnected nets
+    /// because it was 327mm of wirelength tighter than the routable one, which
+    /// at 50 per unrouted net was a trade the score was happy to make. A board
+    /// `lob fab` refuses is not a board, so no wirelength can buy a net.
+    #[test]
+    fn no_amount_of_wirelength_buys_an_unrouted_net() {
+        let broken_but_tight = relax_key([0.0, 0.0, 0.0], 2, 412.4);
+        let routed_but_loose = relax_key([0.0, 0.0, 0.0], 0, 739.6);
+        assert!(routed_but_loose < broken_but_tight);
+
+        // Fewer unrouted still wins, and among equally-routable attempts the
+        // preference cost decides as before.
+        assert!(relax_key([0.0; 3], 1, 9_999.0) < relax_key([0.0; 3], 2, 0.0));
+        assert!(relax_key([0.0; 3], 0, 100.0) < relax_key([0.0; 3], 0, 200.0));
+
+        // But a physical rule still outranks routability: a board that does not
+        // fit its own outline is not rescued by connecting every net.
+        assert!(relax_key([0.0; 3], 3, 0.0) < relax_key([0.5, 0.0, 0.0], 0, 0.0));
     }
 
     #[test]

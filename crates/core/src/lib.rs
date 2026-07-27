@@ -10,6 +10,7 @@
 //! The CLI (`lob`) and the eventual web backend are thin wrappers over this
 //! library — anything one surface can do, the other can too.
 
+pub mod analytical;
 pub mod board;
 pub mod bom;
 pub mod bom_repair;
@@ -64,7 +65,7 @@ pub mod verify;
 pub use board::{
     build_facts, decoupling_pairs, generate_board, generate_board_artifacts, generate_board_report,
     minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
-    Placement, Placer, SeededPlacer,
+    Placement, Placer, SeededPlacer, SilkLegend, SilkValues,
 };
 pub use bom::{generate_bom, Bom, BomLine, LineKind};
 pub use bom_repair::{
@@ -81,8 +82,8 @@ pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCand
 pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
 pub use fab::{
     board_sides, export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos,
-    png_to_jpeg, render_board_jpeg, render_board_png, strip_smd, zip_dir, BoardSides, MountCounts,
-    Populate, Quality,
+    jlcpcb_design_rules, png_to_jpeg, render_board_jpeg, render_board_png, strip_smd, zip_dir,
+    BoardSides, MountCounts, Populate, Quality,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use gerber::{layers_to_svg, read_layers, Layer as GerberLayer, LayerKind};

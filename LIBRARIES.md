@@ -75,7 +75,39 @@ that `legion-of-bom-core` can shell out to or wrap, rather than duplicating.
 
 ---
 
-## 5. Open item
+## 5. Fab design rules (`.kicad_dru`)
+
+KiCad judges a board against whatever design rules the board declares. Ours
+declared none, so `kicad-cli pcb drc` was checking against KiCad's built-in
+defaults — not against what the fab can make. `crate::fab::jlcpcb_design_rules`
+now emits a `.kicad_dru` beside the board in every fab package; `kicad-cli`
+picks it up from the board's own directory automatically.
+
+The numeric limits are **transcribed from JLCPCB's published capability**, not
+copied from any of the files below, because none of them states a licence. These
+are listed as cross-checks — read them when adding a rule or a process class,
+and diff our numbers against theirs.
+
+| Source | What it covers | License |
+|---|---|---|
+| [labtroll/KiCad-DesignRules](https://github.com/labtroll/KiCad-DesignRules) | JLCPCB, KiCad 7, one clean file — closest to our rule set | not stated |
+| [Cimos/KiCad-CustomDesignRules](https://github.com/Cimos/KiCad-CustomDesignRules) | JLCPCB **and** PCBWay, KiCad 8, validated against a paired test board | not stated |
+| [tinfever/KiCAD-Custom-DRC-Rules-for-JLCPCB-with-Unit-Tests](https://github.com/tinfever/KiCAD-Custom-DRC-Rules-for-JLCPCB-with-Unit-Tests) | Selectable 2-layer / 4-layer / 2oz, PASS/FAIL test board **per rule** | not stated |
+| [ziteh/kicad-design-rules](https://github.com/ziteh/kicad-design-rules) | JLCPCB | not stated |
+
+**Two things none of them can do**, both learned the hard way:
+
+1. **No rule checks that a footprint is inside the board outline.** KiCad's
+   constraint vocabulary cannot express it. A part moved 15.8 mm clear of the
+   edge produces zero geometric violations. `crate::rules` `Tier::Physical` is
+   the only check that sees this, and `lob fab` gates on it separately.
+2. **Every rule that can match a non-copper item needs a layer condition.**
+   Without one, `text_height` fires on `B.Fab`/`Cmts.User` annotations that are
+   never manufactured and `silk_clearance` compares silkscreen against courtyard
+   outlines. On one board that was the difference between "9 undersized texts and
+   199 silkscreen overlaps" and the truth: 0 and 4.
+
+## 6. Open item
 
 - [ ] For every "license not confirmed" row above: a real license check
       (reading the repo's actual LICENSE file / provider's actual ToS) should
