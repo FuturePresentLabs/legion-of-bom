@@ -54,6 +54,7 @@ pub mod sourcing;
 pub mod spice;
 pub mod stage;
 pub mod subboard;
+pub mod summing;
 pub mod symbols;
 pub mod theme;
 pub mod thonk;

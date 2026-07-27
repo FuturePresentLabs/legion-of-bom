@@ -1534,6 +1534,21 @@ pub fn generate_board_artifacts(
     // competing claim on that exact spot, so this is set, not scored.
     crate::decouple::snap(&mut placements, circuit, &facts);
 
+    // The passives on an op-amp input go against that pin, for the same reason
+    // and by the same mechanism. A summing junction is high-impedance, so the
+    // node wants to be almost no copper; the placer cannot deliver that, because
+    // a resistor tied to both a panel pot and the summing node has its optimum
+    // halfway between the two — measured at 43mm, and identical at 8 HP and
+    // 10 HP, so it is not a space problem. See `crate::summing`.
+    crate::summing::snap(
+        &mut placements,
+        circuit,
+        &facts,
+        &pinned,
+        crate::skidl::kicad_symbol_dir().as_ref().map(|d| d.path()),
+        options.fixed_outline,
+    );
+
     // Legalization — the middle stage. Global placement decides roughly where
     // things want to be; this moves whatever is physically illegal the minimum
     // distance to make it legal, and leaves everything else alone. Only Physical
