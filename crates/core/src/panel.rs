@@ -4,7 +4,12 @@
 //!
 //! The [`PanelSpec`] trait is the format-agnostic seam: dimensions in mm,
 //! mounting holes, and anchored cutouts. The only v1 implementation is
-//! Eurorack; pedal/rack/500-series are deliberately unimplemented.
+//! Eurorack; rack/500-series are deliberately unimplemented.
+//!
+//! Guitar Pedal is handled by [`crate::enclosure`] rather than by a `PanelSpec`
+//! impl — a pedal's holes land on four faces in three planes, so it is a solid
+//! with faces, not a plate with one working side. What the two share is the
+//! [`CutoutSource`] seam, so the same part mechanical data drives both.
 //!
 //! DXF export consumes any `&dyn PanelSpec` — it does not know about HP, U,
 //! or enclosure size classes.
@@ -539,7 +544,7 @@ fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
 }
 
 /// Whether a net is a power rail / ground (so it isn't used as a control label).
-fn is_power_net(name: &str) -> bool {
+pub(crate) fn is_power_net(name: &str) -> bool {
     let u = name.to_ascii_uppercase();
     u == "GND"
         || u.ends_with("GND")
@@ -549,7 +554,7 @@ fn is_power_net(name: &str) -> bool {
 
 /// Shorten a net name into a control label: drop a `SIG_` prefix / `_CV` suffix,
 /// spaces for underscores, upper-cased.
-fn label_from_net(net: &str) -> String {
+pub(crate) fn label_from_net(net: &str) -> String {
     let s = net.strip_prefix("SIG_").unwrap_or(net);
     let s = s.strip_suffix("_CV").unwrap_or(s);
     s.replace('_', " ").to_uppercase()

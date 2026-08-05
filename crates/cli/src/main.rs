@@ -11,6 +11,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use legion_of_bom_core::cam::{plan_cam, CamOptions, ALUMINIUM_6061, DIECAST_ALUMINIUM};
+use legion_of_bom_core::enclosure::{
+    check_enclosure, derive_enclosure, enclosure_face_dxf, enclosure_to_step, standard_size,
+    DeriveOptions, EnclosureFile, Face, STANDARD_SIZES,
+};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_guide, default_image_cache_dir, default_panel_orders_dir,
@@ -147,6 +152,74 @@ enum Command {
     Panel {
         #[command(subcommand)]
         action: PanelCmd,
+    },
+    /// Guitar-pedal enclosure: derive a spec, export a 3D solid, plan the cuts.
+    Enclosure {
+        #[command(subcommand)]
+        action: EnclosureCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnclosureCmd {
+    /// List the standard enclosure sizes and their nominal dimensions.
+    Sizes,
+    /// Derive an editable enclosure spec (TOML) from a circuit's panel-facing
+    /// parts: controls on top, jacks on the sides, power at the back.
+    Derive {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Enclosure size class (see `lob enclosure sizes`).
+        #[arg(long, default_value = "125B")]
+        size: String,
+        /// Skip the true-bypass footswitch that is otherwise added by default.
+        #[arg(long)]
+        no_footswitch: bool,
+        /// Skip the status LED that is otherwise added by default.
+        #[arg(long)]
+        no_led: bool,
+        /// Output TOML path (default: <circuit>_enclosure.toml).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Check a spec for holes that run off a face, collide, or have no wall
+    /// behind them.
+    Check {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+    },
+    /// Export the enclosure as a STEP (AP214) solid.
+    Step {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+        /// Output .step path (default: same name with .step).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Write 1:1 drill templates (DXF) for every drilled face.
+    Template {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+        /// Only this face (top | front | back | left | right).
+        #[arg(long)]
+        face: Option<String>,
+        /// Output directory (default: alongside the spec).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Plan the machining: setup sheet (Markdown) plus per-setup G-code.
+    Cam {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+        /// Stock material: diecast | 6061.
+        #[arg(long, default_value = "diecast")]
+        material: String,
+        /// Spindle speed ceiling (RPM).
+        #[arg(long, default_value_t = 5000.0)]
+        max_rpm: f64,
+        /// Output directory (default: alongside the spec).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -309,6 +382,7 @@ fn main() -> ExitCode {
             kit,
         } => guide_cmd(circuit, out, panel, kit),
         Command::Panel { action } => panel_cmd(action),
+        Command::Enclosure { action } => enclosure_cmd(action),
     };
 
     match result {
@@ -1734,4 +1808,210 @@ fn init_tracing(verbose: u8) {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+// ---------------------------------------------------------------------------
+//  Enclosure
+// ---------------------------------------------------------------------------
+
+/// Load a spec file and resolve it, reporting the file path on any failure.
+fn load_enclosure(spec: &Path) -> Result<legion_of_bom_core::enclosure::Enclosure> {
+    let toml =
+        std::fs::read_to_string(spec).with_context(|| format!("reading {}", spec.display()))?;
+    let file =
+        EnclosureFile::from_toml(&toml).with_context(|| format!("parsing {}", spec.display()))?;
+    file.to_enclosure()
+        .map_err(|e| anyhow::anyhow!("invalid enclosure spec: {e}"))
+}
+
+/// Print a check outcome the same way the pipeline prints a stage.
+fn print_outcome(outcome: &StageOutcome) {
+    for finding in &outcome.findings {
+        let prefix = match finding.severity {
+            Severity::Info => "",
+            Severity::Warning => "warning: ",
+            Severity::Error => "error: ",
+        };
+        println!("  {prefix}{}", finding.message);
+    }
+}
+
+fn enclosure_cmd(action: EnclosureCmd) -> Result<()> {
+    match action {
+        EnclosureCmd::Sizes => {
+            println!(
+                "{:<9} {:>7} {:>7} {:>7} {:>6} {:>7}",
+                "size", "width", "depth", "height", "wall", "corner"
+            );
+            for s in STANDARD_SIZES {
+                println!(
+                    "{:<9} {:>7.1} {:>7.1} {:>7.1} {:>6.1} {:>7.1}",
+                    s.name, s.width_mm, s.depth_mm, s.height_mm, s.wall_mm, s.corner_radius_mm
+                );
+            }
+            println!("\nAll mm. Width runs left-to-right, depth front-to-back.");
+            println!("Nominal catalogue values — measure your box before machining.");
+        }
+
+        EnclosureCmd::Derive {
+            circuit,
+            size,
+            no_footswitch,
+            no_led,
+            out,
+        } => {
+            let size_spec = standard_size(&size).ok_or_else(|| {
+                anyhow::anyhow!("unknown size {size} (try `lob enclosure sizes`)")
+            })?;
+            let circuit = circuit
+                .canonicalize()
+                .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+            let stem = circuit
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("circuit");
+            let work_dir = PathBuf::from("out").join(stem);
+            let run = SkidlRunner::discover(&work_dir)
+                .run(&circuit)
+                .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+            let model = parse_netlist_file(&run.netlist_path)?;
+            let enc = derive_enclosure(
+                &model,
+                size_spec,
+                &BuiltinCutouts,
+                DeriveOptions {
+                    footswitch: !no_footswitch,
+                    led: !no_led,
+                },
+            );
+            let file = EnclosureFile::from_enclosure(&enc, size_spec.name);
+            let toml = file
+                .to_toml()
+                .map_err(|e| anyhow::anyhow!("serialising enclosure: {e}"))?;
+            let out_path =
+                out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_enclosure.toml")));
+            std::fs::write(&out_path, toml)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("wrote {}", out_path.display());
+            print_outcome(&check_enclosure(&enc));
+            println!(
+                "\nEdit the positions by hand, then `lob enclosure step {}`.",
+                out_path.display()
+            );
+        }
+
+        EnclosureCmd::Check { spec } => {
+            let enc = load_enclosure(&spec)?;
+            let outcome = check_enclosure(&enc);
+            print_outcome(&outcome);
+            if !outcome.passed {
+                anyhow::bail!("enclosure spec has errors");
+            }
+            println!("\n✓ enclosure checks passed");
+        }
+
+        EnclosureCmd::Step { spec, out } => {
+            let enc = load_enclosure(&spec)?;
+            let outcome = check_enclosure(&enc);
+            print_outcome(&outcome);
+            if !outcome.passed {
+                // Rejected holes are skipped rather than emitted as broken
+                // geometry, so the solid would silently disagree with the spec.
+                anyhow::bail!(
+                    "fix the errors above before exporting — the solid would omit those holes"
+                );
+            }
+            let out_path = out.unwrap_or_else(|| spec.with_extension("step"));
+            std::fs::write(&out_path, enclosure_to_step(&enc))
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("\nwrote {}", out_path.display());
+        }
+
+        EnclosureCmd::Template { spec, face, out } => {
+            let enc = load_enclosure(&spec)?;
+            let dir =
+                out.unwrap_or_else(|| spec.parent().map(Path::to_path_buf).unwrap_or_default());
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let stem = spec
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("enclosure");
+            let faces: Vec<Face> = match face {
+                Some(f) => vec![f.parse().map_err(|e: String| anyhow::anyhow!(e))?],
+                None => enc.drilled_faces(),
+            };
+            if faces.is_empty() {
+                println!("no drilled faces — nothing to template");
+                return Ok(());
+            }
+            for f in faces {
+                let path = dir.join(format!("{stem}-{}-drill.dxf", f.as_str()));
+                std::fs::write(&path, enclosure_face_dxf(&enc, f))
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!(
+                    "wrote {} ({} hole(s))",
+                    path.display(),
+                    enc.holes_on(f).count()
+                );
+            }
+            println!("\nPrint at 1:1 — check the outline against the box before trusting it.");
+        }
+
+        EnclosureCmd::Cam {
+            spec,
+            material,
+            max_rpm,
+            out,
+        } => {
+            let enc = load_enclosure(&spec)?;
+            let outcome = check_enclosure(&enc);
+            print_outcome(&outcome);
+            if !outcome.passed {
+                anyhow::bail!("fix the errors above before planning cuts");
+            }
+            let opts = CamOptions {
+                material: match material.as_str() {
+                    "diecast" => DIECAST_ALUMINIUM,
+                    "6061" => ALUMINIUM_6061,
+                    other => anyhow::bail!("unknown material {other} (diecast | 6061)"),
+                },
+                max_rpm,
+                ..Default::default()
+            };
+            let plan = plan_cam(&enc, &opts);
+            if plan.setups.is_empty() {
+                println!("no drilled faces — nothing to machine");
+                return Ok(());
+            }
+            let dir =
+                out.unwrap_or_else(|| spec.parent().map(Path::to_path_buf).unwrap_or_default());
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let stem = spec
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("enclosure");
+
+            let sheet = dir.join(format!("{stem}-setup.md"));
+            std::fs::write(&sheet, plan.to_markdown())
+                .with_context(|| format!("writing {}", sheet.display()))?;
+            println!("\nwrote {}", sheet.display());
+            for (i, setup) in plan.setups.iter().enumerate() {
+                let path = dir.join(format!("{stem}-{}-{}.nc", i + 1, setup.face.as_str()));
+                let gcode = plan
+                    .to_gcode(i, &opts)
+                    .expect("setup index came from the plan itself");
+                std::fs::write(&path, gcode)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!("wrote {}", path.display());
+            }
+            println!(
+                "\n{} setup(s), {} tool(s), ~{:.0} min cutting.",
+                plan.setups.len(),
+                plan.tools.len(),
+                plan.estimated_minutes()
+            );
+            println!("G-code is a generic ISO starting point — simulate it before you cut.");
+        }
+    }
+    Ok(())
 }

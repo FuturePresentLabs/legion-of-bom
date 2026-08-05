@@ -1,0 +1,101 @@
+# Example guitar-pedal enclosure: a 125B with three knobs, a toggle, a status
+# LED, a true-bypass footswitch, 1/4" jacks on the sides, and 9 V on the back.
+#
+#   lob enclosure check    examples/pedal_125b.toml
+#   lob enclosure step     examples/pedal_125b.toml   # -> .step solid
+#   lob enclosure template examples/pedal_125b.toml   # -> 1:1 drill DXFs
+#   lob enclosure cam      examples/pedal_125b.toml   # -> setup sheet + G-code
+#
+# Coordinates are per-face, in mm, measured from the centre of that face.
+# On the top face u runs left-to-right and v runs front-to-back (toward the
+# player is -v). On the side and back faces u runs along the face and v is
+# height above the mid-line. `lob enclosure derive <circuit>` writes this file
+# for you from a netlist; hand-editing afterwards is expected.
+
+name = "pedal-125b-demo"
+size = "125B"
+
+# --- top face: controls -----------------------------------------------------
+
+[[holes]]
+face = "top"
+u_mm = -20.0
+v_mm = 36.0
+diameter_mm = 7.0
+kind = "pot"
+refdes = "RV1"
+label = "VOLUME"
+
+[[holes]]
+face = "top"
+u_mm = 0.0
+v_mm = 36.0
+diameter_mm = 7.0
+kind = "pot"
+refdes = "RV2"
+label = "TONE"
+
+[[holes]]
+face = "top"
+u_mm = 20.0
+v_mm = 36.0
+diameter_mm = 7.0
+kind = "pot"
+refdes = "RV3"
+label = "GAIN"
+
+[[holes]]
+face = "top"
+u_mm = 0.0
+v_mm = 12.0
+diameter_mm = 6.0
+kind = "switch"
+refdes = "SW1"
+label = "MODE"
+
+[[holes]]
+face = "top"
+u_mm = 0.0
+v_mm = -20.5
+diameter_mm = 5.0
+kind = "led"
+refdes = "D1"
+
+[[holes]]
+face = "top"
+u_mm = 0.0
+v_mm = -40.5
+diameter_mm = 12.0
+kind = "footswitch"
+refdes = "SW2"
+
+# --- sides: audio I/O, input right, output left -----------------------------
+
+[[holes]]
+face = "right"
+u_mm = 38.5
+v_mm = 0.0
+diameter_mm = 9.5
+kind = "jack"
+refdes = "J1"
+label = "IN"
+
+[[holes]]
+face = "left"
+u_mm = 38.5
+v_mm = 0.0
+diameter_mm = 9.5
+kind = "jack"
+refdes = "J2"
+label = "OUT"
+
+# --- back: power ------------------------------------------------------------
+
+[[holes]]
+face = "back"
+u_mm = 0.0
+v_mm = 0.0
+diameter_mm = 12.0
+kind = "dc_jack"
+refdes = "J3"
+label = "9V"
