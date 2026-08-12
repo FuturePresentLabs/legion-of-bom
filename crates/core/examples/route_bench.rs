@@ -72,10 +72,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             "pathfinder",
             Box::new(PathfinderRouter {
+                // The SHIPPING iteration count unless overridden. This used to
+                // default to 24 while `board.rs` builds with
+                // `PathfinderRouter::default()` (160) — so the bench compared
+                // GridRouter against a router the project does not use, and
+                // `legion-of-bom-kcq` recorded "byte-identical on 46 parts"
+                // without ever having run what ships.
                 max_iters: std::env::var("LOB_PF_ITERS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(24),
+                    .unwrap_or_else(|| PathfinderRouter::default().max_iters),
             }) as Box<dyn Router>,
         ),
     ] {

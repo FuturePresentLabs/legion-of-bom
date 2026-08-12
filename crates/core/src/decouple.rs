@@ -101,8 +101,7 @@ pub fn snap(
         } else {
             (dx, dy) = (dx / len, dy / len);
         }
-        let reach = clearance(facts, &cap, &ic) + PAD_GAP_MM;
-        let target = (pin.0 + dx * reach, pin.1 + dy * reach);
+        let base = clearance(facts, &cap, &ic) + PAD_GAP_MM;
 
         // Place the cap's *origin* such that its rail pad lands on the target.
         let pad_from_origin = place_point(
@@ -114,23 +113,60 @@ pub fn snap(
             cap_local.0,
             cap_local.1,
         );
-        let moved = Placement {
-            x_mm: target.0 - pad_from_origin.0,
-            y_mm: target.1 - pad_from_origin.1,
-            ..cap_at
-        };
+
         // "There is no competing claim on that exact spot" is only true if you
         // check. When a panel control is anchored across the IC's power pin, the
         // spot is already taken, and setting the cap there anyway buries its pad
         // under the control's copper: on the slew limiter that put an 0603 1.1mm
         // from a 3.5mm jack and made every pad of the -12V net unreachable by any
         // router. A worse-decoupled cap is a trade-off; an unroutable net is not.
-        if let Some(blocker) = first_overlap(&cap, &moved, placements, facts) {
-            report.skipped.push(format!(
-                "{cap}: the spot against {ic}'s rail pin is occupied by {blocker}"
-            ));
-            continue;
+        //
+        // But ONE guess was the whole search. When it was taken the pass gave up
+        // and the cap stayed wherever global placement dropped it — on the dual,
+        // 4 of 6 caps skipped and one sat 20.1mm from its IC against an 8.7mm
+        // rule (`legion-of-bom-ku4`). Giving up is the worst of the options: a
+        // slightly longer loop beats no decoupling at all. So walk outward, and
+        // fan a little either side, taking the first spot that is really clear.
+        // Nearest-and-straightest wins because that is the order tried.
+        let mut found: Option<(Placement, String)> = None;
+        'search: for step in 0..SNAP_STEPS {
+            let reach = base + step as f64 * SNAP_STEP_MM;
+            for deg in SNAP_FAN_DEG {
+                let (s, c) = deg.to_radians().sin_cos();
+                let (rx, ry) = (dx * c - dy * s, dx * s + dy * c);
+                let target = (pin.0 + rx * reach, pin.1 + ry * reach);
+                let cand = Placement {
+                    x_mm: target.0 - pad_from_origin.0,
+                    y_mm: target.1 - pad_from_origin.1,
+                    ..cap_at
+                };
+                match first_overlap(&cap, &cand, placements, facts) {
+                    None => {
+                        found = Some((cand, String::new()));
+                        break 'search;
+                    }
+                    Some(blocker) => {
+                        if found.is_none() {
+                            // Remember the first thing in the way, so a total
+                            // failure still reports something useful.
+                            found = Some((cand, blocker));
+                        }
+                    }
+                }
+            }
         }
+        let moved = match found {
+            Some((p, blocker)) if blocker.is_empty() => p,
+            other => {
+                let blocker = other.map(|(_, b)| b).unwrap_or_default();
+                report.skipped.push(format!(
+                    "{cap}: no clear spot against {ic}'s rail pin within \
+                     {:.1}mm — nearest blocker {blocker}",
+                    base + (SNAP_STEPS - 1) as f64 * SNAP_STEP_MM
+                ));
+                continue;
+            }
+        };
         let landed = place_point(moved, cap_local.0, cap_local.1);
         let d = (landed.0 - pin.0).hypot(landed.1 - pin.1);
         placements.insert(cap.clone(), moved);
@@ -190,11 +226,43 @@ fn ic_body_centre(facts: &HashMap<String, PartFacts>, at: Placement, ic: &str) -
 
 /// How far the cap's origin must clear the IC's edge for their keep-outs not to
 /// overlap, along the tighter axis.
-fn clearance(facts: &HashMap<String, PartFacts>, cap: &str, ic: &str) -> f64 {
-    let get = |r: &str| facts.get(r).map(|f| f.extent).unwrap_or((2.0, 2.0));
-    let (ca, ia) = (get(cap), get(ic));
-    ((ca.0 + ia.0) / 2.0).min((ca.1 + ia.1) / 2.0) * 0.5
+/// The smallest reach FROM THE PIN that could possibly clear: the cap's own half
+/// extent plus a pad gap.
+///
+/// The distance that matters is the current loop — the cap's pad to the IC's
+/// power pin — so the reach is measured from the pin, and the only thing that has
+/// to fit in it is the cap itself. The IC's own size does not belong here: the
+/// pin is already ON the IC, so adding the IC's half-extent to a distance
+/// starting at the pin counts it twice.
+///
+/// That double-count is what this function used to do. It returned the
+/// centre-to-centre half-sum `min((ca+ia)/2)` — an IC-centre quantity — and
+/// [`snap`] applied it from the pin, putting caps 9-12mm out against an 8.6mm
+/// rule. A trailing `* 0.5` had been bolted on, which cancelled roughly half the
+/// error and made the pass look approximately right; removing it (correctly, it
+/// asked for less than could ever clear) made the caps go FURTHER out, which is
+/// how the real mistake surfaced (`legion-of-bom-ku4`).
+///
+/// Deliberately optimistic, because [`snap`] verifies and walks outward from
+/// here. A short loop that is checked beats a long one that is assumed.
+fn clearance(facts: &HashMap<String, PartFacts>, cap: &str, _ic: &str) -> f64 {
+    let ce = facts.get(cap).map(|f| f.extent).unwrap_or((2.0, 2.0));
+    ce.0.min(ce.1) / 2.0
 }
+
+/// How far past the first guess to keep looking, and in what increments.
+///
+/// A decoupling cap 6mm from its pin is worth having; one left 20mm away because
+/// the first spot was taken is not.
+/// Range is `SNAP_STEPS * SNAP_STEP_MM` past the first guess. Fine steps because
+/// the search now starts at the physical minimum and walks out, so the step size
+/// is the precision of the answer, not just its granularity.
+const SNAP_STEPS: usize = 30;
+const SNAP_STEP_MM: f64 = 0.4;
+/// Angles either side of straight-out to try at each radius, in degrees. The
+/// outward normal is tried first at every radius, so a clear straight-out spot
+/// always wins over an angled nearer one.
+const SNAP_FAN_DEG: [f64; 5] = [0.0, 25.0, -25.0, 50.0, -50.0];
 
 fn is_power(net: &str) -> bool {
     let u = net.trim().to_ascii_uppercase();

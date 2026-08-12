@@ -1123,6 +1123,19 @@ pub struct PathfinderRouter {
     pub max_iters: usize,
 }
 
+/// Stop when the best result has not improved for this many consecutive rounds.
+///
+/// What makes a generous [`PathfinderRouter::max_iters`] safe. Without it the cap
+/// is the only stopping condition, so raising it to cover a hard board taxes
+/// every board that will never settle — the 42 HP crossfader already spends ~20
+/// minutes at 160 (`legion-of-bom-an8`).
+///
+/// Sized from the measured trace, not picked: on the dual the longest gap between
+/// two improvements is 33 rounds (round 123 -> 156). 120 is ~3.6x that, so a board
+/// still making progress at this board's worst rate keeps its budget, and one that
+/// has genuinely stopped gives up in a bounded time.
+const PF_STALL_ROUNDS: usize = 120;
+
 impl Default for PathfinderRouter {
     fn default() -> Self {
         // Generous, because it costs nothing when it is not needed: negotiation
@@ -1134,7 +1147,23 @@ impl Default for PathfinderRouter {
         //      24 iters -> 2 unrouted, 2 DRC
         //     150 iters -> 0 unrouted, 0 DRC
         // The board was one budget away from clean and 24 was hiding it.
-        PathfinderRouter { max_iters: 160 }
+        //
+        // THEN THE SAME THING HAPPENED ONE BOARD SIZE UP (`legion-of-bom-kcq`).
+        // The 46-part dual at 160 came back byte-identical to GridRouter, which
+        // read as "negotiation never converges on a board this size". It does.
+        // `LOB_PF_TRACE=1` shows overused cells falling 1006 -> 237 by round 10,
+        // then grinding: 161@33, 115@106, 94@123, 55@156, 5@158, 3@184, and
+        // ZERO at round 186. The cap stopped it at 158 holding five contested
+        // cells, so the never-worse guard correctly handed back the baseline —
+        // the guard was right, the budget was wrong.
+        //
+        //     160 iters -> 17 unrouted, 16 DRC   (identical to grid)
+        //     300 iters ->  0 unrouted,  0 DRC
+        //     600 iters ->  0 unrouted,  0 DRC   (same board; nothing bought)
+        //
+        // So the cap is now well clear of any board we have measured, and
+        // `PF_STALL_ROUNDS` — not the cap — is what stops a hopeless one.
+        PathfinderRouter { max_iters: 600 }
     }
 }
 
@@ -1160,6 +1189,8 @@ impl Router for PathfinderRouter {
         // contested). Negotiation does not improve monotonically — a round can be
         // worse than the one before — so taking the *last* round throws away work.
         let mut best: Option<(usize, usize, Vec<NetRoute>, Vec<usize>)> = None;
+        // Consecutive rounds that did not improve on `best`. See PF_STALL_ROUNDS.
+        let mut stalled = 0usize;
 
         for _it in 0..self.max_iters.max(1) {
             for &ni in &order {
@@ -1174,10 +1205,18 @@ impl Router for PathfinderRouter {
             }
             let over = (0..cong.core.len()).filter(|&i| cong.overused(i)).count();
             let unreached: usize = routes.iter().map(|r| r.unreached.len()).sum();
-            if best
+            // `LOB_PF_TRACE=1` prints every round that improves on the best so
+            // far. Tuning `max_iters` without this is guesswork: the question is
+            // not "how many rounds did it take" but "was it still making progress
+            // when the cap cut it off", and only the improvement trace answers
+            // that. Matches `LOB_PLACE_TRACE` in the placer.
+            let improved = best
                 .as_ref()
-                .is_none_or(|(u, o, _, _)| (unreached, over) < (*u, *o))
-            {
+                .is_none_or(|(u, o, _, _)| (unreached, over) < (*u, *o));
+            if improved && std::env::var_os("LOB_PF_TRACE").is_some() {
+                eprintln!("  pf round {_it}: unreached {unreached}, overused {over}");
+            }
+            if improved {
                 let contested: Vec<usize> = (0..routable.len())
                     .map(|ni| {
                         routes[ni]
@@ -1188,8 +1227,17 @@ impl Router for PathfinderRouter {
                     })
                     .collect();
                 best = Some((unreached, over, routes.clone(), contested));
+                stalled = 0;
+            } else {
+                stalled += 1;
             }
             if over == 0 {
+                break;
+            }
+            // Nothing has got better for a long time. More rounds of a
+            // negotiation that has stopped negotiating are just wall clock, and
+            // the fallback ordering search below still gets the history map.
+            if stalled >= PF_STALL_ROUNDS {
                 break;
             }
             cong.age();
@@ -2116,6 +2164,36 @@ mod tests {
                  this placement — the difference is the router giving up"
             );
         }
+    }
+
+    /// The board pipeline must route with the router the benches measure.
+    ///
+    /// `legion-of-bom-kcq` recorded "PathfinderRouter returns byte-identical
+    /// results to GridRouter on a 46-part board" and built a theory on it — the
+    /// negotiation never converging, the never-worse guard handing back the
+    /// baseline every time. None of that was true. `route_bench` defaulted to
+    /// `max_iters: 24` while `board.rs` builds with `PathfinderRouter::default()`
+    /// (160), so the bench had measured a router the project does not ship. At
+    /// 160 the two separate cleanly: 14 unrouted vs 16, 14 DRC vs 15.
+    ///
+    /// A day of reasoning about a number that came from the wrong binary. This
+    /// asserts the default is what the pipeline uses, so a bench that wants a
+    /// different count has to say so out loud.
+    /// Deliberately a change-detector — that is the job. It is not asserting 600
+    /// is correct; it is asserting that nobody moves the number without seeing
+    /// this message, because every routing figure recorded in a bead was measured
+    /// against one specific value. It has already earned its keep once: it failed
+    /// the moment I raised 160 to 600, which is exactly when the old numbers
+    /// stopped meaning anything.
+    #[test]
+    fn the_shipping_router_is_the_default_one() {
+        assert_eq!(
+            PathfinderRouter::default().max_iters,
+            600,
+            "board.rs builds with PathfinderRouter::default(); if this number \
+             moves, every recorded routing measurement was taken against a \
+             different router and needs re-running"
+        );
     }
 
     #[test]
