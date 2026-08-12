@@ -1049,7 +1049,41 @@ pub fn min_panel_hp_for(
         if widest <= 0.0 {
             return 1;
         }
-        widest + 2.0 * envelope::EDGE_MM
+        // WIDTH ALONE IS NOT THE ANSWER. A 3U panel is a column, and a column
+        // taller than the panel does not overflow visibly — `derive_panel_for`
+        // clamps it, so every control past the end lands on the SAME point and
+        // the surplus jacks silently vanish into one hole (measured: 8
+        // Thonkiconns at 4 HP put J7 and J8 both at (10.160, 12.000), and this
+        // function returned 3). Two identical cutouts then reach the DXF and the
+        // panel PCB's Edge.Cuts as duplicate loops.
+        //
+        // So size for the COLUMNS the stack actually needs. This is the exact
+        // inverse of `derive_panel_for`'s `fits_wide`, which is what makes the
+        // two agree: it can always fit the columns this asks for.
+        let stack: f64 = controls
+            .iter()
+            .map(|(_, k, env)| (env.1 + envelope::GAP_MM).max(control_pitch(*k)))
+            .sum();
+        let width_for = |cols: f64| {
+            (cols * (widest + envelope::GAP_MM) - envelope::GAP_MM + 2.0 * envelope::EDGE_MM)
+                .max(widest + 2.0 * envelope::EDGE_MM)
+        };
+        // The usable height depends on the margins, which depend on HP, which is
+        // what we are solving for. There are only two margin buckets (narrow and
+        // wide), and each pass can only widen, so this settles immediately —
+        // bounded anyway rather than trusting that argument.
+        let mut hp = (width_for(1.0) / HP_MM).ceil().max(1.0) as u16;
+        for _ in 0..4 {
+            let (top, bot) = derive_rules::margins_mm(hp);
+            let avail = (format.height_mm() - top - bot).max(1.0);
+            let cols = (stack / avail).ceil().max(1.0);
+            let next = (width_for(cols) / HP_MM).ceil().max(1.0) as u16;
+            if next <= hp {
+                break;
+            }
+            hp = next;
+        }
+        return hp;
     };
     (needed / HP_MM).ceil().max(1.0) as u16
 }
@@ -1253,6 +1287,12 @@ pub fn derive_panel_for(
             let (refdes, kind, _) = &ordered[i];
             // Clamp inside the panel. A derived spec that puts hardware off the
             // edge is not a spec, and it used to happen silently.
+            // The clamp is a floor, not a layout strategy. It is what silently
+            // stacked controls on one point when `min_panel_hp_for` sized by
+            // width alone: everything past the end of the column pinned to
+            // `avail_bot`. Sizing now accounts for the stack, so reaching this
+            // clamp at all means the two disagree again — see the debug_assert
+            // at the end of this branch.
             let cy = (y - pitches[i] / 2.0).clamp(avail_bot, avail_top);
             out.push(CutoutFile {
                 x_mm: col_x,
@@ -1267,6 +1307,26 @@ pub fn derive_panel_for(
         }
     }
     let _ = cx;
+
+    // Two controls at one point is an unbuildable panel, and it reaches the DXF
+    // and the panel PCB's Edge.Cuts as duplicate loops rather than as an error.
+    // Sizing above is meant to make it impossible; this is how we find out if it
+    // stops being. Debug-only — a release build should not abort a derive.
+    debug_assert!(
+        {
+            let mut ok = true;
+            for (i, a) in out.iter().enumerate() {
+                for b in &out[i + 1..] {
+                    if (a.x_mm - b.x_mm).abs() < 0.01 && (a.y_mm - b.y_mm).abs() < 0.01 {
+                        ok = false;
+                    }
+                }
+            }
+            ok
+        },
+        "derived panel puts two controls in one hole — min_panel_hp_for and \
+         derive_panel_for disagree about how tall a column fits"
+    );
 
     PanelFile {
         format: format.as_str().into(),
@@ -2373,6 +2433,70 @@ mod panel_from_board_tests {
         xs.sort_by(f64::total_cmp);
         xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
         assert!(xs.len() >= 2, "expected multiple columns, got {xs:?}");
+    }
+
+    /// **No two controls may share a hole.** A derived panel that stacks two
+    /// jacks on one point is not a tight panel, it is an unbuildable one.
+    ///
+    /// `min_panel_hp_for`'s 3U branch sized the panel by `widest + 2·EDGE` —
+    /// WIDTH ONLY. A 3U panel is a column, and nothing checked the column of
+    /// pitches against the ~105mm vertical band, so `derive_panel_for`'s
+    /// `.clamp(avail_bot, avail_top)` pinned every control past the end to
+    /// exactly `avail_bot`. Measured before the fix: 8 Thonkiconns at 4 HP put
+    /// J7 and J8 both at (10.160, 12.000), and `min_panel_hp_for` returned 3, so
+    /// the CLI's "widened to N HP" line never fired either.
+    ///
+    /// It reached the manufactured artifacts: `write_dxf` emitted two identical
+    /// CIRCLEs and `panel_to_kicad_pcb` two identical inner `Edge.Cuts` loops —
+    /// a self-overlapping outline the panel shop resolves however it likes, and
+    /// one jack with no hole at all.
+    #[test]
+    fn a_crowded_panel_never_puts_two_controls_in_one_place() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        for n in [8usize, 10, 14] {
+            let mut c = Circuit::new("crowded");
+            for i in 1..=n {
+                c.parts
+                    .push(Part::new(format!("J{i}"), "io").with_footprint(jack));
+            }
+            // Ask for a width that cannot hold them in one column, which is the
+            // case that used to stack silently.
+            let p = derive_panel_for(&c, PanelFormat::Eurorack3U, 4, &BuiltinCutouts);
+            assert_eq!(p.cutouts.len(), n, "{n} jacks in, {n} cutouts out");
+
+            for (i, a) in p.cutouts.iter().enumerate() {
+                for b in &p.cutouts[i + 1..] {
+                    let coincident =
+                        (a.x_mm - b.x_mm).abs() < 0.01 && (a.y_mm - b.y_mm).abs() < 0.01;
+                    assert!(
+                        !coincident,
+                        "{n} jacks: {:?} and {:?} share a hole at ({:.3}, {:.3})",
+                        a.refdes, b.refdes, a.x_mm, a.y_mm
+                    );
+                }
+            }
+            // And the width it settled on must be one the controls really fit in,
+            // not the 4 HP that was asked for.
+            let hp = p.hp.expect("derived panel declares its width");
+            assert!(
+                hp >= min_panel_hp_for(&c, PanelFormat::Eurorack3U, &BuiltinCutouts),
+                "{n} jacks: emitted {hp} HP below its own stated minimum"
+            );
+            // Everything still on the panel.
+            let w = f64::from(hp) * HP_MM;
+            for cut in &p.cutouts {
+                assert!(
+                    cut.x_mm > 0.0
+                        && cut.x_mm < w
+                        && cut.y_mm > 0.0
+                        && cut.y_mm < EURORACK_HEIGHT_MM,
+                    "{n} jacks: {:?} off the panel at ({:.2}, {:.2}) on {hp} HP",
+                    cut.refdes,
+                    cut.x_mm,
+                    cut.y_mm
+                );
+            }
+        }
     }
 
     /// A module that fits in one column keeps one — columns are a response to

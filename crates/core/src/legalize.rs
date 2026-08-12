@@ -141,10 +141,41 @@ fn nearest_free(
     placements: &HashMap<String, Placement>,
     facts: &HashMap<String, PartFacts>,
 ) -> Option<(f64, f64)> {
-    let Some(me) = facts.get(refdes) else {
-        return Some(target);
-    };
+    // A part with no measured facts used to short-circuit to `Some(target)` —
+    // moved with NO collision check at all. We cannot check its own body without
+    // an extent, but we can still refuse to drop it inside a part we DO know,
+    // so treat it as a point rather than skipping the test. Callers legitimately
+    // pass an empty `facts` and rely on the rule's own repair target (see
+    // `panel_hardware_that_overlaps_is_a_physical_violation_and_gets_repaired`),
+    // and that keeps working: with nothing to collide against, nothing clashes.
+    let (my_extent, my_offset) = facts
+        .get(refdes)
+        .map(|f| (f.extent, f.origin_offset))
+        .unwrap_or(((0.0, 0.0), (0.0, 0.0)));
     let clashes = |x: f64, y: f64| {
+        // Ask the geometry question the way the RULE asks it. This used to
+        // compare placement origin to placement origin with unrotated extents,
+        // while `rules::placed_box` applies the back-flip, `rotate_local`, the
+        // quarter-turn extent swap and `origin_offset`. An Alpha pot's origin is
+        // pin 1, ~5.35mm off its body centre, so the two disagreed by that much
+        // on every Eurorack board — legalization would declare a spot free, move
+        // the part there, and hand back a clean report on interpenetrating
+        // bodies (measured: RV1 moved 22.1mm to escape an edge and landed 5.065mm
+        // inside SW1, `legion-of-bom-<legalize>`).
+        //
+        // `-TOLERANCE_MM` rather than a bare `<` for the same reason `rules`
+        // needs it: `escape_target` returns precisely the touching distance, so
+        // an exact tie is the common case, and the two sides reach that number by
+        // different summation orders.
+        let mine = crate::rules::placed_box(
+            my_extent,
+            my_offset,
+            &Placement {
+                x_mm: x,
+                y_mm: y,
+                ..current
+            },
+        );
         placements.iter().any(|(other, p)| {
             if other == refdes {
                 return false;
@@ -157,8 +188,8 @@ fn nearest_free(
             let Some(of) = facts.get(other) else {
                 return false;
             };
-            let (dx, dy) = ((x - p.x_mm).abs(), (y - p.y_mm).abs());
-            dx < (me.extent.0 + of.extent.0) / 2.0 && dy < (me.extent.1 + of.extent.1) / 2.0
+            let theirs = crate::rules::placed_box(of.extent, of.origin_offset, p);
+            crate::rules::gap_between(mine, theirs) < -crate::rules::TOLERANCE_MM
         })
     };
     if !clashes(target.0, target.1) {
@@ -216,6 +247,114 @@ mod tests {
             min_mm: EDGE_CLEARANCE_MM,
             tier: Tier::Physical,
         }
+    }
+
+    /// **Repairing one violation must not create another.**
+    ///
+    /// `nearest_free`'s clash test measured placement ORIGIN to ORIGIN with
+    /// UNROTATED extents, while the checker it has to satisfy — `rules`'
+    /// `placed_box` — applies the back-flip, `rotate_local`, the quarter-turn
+    /// extent swap AND `origin_offset`. An Alpha pot's origin is pin 1, ~5.35mm
+    /// from its body centre, so the two disagree by that offset on every
+    /// Eurorack board.
+    ///
+    /// The fixture is MEASURED, not reasoned about
+    /// (`examples/legalize_probe.rs`). Two hand-built guesses failed to
+    /// reproduce it: at 90° the offset rotates out of the way, and at the switch
+    /// positions I first picked the gap happened to be clear either way. The
+    /// probe swept rotation × both x positions and found the real case — at
+    /// rotation ZERO, legalize moves RV1 22.1mm to escape the edge and parks it
+    /// 5.065mm inside SW1. Origin-to-origin it looks fine (12.1mm apart against
+    /// a 11.815mm sum of half-extents); with the offset applied, RV1's body
+    /// spans 14.00..28.50 and SW1's 23.435..32.565.
+    ///
+    /// An earlier version of this test asserted `report.is_clean()` against
+    /// `rules::assess` over the SAME rule list `legalize` computes `stuck` from —
+    /// a tautology that could not fail. The rules here are deliberately split:
+    /// only the edge rule goes in, and the overlap is checked afterwards.
+    #[test]
+    fn legalize_does_not_create_an_overlap_while_repairing_an_edge() {
+        // A pot: rotated a quarter turn, origin well away from its body centre.
+        let pot = PartFacts {
+            extent: (14.5, 14.32),
+            body_extent: (14.5, 14.32),
+            origin_offset: (5.35, 0.0),
+            ..fact(14.5, 14.32)
+        };
+        let sw = fact(9.13, 10.14);
+        let facts: HashMap<String, PartFacts> =
+            [("RV1".into(), pot.clone()), ("SW1".into(), sw.clone())].into();
+
+        let bounds = (0.0, 0.0, 40.0, 100.0);
+        let mut placements: HashMap<String, Placement> = [
+            (
+                "RV1".to_string(),
+                Placement {
+                    x_mm: 38.0,
+                    y_mm: 50.0,
+                    rotation_deg: 0.0,
+                    back: false,
+                },
+            ),
+            ("SW1".to_string(), at(28.0, 50.0)),
+        ]
+        .into();
+
+        // ONLY the edge rule. `report.stuck` is computed by running `assess` over
+        // exactly these rules, so asserting against the same list is a tautology
+        // — it cannot fail however wrong the placement is. The thing under test
+        // is `nearest_free`'s own `clashes` guard, whose entire job is to avoid
+        // parking a part on top of another WHILE repairing something else.
+        let rules = vec![Rule::EdgeClearance {
+            refdes: "RV1".into(),
+            extent: pot.extent,
+            origin_offset: pot.origin_offset,
+            bounds,
+            min_mm: EDGE_CLEARANCE_MM,
+            tier: Tier::Physical,
+        }];
+
+        let report = legalize(&mut placements, &rules, &facts);
+        assert!(
+            !report.moved.is_empty(),
+            "precondition: RV1 must actually be repaired, else this proves nothing"
+        );
+
+        // Now ask the checker the fab gate uses whether the repair left the two
+        // bodies interpenetrating.
+        let overlap = vec![Rule::Overlap {
+            a: "RV1".into(),
+            a_extent: pot.extent,
+            a_offset: pot.origin_offset,
+            a_tht: Vec::new(),
+            a_back: false,
+            b: "SW1".into(),
+            b_extent: sw.extent,
+            b_offset: sw.origin_offset,
+            b_tht: Vec::new(),
+            b_back: false,
+            tier: Tier::Physical,
+        }];
+        let bad: Vec<String> = crate::rules::assess(&overlap, &placements)
+            .into_iter()
+            .filter(|a| !a.ok())
+            .map(|a| format!("{} overlaps by {:.4}mm", a.subject, -a.margin_mm))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "legalize reported clean={} after moving {:?}, but {bad:?}",
+            report.is_clean(),
+            report.moved
+        );
+
+        // Minimum disturbance is the module's stated contract. A ring search
+        // escaping a phantom keep-out can travel further than the board is wide.
+        let travelled: f64 = report.moved.iter().map(|(_, d)| d).sum();
+        assert!(
+            travelled < 40.0,
+            "travelled {travelled:.3}mm on a 40mm board: {:?}",
+            report.moved
+        );
     }
 
     #[test]

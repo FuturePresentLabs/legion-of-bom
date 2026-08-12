@@ -454,7 +454,7 @@ pub struct Assessment {
 /// `Tier::Physical` rule and refuses the fab package with "hangs 0.0mm past the
 /// board's 1.5mm edge clearance", which is not a board defect, it is arithmetic.
 /// KiCad's own board unit is 1nm; nothing below that is a different board.
-const TOLERANCE_MM: f64 = 1e-6;
+pub(crate) const TOLERANCE_MM: f64 = 1e-6;
 
 impl Assessment {
     pub fn ok(&self) -> bool {
@@ -684,15 +684,18 @@ pub fn evaluate(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<
 }
 
 /// A footprint's keep-out in board space, given where it is placed.
-fn placed_box(extent: (f64, f64), offset: (f64, f64), p: &Placement) -> (f64, f64, f64, f64) {
+pub(crate) fn placed_box(
+    extent: (f64, f64),
+    offset: (f64, f64),
+    p: &Placement,
+) -> (f64, f64, f64, f64) {
     let local = if p.back {
         (offset.0, -offset.1)
     } else {
         offset
     };
     let (ox, oy) = crate::board::rotate_local(local, p.rotation_deg);
-    let quarter = (p.rotation_deg / 90.0).round() as i64;
-    let (w, h) = if quarter % 2 == 0 {
+    let (w, h) = if crate::board::quarter_turns(p.rotation_deg) % 2 == 0 {
         extent
     } else {
         (extent.1, extent.0)
@@ -710,7 +713,7 @@ fn placed_rect(r: (f64, f64, f64, f64), p: &Placement) -> (f64, f64, f64, f64) {
 /// Signed gap between two axis-aligned boxes: positive is clear air, negative is
 /// how far they interpenetrate. Boxes are apart if EITHER axis separates them,
 /// so the gap is the larger of the two — which is also the cheaper escape.
-fn gap_between(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> f64 {
+pub(crate) fn gap_between(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> f64 {
     let gx = (b.0 - a.2).max(a.0 - b.2);
     let gy = (b.1 - a.3).max(a.1 - b.3);
     gx.max(gy)
