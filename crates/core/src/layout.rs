@@ -48,6 +48,16 @@ impl LayoutMode {
         }
     }
 
+    /// The name this mode parses from — so a command can report the mode it
+    /// actually used rather than echoing back the string it was given.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayoutMode::Analog => "analog",
+            LayoutMode::Digital => "digital",
+            LayoutMode::Mixed => "mixed",
+        }
+    }
+
     /// The cost weights this mode scores placements by.
     pub fn weights(self) -> CostWeights {
         match self {

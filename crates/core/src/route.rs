@@ -1747,14 +1747,22 @@ mod tests {
         assert!(!straight, "OUT should detour around the GND pad");
     }
 
-    /// Two signals that both want the same gap in a wall.
+    /// Two signals crossing one gap in a wall. A CORRECTNESS fixture only.
     ///
-    /// Note what this does and does not prove. Small contested boards are
-    /// generally solvable by *reordering* too — GridRouter clears this one — so
-    /// this is a correctness case, not a demonstration of the advantage. The
-    /// advantage shows up where blame-and-reorder runs out of road: many nets,
-    /// diffuse congestion, no single "A boxed in B" to blame. That is measured on
-    /// the real board, not here.
+    /// Named "contested" once; it is not, in two ways that were both measured
+    /// rather than argued (`legion-of-bom-69v.1`):
+    ///
+    /// * The wall pads are `PadLayer::Front`, so the back layer is an open field.
+    ///   Both nets simply via down, cross under the wall, and via back up — they
+    ///   never touch the gap at all.
+    /// * Widening or narrowing the gap does not fix that. Swept 0.6 to 2.9mm with
+    ///   a both-layer wall (`examples/channel_sweep.rs`): both routers clear every
+    ///   width. The cost model is Manhattan, so a great many routes tie and
+    ///   nothing pushes two nets onto the same cell.
+    ///
+    /// So this proves both routers can get two nets past an obstacle, which is
+    /// worth having. It proves nothing about negotiated congestion — see
+    /// [`crossbar_board`] for that.
     fn corridor_board() -> (Vec<RouteNet>, RouteOptions) {
         // A wall of no-net pads with a single one-cell gap in it. Both signal
         // nets have to cross the wall.
@@ -1771,19 +1779,25 @@ mod tests {
             },
         ];
         // The wall: pads down the middle, leaving one gap at y = 100.
-        let mut wall = Vec::new();
+        //
+        // ONE NET PER PAD. Collecting them into a single `net_idx: 99` with 12
+        // pads made `pads.len() >= 2` true, so the routers classified the wall as
+        // a net to be ROUTED and dutifully wired it together — 11 tracks of copper
+        // down x=106 — instead of treating it as an obstacle. Compare
+        // `no_net_pad_forces_traces_to_route_around_it`, which had it right.
         let mut y: f64 = 94.0;
+        let mut idx = 90;
         while y <= 106.0 {
             if (y - 100.0).abs() > 0.5 {
-                wall.push(pad("W", "1", 106.0, y));
+                nets.push(RouteNet {
+                    net_idx: idx,
+                    name: String::new(),
+                    pads: vec![pad("W", "1", 106.0, y)],
+                });
+                idx += 1;
             }
             y += 1.0;
         }
-        nets.push(RouteNet {
-            net_idx: 99,
-            name: "".into(),
-            pads: wall,
-        });
         let opts = RouteOptions {
             bounds: Some((96.0, 92.0, 116.0, 108.0)),
             ..Default::default()
@@ -1802,9 +1816,19 @@ mod tests {
     /// those cells `Blocked` — the board was unroutable by construction and the
     /// test was measuring nothing.
     ///
-    /// This is the case negotiated congestion exists for, and it is written as a
-    /// test of BOTH routers on purpose: if GridRouter ever passes it, the board
-    /// has stopped being a discriminating case and the test is worthless.
+    /// The paragraph above is what this fixture was FOR. It does not achieve it,
+    /// and the next sentence used to read: "if GridRouter ever passes it, the
+    /// board has stopped being a discriminating case and the test is worthless."
+    ///
+    /// GridRouter passes it, with 0 conflicts. That condition — written down as
+    /// fatal, in prose, with no assertion behind it — was true for months and
+    /// nothing noticed, which is the whole lesson of `legion-of-bom-69v.1`.
+    /// GridRouter is not the naive baseline this assumed: it does rip-up and
+    /// reroute over net orderings, so a 2-net board is nearly always solvable by
+    /// reordering.
+    ///
+    /// Kept as a second correctness board. The discriminating case is
+    /// [`crossbar_board`], and the guard is now an `assert!`.
     fn channel_board() -> (Vec<RouteNet>, RouteOptions) {
         // Walls of through-hole pads (both layers, so there is no escape to the
         // back) with a 2.2mm gap between them at x = 106.
@@ -1846,6 +1870,108 @@ mod tests {
         (nets, opts)
     }
 
+    /// **The board the ordering search cannot solve.** Four nets across an 8mm
+    /// span, left pad `i` wired to right pad `3-i`, so every pair must cross.
+    ///
+    /// Found by measurement, not by design (`examples/channel_sweep.rs`), because
+    /// two earlier attempts at a discriminating fixture were not:
+    ///
+    /// * A single narrow gap in a wall does not work at any width. Swept 0.6 to
+    ///   2.9mm: both routers clear every one. The cost model is Manhattan, so a
+    ///   great many paths tie and nothing pushes two nets onto the same cell —
+    ///   there is no contention to negotiate.
+    /// * Narrowing it until there IS contention goes straight from "both route"
+    ///   to "impossible for both", with no window between.
+    ///
+    /// What defeats an order-based search is *diffuse* congestion: whoever commits
+    /// first takes a path that boxes in a net it cannot single out to blame, and
+    /// there is no permutation that avoids it. That is what a full crossing
+    /// permutation produces, and it is what the module docs always claimed the
+    /// advantage was for. Measured here: grid 2 conflicts, pathfinder 0, and 0
+    /// impossible by placement.
+    fn crossbar_board() -> (Vec<RouteNet>, RouteOptions) {
+        const N: usize = 4;
+        const PITCH: f64 = 1.27;
+        const SPAN: f64 = 8.0;
+        let (lx, rx) = (100.0, 100.0 + SPAN);
+        let y0 = 100.0;
+        let p = |refdes: String, x: f64, y: f64| PadPoint {
+            refdes,
+            pad: "1".into(),
+            x_mm: x,
+            y_mm: y,
+            w_mm: 0.8,
+            h_mm: 0.8,
+            // Through-hole: no escaping to an empty back layer, which is what
+            // made `corridor_board` trivial.
+            layer: PadLayer::Both,
+        };
+        let nets = (0..N)
+            .map(|i| RouteNet {
+                net_idx: i + 1,
+                name: format!("N{i}"),
+                pads: vec![
+                    p(format!("L{i}"), lx, y0 + i as f64 * PITCH),
+                    p(format!("R{i}"), rx, y0 + (N - 1 - i) as f64 * PITCH),
+                ],
+            })
+            .collect();
+        let opts = RouteOptions {
+            bounds: Some((
+                lx - 1.0,
+                y0 - 1.0,
+                rx + 1.0,
+                y0 + (N - 1) as f64 * PITCH + 1.0,
+            )),
+            ..Default::default()
+        };
+        (nets, opts)
+    }
+
+    /// **The claim, stated so it can fail.** Negotiated congestion routes a board
+    /// that committing-in-order cannot — including with rip-up, which `GridRouter`
+    /// already does.
+    ///
+    /// Written with its own preconditions asserted, because the previous version
+    /// of this test passed with `PathfinderRouter` aliased to `GridRouter`, and
+    /// seven of its eight siblings passed with the obstacle-blind `MstRouter`
+    /// (`legion-of-bom-69v.1`). Two guards stop that recurring:
+    ///
+    /// * the board must be routable at all, or "pathfinder routed it" is luck;
+    /// * `GridRouter` must actually FAIL it, or the fixture has stopped
+    ///   discriminating and this test has quietly become a formality.
+    ///
+    /// `channel_board` carried the second requirement in prose — "if GridRouter
+    /// ever passes it, the test is worthless" — and GridRouter passed it for
+    /// months with nothing to notice. Prose is not an assertion.
+    #[test]
+    fn pathfinder_routes_a_board_the_ordering_search_cannot() {
+        let (nets, opts) = crossbar_board();
+
+        let impossible = unroutable_by_placement(&nets, &opts);
+        assert!(
+            impossible.is_empty(),
+            "precondition: every net must be routable alone, else this proves nothing — {impossible:?}"
+        );
+
+        let grid = GridRouter.route(&nets, &opts).conflicts;
+        assert!(
+            !grid.is_empty(),
+            "FIXTURE NO LONGER DISCRIMINATES: GridRouter now solves the crossbar, \
+             so passing this test says nothing about negotiation. Make the board \
+             harder (examples/channel_sweep.rs sweeps n/pitch/span) rather than \
+             deleting this assertion."
+        );
+
+        let pf = PathfinderRouter::default().route(&nets, &opts).conflicts;
+        assert!(
+            pf.is_empty(),
+            "negotiation left {} unrouted where the ordering search left {} — {pf:?}",
+            pf.len(),
+            grid.len()
+        );
+    }
+
     /// **Never worse than the baseline.** `PathfinderRouter` falls back to the
     /// same ordering search `GridRouter` runs, and keeps the negotiation-guided
     /// result only when it actually beat the unguided one — so it cannot lose to
@@ -1856,9 +1982,20 @@ mod tests {
     /// settled, and lost 0 conflicts to 1 on the channel board below.
     #[test]
     fn pathfinder_is_never_worse_than_the_grid_router() {
-        for (name, (nets, opts)) in [("corridor", corridor_board()), ("channel", channel_board())] {
+        // The crossbar is here because it is the only one of the three where
+        // GridRouter leaves any conflicts at all. On the other two the comparison
+        // is 0 <= 0 and holds for any router whatsoever — including one that
+        // emits nothing. A "never worse" test needs at least one board where
+        // "worse" is expressible.
+        let mut grid_ever_failed = false;
+        for (name, (nets, opts)) in [
+            ("crossbar", crossbar_board()),
+            ("corridor", corridor_board()),
+            ("channel", channel_board()),
+        ] {
             let grid = GridRouter.route(&nets, &opts);
             let pf = PathfinderRouter::default().route(&nets, &opts);
+            grid_ever_failed |= !grid.conflicts.is_empty();
             assert!(
                 pf.conflicts.len() <= grid.conflicts.len(),
                 "{name}: pathfinder {:?} lost to grid {:?}",
@@ -1866,10 +2003,23 @@ mod tests {
                 grid.conflicts
             );
         }
+        assert!(
+            grid_ever_failed,
+            "every board here is trivially routable, so 'never worse' compared \
+             0 <= 0 throughout and proved nothing"
+        );
     }
 
+    /// Two signals through one gap, both routed, both with copper on the board.
+    ///
+    /// A CORRECTNESS test — renamed from `pathfinder_clears_a_contested_corridor`,
+    /// which oversold it. Nothing here is contested: measured, GridRouter clears
+    /// this board too, and so does a single negotiation round. The claim about
+    /// negotiation beating an ordering search lives in
+    /// `pathfinder_routes_a_board_the_ordering_search_cannot`, which asserts its
+    /// own preconditions so it cannot quietly stop being true.
     #[test]
-    fn pathfinder_clears_a_contested_corridor() {
+    fn pathfinder_routes_both_signals_through_one_gap() {
         let (nets, opts) = corridor_board();
         let grid = GridRouter.route(&nets, &opts);
         let pf = PathfinderRouter::default().route(&nets, &opts);
@@ -1895,11 +2045,15 @@ mod tests {
 
     /// Emitted copper must never be knowingly shorted: a net that still clashes
     /// after the last round is reported, not drawn.
+    ///
+    /// On the crossbar with a single round, because that is a board where one
+    /// round genuinely fails. This used to run on `corridor_board` under the
+    /// premise "one round is not enough to negotiate anything" — measured, that
+    /// premise is false: `max_iters: 1` clears the corridor with 0 conflicts, so
+    /// the test never saw a failing net at all (`legion-of-bom-69v.1`).
     #[test]
     fn pathfinder_reports_rather_than_emitting_shorted_copper() {
-        let (nets, opts) = corridor_board();
-        // One round is not enough to negotiate anything — it is a plain
-        // shortest-path solve, so both signals want the same gap.
+        let (nets, opts) = crossbar_board();
         let out = PathfinderRouter { max_iters: 1 }.route(&nets, &opts);
         let routed: HashSet<usize> = out.tracks.iter().map(|t| t.net_idx).collect();
         let complained: HashSet<usize> = out
@@ -1908,12 +2062,25 @@ mod tests {
             .filter_map(|c| c.split_whitespace().nth(1))
             .filter_map(|n| n.parse().ok())
             .collect();
+        // Without this the loop below is satisfied by a router that simply routes
+        // everything, which is not what this test is about.
+        assert!(
+            !complained.is_empty(),
+            "one round was expected to leave something unrouted; if the router got \
+             better, move this to a harder board rather than deleting the check"
+        );
         // Every signal net either shipped copper or was reported — never silently
-        // dropped, and never both.
-        for idx in [1usize, 2] {
+        // dropped. A net that was reported must NOT also have copper on the board:
+        // that is the knowingly-shorted case this exists to prevent.
+        for net in &nets {
+            let idx = net.net_idx;
             assert!(
                 routed.contains(&idx) || complained.contains(&idx),
                 "net {idx} vanished: tracks {routed:?} conflicts {complained:?}"
+            );
+            assert!(
+                !(routed.contains(&idx) && complained.contains(&idx)),
+                "net {idx} was reported as unroutable AND had copper emitted"
             );
         }
     }
@@ -1929,7 +2096,15 @@ mod tests {
     /// whether the router had achieved what the placement allowed.
     #[test]
     fn pathfinder_routes_everything_the_placement_allows() {
-        for (name, (nets, opts)) in [("corridor", corridor_board()), ("channel", channel_board())] {
+        // The crossbar makes this bound non-trivial: it is the one board here the
+        // ordering search fails, so `got <= impossible` is `0 <= 0` only if the
+        // router really did achieve what the placement allowed. On the other two
+        // it is 0 <= 0 for any router at all.
+        for (name, (nets, opts)) in [
+            ("crossbar", crossbar_board()),
+            ("corridor", corridor_board()),
+            ("channel", channel_board()),
+        ] {
             let impossible = unroutable_by_placement(&nets, &opts).len();
             let got = PathfinderRouter::default()
                 .route(&nets, &opts)

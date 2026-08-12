@@ -16,17 +16,17 @@ use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
-    generate_board_artifacts, generate_board_report, generate_bom, guide, guide_to_html,
-    guide_to_pdf, jlc_bom_csv, jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp,
-    minimum_routable_hp, package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb,
-    parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png,
-    rules, run_drc, run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns,
-    validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng,
-    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions,
-    HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient,
-    PanelFile, PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    generate_board_artifacts, generate_bom, guide, guide_to_html, guide_to_pdf, jlc_bom_csv,
+    jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
+    package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
+    part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, rules, run_drc,
+    run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc,
+    value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
+    BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions, HpSearch, JlcpcbClient,
+    KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat,
+    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate,
+    ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig,
+    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -107,7 +107,7 @@ enum Command {
         panel: Option<PathBuf>,
         /// Layout cost-function mode (only affects the panel-anchored loop):
         /// analog | digital | mixed.
-        #[arg(long, default_value = "analog")]
+        #[arg(long, default_value = LAYOUT_MODE)]
         mode: String,
         /// Iterative layout attempts over a panel board (0 = one-shot placement).
         #[arg(long, default_value_t = 6)]
@@ -132,7 +132,7 @@ enum Command {
         #[arg(long)]
         panel: Option<PathBuf>,
         /// Layout cost-function mode: analog | digital | mixed.
-        #[arg(long, default_value = "analog")]
+        #[arg(long, default_value = LAYOUT_MODE)]
         mode: String,
         /// Iterative layout attempts over a panel board (0 = one-shot placement).
         #[arg(long, default_value_t = 6)]
@@ -159,6 +159,13 @@ enum Command {
         /// mixed. THT-first framing + copy — most DIY kits are through-hole.
         #[arg(long, default_value = "auto")]
         kit: String,
+        /// Layout cost-function mode: analog | digital | mixed.
+        ///
+        /// Must match what `lob fab` is given, or the guide documents a different
+        /// board from the one manufactured (`legion-of-bom-p6m`). Before this
+        /// existed, `guide` had no way to be told and always laid out `analog`.
+        #[arg(long, default_value = LAYOUT_MODE)]
+        mode: String,
     },
     /// Import a board from another EDA tool.
     Import {
@@ -390,6 +397,13 @@ enum PanelCmd {
         /// to start a fresh arrangement the board will then follow.
         #[arg(long)]
         idealised: bool,
+        /// Overwrite the output spec if it already exists.
+        ///
+        /// The default output path is the circuit's own `<name>_panel.toml`, which
+        /// for anything already built is the tracked, hand-authored spec. Deriving
+        /// over it silently is how `legion-of-bom-byh` lost a hand-built layout.
+        #[arg(long)]
+        force: bool,
     },
     /// Compute the minimum Eurorack HP that fits a circuit — the PCB drives the
     /// panel width (DESIGN 6.1).
@@ -460,7 +474,8 @@ fn main() -> ExitCode {
             out,
             panel,
             kit,
-        } => guide_cmd(circuit, out, panel, kit),
+            mode,
+        } => guide_cmd(circuit, out, panel, kit, mode),
         Command::Import { action } => import_cmd(action),
         Command::Panel { action } => panel_cmd(action),
     };
@@ -721,9 +736,7 @@ fn effective_panel(
     stem: &str,
 ) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit {
-        // A declared panel is the author's file and is never written to. When it
-        // has gone stale we derive a substitute NEXT TO it and build against
-        // that, saying so loudly.
+        // A declared panel is the author's file and is never written to.
         //
         // This used to regenerate the declared spec in place. The intent was
         // sound — a panel missing a cutout cannot mate the board, so faithfully
@@ -731,27 +744,78 @@ fn effective_panel(
         // destroying hand-authored work: comments, a deliberate two-column
         // layout, a chosen HP. A command that reads like a read must not rewrite
         // tracked source (`legion-of-bom-byh`).
-        let Some(reason) = declared_panel_staleness(&path, model, footprint_dir)? else {
+        let Some(stale) = declared_panel_staleness(&path, model, footprint_dir)? else {
             return Ok(Some(path)); // fresh — authoritative, use as-is
         };
+        // Derive the substitute anyway. It is no longer what we build; it is the
+        // worked example the error points at, so "adopt the derived panel" is a
+        // file on disk rather than an instruction to go and make one.
         let substitute = write_auto_panel(model, footprint_dir, work_dir, stem)?;
-        println!("  ⚠ declared panel {} is stale ({reason})", path.display());
-        match &substitute {
-            Some(sub) => {
-                println!(
-                    "    left untouched — building against {} instead",
-                    sub.display()
-                );
-                println!("    fix the declared spec, or drop `panel = …` to adopt the derived one");
-            }
-            None => {
-                println!("    left untouched — and the circuit has no panel controls to derive")
-            }
-        }
-        return Ok(substitute);
+        return Err(panel_mismatch(&path, &stale, substitute.as_deref()));
     }
     let path = write_auto_panel(model, footprint_dir, work_dir, stem)?;
     Ok(path)
+}
+
+/// Why a declared panel spec cannot be built against.
+enum PanelStaleness {
+    /// Controls the circuit has that the panel declares no cutout for.
+    Missing(Vec<String>),
+    /// Declared narrower than the PCB the circuit lays out into.
+    TooNarrow { declared: u16, needed: u16 },
+}
+
+impl std::fmt::Display for PanelStaleness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(refs) => write!(f, "no cutout for {}", refs.join(", ")),
+            Self::TooNarrow { declared, needed } => {
+                write!(f, "{declared} HP, but the PCB needs {needed} HP")
+            }
+        }
+    }
+}
+
+/// The build refuses when the declared panel and the PCB disagree.
+///
+/// This used to warn and build against a derived substitute. That is the one
+/// outcome this tool must never produce quietly: panel and PCB are ordered from
+/// different vendors weeks apart, so a board built to a width its panel does not
+/// have is money spent on two parts that cannot be assembled. `legion-of-bom-unc`
+/// is the whole story — an explicit `hp = 4` was accepted, refused, and replaced
+/// with 6 behind a warning; the mismatch surfaced as "why is the panel/PCB
+/// mismatched?" only after both had been rendered and looked at.
+///
+/// Pure so the wording is testable without a KiCad footprint library.
+fn panel_mismatch(path: &Path, stale: &PanelStaleness, substitute: Option<&Path>) -> anyhow::Error {
+    let file = path.display();
+    let mut lines = vec![
+        format!("declared panel {file} does not fit the PCB: {stale}"),
+        "  panel and board are manufactured separately, so a board that does not mate".into(),
+        "  its panel is not a warning — it is two parts that cannot be assembled.".into(),
+        "  fix one of:".into(),
+    ];
+    match stale {
+        PanelStaleness::TooNarrow { needed, .. } => {
+            lines.push(format!(
+                "    • set hp = {needed} in that file, then re-check the cutout x positions"
+            ));
+            lines.push("    • shrink the circuit until it fits the width you declared".into());
+        }
+        PanelStaleness::Missing(refs) => {
+            lines.push(format!(
+                "    • add a cutout for {} to that file",
+                refs.join(", ")
+            ));
+            lines.push("    • drop those controls from the circuit".into());
+        }
+    }
+    if let Some(sub) = substitute {
+        lines.push("    • adopt the derived panel: drop `panel = …` from lob.toml, or pass".into());
+        lines.push(format!("      --panel {}", sub.display()));
+    }
+    lines.push(format!("  ({file} was left untouched.)"));
+    anyhow::anyhow!(lines.join("\n"))
 }
 
 /// Derive a panel from the circuit and write it to `<work_dir>/<stem>_auto_panel.toml`.
@@ -794,7 +858,7 @@ fn declared_panel_staleness(
     path: &Path,
     model: &legion_of_bom_core::Circuit,
     footprint_dir: &Path,
-) -> Result<Option<String>> {
+) -> Result<Option<PanelStaleness>> {
     let Some(declared) = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| PanelFile::from_toml(&t).ok())
@@ -809,20 +873,21 @@ fn declared_panel_staleness(
         .iter()
         .filter_map(|c| c.refdes.as_deref())
         .collect();
-    let missing: Vec<&str> = expected
+    let missing: Vec<String> = expected
         .cutouts
         .iter()
         .filter_map(|c| c.refdes.as_deref())
         .filter(|r| !have.contains(r))
+        .map(String::from)
         .collect();
     if !missing.is_empty() {
-        return Ok(Some(format!("missing {}", missing.join(", "))));
+        return Ok(Some(PanelStaleness::Missing(missing)));
     }
-    if declared.hp.is_some_and(|h| h < min_hp) {
-        return Ok(Some(format!(
-            "{} HP, but the PCB needs {min_hp} HP",
-            declared.hp.unwrap_or(0)
-        )));
+    if let Some(declared_hp) = declared.hp.filter(|h| *h < min_hp) {
+        return Ok(Some(PanelStaleness::TooNarrow {
+            declared: declared_hp,
+            needed: min_hp,
+        }));
     }
     Ok(None)
 }
@@ -993,31 +1058,69 @@ fn resolve_panel_spec(arg: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Iterations the guide's board gets. Matches `lob fab`'s default, because the
-/// point is that they produce the same board.
-const GUIDE_LAYOUT_ITERS: usize = 6;
+/// Placement attempts every command gives a board. One number, because the whole
+/// point is that `lob guide` and `lob fab` produce the *same* board.
+const LAYOUT_ITERS: usize = 6;
 
-/// Generate a board the way every command should: the iterative layout loop when
+/// Default `--mode` for every command that lays out a board. Shared so the three
+/// cannot drift apart by each declaring their own default.
+const LAYOUT_MODE: &str = "analog";
+
+/// One layout, and everything a caller needs to report on it.
+struct Layout {
+    board: String,
+    /// Connections the router could not make.
+    conflicts: Vec<String>,
+    /// Mechanical clearance problems (DESIGN 6.7). Empty on the one-shot path.
+    collisions: Vec<String>,
+}
+
+/// Generate a board the way every command **must**: the iterative layout loop when
 /// there is a panel to anchor to, one-shot placement when there is not.
 ///
 /// Exists so no command can quietly emit a *different* board from the one the fab
-/// package contains. If you are about to call `generate_board_report` directly,
-/// you probably want this instead.
+/// package contains. If you are about to call `generate_board_report` or
+/// `generate_board_artifacts` directly, you want this instead.
+///
+/// It did not do that job. `legion-of-bom-p6m`: for months this had exactly ONE
+/// caller — `guide_cmd` — while `board_cmd` and `fab_cmd` each inlined their own
+/// copy of the match, and this copy hardcoded `LayoutLoop::default()` so it
+/// ignored `--mode` entirely. `lob fab --mode digital` and `lob guide` therefore
+/// laid out two different boards, and guide's is the one written to
+/// `out/<n>/<n>.kicad_pcb` — what the dashboard renders and what `lob panel
+/// derive` reads back. Taking the whole `LayoutLoop` is what stops that: there is
+/// no longer a knob a caller can hold that this function ignores.
 fn build_layout(
     model: &legion_of_bom_core::Circuit,
     options: BoardOptions,
     panel: &Option<PathBuf>,
-    iters: usize,
-) -> Result<String> {
-    match (seeded_template(panel)?, iters) {
+    cfg: &LayoutLoop,
+) -> Result<Layout> {
+    match (seeded_template(panel)?, cfg.max_iters) {
         (Some(template), n) if n > 0 => {
-            let cfg = LayoutLoop {
-                max_iters: n,
-                ..LayoutLoop::default()
-            };
-            Ok(run_layout_loop(model, options, template, &cfg)?.board)
+            let report = run_layout_loop(model, options, template, cfg)?;
+            println!(
+                "  seeded layout ({}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
+                cfg.mode.as_str(),
+                report.iterations,
+                report.metrics.signal_hpwl_mm,
+                report.metrics.critical_hpwl_mm,
+                report.metrics.via_count,
+            );
+            Ok(Layout {
+                board: report.board,
+                conflicts: report.unresolved,
+                collisions: report.collisions,
+            })
         }
-        _ => Ok(generate_board_report(model, &options)?.0),
+        _ => {
+            let art = generate_board_artifacts(model, &options)?;
+            Ok(Layout {
+                board: art.pcb,
+                conflicts: art.route.conflicts,
+                collisions: art.collisions,
+            })
+        }
     }
 }
 
@@ -1123,29 +1226,17 @@ fn board_cmd(
 
     // Iterative, connectivity-aware layout when a panel is given (needs anchors);
     // otherwise the one-shot placement path.
-    let (board, conflicts, collisions) = match (seeded_template(&panel)?, iterations) {
-        (Some(template), iters) if iters > 0 => {
-            let cfg = LayoutLoop {
-                mode: parse_mode(&mode)?,
-                max_iters: iters,
-                kicad_cli: None,
-                drc_every_iter: false,
-            };
-            let report = run_layout_loop(&model, options, template, &cfg)?;
-            println!(
-                "  seeded layout ({mode}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
-                report.iterations,
-                report.metrics.signal_hpwl_mm,
-                report.metrics.critical_hpwl_mm,
-                report.metrics.via_count,
-            );
-            (report.board, report.unresolved, report.collisions)
-        }
-        _ => {
-            let art = generate_board_artifacts(&model, &options)?;
-            (art.pcb, art.route.conflicts, art.collisions)
-        }
+    let cfg = LayoutLoop {
+        mode: parse_mode(&mode)?,
+        max_iters: iterations,
+        kicad_cli: None,
+        drc_every_iter: false,
     };
+    let Layout {
+        board,
+        conflicts,
+        collisions,
+    } = build_layout(&model, options, &panel, &cfg)?;
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
     let tracks = board.matches("(segment").count();
@@ -1269,26 +1360,15 @@ fn fab_cmd(
     // Iterative, connectivity-aware layout when a panel is given; else one-shot.
     // The DRC gate below is the loop's final verification (§6.5), so the loop
     // scores in-process unless `--drc-every-iter` is set.
-    let (board, conflicts) = match (seeded_template(&panel)?, iterations) {
-        (Some(template), iters) if iters > 0 => {
-            let cfg = LayoutLoop {
-                mode: parse_mode(&mode)?,
-                max_iters: iters,
-                kicad_cli: drc_every_iter.then(|| kicad.clone()),
-                drc_every_iter,
-            };
-            let report = run_layout_loop(&model, options, template, &cfg)?;
-            println!(
-                "  seeded layout ({mode}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
-                report.iterations,
-                report.metrics.signal_hpwl_mm,
-                report.metrics.critical_hpwl_mm,
-                report.metrics.via_count,
-            );
-            (report.board, report.unresolved)
-        }
-        _ => generate_board_report(&model, &options)?,
+    let cfg = LayoutLoop {
+        mode: parse_mode(&mode)?,
+        max_iters: iterations,
+        kicad_cli: drc_every_iter.then(|| kicad.clone()),
+        drc_every_iter,
     };
+    let Layout {
+        board, conflicts, ..
+    } = build_layout(&model, options, &panel, &cfg)?;
 
     let pkg = out.unwrap_or_else(|| work_dir.join("fab"));
     std::fs::create_dir_all(&pkg)?;
@@ -1640,12 +1720,28 @@ fn build_cmd(name: Option<String>) -> Result<()> {
         }
 
         let arg = || PathBuf::from(name);
+        // ONE mode and ONE iteration count, passed to both. They agreed before
+        // only because three separately-chosen defaults happened to match —
+        // guide's hardcoded `LayoutLoop::default()`, fab's `"analog"` literal, and
+        // `GUIDE_LAYOUT_ITERS` vs fab's `6`. Any one of them moving split the
+        // guide's board from the one in the fab package (`legion-of-bom-p6m`).
         let steps: [(&str, Result<()>); 3] = [
-            ("guide", guide_cmd(arg(), None, None, "auto".into())),
+            (
+                "guide",
+                guide_cmd(arg(), None, None, "auto".into(), LAYOUT_MODE.into()),
+            ),
             ("bom", bom_cmd(arg(), false, None, true, false)),
             (
                 "fab",
-                fab_cmd(arg(), None, None, "analog".into(), 6, false, None),
+                fab_cmd(
+                    arg(),
+                    None,
+                    None,
+                    LAYOUT_MODE.into(),
+                    LAYOUT_ITERS,
+                    false,
+                    None,
+                ),
             ),
         ];
         let mut done = Vec::new();
@@ -1731,6 +1827,7 @@ fn guide_cmd(
     out: Option<PathBuf>,
     panel: Option<PathBuf>,
     kit: String,
+    mode: String,
 ) -> Result<()> {
     // A path is used directly; a bare name resolves via the repo's lob.toml
     // (source + panel + kit + build copy + brand). Explicit flags still win.
@@ -1774,7 +1871,13 @@ fn guide_cmd(
     // the fab package was clean. Worse, out/<name>/<name>.kicad_pcb is what the
     // dashboard renders, so the picture everyone looks at was the bad one.
     // Two boards from one circuit is not a layout problem, it is a trust problem.
-    let board = build_layout(&model, options, &panel, GUIDE_LAYOUT_ITERS)?;
+    let cfg = LayoutLoop {
+        mode: parse_mode(&mode)?,
+        max_iters: LAYOUT_ITERS,
+        kicad_cli: None,
+        drc_every_iter: false,
+    };
+    let board = build_layout(&model, options, &panel, &cfg)?.board;
 
     let guide_opts = GuideOptions {
         include_smd: resolved.guide_smd,
@@ -2715,6 +2818,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             format,
             out,
             idealised,
+            force,
         } => {
             let format = match format.as_deref() {
                 Some(f) => PanelFormat::parse(f).with_context(|| {
@@ -2734,6 +2838,9 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 .run(&circuit)
                 .with_context(|| "SKiDL failed (try `lob doctor`)")?;
             let model = parse_netlist_file(&run.netlist_path)?;
+            // An explicit --hp asks to design at a width the built board may not
+            // have. Remember it before the auto default shadows it.
+            let asked_hp = hp;
             // Default: let the PCB drive the width (minimum HP it fits in).
             let hp = match hp {
                 Some(h) => h,
@@ -2761,10 +2868,29 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             // that will not fit the hardware soldered to it. So when a built
             // board exists, read the cutouts off where the parts actually are.
             let board_path = work_dir.join(format!("{stem}.kicad_pcb"));
-            let from_board = (!idealised)
+            let built = (!idealised)
                 .then(|| std::fs::read_to_string(&board_path).ok())
                 .flatten()
                 .and_then(|pcb| panel_from_board(&pcb, &model, &BuiltinCutouts).ok());
+            // ...unless you asked for a width that board does not have. Its cutout
+            // positions are then evidence about a DIFFERENT panel, and using them
+            // is the circular step in `legion-of-bom-unc`: the controls sit at
+            // x=15.24 because the board is 6 HP, 15.24 + 7 overflows 4 HP, therefore
+            // "4 HP can't fit the control hardware" — the 6 HP board offered as
+            // proof that 6 HP is needed. Worse, `panel_from_board` takes its HP from
+            // the board outline, so the requested width was discarded and that
+            // verdict printed without 4 HP ever being tried.
+            let width_clash = built
+                .as_ref()
+                .and_then(|p| asked_hp.zip(p.hp))
+                .filter(|(want, have)| want != have);
+            if let Some((want, have)) = width_clash {
+                println!(
+                    "  built board is {have} HP but you asked for {want} — laying out from \
+                     scratch; positions from a board of another width prove nothing here"
+                );
+            }
+            let from_board = built.filter(|_| width_clash.is_none());
             let mut panel = match from_board {
                 Some(p) => {
                     println!(
@@ -2775,7 +2901,9 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                     p
                 }
                 None => {
-                    if !idealised {
+                    // Not when the board was deliberately set aside just above —
+                    // "no built board" would be a plain untruth.
+                    if !idealised && width_clash.is_none() {
                         println!(
                             "  no built board at {} — laying out from scratch; \
                              the board will follow this panel",
@@ -2793,6 +2921,21 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             }
             let out_path =
                 out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_panel.toml")));
+            // The default output path IS the declared spec for any circuit that has
+            // one — comments, the control order somebody chose, edited labels. A
+            // derived panel keeps none of that. `effective_panel` was carefully
+            // taught never to write to a declared spec (`legion-of-bom-byh`); this
+            // command still could, and did.
+            if out_path.exists() && !force {
+                anyhow::bail!(
+                    "{} already exists — refusing to overwrite it\n  \
+                     a derived spec keeps none of what a person put there: comments, the\n  \
+                     control order they chose, labels they edited.\n  \
+                     • --out <path>  write it elsewhere and diff the two\n  \
+                     • --force       overwrite this one anyway",
+                    out_path.display()
+                );
+            }
             // Re-deriving must not wipe the builder-owned finish / thickness they set
             // on the existing spec (cutout topology is what we're regenerating).
             if let Some(prev) = std::fs::read_to_string(&out_path)
@@ -3299,13 +3442,170 @@ mod tests {
         };
         let reason = declared_panel_staleness(&path, &circuit, &fp_dir).unwrap();
         assert!(
-            reason.is_some_and(|r| r.contains("RV1")),
+            reason.is_some_and(|r| r.to_string().contains("RV1")),
             "the missing control is reported"
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             original,
             "the author's file is byte-identical after the check"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `board`, `fab` and `guide` must lay out the same board by DEFAULT.
+    ///
+    /// `legion-of-bom-p6m`: they agreed only because three separately-chosen
+    /// defaults happened to match — `guide` hardcoded `LayoutLoop::default()`
+    /// (mode Analog), `fab` and `board` each spelled `"analog"` as a literal, and
+    /// `GUIDE_LAYOUT_ITERS` was a different constant from fab's `6`. Any one of
+    /// them moving split the guide's board from the one in the fab package, and
+    /// the guide's is what the dashboard renders.
+    ///
+    /// The fix is that they now share `LAYOUT_MODE`/`LAYOUT_ITERS`; this is the
+    /// assertion that keeps them sharing it.
+    #[test]
+    fn board_fab_and_guide_default_to_the_same_layout() {
+        use clap::Parser;
+        let mode_of = |argv: &[&str]| -> String {
+            match Cli::parse_from(argv).command {
+                Command::Board { mode, .. } => mode,
+                Command::Fab { mode, .. } => mode,
+                Command::Guide { mode, .. } => mode,
+                _ => unreachable!("only the three layout commands belong here"),
+            }
+        };
+        let board = mode_of(&["lob", "board", "c.py"]);
+        let fab = mode_of(&["lob", "fab", "c.py"]);
+        let guide = mode_of(&["lob", "guide", "c.py"]);
+        assert_eq!(board, fab, "board and fab default to different modes");
+        assert_eq!(fab, guide, "fab and guide default to different modes");
+        // And the shared default has to be a mode that actually parses, or every
+        // one of them fails identically at run time instead of here.
+        assert!(
+            parse_mode(&board).is_ok(),
+            "the shared default mode {board:?} does not parse"
+        );
+    }
+
+    /// The refusal MESSAGE carries both numbers and a way out.
+    ///
+    /// Pure formatter only — deliberately not the proof that anything refuses.
+    /// See `a_panel_narrower_than_the_pcb_stops_the_build` for that; an earlier
+    /// version of this file had only this test and called it the guard, which
+    /// would have stayed green through the exact `legion-of-bom-unc` regression
+    /// it was named after.
+    #[test]
+    fn the_refusal_says_both_widths_and_how_to_get_out() {
+        let stale = PanelStaleness::TooNarrow {
+            declared: 5,
+            needed: 6,
+        };
+        let err = panel_mismatch(
+            Path::new("circuits/slew/slew_panel.toml"),
+            &stale,
+            Some(Path::new("out/slew/slew_auto_panel.toml")),
+        )
+        .to_string();
+        // Both numbers, because "does not fit" without them is unactionable.
+        assert!(err.contains("5 HP"), "{err}");
+        assert!(err.contains("needs 6 HP"), "{err}");
+        // A way out that exists on disk, and the promise we keep about their file.
+        assert!(err.contains("out/slew/slew_auto_panel.toml"), "{err}");
+        assert!(err.contains("left untouched"), "{err}");
+    }
+
+    /// A panel narrower than the PCB is a REFUSAL, not a warning.
+    ///
+    /// `legion-of-bom-unc`: `hp = 5` was accepted, rejected and silently rebuilt
+    /// at 6, and the two were rendered and ordered as if they matched. The panel
+    /// and the board come from different vendors, so nothing downstream ever gets
+    /// the chance to notice they disagree — this is the only place that can.
+    ///
+    /// So this drives the real thing: DETECTION (`declared_panel_staleness` must
+    /// classify it `TooNarrow`) and REFUSAL (`effective_panel` must return `Err`).
+    /// Asserting on `panel_mismatch`'s wording proves neither — a build that
+    /// logged the error and carried on would satisfy it.
+    #[test]
+    fn a_panel_narrower_than_the_pcb_stops_the_build() {
+        let Some(fp_dir) = kicad_footprint_dir() else {
+            return; // needs real footprints to know how wide the PCB must be
+        };
+        let dir = std::env::temp_dir().join(format!("lob-unc-narrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("narrow_panel.toml");
+        // 1 HP is narrower than any real circuit's PCB, so this does not depend on
+        // the packer's exact answer — only that it is more than one.
+        std::fs::write(
+            &path,
+            "format = \"eurorack\"\nhp = 1\nthickness_mm = 1.6\n\n\
+             [[cutouts]]\nx_mm = 2.5\ny_mm = 100.0\nrotation_deg = 0.0\n\
+             footprint = \"Thonkiconn\"\nrefdes = \"J1\"\n",
+        )
+        .unwrap();
+
+        let mut circuit = legion_of_bom_core::Circuit::new("t");
+        circuit.parts = vec![
+            legion_of_bom_core::Part::new("J1", "in").with_footprint(
+                "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical_CircularHoles",
+            ),
+            legion_of_bom_core::Part::new("U1", "TL074")
+                .with_footprint("Package_SO:SOIC-14_3.9x8.7mm_P1.27mm"),
+        ];
+
+        // DETECTION: narrower than the PCB, and classified as such — not as a
+        // missing cutout, which takes a different branch and a different message.
+        let stale = declared_panel_staleness(&path, &circuit, &fp_dir).unwrap();
+        let Some(PanelStaleness::TooNarrow { declared, needed }) = stale else {
+            panic!("expected TooNarrow, got {:?}", stale.map(|s| s.to_string()));
+        };
+        assert_eq!(declared, 1);
+        assert!(needed > 1, "the PCB needs more than 1 HP, got {needed}");
+
+        // REFUSAL: the build stops. This is the assertion `unc` was filed about —
+        // the old code returned Ok(Some(derived_substitute)) here and built on.
+        let err = effective_panel(Some(path.clone()), &circuit, &fp_dir, &dir, "t")
+            .expect_err("a panel narrower than the PCB must stop the build");
+        assert!(err.to_string().contains("does not fit the PCB"), "{err}");
+        // And the author's file survived being refused.
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("hp = 1"),
+            "the declared spec must not be rewritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The width check fires only when the declared panel is *narrower*. A wider
+    /// one is a deliberate choice (rack symmetry, a blank strip) and must build.
+    #[test]
+    fn a_panel_wider_than_the_pcb_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("lob-unc-wide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide_panel.toml");
+        // 42 HP for a single jack — absurd, and entirely the author's business.
+        std::fs::write(
+            &path,
+            "format = \"eurorack\"\nhp = 42\nthickness_mm = 1.6\n\n\
+             [[cutouts]]\nx_mm = 10.0\ny_mm = 100.0\nrotation_deg = 0.0\n\
+             footprint = \"Thonkiconn\"\nrefdes = \"J1\"\n",
+        )
+        .unwrap();
+
+        let mut circuit = legion_of_bom_core::Circuit::new("t");
+        circuit.parts = vec![legion_of_bom_core::Part::new("J1", "in").with_footprint(
+            "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical_CircularHoles",
+        )];
+
+        let Some(fp_dir) = kicad_footprint_dir() else {
+            return; // no KiCad here
+        };
+        let reason = declared_panel_staleness(&path, &circuit, &fp_dir).unwrap();
+        assert!(
+            reason.is_none(),
+            "a wider-than-needed panel is not stale, got {:?}",
+            reason.map(|r| r.to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

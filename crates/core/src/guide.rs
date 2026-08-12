@@ -749,9 +749,11 @@ fn refdes_key(refdes: &str) -> (String, u64) {
 }
 
 /// Quarter turns in `deg`, normalised to 0..=3.
-fn quarter_turns(deg: f64) -> i64 {
-    (((deg / 90.0).round() as i64) % 4 + 4) % 4
-}
+///
+/// Re-exported from `board` rather than spelled again here: this test had four
+/// independent spellings across the crate and the router's was missing entirely
+/// (`legion-of-bom-4t9`).
+use crate::board::quarter_turns;
 
 /// Rotate a footprint-local point by a footprint orientation, in **KiCad's** sense:
 /// a `(at x y 90)` footprint maps a local `(x, y)` to `(y, -x)` (KiCad's Y axis

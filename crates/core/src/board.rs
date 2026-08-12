@@ -124,7 +124,7 @@ impl PartFacts {
         };
         let (ox, oy) = rotate_local(local, rot_deg);
         let (w, h) = self.extent;
-        let (ew, eh) = if (rot_deg / 90.0).round() as i64 % 2 != 0 {
+        let (ew, eh) = if quarter_turns(rot_deg) % 2 != 0 {
             (h, w)
         } else {
             (w, h)
@@ -1814,10 +1814,12 @@ pub fn generate_board_artifacts(
         });
         for pad in &pads {
             let (x, y) = place_point(placement, pad.px, pad.py);
-            pad_bb.0 = pad_bb.0.min(x - pad.w / 2.0);
-            pad_bb.1 = pad_bb.1.min(y - pad.h / 2.0);
-            pad_bb.2 = pad_bb.2.max(x + pad.w / 2.0);
-            pad_bb.3 = pad_bb.3.max(y + pad.h / 2.0);
+            // Turning the footprint turns the pad: its width and height swap.
+            let (pw, ph) = place_pad_extent(placement, pad.w, pad.h);
+            pad_bb.0 = pad_bb.0.min(x - pw / 2.0);
+            pad_bb.1 = pad_bb.1.min(y - ph / 2.0);
+            pad_bb.2 = pad_bb.2.max(x + pw / 2.0);
+            pad_bb.3 = pad_bb.3.max(y + ph / 2.0);
             // A back-placed footprint mirrors its pads to the other side.
             let layer = pad_layer_on_board(pad.layer, placement.back);
             let point = PadPoint {
@@ -1825,8 +1827,8 @@ pub fn generate_board_artifacts(
                 pad: pad.num.clone(),
                 x_mm: x,
                 y_mm: y,
-                w_mm: pad.w,
-                h_mm: pad.h,
+                w_mm: pw,
+                h_mm: ph,
                 layer,
             };
             // Resolve the pad's net by pad number, then (for a sub-board) by any of
@@ -2248,6 +2250,37 @@ fn pad_layer_on_board(local: PadLayer, back: bool) -> PadLayer {
 /// (`x' = px·cosθ + py·sinθ`, `y' = py·cosθ − px·sinθ`); the grid placer only
 /// emits rotation 0 today, so that identity path is what ships — the formula is
 /// validated against KiCad ground truth when the layout loop introduces angles.
+/// Quarter turns in `deg`, normalised to `0..=3`. The one spelling of the
+/// odd-quarter-turn test; it had four (`legion-of-bom-4t9`).
+pub fn quarter_turns(deg: f64) -> i64 {
+    (((deg / 90.0).round() as i64) % 4 + 4) % 4
+}
+
+/// The axis-aligned copper extent of a pad whose footprint is placed per
+/// `placement`, given its extent `(w, h)` in the footprint frame.
+///
+/// [`place_point`] carries a pad's **centre** around when a footprint is turned;
+/// this is the other half. A quarter turn turns the pad with the footprint, so
+/// its width and height swap.
+///
+/// Leaving this out is `legion-of-bom-4t9`: the emitted board was always right,
+/// because [`turn_pad_with_footprint`] writes the angle into the pad's absolute
+/// `at`, and `guide::parse_board` swapped it back out when reading — but the
+/// extent handed to the router came straight from the footprint frame. So the
+/// router modelled a 90°-turned SOIC pad as 1.95mm wide where the copper is
+/// 0.6mm, and nothing disagreed out loud. It only began to bite when the placer
+/// started turning SMD parts and pots.
+///
+/// Only quarter turns swap. At any other angle an axis-aligned box is an
+/// approximation whichever way you take it, and the placers emit quarter turns.
+pub fn place_pad_extent(placement: Placement, w: f64, h: f64) -> (f64, f64) {
+    if quarter_turns(placement.rotation_deg) % 2 != 0 {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
 pub fn place_point(placement: Placement, px: f64, py: f64) -> (f64, f64) {
     // A back-placed footprint mirrors local Y (matching `flip_to_back`), then the
     // whole footprint rotates about its origin.
@@ -3614,6 +3647,112 @@ mod tests {
         assert_eq!((g("2").w, g("2").h), (0.65, 1.98), "90°: swapped");
         assert_eq!((g("3").w, g("3").h), (0.65, 1.98), "270°: swapped");
         assert_eq!((g("4").w, g("4").h), (1.98, 0.65), "180°: as-is");
+    }
+
+    /// Turning the FOOTPRINT must turn its pads' copper, not just move it.
+    ///
+    /// `footprint_pads` above handles a pad's *own* `(at x y rot)` angle. This is
+    /// the other rotation: the placement's. `place_point` carries the pad centre
+    /// around, and the emitted board is correct because `turn_pad_with_footprint`
+    /// writes the angle into the pad — but the extent handed to the router was
+    /// taken straight from the footprint frame, so the router modelled a 90°
+    /// SOIC pad as 1.95mm wide where the copper is 0.6mm (`legion-of-bom-4t9`).
+    ///
+    /// Asserted as a swap between two placements of the same part rather than
+    /// against hard-coded numbers, so the test cannot drift away from the
+    /// fixture — and the non-square precondition is asserted, so it cannot go
+    /// quietly vacuous if the fixture ever changes.
+    #[test]
+    fn a_rotated_footprint_turns_its_pads_copper_too() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!("lob-4t9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = dir.join("T.pretty");
+        std::fs::create_dir_all(&lib).unwrap();
+        // Deliberately long and thin: a square pad could not tell the two poses
+        // apart, which is exactly how this went unnoticed.
+        std::fs::write(
+            lib.join("PAD2.kicad_mod"),
+            r#"(footprint "PAD2" (layer "F.Cu")
+                 (pad "1" smd rect (at 0 0) (size 2.0 0.5) (layers "F.Cu"))
+                 (pad "2" smd rect (at 6 0) (size 2.0 0.5) (layers "F.Cu")))"#,
+        )
+        .unwrap();
+
+        struct At(f64);
+        impl Placer for At {
+            fn place(
+                &self,
+                circuit: &dyn CircuitSource,
+                _facts: &HashMap<String, PartFacts>,
+            ) -> HashMap<String, Placement> {
+                circuit
+                    .parts()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.refdes.0.clone(),
+                            Placement {
+                                x_mm: 60.0,
+                                y_mm: 60.0,
+                                rotation_deg: self.0,
+                                back: false,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+        }
+
+        #[derive(Default)]
+        struct Probe(Arc<Mutex<Vec<PadPoint>>>);
+        impl crate::route::Router for Probe {
+            fn route(
+                &self,
+                nets: &[crate::route::RouteNet],
+                _opts: &crate::route::RouteOptions,
+            ) -> crate::route::RouteOutput {
+                *self.0.lock().unwrap() = nets.iter().flat_map(|n| n.pads.clone()).collect();
+                crate::route::RouteOutput::default()
+            }
+        }
+
+        // The pad extents the ROUTER is given, for a part placed at `rot`.
+        let seen = |rot: f64| -> HashMap<String, (f64, f64)> {
+            let c = Circuit {
+                name: "t".into(),
+                parts: vec![Part::new("U1", "t").with_footprint("T:PAD2")],
+                nets: vec![Net::new(
+                    "SIG",
+                    vec![PinRef::new("U1", "1"), PinRef::new("U1", "2")],
+                )],
+            };
+            let pads = Arc::new(Mutex::new(Vec::new()));
+            let mut opts = BoardOptions::new(&dir);
+            opts.placer = Box::new(At(rot));
+            opts.router = Some(Box::new(Probe(pads.clone())));
+            generate_board_artifacts(&c, &opts).expect("board generates");
+            let out = pads.lock().unwrap().clone();
+            out.into_iter().map(|p| (p.pad, (p.w_mm, p.h_mm))).collect()
+        };
+
+        let flat = seen(0.0);
+        let turned = seen(90.0);
+        assert!(!flat.is_empty(), "the probe router saw the pads at all");
+
+        for (num, &(w0, h0)) in &flat {
+            assert!(
+                (w0 - h0).abs() > 0.1,
+                "pad {num} must be non-square for this test to mean anything, got {w0}x{h0}"
+            );
+            let (w1, h1) = turned[num];
+            assert!(
+                (w1 - h0).abs() < 1e-9 && (h1 - w0).abs() < 1e-9,
+                "pad {num}: {w0}x{h0} turned 90° is {h0}x{w0} of copper, router was told {w1}x{h1}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
