@@ -84,9 +84,9 @@ pub use eagle::{
 pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCandidate};
 pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
 pub use fab::{
-    board_sides, export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos,
-    jlcpcb_design_rules, png_to_jpeg, render_board_jpeg, render_board_png, strip_smd, zip_dir,
-    BoardSides, MountCounts, Populate, Quality,
+    board_sides, export_board_svg, export_cpl, export_gerbers, jlc_assembly_bom, jlc_bom_csv,
+    jlc_cpl_from_kicad_pos, jlcpcb_design_rules, png_to_jpeg, render_board_jpeg, render_board_png,
+    strip_smd, zip_dir, BoardSides, MountCounts, Populate, Quality,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use gerber::{layers_to_svg, read_layers, Layer as GerberLayer, LayerKind};

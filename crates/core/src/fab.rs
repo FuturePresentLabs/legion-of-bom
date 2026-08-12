@@ -586,13 +586,24 @@ pub fn zip_dir(dir: &Path, zip_path: &Path) -> Result<bool, StageError> {
 }
 
 /// Write a JLCPCB CPL (pick-and-place) by reformatting `kicad-cli`'s position
-/// export. Returns the number of placed components.
-pub fn export_cpl(board: &Path, out: &Path, kicad_cli: &Path) -> Result<usize, StageError> {
+/// export, omitting `hand_soldered`. Returns the number of placed components.
+pub fn export_cpl(
+    board: &Path,
+    out: &Path,
+    kicad_cli: &Path,
+    hand_soldered: &std::collections::HashSet<String>,
+) -> Result<usize, StageError> {
     let stem = board
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("board");
     let tmp = std::env::temp_dir().join(format!("lob-{stem}-pos.csv"));
+    // Clear it first. This is a FIXED path: two boards with the same stem share
+    // it, and a `kicad-cli` that fails after having written it once before leaves
+    // the old contents behind — so the shipped pick-and-place would be a previous
+    // board's. `drc.rs` documents and defends against exactly this; this path did
+    // not. Ignore a missing file; that is the state we want.
+    let _ = std::fs::remove_file(&tmp);
     run_kicad(
         kicad_cli,
         &[
@@ -609,21 +620,43 @@ pub fn export_cpl(board: &Path, out: &Path, kicad_cli: &Path) -> Result<usize, S
         ],
         board,
     )?;
-    let pos = std::fs::read_to_string(&tmp)?;
-    let (csv, n) = jlc_cpl_from_kicad_pos(&pos);
+    let pos = std::fs::read_to_string(&tmp).map_err(|e| StageError::ToolFailed {
+        tool: "kicad-cli pcb export pos".into(),
+        code: 0,
+        stderr: format!(
+            "reported success but wrote no position file at {}: {e}",
+            tmp.display()
+        ),
+    })?;
+    let (csv, n) = jlc_cpl_from_kicad_pos(&pos, hand_soldered);
     std::fs::write(out, csv)?;
     Ok(n)
 }
 
 /// Reformat `kicad-cli pcb export pos` CSV (`Ref,Val,Package,PosX,PosY,Rot,Side`)
-/// into JLCPCB's CPL (`Designator,Mid X,Mid Y,Layer,Rotation`). Returns the CSV
-/// and the row count.
-pub fn jlc_cpl_from_kicad_pos(pos_csv: &str) -> (String, usize) {
+/// into JLCPCB's CPL (`Designator,Mid X,Mid Y,Layer,Rotation`), omitting the
+/// designators in `hand_soldered`. Returns the CSV and the row count.
+///
+/// THE FILTER IS THE POINT. The assembly BOM already withheld through-hole parts
+/// — the fab reflows surface-mount and through-hole is ours — but the CPL kept
+/// listing every placement, so the two halves of one upload told the fab
+/// different things: "assemble these 8 lines" and "here are coordinates for 46
+/// parts, 17 of them through-hole". Measured on both circuits, so it was
+/// systemic, not a one-off (`legion-of-bom-g5a`). A designator in the CPL and
+/// not the BOM is a part the fab has no number for and will query or quote
+/// wrongly.
+pub fn jlc_cpl_from_kicad_pos(
+    pos_csv: &str,
+    hand_soldered: &std::collections::HashSet<String>,
+) -> (String, usize) {
     let mut out = String::from("Designator,Mid X,Mid Y,Layer,Rotation\n");
     let mut n = 0;
     for line in pos_csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
         let f = parse_csv_row(line);
         if f.len() < 7 {
+            continue;
+        }
+        if hand_soldered.contains(&f[0]) {
             continue;
         }
         let layer = if f[6].eq_ignore_ascii_case("bottom") {
@@ -649,6 +682,49 @@ pub fn jlc_cpl_from_kicad_pos(pos_csv: &str) -> (String, usize) {
 /// [`BomLine`](crate::bom::BomLine); the footprint short name (after `lib:`) is
 /// used, and the MPN goes in the LCSC column when present.
 pub fn jlc_bom_csv(bom: &Bom, hand_soldered: &std::collections::HashSet<String>) -> String {
+    jlc_assembly_bom(bom, hand_soldered).csv
+}
+
+/// The assembly BOM, plus what the caller has to tell the operator about it.
+pub struct AssemblyBom {
+    pub csv: String,
+    /// Lines actually written. NOT `bom.lines.len()` — that is the pre-filter
+    /// count, and reporting it said "BOM (14 line items)" over an 8-row file
+    /// (`legion-of-bom-g5a`). A summary that disagrees with its own artifact is
+    /// how you stop trusting summaries.
+    pub lines: usize,
+    /// Designators on lines with no part number. JLCPCB cannot source these, so
+    /// the upload is not an assembly order until they are resolved or dropped.
+    pub unsourceable: Vec<String>,
+}
+
+/// [`jlc_bom_csv`] with the counts the caller needs to report honestly.
+pub fn jlc_assembly_bom(
+    bom: &Bom,
+    hand_soldered: &std::collections::HashSet<String>,
+) -> AssemblyBom {
+    let csv = jlc_bom_rows(bom, hand_soldered);
+    let lines = csv.lines().count().saturating_sub(1);
+    let mut unsourceable: Vec<String> = Vec::new();
+    for line in bom.components() {
+        if line.mpn.as_deref().unwrap_or("").is_empty() {
+            unsourceable.extend(
+                line.refdes
+                    .iter()
+                    .filter(|r| !hand_soldered.contains(*r))
+                    .cloned(),
+            );
+        }
+    }
+    unsourceable.sort();
+    AssemblyBom {
+        csv,
+        lines,
+        unsourceable,
+    }
+}
+
+fn jlc_bom_rows(bom: &Bom, hand_soldered: &std::collections::HashSet<String>) -> String {
     let mut out = String::from("Comment,Designator,Footprint,LCSC Part #\n");
     // Components only: a nut has no designator and no machine places it, so
     // loose hardware would be an unmatched row the fab has to query.
@@ -731,11 +807,100 @@ mod tests {
         let pos = "Ref,Val,Package,PosX,PosY,Rot,Side\n\
                    \"C1\",\"159n\",\"C_0805\",100.0,-50.0,90.0,top\n\
                    \"J1\",\"Conn\",\"Hdr\",103.0,-50.0,0.0,bottom\n";
-        let (csv, n) = jlc_cpl_from_kicad_pos(pos);
+        let (csv, n) = jlc_cpl_from_kicad_pos(pos, &std::collections::HashSet::new());
         assert_eq!(n, 2);
         assert!(csv.starts_with("Designator,Mid X,Mid Y,Layer,Rotation\n"));
         assert!(csv.contains("C1,100.0,-50.0,Top,90.0"));
         assert!(csv.contains("J1,103.0,-50.0,Bottom,0.0"));
+    }
+
+    /// **The CPL and the BOM must describe the same job.**
+    ///
+    /// They are two halves of one upload. The BOM withheld through-hole parts
+    /// while the CPL listed every placement, so the fab was handed "assemble
+    /// these 8 lines" and "here are coordinates for 46 parts, 17 of them
+    /// through-hole" at the same time. Measured on both circuits in the repo, so
+    /// it was systemic (`legion-of-bom-g5a`).
+    #[test]
+    fn the_cpl_withholds_exactly_what_the_bom_withholds() {
+        let pos = "Ref,Val,Package,PosX,PosY,Rot,Side\n\
+                   \"C1\",\"100n\",\"C_0603\",10.0,-10.0,0.0,top\n\
+                   \"J1\",\"Jack\",\"Thonk\",20.0,-10.0,0.0,top\n\
+                   \"U1\",\"TL074\",\"SOIC\",30.0,-10.0,0.0,top\n";
+        let hand: std::collections::HashSet<String> = ["J1".to_string()].into();
+
+        let (csv, n) = jlc_cpl_from_kicad_pos(pos, &hand);
+        assert_eq!(n, 2, "the hand-soldered jack is not a placement");
+        assert!(!csv.contains("J1"), "J1 must not be in the CPL: {csv}");
+        assert!(csv.contains("C1") && csv.contains("U1"), "{csv}");
+
+        // The same set, through the other half of the upload.
+        let mut bom = Bom::default();
+        bom.lines.push(BomLine {
+            value: "100n".into(),
+            refdes: vec!["C1".into()],
+            footprint: Some("Capacitor_SMD:C_0603".into()),
+            mpn: Some("CL10B104KB8NNNC".into()),
+            kind: LineKind::Component,
+            unit_price: None,
+            ext_price: None,
+            image_url: None,
+        });
+        bom.lines.push(BomLine {
+            value: "Jack".into(),
+            refdes: vec!["J1".into()],
+            footprint: Some("Connector:Thonk".into()),
+            mpn: Some("WQP-PJ398SM".into()),
+            kind: LineKind::Component,
+            unit_price: None,
+            ext_price: None,
+            image_url: None,
+        });
+        let assembly = jlc_assembly_bom(&bom, &hand);
+        assert!(!assembly.csv.contains("J1"), "{}", assembly.csv);
+
+        // …and the count reported is the count written. Reporting the pre-filter
+        // number said "14 line items" over an 8-row file.
+        assert_eq!(assembly.lines, 1);
+        assert_eq!(
+            assembly.lines,
+            assembly.csv.lines().count() - 1,
+            "the reported line count must match the artifact"
+        );
+    }
+
+    /// A line the fab cannot source is named, not silently shipped.
+    #[test]
+    fn a_bom_line_with_no_part_number_is_reported_unsourceable() {
+        let mut bom = Bom::default();
+        bom.lines.push(BomLine {
+            value: "470nF".into(),
+            refdes: vec!["C1".into(), "C2".into()],
+            footprint: Some("Capacitor_SMD:C_0603".into()),
+            mpn: None,
+            kind: LineKind::Component,
+            unit_price: None,
+            ext_price: None,
+            image_url: None,
+        });
+        bom.lines.push(BomLine {
+            value: "TL074".into(),
+            refdes: vec!["U1".into()],
+            footprint: Some("Package_SO:SOIC-14".into()),
+            mpn: Some("C6961".into()),
+            kind: LineKind::Component,
+            unit_price: None,
+            ext_price: None,
+            image_url: None,
+        });
+        let a = jlc_assembly_bom(&bom, &std::collections::HashSet::new());
+        assert_eq!(a.unsourceable, vec!["C1".to_string(), "C2".to_string()]);
+        assert_eq!(a.lines, 2, "both lines are still written");
+
+        // A hand-soldered part is not the fab's problem, so it is not reported.
+        let hand: std::collections::HashSet<String> = ["C1".into(), "C2".into()].into();
+        let b = jlc_assembly_bom(&bom, &hand);
+        assert!(b.unsourceable.is_empty(), "{:?}", b.unsourceable);
     }
 
     #[test]

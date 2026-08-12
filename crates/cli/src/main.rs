@@ -16,7 +16,7 @@ use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
-    generate_board_artifacts, generate_bom, guide, guide_to_html, guide_to_pdf, jlc_bom_csv,
+    generate_board_artifacts, generate_bom, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom,
     jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
     package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
     part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, rules, run_drc,
@@ -1450,13 +1450,19 @@ fn fab_cmd(
     export_gerbers(&board_path, &gerber_dir, &kicad)?;
     let zip_path = pkg.join(format!("{stem}-gerbers.zip"));
     let zipped = zip_dir(&gerber_dir, &zip_path)?;
-    let cpl_path = pkg.join(format!("{stem}-cpl.csv"));
-    let placed = export_cpl(&board_path, &cpl_path, &kicad)?;
-    let bom = generate_bom(&model);
-    let bom_path = pkg.join(format!("{stem}-bom.csv"));
     // Which parts the fab will NOT place, read off the BOARD's real pads rather
     // than guessed from footprint names — a part is through-hole if it has a
     // through-hole pad, and that is a fact about the geometry, not the string.
+    //
+    // Computed BEFORE the CPL, because both halves of the upload have to be
+    // filtered by the same set. It used to be computed after, so only the BOM
+    // ever saw it (`legion-of-bom-g5a`).
+    //
+    // A parse failure here used to `unwrap_or_default()` into an EMPTY set,
+    // which silently puts every through-hole part back into the assembly BOM —
+    // the exact regression the kit-split exists to prevent, arriving quietly.
+    // The board was just written and DRC'd, so failing to parse it is a real
+    // fault and worth stopping for.
     let hand_soldered: std::collections::HashSet<String> = guide::parse_board(&board)
         .map(|parts| {
             parts
@@ -1465,7 +1471,13 @@ fn fab_cmd(
                 .map(|p| p.refdes)
                 .collect()
         })
-        .unwrap_or_default();
+        .map_err(|e| {
+            anyhow::anyhow!("reading placements back from the board we just wrote: {e}")
+        })?;
+    let cpl_path = pkg.join(format!("{stem}-cpl.csv"));
+    let placed = export_cpl(&board_path, &cpl_path, &kicad, &hand_soldered)?;
+    let bom = generate_bom(&model);
+    let bom_path = pkg.join(format!("{stem}-bom.csv"));
     if !hand_soldered.is_empty() {
         let mut hs: Vec<&String> = hand_soldered.iter().collect();
         hs.sort();
@@ -1475,7 +1487,8 @@ fn fab_cmd(
             hs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")
         );
     }
-    std::fs::write(&bom_path, jlc_bom_csv(&bom, &hand_soldered))
+    let assembly = jlc_assembly_bom(&bom, &hand_soldered);
+    std::fs::write(&bom_path, &assembly.csv)
         .with_context(|| format!("writing {}", bom_path.display()))?;
 
     println!("fab package: {}", pkg.display());
@@ -1490,10 +1503,28 @@ fn fab_cmd(
     println!("  CPL ({placed} placements): {}", cpl_path.display());
     println!(
         "  BOM ({} line items): {}",
-        bom.lines.len(),
+        assembly.lines,
         bom_path.display()
     );
-    println!("  → JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly");
+    // The PCB half of this package is orderable on its own. The ASSEMBLY half is
+    // not, unless every line the fab is asked to place carries a part number —
+    // and saying "upload the CPL + BOM for assembly" over a BOM with none is how
+    // a package that cannot be quoted looks finished (`legion-of-bom-g5a`).
+    if assembly.unsourceable.is_empty() {
+        println!("  → JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly");
+    } else {
+        println!("  → JLCPCB: upload the gerber zip — the PCB is ready to order.");
+        println!(
+            "  ⚠ NOT an assembly order yet: {} part(s) on the BOM have no LCSC number, so the\n    \
+             fab cannot source them — {}",
+            assembly.unsourceable.len(),
+            assembly.unsourceable.join(" ")
+        );
+        println!(
+            "    resolve them (`lob parts suggest {stem}` → `lob parts fetch` → `lob parts verify`)\n    \
+             or match them by hand in JLCPCB's BOM step."
+        );
+    }
     Ok(())
 }
 
