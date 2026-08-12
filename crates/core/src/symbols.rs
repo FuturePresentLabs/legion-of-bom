@@ -328,9 +328,25 @@ fn builtin_model(part: &crate::model::Part) -> Option<SpiceModel> {
         part.value
     )
     .to_ascii_uppercase();
-    // (subckt name, part pin numbers in the subckt's terminal order).
+    // (subckt name, part pin numbers in the subckt's terminal order). Each model
+    // lists ALL of the package's pins in numeric order — an unused section is
+    // left unconnected by the *circuit*, not omitted from the model, so the same
+    // entry serves a board that uses one channel and a board that uses both.
     let (subckt, pins): (&str, &[&str]) = if hay.contains("LM13700") || hay.contains("LM13600") {
-        ("LM13700", &["1", "3", "4", "5", "6", "7", "8", "11"])
+        (
+            "LM13700",
+            &[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "16",
+            ],
+        )
+    } else if hay.contains("TL074") || hay.contains("TL084") || hay.contains("LM324") {
+        (
+            "TL074",
+            &[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
+            ],
+        )
     } else if hay.contains("TL072") || hay.contains("TL082") || hay.contains("NE5532") {
         ("TL072", &["1", "2", "3", "4", "5", "6", "7", "8"])
     } else {

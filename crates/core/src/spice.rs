@@ -91,6 +91,57 @@ const OUTPUT_NETS: &[&str] = &[
     "AUDIO_OUT_L",
 ];
 
+/// The channel number a net name carries, if it is a candidate I/O name with a
+/// channel suffix — `SIG_IN1` → 1, `SIG_IN_2` → 2. `None` when the name isn't
+/// `candidate` plus a number.
+///
+/// A multi-channel board has no bare `SIG_IN`: a dual slew limiter's jacks are
+/// `SIG_IN1`/`SIG_IN2`, and without this the harness reports "simulation needs a
+/// net named 'IN'" and no two-channel circuit can be simulated at all.
+fn channel_suffix(name: &str, candidate: &str) -> Option<u32> {
+    let rest = name
+        .get(..candidate.len())
+        .filter(|head| head.eq_ignore_ascii_case(candidate))
+        .map(|_| &name[candidate.len()..])?;
+    let digits = rest.strip_prefix('_').unwrap_or(rest);
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
+/// Every channel-suffixed net matching any of `candidates`, ordered by channel
+/// number — `[SIG_IN1, SIG_IN2]` for a dual. Empty for a single-channel board,
+/// whose I/O nets are unsuffixed.
+fn channel_nets(names: &[&str], candidates: &[&str]) -> Vec<String> {
+    let mut found: Vec<(u32, String)> = names
+        .iter()
+        .filter_map(|n| {
+            candidates
+                .iter()
+                .find_map(|c| channel_suffix(n, c))
+                .map(|ch| (ch, n.to_string()))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found.into_iter().map(|(_, n)| n).collect()
+}
+
+/// The circuit's per-channel signal inputs and outputs, paired by channel and
+/// ordered by channel number. Empty unless the circuit really is multi-channel
+/// (at least two inputs *and* two outputs) — so a single-channel board is
+/// unaffected and nothing downstream has to ask "is this a dual?".
+pub fn signal_channels(circuit: &dyn CircuitSource) -> Vec<(String, String)> {
+    let names: Vec<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    let ins = channel_nets(&names, INPUT_NETS);
+    let outs = channel_nets(&names, OUTPUT_NETS);
+    if ins.len() < 2 || outs.len() < 2 {
+        return Vec::new();
+    }
+    ins.into_iter().zip(outs).collect()
+}
+
 /// The DC voltage a net name implies if it's a supply rail — `+12V`→+12, `-12V`→
 /// −12, `+5V`→5, `+3V3`→3.3, or the named rails VCC/VDD (+12) / VEE/VSS (−12).
 /// `None` for anything that isn't rail-shaped (signals, ground, IABC, …).
@@ -128,6 +179,11 @@ impl SimConfig {
                 if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(c)) {
                     return n.to_string();
                 }
+            }
+            // No bare candidate — fall back to the lowest-numbered channel, so a
+            // multi-channel board simulates channel 1 by default.
+            if let Some(n) = channel_nets(&names, cands).into_iter().next() {
+                return n;
             }
             fallback.to_string()
         };
@@ -288,9 +344,15 @@ fn netlist_body(
             includes.insert(include.clone());
             let mut nodes = Vec::with_capacity(pin_order.len());
             for pin in pin_order {
-                let node = node_at(refdes, pin).ok_or_else(|| {
-                    StageError::Other(format!("{refdes}: pin {pin} is not connected to a net"))
-                })?;
+                // A pin that's on no net gets its own dangling node rather than
+                // failing the whole deck. A multi-section device legitimately
+                // leaves sections open — the mono slew limiter uses OTA A of an
+                // LM13700 and leaves B's seven pins unconnected, and both
+                // channels leave the diode-linearisation pins open (the
+                // datasheet's own test configuration). Whether an open pin is a
+                // *mistake* is ERC's judgement, not the simulator's; `.options
+                // rshunt` keeps the node well-conditioned either way.
+                let node = node_at(refdes, pin).unwrap_or_else(|| format!("{refdes}_nc{pin}"));
                 nodes.push(node);
             }
             let mut line = format!("X{refdes} {} {subckt}", nodes.join(" "));
@@ -318,6 +380,16 @@ fn netlist_body(
                 components.push(format!("R{refdes}B {nw} {n3} {half}"));
                 continue;
             }
+        }
+
+        // A mechanical switch (`SW…`) contributes no device: the netlist records
+        // its *wiring*, never which way the lever is thrown, so there is nothing
+        // to instantiate. Its contacts are therefore open — for the slew
+        // limiter's RANGE switch that is the centre detent, the documented
+        // fastest range. A closed-contact model has to arrive the same way every
+        // other device model does, carried by the part.
+        if refdes.to_ascii_uppercase().starts_with("SW") {
+            continue;
         }
 
         // Otherwise a SPICE primitive, by reference-designator letter.
@@ -480,6 +552,16 @@ impl TranResult {
                 (dt > 0.0).then(|| ((w[1].v - w[0].v) / dt).abs())
             })
             .fold(None, |m, s| Some(m.map_or(s, |mx: f64| mx.max(s))))
+    }
+
+    /// Peak-to-peak excursion of the waveform (V) — how far the probed net moved
+    /// in total. On a driven channel that's the signal; on an undriven one it's
+    /// whatever leaked in.
+    pub fn peak_to_peak_v(&self) -> Option<f64> {
+        let mut it = self.points.iter().map(|p| p.v);
+        let first = it.next()?;
+        let (lo, hi) = it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        Some(hi - lo)
     }
 
     /// 10%→90% rise time between the initial and final output levels (s), for a
@@ -927,6 +1009,110 @@ mod tests {
             ("IN", "OUT")
         );
         assert_eq!(rc.supplies, SimConfig::default().supplies);
+    }
+
+    /// A two-channel circuit shaped like the dual slew limiter: per-channel I/O
+    /// nets and one shared device.
+    fn dual_channel_circuit() -> Circuit {
+        Circuit {
+            name: "dual".into(),
+            parts: vec![Part::new("U1", "LM13700")],
+            nets: vec![
+                Net::new("SIG_IN1", vec![PinRef::new("U1", "3")]),
+                Net::new("SIG_OUT1", vec![PinRef::new("U1", "5")]),
+                Net::new("SIG_IN2", vec![PinRef::new("U1", "14")]),
+                Net::new("SIG_OUT2", vec![PinRef::new("U1", "12")]),
+                Net::new("+12V", vec![PinRef::new("U1", "11")]),
+                Net::new("-12V", vec![PinRef::new("U1", "6")]),
+            ],
+        }
+    }
+
+    #[test]
+    fn channel_suffix_reads_a_channel_number() {
+        assert_eq!(channel_suffix("SIG_IN1", "SIG_IN"), Some(1));
+        assert_eq!(channel_suffix("SIG_IN_2", "SIG_IN"), Some(2));
+        assert_eq!(channel_suffix("sig_out12", "SIG_OUT"), Some(12));
+        // Not a suffixed form of the candidate.
+        assert_eq!(channel_suffix("SIG_IN", "SIG_IN"), None);
+        assert_eq!(channel_suffix("SIG_INA", "SIG_IN"), None);
+        assert_eq!(channel_suffix("SLEW_NODE1", "SIG_IN"), None);
+    }
+
+    #[test]
+    fn infer_finds_channel_one_on_a_multi_channel_board() {
+        // A dual has no bare SIG_IN — before channel-suffix inference this failed
+        // with "simulation needs a net named 'IN'" and no dual could be simulated.
+        let cfg = SimConfig::infer(&dual_channel_circuit());
+        assert_eq!(cfg.input_net, "SIG_IN1");
+        assert_eq!(cfg.output_net, "SIG_OUT1");
+    }
+
+    #[test]
+    fn signal_channels_pairs_channels_and_ignores_single_channel_boards() {
+        let chans = signal_channels(&dual_channel_circuit());
+        assert_eq!(
+            chans,
+            vec![
+                ("SIG_IN1".to_string(), "SIG_OUT1".to_string()),
+                ("SIG_IN2".to_string(), "SIG_OUT2".to_string()),
+            ]
+        );
+        // A one-channel board is not multi-channel, so the dual-only checks bow out.
+        assert!(signal_channels(&rc_lowpass()).is_empty());
+    }
+
+    #[test]
+    fn unconnected_subckt_pins_get_dangling_nodes() {
+        // The mono slew limiter uses OTA A of an LM13700 and leaves channel B's
+        // pins open. That must produce a deck, not an error — a whole-package
+        // model is what lets the same entry serve mono and dual boards.
+        let c = Circuit {
+            name: "mono".into(),
+            parts: vec![Part::new("U1", "LM13700")],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("U1", "3")]),
+                Net::new("OUT", vec![PinRef::new("U1", "5")]),
+            ],
+        };
+        let mut models = HashMap::new();
+        models.insert(
+            "U1".to_string(),
+            SpiceModel::Subckt {
+                subckt: "LM13700".into(),
+                include: PathBuf::from("lob_builtin.lib"),
+                pin_order: (1..=16).map(|p| p.to_string()).collect(),
+                params: None,
+            },
+        );
+        let deck =
+            generate_ac_deck(&c, &SimConfig::default(), &models, Path::new("/tmp/x.dat")).unwrap();
+        assert!(
+            deck.contains("XU1 U1_nc1 U1_nc2 IN U1_nc4 OUT "),
+            "connected pins keep their nets, open ones get unique nodes:\n{deck}"
+        );
+        // Every open pin gets its OWN node — collapsing them would short the
+        // unused channel's inputs together.
+        assert!(deck.contains("U1_nc16"), "deck:\n{deck}");
+    }
+
+    #[test]
+    fn a_switch_contributes_no_device() {
+        // A netlist records a switch's wiring, never its position, so there is
+        // nothing to instantiate — and demanding a model would make every board
+        // with a panel switch unsimulatable.
+        let mut c = rc_lowpass();
+        c.parts.push(Part::new("SW1", "RANGE"));
+        c.nets
+            .push(Net::new("THROW", vec![PinRef::new("SW1", "1")]));
+        let deck = generate_ac_deck(
+            &c,
+            &SimConfig::default(),
+            &HashMap::new(),
+            Path::new("/tmp/x.dat"),
+        )
+        .unwrap();
+        assert!(!deck.contains("SW1"), "deck:\n{deck}");
     }
 
     #[test]

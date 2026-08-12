@@ -19,6 +19,7 @@ import {
   type RuleReport,
   type SourceDoc,
 } from "./api.ts";
+import { PlacementEditor } from "./placement.tsx";
 import { ScopeSection } from "./scope.tsx";
 
 hljs.registerLanguage("python", python);
@@ -531,6 +532,7 @@ function panelCaption(c: Circuit): string {
 const SUBJECTS: { key: string; label: string }[] = [
   { key: "pcb", label: "PCB" },
   { key: "panel", label: "Panel" },
+  { key: "place", label: "Placement" },
   { key: "schematic", label: "Schematic" },
 ];
 const MODES: { key: string; label: string }[] = [
@@ -543,7 +545,8 @@ const MODES: { key: string; label: string }[] = [
 // own, and a schematic is only ever itself.
 function modesFor(subject: string): string[] {
   if (subject === "panel") return ["render", "gerber"];
-  if (subject === "schematic") return [];
+  // Placement is an editor, not a drawing — it has no render/gerber variants.
+  if (subject === "schematic" || subject === "place") return [];
   return ["render", "layout", "gerber"];
 }
 
@@ -600,6 +603,9 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
   const hasSide = subject === "pcb";
   const mirrored = hasSide && side === "bottom" && activeMode !== "render";
   const hasSmd = subject === "pcb" && activeMode !== "gerber";
+  // The placement editor is interactive, so it owns its own pointer handling —
+  // wrapping it in ZoomPan would fight every drag.
+  const editing = subject === "place";
   // The layout is a single top-down plot of both faces, so its SMD filter acts
   // on the whole board; a render only shows the face you are looking at.
   const faceSmd =
@@ -666,7 +672,7 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
             ))}
           </div>
         )}
-        {hasSmd && (
+        {hasSmd && !editing && (
           <label
             class={`smd-toggle${smdActs ? "" : " inert"}`}
             title={
@@ -691,13 +697,15 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
           </label>
         )}
         <span class="spacer" />
-        <button
-          class="btn tiny"
-          onClick={() => setResetKey((k) => k + 1)}
-          title="Reset zoom and pan"
-        >
-          Reset
-        </button>
+        {!editing && (
+          <button
+            class="btn tiny"
+            onClick={() => setResetKey((k) => k + 1)}
+            title="Reset zoom and pan"
+          >
+            Reset
+          </button>
+        )}
       </div>
 
       {isGerber && (
@@ -715,17 +723,25 @@ function PcbViewer({ name, version }: { name: string; version: number }) {
           ))}
         </div>
       )}
-      {/* Remount on any choice change so the transform resets between views. */}
-      <ZoomPan
-        key={`${view}-${smd}-${resetKey}`}
-        src={src}
-        alt={`${subject} ${activeMode}`}
-        flip={mirrored}
-      />
-      <p class="pcb-hint muted">
-        scroll to zoom · drag to pan · double-click to reset
-      </p>
-      {subject === "pcb" && <RulePanel name={name} version={version} />}
+      {editing ? (
+        <PlacementEditor name={name} version={version} />
+      ) : (
+        <>
+          {/* Remount on any choice change so the transform resets between views. */}
+          <ZoomPan
+            key={`${view}-${smd}-${resetKey}`}
+            src={src}
+            alt={`${subject} ${activeMode}`}
+            flip={mirrored}
+          />
+          <p class="pcb-hint muted">
+            scroll to zoom · drag to pan · double-click to reset
+          </p>
+        </>
+      )}
+      {(subject === "pcb" || editing) && (
+        <RulePanel name={name} version={version} />
+      )}
     </div>
   );
 }

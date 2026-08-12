@@ -299,10 +299,35 @@ impl Router for GridRouter {
         if routable.is_empty() {
             return RouteOutput::default();
         }
-        // Base order: deterministic by net index. `net_idx → routable index` maps a
-        // blocker (known by net index) back to an orderable net.
+        // Base order: deterministic by net index.
         let mut base: Vec<usize> = (0..routable.len()).collect();
         base.sort_by_key(|&i| routable[i].net_idx);
+        let neutral = Congestion::neutral();
+        search_orderings(nets, &routable, base, opts, &neutral)
+    }
+}
+
+/// Search net **orderings** for one that routes everything, committing copper
+/// hard as it goes.
+///
+/// Route in `base` order; any net that can't reach a pad reports which committed
+/// nets boxed it in (blame), and those blockers are forced to route *after* it on
+/// the next attempt. Constraints only accumulate (so this is bounded),
+/// unsatisfiable cycles are dropped, and the fewest-conflict attempt wins.
+///
+/// Shared by both grid routers: [`GridRouter`] starts from net order with no
+/// bias, [`PathfinderRouter`] starts from a hardest-first order and biases the
+/// search with what its negotiation learned.
+fn search_orderings(
+    nets: &[RouteNet],
+    routable: &[&RouteNet],
+    base: Vec<usize>,
+    opts: &RouteOptions,
+    learned: &Congestion,
+) -> RouteOutput {
+    {
+        // `net_idx → routable index` maps a blocker (known by net index) back to
+        // an orderable net.
         let net_to_rt: HashMap<usize, usize> = routable
             .iter()
             .enumerate()
@@ -314,7 +339,8 @@ impl Router for GridRouter {
         let mut best: Option<RouteOutput> = None;
         for _ in 0..RIPUP_MAX_ITERS {
             let order = topo_order(&base, &before);
-            let (out, failed, blame) = self.route_pass(nets, &routable, &order, &net_to_rt, opts);
+            let (out, failed, blame) =
+                route_pass(nets, routable, &order, &net_to_rt, opts, learned);
             if failed.is_empty() {
                 return out;
             }
@@ -411,180 +437,251 @@ fn topo_order(base: &[usize], before: &[(usize, usize)]) -> Vec<usize> {
     out
 }
 
-impl GridRouter {
-    /// One routing pass over `routable` in the given `order` (indices into
-    /// `routable`). Returns the routed output and the indices of nets that did
-    /// not fully route this pass.
-    #[allow(clippy::type_complexity)]
-    fn route_pass(
-        &self,
-        nets: &[RouteNet],
-        routable: &[&RouteNet],
-        order: &[usize],
-        net_to_rt: &HashMap<usize, usize>,
-        opts: &RouteOptions,
-    ) -> (RouteOutput, Vec<usize>, HashMap<usize, HashSet<usize>>) {
-        let mut out = RouteOutput::default();
-        let res = opts.grid_mm.max(0.01);
-        // `bounds`, when given, is the board outline: inset the routable area by the
-        // edge clearance plus the widest copper half (a via) so no track/via lands
-        // within `edge_clearance_mm` of the edge. The pad-bbox fallback has no board
-        // edge, so it is used as-is.
-        let (minx, miny, maxx, maxy) = match opts.bounds {
-            Some((x0, y0, x1, y1)) => {
-                let inset = opts.edge_clearance_mm
-                    + (opts.via_size_mm / 2.0).max(opts.signal_width_mm / 2.0)
-                    + res / 2.0;
-                if x1 - x0 > 2.0 * inset && y1 - y0 > 2.0 * inset {
-                    (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
-                } else {
-                    (x0, y0, x1, y1) // too small to inset — leave it (surfaces as conflicts)
-                }
+/// The routing surface both grid routers work on: the discretised board, the
+/// pad territory that is **never** negotiable, and the derived clearance radii.
+///
+/// Split out because [`GridRouter`] and [`PathfinderRouter`] must discretise the
+/// board identically — otherwise their results are not comparable, and a board
+/// that routes under one would fail DRC under the other for reasons that have
+/// nothing to do with the routing algorithm.
+struct Surface {
+    /// Pads and their clearance halos only. Traces are never committed here:
+    /// [`GridRouter`] adds them as it goes, [`PathfinderRouter`] keeps them in a
+    /// separate congestion map so they stay negotiable.
+    grid: Grid,
+    cols: usize,
+    rows: usize,
+    res: f64,
+    minx: f64,
+    miny: f64,
+    /// Clearance halo radius in cells: how far another net must stay from copper.
+    halo: isize,
+    /// A via is bigger than a track, so it needs a wider keep-out.
+    via_halo: isize,
+    /// Per routable net: each pad's cell and the layers it connects.
+    pad_cells: Vec<Vec<((usize, usize), PadLayer)>>,
+    costs: Costs,
+}
+
+impl Surface {
+    #[inline]
+    fn cells(&self) -> usize {
+        self.cols * self.rows * 2
+    }
+}
+
+/// Discretise the board and paint the pads. See [`Surface`].
+fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions) -> Surface {
+    let res = opts.grid_mm.max(0.01);
+    // `bounds`, when given, is the board outline: inset the routable area by the
+    // edge clearance plus the widest copper half (a via) so no track/via lands
+    // within `edge_clearance_mm` of the edge. The pad-bbox fallback has no board
+    // edge, so it is used as-is.
+    let (minx, miny, maxx, maxy) = match opts.bounds {
+        Some((x0, y0, x1, y1)) => {
+            let inset = opts.edge_clearance_mm
+                + (opts.via_size_mm / 2.0).max(opts.signal_width_mm / 2.0)
+                + res / 2.0;
+            if x1 - x0 > 2.0 * inset && y1 - y0 > 2.0 * inset {
+                (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
+            } else {
+                (x0, y0, x1, y1) // too small to inset — leave it (surfaces as conflicts)
             }
-            None => bounds_of(nets, 2.0),
-        };
-        let cols = (((maxx - minx) / res).ceil() as usize).max(1) + 1;
-        let rows = (((maxy - miny) / res).ceil() as usize).max(1) + 1;
-        let cell_of = |x: f64, y: f64| {
-            let c = (((x - minx) / res).round() as isize).clamp(0, cols as isize - 1) as usize;
-            let r = (((y - miny) / res).round() as isize).clamp(0, rows as isize - 1) as usize;
-            (c, r)
-        };
-        let mm_of = |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
+        }
+        None => bounds_of(nets, 2.0),
+    };
+    let cols = (((maxx - minx) / res).ceil() as usize).max(1) + 1;
+    let rows = (((maxy - miny) / res).ceil() as usize).max(1) + 1;
+    let cell_of = |x: f64, y: f64| {
+        let c = (((x - minx) / res).round() as isize).clamp(0, cols as isize - 1) as usize;
+        let r = (((y - miny) / res).round() as isize).clamp(0, rows as isize - 1) as usize;
+        (c, r)
+    };
 
-        let mut grid = Grid {
-            cols,
-            rows,
-            cells: vec![Cell::Free; cols * rows * 2],
-        };
+    let mut grid = Grid {
+        cols,
+        rows,
+        cells: vec![Cell::Free; cols * rows * 2],
+    };
+    let halo = ((opts.clearance_mm + opts.signal_width_mm / 2.0) / res).ceil() as isize;
+    let via_halo = ((opts.via_size_mm / 2.0 + opts.clearance_mm + opts.signal_width_mm / 2.0) / res)
+        .ceil() as isize;
 
-        // Clearance halo radius, in cells: keep other nets a trace-half + clearance away.
-        let halo = ((opts.clearance_mm + opts.signal_width_mm / 2.0) / res).ceil() as isize;
-        // A via is bigger than a track, so it needs a wider keep-out.
-        let via_halo = ((opts.via_size_mm / 2.0 + opts.clearance_mm + opts.signal_width_mm / 2.0)
-            / res)
-            .ceil() as isize;
-
-        // Paint every pad (and its clearance halo) as its net's territory. Do the
-        // cores first so a halo never overwrites a real pad connection point.
-        // Per routable net: each pad's cell + which layers it connects.
-        let mut pad_cells: Vec<Vec<((usize, usize), PadLayer)>> = Vec::new();
-        for net in nets {
-            for pad in &net.pads {
-                for layer in [FRONT, BACK] {
-                    if !pad.layer.on(layer) {
-                        continue;
-                    }
-                    let (cc, cr) = cell_of(pad.x_mm, pad.y_mm);
-                    for (c, r) in pad_core_cells(cc, cr, pad.w_mm, pad.h_mm, res, cols, rows) {
-                        grid.claim_core(c, r, layer, net.net_idx);
-                    }
+    // Paint every pad (and its clearance halo) as its net's territory. Do the
+    // cores first so a halo never overwrites a real pad connection point.
+    for net in nets {
+        for pad in &net.pads {
+            for layer in [FRONT, BACK] {
+                if !pad.layer.on(layer) {
+                    continue;
+                }
+                let (cc, cr) = cell_of(pad.x_mm, pad.y_mm);
+                for (c, r) in pad_core_cells(cc, cr, pad.w_mm, pad.h_mm, res, cols, rows) {
+                    grid.claim_core(c, r, layer, net.net_idx);
                 }
             }
         }
-        for net in nets {
-            for pad in &net.pads {
-                for layer in [FRONT, BACK] {
-                    if !pad.layer.on(layer) {
-                        continue;
-                    }
-                    let (cc, cr) = cell_of(pad.x_mm, pad.y_mm);
-                    let (pw, ph) = (
-                        (pad.w_mm / 2.0 / res).ceil() as isize,
-                        (pad.h_mm / 2.0 / res).ceil() as isize,
-                    );
-                    grid.halo(cc, cr, layer, net.net_idx, pw + halo, ph + halo);
+    }
+    for net in nets {
+        for pad in &net.pads {
+            for layer in [FRONT, BACK] {
+                if !pad.layer.on(layer) {
+                    continue;
                 }
+                let (cc, cr) = cell_of(pad.x_mm, pad.y_mm);
+                let (pw, ph) = (
+                    (pad.w_mm / 2.0 / res).ceil() as isize,
+                    (pad.h_mm / 2.0 / res).ceil() as isize,
+                );
+                grid.halo(cc, cr, layer, net.net_idx, pw + halo, ph + halo);
             }
         }
+    }
 
-        // Record each routable net's pad cells (for source/target sets). A pad is
-        // a connection point on every layer it touches — so a through-hole pad is
-        // reachable on both, letting the router meet it without a via.
-        for net in routable {
-            let mut cells = Vec::new();
-            for pad in &net.pads {
-                let (c, r) = cell_of(pad.x_mm, pad.y_mm);
-                for &layer in pad.layer.layers() {
-                    grid.set(c, r, layer, Cell::Owner(net.net_idx));
-                }
-                cells.push(((c, r), pad.layer));
+    // Record each routable net's pad cells (for source/target sets). A pad is a
+    // connection point on every layer it touches — so a through-hole pad is
+    // reachable on both, letting the router meet it without a via.
+    let mut pad_cells: Vec<Vec<((usize, usize), PadLayer)>> = Vec::new();
+    for net in routable {
+        let mut cells = Vec::new();
+        for pad in &net.pads {
+            let (c, r) = cell_of(pad.x_mm, pad.y_mm);
+            for &layer in pad.layer.layers() {
+                grid.set(c, r, layer, Cell::Owner(net.net_idx));
             }
-            pad_cells.push(cells);
+            cells.push(((c, r), pad.layer));
+        }
+        pad_cells.push(cells);
+    }
+
+    Surface {
+        grid,
+        cols,
+        rows,
+        res,
+        minx,
+        miny,
+        halo,
+        via_halo,
+        pad_cells,
+        costs: Costs {
+            step: (res * 1000.0) as i64,
+            via: (opts.via_cost_mm * 1000.0) as i64,
+            back: (opts.back_penalty_mm * 1000.0) as i64,
+        },
+    }
+}
+
+/// One routing pass over `routable` in the given `order` (indices into
+/// `routable`). Returns the routed output and the indices of nets that did not
+/// fully route this pass.
+///
+/// `learned` biases the search away from cells a prior negotiation found
+/// contested (see [`PathfinderRouter`]). Pass [`Congestion::neutral`] for a plain
+/// pass — the cost arithmetic then reduces to exactly the unbiased cost.
+#[allow(clippy::type_complexity)]
+fn route_pass(
+    nets: &[RouteNet],
+    routable: &[&RouteNet],
+    order: &[usize],
+    net_to_rt: &HashMap<usize, usize>,
+    opts: &RouteOptions,
+    learned: &Congestion,
+) -> (RouteOutput, Vec<usize>, HashMap<usize, HashSet<usize>>) {
+    let mut out = RouteOutput::default();
+    // Same discretisation as `PathfinderRouter`, so the two are comparable.
+    let mut surface = build_surface(nets, routable, opts);
+    let (cols, rows, halo, via_halo, res) = (
+        surface.cols,
+        surface.rows,
+        surface.halo,
+        surface.via_halo,
+        surface.res,
+    );
+    let (minx, miny) = (surface.minx, surface.miny);
+    let mm_of = move |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
+    let pad_cells = surface.pad_cells.clone();
+    let grid = &mut surface.grid;
+
+    // Route each net in the given order, growing a tree from pad 0.
+    let mut failed: Vec<usize> = Vec::new();
+    // Blame: victim routable-idx → the routable nets whose committed copper
+    // boxes in one of its pads (candidates to rip up and reroute).
+    let mut blame: HashMap<usize, HashSet<usize>> = HashMap::new();
+    // How far around an unreachable pad to look for the nets fencing it in.
+    let blame_radius = (halo * 3).max(6);
+    for &ni in order {
+        let net = routable[ni];
+        let costs = Costs {
+            step: (res * 1000.0) as i64,
+            via: (opts.via_cost_mm * 1000.0) as i64,
+            back: (opts.back_penalty_mm * 1000.0) as i64,
+        };
+
+        // Connected component: cells already part of this net's routed tree.
+        // A through-hole pad seeds both layers (it bridges them).
+        let mut connected: Vec<(usize, usize, usize)> = Vec::new(); // (c,r,layer)
+        let ((p0c, p0r), p0layer) = pad_cells[ni][0];
+        for &l in p0layer.layers() {
+            connected.push((p0c, p0r, l));
         }
 
-        // Route each net in the given order, growing a tree from pad 0.
-        let mut failed: Vec<usize> = Vec::new();
-        // Blame: victim routable-idx → the routable nets whose committed copper
-        // boxes in one of its pads (candidates to rip up and reroute).
-        let mut blame: HashMap<usize, HashSet<usize>> = HashMap::new();
-        // How far around an unreachable pad to look for the nets fencing it in.
-        let blame_radius = (halo * 3).max(6);
-        for &ni in order {
-            let net = routable[ni];
-            let costs = Costs {
-                step: (res * 1000.0) as i64,
-                via: (opts.via_cost_mm * 1000.0) as i64,
-                back: (opts.back_penalty_mm * 1000.0) as i64,
-            };
-
-            // Connected component: cells already part of this net's routed tree.
-            // A through-hole pad seeds both layers (it bridges them).
-            let mut connected: Vec<(usize, usize, usize)> = Vec::new(); // (c,r,layer)
-            let ((p0c, p0r), p0layer) = pad_cells[ni][0];
-            for &l in p0layer.layers() {
-                connected.push((p0c, p0r, l));
-            }
-
-            let mut pending: Vec<usize> = (1..net.pads.len()).collect();
-            while let Some(k) = pending.pop() {
-                let ((tc, tr), tlayer) = pad_cells[ni][k];
-                // Reach the pad on any layer it touches (cheapest wins).
-                let targets: Vec<(usize, usize, usize)> =
-                    tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
-                match grid.route_one(net.net_idx, &connected, &targets, costs, via_halo) {
-                    Some(path) => {
-                        emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
-                        for &(c, r, l) in &path {
-                            grid.commit(c, r, l, net.net_idx, halo);
-                            if !connected.contains(&(c, r, l)) {
-                                connected.push((c, r, l));
-                            }
-                        }
-                        // A through-hole target bridges both layers into the tree.
-                        for &l in tlayer.layers() {
-                            if !connected.contains(&(tc, tr, l)) {
-                                connected.push((tc, tr, l));
-                            }
-                        }
-                        // Reserve each via's wider body so later nets keep clear.
-                        for w in path.windows(2) {
-                            if w[0].2 != w[1].2 {
-                                grid.commit_via(w[0].0, w[0].1, net.net_idx, via_halo);
-                            }
+        let mut pending: Vec<usize> = (1..net.pads.len()).collect();
+        while let Some(k) = pending.pop() {
+            let ((tc, tr), tlayer) = pad_cells[ni][k];
+            // Reach the pad on any layer it touches (cheapest wins).
+            let targets: Vec<(usize, usize, usize)> =
+                tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
+            match grid.route_one_soft(
+                net.net_idx,
+                &connected,
+                &targets,
+                costs,
+                via_halo,
+                learned,
+                0,
+            ) {
+                Some(path) => {
+                    emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
+                    for &(c, r, l) in &path {
+                        grid.commit(c, r, l, net.net_idx, halo);
+                        if !connected.contains(&(c, r, l)) {
+                            connected.push((c, r, l));
                         }
                     }
-                    None => {
-                        out.conflicts.push(format!(
-                            "net {} ({}): could not route to pad {}.{}",
-                            net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
-                        ));
-                        if !failed.contains(&ni) {
-                            failed.push(ni);
+                    // A through-hole target bridges both layers into the tree.
+                    for &l in tlayer.layers() {
+                        if !connected.contains(&(tc, tr, l)) {
+                            connected.push((tc, tr, l));
                         }
-                        // Blame the routable nets whose copper boxes in this pad.
-                        for &l in tlayer.layers() {
-                            for dr in -blame_radius..=blame_radius {
-                                for dc in -blame_radius..=blame_radius {
-                                    let (c, r) = (tc as isize + dc, tr as isize + dr);
-                                    if c < 0 || r < 0 || c >= cols as isize || r >= rows as isize {
-                                        continue;
-                                    }
-                                    if let Cell::Owner(m) = grid.get(c as usize, r as usize, l) {
-                                        if m != net.net_idx {
-                                            if let Some(&rt) = net_to_rt.get(&m) {
-                                                blame.entry(ni).or_default().insert(rt);
-                                            }
+                    }
+                    // Reserve each via's wider body so later nets keep clear.
+                    for w in path.windows(2) {
+                        if w[0].2 != w[1].2 {
+                            grid.commit_via(w[0].0, w[0].1, net.net_idx, via_halo);
+                        }
+                    }
+                }
+                None => {
+                    out.conflicts.push(format!(
+                        "net {} ({}): could not route to pad {}.{}",
+                        net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
+                    ));
+                    if !failed.contains(&ni) {
+                        failed.push(ni);
+                    }
+                    // Blame the routable nets whose copper boxes in this pad.
+                    for &l in tlayer.layers() {
+                        for dr in -blame_radius..=blame_radius {
+                            for dc in -blame_radius..=blame_radius {
+                                let (c, r) = (tc as isize + dc, tr as isize + dr);
+                                if c < 0 || r < 0 || c >= cols as isize || r >= rows as isize {
+                                    continue;
+                                }
+                                if let Cell::Owner(m) = grid.get(c as usize, r as usize, l) {
+                                    if m != net.net_idx {
+                                        if let Some(&rt) = net_to_rt.get(&m) {
+                                            blame.entry(ni).or_default().insert(rt);
                                         }
                                     }
                                 }
@@ -594,8 +691,8 @@ impl GridRouter {
                 }
             }
         }
-        (out, failed, blame)
     }
+    (out, failed, blame)
 }
 
 /// The routing grid: `cols × rows × 2` layers of [`Cell`].
@@ -686,16 +783,30 @@ impl Grid {
         true
     }
 
-    /// Dijkstra from any `sources` cell to the `target` cell for `net`. Moves are
-    /// 4-connected on a layer (cost `step`) or a via to the other layer (cost
-    /// `via_cost`). Returns the path as `(c, r, layer)` cells, or `None`.
-    fn route_one(
+    /// A* from any `sources` cell to the nearest `targets` cell for `net`, where
+    /// other nets' **copper is negotiable**: routing through it costs more rather
+    /// than being impossible. Pads and their clearance stay hard — those are not
+    /// a resource anyone can bargain for.
+    ///
+    /// With a [`neutral`](Congestion::neutral) congestion and `p_fac = 0` every
+    /// multiplier is 1 and this is a plain least-cost maze search, which is how
+    /// [`GridRouter`] uses it.
+    ///
+    /// The toll on a cell is PathFinder's: `base × present × history`. `present`
+    /// rises with how many nets are on the cell right now and with `p_fac`, which
+    /// grows each iteration; `history` accumulates on cells that keep being
+    /// fought over. Both are ≥ 1, so the octile heuristic stays admissible and A*
+    /// still finds the true least-cost path.
+    #[allow(clippy::too_many_arguments)]
+    fn route_one_soft(
         &self,
         net: usize,
         sources: &[(usize, usize, usize)],
         targets: &[(usize, usize, usize)],
         costs: Costs,
         via_halo: isize,
+        cong: &Congestion,
+        p_fac: i64,
     ) -> Option<Vec<(usize, usize, usize)>> {
         let Costs {
             step,
@@ -706,13 +817,6 @@ impl Grid {
         let cr = self.cols * self.rows;
         let mut dist = vec![i64::MAX; n];
         let mut prev = vec![usize::MAX; n];
-        // A* heuristic: cost-scaled **octile** distance to the nearest target.
-        //
-        // Manhattan was right for a 4-connected grid and is inadmissible here: a
-        // diagonal covers one column AND one row for SQRT2 steps, so Manhattan
-        // overestimates by up to 41% and A* would stop finding the least-cost
-        // path. Octile is the exact free-space distance with diagonals, so it
-        // stays admissible and consistent while still aiming the search.
         let heuristic = |i: usize| -> i64 {
             let rem = i % cr;
             let (c, r) = ((rem % self.cols) as isize, (rem / self.cols) as isize);
@@ -721,13 +825,17 @@ impl Grid {
                 .map(|&(tc, tr, _)| {
                     let (dc, dr) = ((c - tc as isize).abs(), (r - tr as isize).abs());
                     let (lo, hi) = (dc.min(dr) as i64, dc.max(dr) as i64);
-                    // hi straight steps, of which `lo` are upgraded to diagonals.
                     hi * step + lo * (DIAG_NUM - DENOM) * step / DENOM
                 })
                 .min()
                 .unwrap_or(0)
         };
-        // Heap of (f = g + h, g, cell); `dist` tracks g (the actual cost so far).
+        // What entering cell `j` really costs, once contention is priced in.
+        let toll = |j: usize, base: i64| -> i64 {
+            let present = (PF_ONE + p_fac.saturating_mul(cong.contest(j))).min(PF_PRESENT_MAX);
+            let scaled = base.saturating_mul(present) / PF_ONE;
+            scaled.saturating_mul(cong.hist_at(j)) / PF_ONE
+        };
         let mut heap: BinaryHeap<Reverse<(i64, i64, usize)>> = BinaryHeap::new();
         for &(c, r, l) in sources {
             let i = self.idx(c, r, l);
@@ -742,26 +850,20 @@ impl Grid {
                 continue;
             }
             if tgt.contains(&i) {
-                // Reconstruct.
                 let mut path = Vec::new();
                 let mut cur = i;
                 while cur != usize::MAX {
-                    let layer = cur / (self.cols * self.rows);
-                    let rem = cur % (self.cols * self.rows);
+                    let layer = cur / cr;
+                    let rem = cur % cr;
                     path.push((rem % self.cols, rem / self.cols, layer));
                     cur = prev[cur];
                 }
                 path.reverse();
                 return Some(path);
             }
-            let layer = i / (self.cols * self.rows);
-            let rem = i % (self.cols * self.rows);
+            let layer = i / cr;
+            let rem = i % cr;
             let (c, r) = (rem % self.cols, rem / self.cols);
-            // 8-connected: the four orthogonals plus the four diagonals, which is
-            // what puts 45-degree copper on the board. A Manhattan-only router
-            // turns every corner at 90 degrees, and that staircasing is most of
-            // what makes generated boards look like spaghetti next to hand
-            // routing (`legion-of-bom-drk`).
             let neigh = [
                 (-1isize, 0isize),
                 (1, 0),
@@ -782,27 +884,22 @@ impl Grid {
                     continue;
                 }
                 let diagonal = dc != 0 && dr != 0;
-                // No corner cutting. A diagonal squeezing between two blocked
-                // cells would clip both their corners — legal on a grid, not in
-                // copper, where the track has width.
                 if diagonal
                     && (!self.passable((c as isize + dc) as usize, r, layer, net)
                         || !self.passable(c, (r as isize + dr) as usize, layer, net))
                 {
                     continue;
                 }
-                // Bias signals to the front: routing on the back (pour layer)
-                // costs extra, so the back stays a mostly-intact ground plane.
                 let straight = if diagonal {
                     step * DIAG_NUM / DENOM
                 } else {
                     step
                 };
-                let move_cost = straight + if layer == BACK { back_penalty } else { 0 };
+                let base = straight + if layer == BACK { back_penalty } else { 0 };
                 let j = self.idx(nc, nr, layer);
                 relax(
                     j,
-                    g + move_cost,
+                    g + toll(j, base),
                     heuristic(j),
                     i,
                     &mut dist,
@@ -810,14 +907,14 @@ impl Grid {
                     &mut heap,
                 );
             }
-            // Via to the other layer (same cell) — a via is bigger than a track,
-            // so its whole body must clear other nets on both layers.
+            // A via still needs its whole body clear of *pads*; other nets' copper
+            // there is priced by the toll like any other contention.
             let other = layer ^ 1;
             if self.via_area_clear(c, r, net, via_halo) {
                 let j = self.idx(c, r, other);
                 relax(
                     j,
-                    g + via_cost,
+                    g + toll(j, via_cost),
                     heuristic(j),
                     i,
                     &mut dist,
@@ -828,6 +925,409 @@ impl Grid {
         }
         None
     }
+}
+
+// ---- PathfinderRouter: negotiated congestion -------------------------------
+
+/// Fixed-point 1.0 for the congestion multipliers.
+const PF_ONE: i64 = DENOM;
+/// Starting present-congestion factor. Deliberately low: the first iteration is
+/// then close to a pure shortest-path solve, so every net asks for the route it
+/// actually wants and the contention that shows up is *real* contention rather
+/// than an artefact of the penalty.
+const PF_PRESENT_START: i64 = PF_ONE / 2;
+/// Multiplier applied to the present factor each iteration — the pressure ramp.
+/// Gentle on purpose (VPR uses ~1.3): doubling saturates the cost in a handful of
+/// rounds, after which every occupied cell looks equally catastrophic and nets
+/// stop choosing between corridors and simply stampede away from whatever is
+/// occupied *this* round. That is what oscillation looks like from the inside.
+const PF_PRESENT_GROWTH: i64 = 1300;
+/// Ceiling on the present factor. This is the knob that was wrong: at 1<<22 the
+/// present term reached ~4,200,000x base while history could only ever reach
+/// ~13x, so history — the thing that is supposed to *settle* the negotiation —
+/// could never out-argue it and the router thrashed for 24 rounds.
+const PF_PRESENT_MAX: i64 = 64 * PF_ONE;
+/// How much a contested cell's history grows per iteration it stays contested.
+/// Comparable to the present ceiling over a full run, so a corridor that keeps
+/// being fought over eventually loses regardless of who is momentarily on it.
+const PF_HISTORY_STEP: i64 = PF_ONE;
+
+/// Per-cell contention: who is on each routing resource now, and how hard it has
+/// been fought over across iterations.
+struct Congestion {
+    /// Distinct nets whose copper *core* occupies this cell.
+    core: Vec<u16>,
+    /// Distinct nets whose clearance halo covers it. A net's halo never includes
+    /// its own core cells, so `core >= 1 && halo >= 1` always means two nets.
+    halo: Vec<u16>,
+    /// Accumulated historical contention, fixed point; `PF_ONE` is neutral.
+    hist: Vec<i64>,
+}
+
+impl Congestion {
+    /// No occupancy and no history — every cost multiplier is exactly 1, so a
+    /// search biased by this is identical to an unbiased one. Allocates nothing:
+    /// the accessors read an absent cell as neutral, which is what makes it safe
+    /// to hand to a pass whose grid size the caller does not know.
+    fn neutral() -> Self {
+        Congestion {
+            core: Vec::new(),
+            halo: Vec::new(),
+            hist: Vec::new(),
+        }
+    }
+    fn new(cells: usize) -> Self {
+        Congestion {
+            core: vec![0; cells],
+            halo: vec![0; cells],
+            hist: vec![PF_ONE; cells],
+        }
+    }
+    /// What another net's core would collide with here. A core cell and a halo
+    /// cell are both clearance violations, so both are priced.
+    #[inline]
+    fn contest(&self, i: usize) -> i64 {
+        let c = self.core.get(i).copied().unwrap_or(0) as i64;
+        let h = self.halo.get(i).copied().unwrap_or(0) as i64;
+        c + h
+    }
+    /// Accumulated contention for a cell; `PF_ONE` (neutral) when unknown.
+    #[inline]
+    fn hist_at(&self, i: usize) -> i64 {
+        self.hist.get(i).copied().unwrap_or(PF_ONE)
+    }
+    #[inline]
+    fn overused(&self, i: usize) -> bool {
+        self.core[i] > 1 || (self.core[i] >= 1 && self.halo[i] >= 1)
+    }
+    fn add(&mut self, rt: &NetRoute) {
+        for &i in &rt.core {
+            self.core[i] += 1;
+        }
+        for &i in &rt.halo {
+            self.halo[i] += 1;
+        }
+    }
+    fn remove(&mut self, rt: &NetRoute) {
+        for &i in &rt.core {
+            self.core[i] = self.core[i].saturating_sub(1);
+        }
+        for &i in &rt.halo {
+            self.halo[i] = self.halo[i].saturating_sub(1);
+        }
+    }
+    /// Raise the history cost of everything still contested. This is what stops
+    /// the router oscillating: a corridor two nets keep swapping into gets
+    /// permanently more expensive until one of them gives up on it for good.
+    fn age(&mut self) {
+        for i in 0..self.core.len() {
+            if self.overused(i) {
+                self.hist[i] += PF_HISTORY_STEP;
+            }
+        }
+    }
+}
+
+/// One net's current routing, and the resources it is holding.
+#[derive(Default, Clone)]
+struct NetRoute {
+    paths: Vec<Vec<(usize, usize, usize)>>,
+    /// Cell indices the copper itself occupies.
+    core: Vec<usize>,
+    /// Cell indices its clearance covers, excluding `core`.
+    halo: Vec<usize>,
+    /// Pad indices that could not be reached at all, even paying every toll.
+    unreached: Vec<usize>,
+}
+
+impl NetRoute {
+    /// Work out which cells this route holds: the copper, and the clearance
+    /// around it. Sorted and deduped, so a net is counted once per cell however
+    /// many times its own path crosses it.
+    fn claim(&mut self, s: &Surface) {
+        let mut core: Vec<usize> = Vec::new();
+        let mut halo: Vec<usize> = Vec::new();
+        let disc = |v: &mut Vec<usize>, c: usize, r: usize, l: usize, rad: isize| {
+            for dr in -rad..=rad {
+                for dc in -rad..=rad {
+                    let (nc, nr) = (c as isize + dc, r as isize + dr);
+                    if nc < 0 || nr < 0 || nc >= s.cols as isize || nr >= s.rows as isize {
+                        continue;
+                    }
+                    v.push(s.grid.idx(nc as usize, nr as usize, l));
+                }
+            }
+        };
+        for path in &self.paths {
+            for &(c, r, l) in path {
+                core.push(s.grid.idx(c, r, l));
+            }
+            // A via is a hole through both layers, with a wider body than a track.
+            for w in path.windows(2) {
+                if w[0].2 != w[1].2 {
+                    for l in [FRONT, BACK] {
+                        core.push(s.grid.idx(w[0].0, w[0].1, l));
+                        disc(&mut halo, w[0].0, w[0].1, l, s.via_halo);
+                    }
+                }
+            }
+        }
+        for path in &self.paths {
+            for &(c, r, l) in path {
+                disc(&mut halo, c, r, l, s.halo);
+            }
+        }
+        core.sort_unstable();
+        core.dedup();
+        halo.sort_unstable();
+        halo.dedup();
+        halo.retain(|i| core.binary_search(i).is_err());
+        self.core = core;
+        self.halo = halo;
+    }
+}
+
+/// Negotiated-congestion router — PathFinder (McMurchie & Ebeling, FPGA'95).
+///
+/// [`GridRouter`] commits copper as it goes, so the first net to want a corridor
+/// owns it outright and a later net simply fails. Its only recourse is a
+/// different net *ordering*, and ordering cannot help when two nets both need the
+/// same corridor and no order works — which is exactly the shape of failure that
+/// left the slew limiter with unroutable nets at every width.
+///
+/// PathFinder takes ordering out of the answer. Every iteration rips up and
+/// reroutes **every** net, and nets are allowed to overlap: overlap is *priced*,
+/// not forbidden. The price has two parts.
+///
+/// * **Present** congestion rises with the number of nets on a cell, scaled by a
+///   factor that grows each iteration. Early on sharing is cheap, so every net
+///   asks for the route it genuinely wants; as the factor ramps, shared corridors
+///   become expensive and nets with an alternative peel away.
+/// * **History** accumulates on cells that stay contested, and never decays. This
+///   is what stops two nets swapping into the same corridor forever: the corridor
+///   itself gets more expensive every iteration it is fought over, until one net
+///   abandons it permanently.
+///
+/// A net with a cheap detour takes it; a net with no alternative keeps the
+/// resource. The outcome is decided by *measured contention* rather than by who
+/// happened to be routed first.
+///
+/// When negotiation converges, every cell is held by one net and the result is
+/// legal by construction. When it does not, the nets that are still conflict-free
+/// are emitted and the rest are reported through [`RouteOutput::conflicts`] —
+/// this never emits copper it knows to be shorted.
+#[derive(Debug, Clone)]
+pub struct PathfinderRouter {
+    /// Negotiation rounds before giving up. Each is a full rip-up and reroute of
+    /// every net.
+    pub max_iters: usize,
+}
+
+impl Default for PathfinderRouter {
+    fn default() -> Self {
+        // Generous, because it costs nothing when it is not needed: negotiation
+        // breaks out the moment no cell is over capacity, so a board that settles
+        // in six rounds pays for six. The cap only bites on boards that are still
+        // negotiating, and those are exactly the ones that need the rounds.
+        //
+        // Measured on the real slew limiter, same placement, only this changed:
+        //      24 iters -> 2 unrouted, 2 DRC
+        //     150 iters -> 0 unrouted, 0 DRC
+        // The board was one budget away from clean and 24 was hiding it.
+        PathfinderRouter { max_iters: 160 }
+    }
+}
+
+impl Router for PathfinderRouter {
+    fn route(&self, nets: &[RouteNet], opts: &RouteOptions) -> RouteOutput {
+        let routable: Vec<&RouteNet> = nets.iter().filter(|n| n.pads.len() >= 2).collect();
+        if routable.is_empty() {
+            return RouteOutput::default();
+        }
+        // Deterministic net order. Unlike GridRouter this is *not* load-bearing —
+        // it only decides who moves first within a round — but it must be stable
+        // so the same board comes out twice.
+        let mut order: Vec<usize> = (0..routable.len()).collect();
+        order.sort_by_key(|&i| routable[i].net_idx);
+
+        let surface = build_surface(nets, &routable, opts);
+        let (minx, miny, res) = (surface.minx, surface.miny, surface.res);
+        let mm_of = move |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
+        let mut cong = Congestion::new(surface.cells());
+        let mut routes: Vec<NetRoute> = vec![NetRoute::default(); routable.len()];
+        let mut p_fac = PF_PRESENT_START;
+        // The best round seen, by (connections it could not reach, cells still
+        // contested). Negotiation does not improve monotonically — a round can be
+        // worse than the one before — so taking the *last* round throws away work.
+        let mut best: Option<(usize, usize, Vec<NetRoute>, Vec<usize>)> = None;
+
+        for _it in 0..self.max_iters.max(1) {
+            for &ni in &order {
+                // Rip up first, so the net does not negotiate against itself: with
+                // its own copper removed, every contested cell it sees belongs to
+                // somebody else.
+                cong.remove(&routes[ni]);
+                let mut rt = route_net_soft(&surface, routable[ni], ni, &cong, p_fac);
+                rt.claim(&surface);
+                cong.add(&rt);
+                routes[ni] = rt;
+            }
+            let over = (0..cong.core.len()).filter(|&i| cong.overused(i)).count();
+            let unreached: usize = routes.iter().map(|r| r.unreached.len()).sum();
+            if best
+                .as_ref()
+                .is_none_or(|(u, o, _, _)| (unreached, over) < (*u, *o))
+            {
+                let contested: Vec<usize> = (0..routable.len())
+                    .map(|ni| {
+                        routes[ni]
+                            .core
+                            .iter()
+                            .filter(|&&i| cong.overused(i))
+                            .count()
+                    })
+                    .collect();
+                best = Some((unreached, over, routes.clone(), contested));
+            }
+            if over == 0 {
+                break;
+            }
+            cong.age();
+            p_fac = (p_fac.saturating_mul(PF_PRESENT_GROWTH) / PF_ONE).min(PF_PRESENT_MAX);
+        }
+
+        // When negotiation settled, every cell is held by one net and the routes
+        // ARE the answer — legal by construction. Shipping them is the whole point
+        // of the algorithm; re-routing from scratch here would throw away exactly
+        // the corridors the negotiation was run to find.
+        if let Some((_, 0, settled, _)) = &best {
+            let mut out = RouteOutput::default();
+            for &ni in &order {
+                let net = routable[ni];
+                for path in &settled[ni].paths {
+                    emit_path(path, net.net_idx, opts, &mm_of, &mut out);
+                }
+                for &k in &settled[ni].unreached {
+                    out.conflicts.push(format!(
+                        "net {} ({}): could not route to pad {}.{}",
+                        net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
+                    ));
+                }
+            }
+            return out;
+        }
+        // Negotiation did not settle. Spend what it learned on the same
+        // hard-clearance ordering search GridRouter uses: nets that ended up most
+        // contested go first, and every net pays the history cost of corridors
+        // that turned out to be fought over.
+        let (contested, hist) = match best {
+            Some((_, _, _, c)) => (c, cong.hist),
+            None => (vec![0; routable.len()], Vec::new()),
+        };
+        let mut biased = order.clone();
+        biased.sort_by_key(|&ni| (Reverse(contested[ni]), routable[ni].net_idx));
+        let learned = Congestion {
+            core: Vec::new(),
+            halo: Vec::new(),
+            hist,
+        };
+        let guided = search_orderings(nets, &routable, biased, opts, &learned);
+
+        // …and keep it only if it actually helped. A history map from a
+        // negotiation that never settled can be misleading, and steering the
+        // search with a bad map is how this router ended up LOSING to the plain
+        // one on boards the plain one handles. Running the unbiased search too
+        // costs one pass and makes "never worse than the baseline" a property of
+        // the code rather than a hope.
+        let plain = search_orderings(nets, &routable, order, opts, &Congestion::neutral());
+        if guided.conflicts.len() <= plain.conflicts.len() {
+            guided
+        } else {
+            plain
+        }
+    }
+}
+
+/// Which connections are **impossible for this placement**, whatever the router.
+///
+/// Each net is routed as if it were alone on the board: pads and their clearance
+/// are obstacles, every other net's copper is ignored entirely. A connection that
+/// fails here cannot be made by *any* router, because there is no path through
+/// the geometry — the parts are simply in the wrong places.
+///
+/// This is the measurement that separates "the router gave up" from "placement
+/// made it impossible", which are the same symptom (an unrouted net) with
+/// completely different fixes. Run it before tuning a router.
+pub fn unroutable_by_placement(nets: &[RouteNet], opts: &RouteOptions) -> Vec<String> {
+    let routable: Vec<&RouteNet> = nets.iter().filter(|n| n.pads.len() >= 2).collect();
+    if routable.is_empty() {
+        return Vec::new();
+    }
+    let surface = build_surface(nets, &routable, opts);
+    let free = Congestion::neutral();
+    let mut out = Vec::new();
+    for (ni, net) in routable.iter().enumerate() {
+        // p_fac = 0 and no history: nothing costs more than its own length, and
+        // no other net is on the board at all.
+        let rt = route_net_soft(&surface, net, ni, &free, 0);
+        for &k in &rt.unreached {
+            out.push(format!(
+                "net {} ({}): pad {}.{} unreachable even with the board to itself",
+                net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
+            ));
+        }
+    }
+    out
+}
+
+/// Route one net's whole tree against the current congestion, growing from pad 0
+/// and letting each later pad reach whatever the net has already built.
+fn route_net_soft(
+    s: &Surface,
+    net: &RouteNet,
+    ni: usize,
+    cong: &Congestion,
+    p_fac: i64,
+) -> NetRoute {
+    let mut rt = NetRoute::default();
+    let mut connected: Vec<(usize, usize, usize)> = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut join = |c: usize, r: usize, l: usize, conn: &mut Vec<(usize, usize, usize)>| {
+        if seen.insert(s.grid.idx(c, r, l)) {
+            conn.push((c, r, l));
+        }
+    };
+    let ((p0c, p0r), p0layer) = s.pad_cells[ni][0];
+    for &l in p0layer.layers() {
+        join(p0c, p0r, l, &mut connected);
+    }
+    for k in 1..net.pads.len() {
+        let ((tc, tr), tlayer) = s.pad_cells[ni][k];
+        let targets: Vec<(usize, usize, usize)> =
+            tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
+        match s.grid.route_one_soft(
+            net.net_idx,
+            &connected,
+            &targets,
+            s.costs,
+            s.via_halo,
+            cong,
+            p_fac,
+        ) {
+            Some(path) => {
+                for &(c, r, l) in &path {
+                    join(c, r, l, &mut connected);
+                }
+                // A through-hole target bridges both layers into the tree.
+                for &l in tlayer.layers() {
+                    join(tc, tr, l, &mut connected);
+                }
+                rt.paths.push(path);
+            }
+            None => rt.unreached.push(k),
+        }
+    }
+    rt
 }
 
 fn relax(
@@ -1205,6 +1705,266 @@ mod tests {
             out.conflicts
         );
         assert_eq!(out.tracks[0].net_idx, 3);
+    }
+
+    // ---- PathfinderRouter -------------------------------------------------
+
+    #[test]
+    fn pathfinder_routes_a_two_pad_net() {
+        let net = RouteNet {
+            net_idx: 3,
+            name: "OUT".into(),
+            pads: vec![pad("R1", "2", 100.0, 100.0), pad("C1", "1", 104.0, 100.0)],
+        };
+        let out = PathfinderRouter::default().route(&[net], &RouteOptions::default());
+        assert!(!out.tracks.is_empty(), "should route the net");
+        assert!(out.conflicts.is_empty(), "conflicts: {:?}", out.conflicts);
+        assert_eq!(out.tracks[0].net_idx, 3);
+    }
+
+    #[test]
+    fn pathfinder_routes_around_an_obstructing_pad() {
+        let nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "OUT".into(),
+                pads: vec![pad("R1", "1", 100.0, 100.0), pad("R2", "1", 110.0, 100.0)],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "GND".into(),
+                pads: vec![pad("C1", "1", 105.0, 100.0), pad("C1", "2", 105.0, 106.0)],
+            },
+        ];
+        let out = PathfinderRouter::default().route(&nets, &RouteOptions::default());
+        assert!(out.conflicts.is_empty(), "conflicts: {:?}", out.conflicts);
+        // OUT cannot go straight through GND's pad, so it must leave the y=100 line.
+        let straight = out
+            .tracks
+            .iter()
+            .filter(|t| t.net_idx == 1)
+            .all(|t| (t.start.1 - 100.0).abs() < 1e-9 && (t.end.1 - 100.0).abs() < 1e-9);
+        assert!(!straight, "OUT should detour around the GND pad");
+    }
+
+    /// Two signals that both want the same gap in a wall.
+    ///
+    /// Note what this does and does not prove. Small contested boards are
+    /// generally solvable by *reordering* too — GridRouter clears this one — so
+    /// this is a correctness case, not a demonstration of the advantage. The
+    /// advantage shows up where blame-and-reorder runs out of road: many nets,
+    /// diffuse congestion, no single "A boxed in B" to blame. That is measured on
+    /// the real board, not here.
+    fn corridor_board() -> (Vec<RouteNet>, RouteOptions) {
+        // A wall of no-net pads with a single one-cell gap in it. Both signal
+        // nets have to cross the wall.
+        let mut nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "SIG_A".into(),
+                pads: vec![pad("A1", "1", 100.0, 98.0), pad("A2", "1", 112.0, 98.0)],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG_B".into(),
+                pads: vec![pad("B1", "1", 100.0, 102.0), pad("B2", "1", 112.0, 102.0)],
+            },
+        ];
+        // The wall: pads down the middle, leaving one gap at y = 100.
+        let mut wall = Vec::new();
+        let mut y: f64 = 94.0;
+        while y <= 106.0 {
+            if (y - 100.0).abs() > 0.5 {
+                wall.push(pad("W", "1", 106.0, y));
+            }
+            y += 1.0;
+        }
+        nets.push(RouteNet {
+            net_idx: 99,
+            name: "".into(),
+            pads: wall,
+        });
+        let opts = RouteOptions {
+            bounds: Some((96.0, 92.0, 116.0, 108.0)),
+            ..Default::default()
+        };
+        (nets, opts)
+    }
+
+    /// Two signals crossing through one narrow gap in a wall. Both want the
+    /// middle of the gap — their straight lines cross there — and the gap only
+    /// admits two tracks if each hugs an edge. Routed greedily the first net takes
+    /// the middle and leaves neither side wide enough; reordering cannot fix that,
+    /// because whoever goes first takes the middle and every order fails alike.
+    ///
+    /// The pads are deliberately at four *distinct* points. An earlier version of
+    /// this fixture put both nets\' pads at identical coordinates, which makes
+    /// those cells `Blocked` — the board was unroutable by construction and the
+    /// test was measuring nothing.
+    ///
+    /// This is the case negotiated congestion exists for, and it is written as a
+    /// test of BOTH routers on purpose: if GridRouter ever passes it, the board
+    /// has stopped being a discriminating case and the test is worthless.
+    fn channel_board() -> (Vec<RouteNet>, RouteOptions) {
+        // Walls of through-hole pads (both layers, so there is no escape to the
+        // back) with a 2.2mm gap between them at x = 106.
+        let mut wall = Vec::new();
+        let mut y: f64 = 90.0;
+        while y <= 110.0 {
+            if !(99.0..=101.2).contains(&y) {
+                wall.push(pad_on("W", "1", 106.0, y, PadLayer::Both));
+            }
+            y += 0.8;
+        }
+        let nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "SIG_A".into(),
+                pads: vec![
+                    pad_on("A1", "1", 101.0, 96.0, PadLayer::Both),
+                    pad_on("A2", "1", 111.0, 104.0, PadLayer::Both),
+                ],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG_B".into(),
+                pads: vec![
+                    pad_on("B1", "1", 101.0, 104.0, PadLayer::Both),
+                    pad_on("B2", "1", 111.0, 96.0, PadLayer::Both),
+                ],
+            },
+            RouteNet {
+                net_idx: 99,
+                name: "".into(),
+                pads: wall,
+            },
+        ];
+        let opts = RouteOptions {
+            bounds: Some((99.0, 88.0, 113.0, 112.0)),
+            ..Default::default()
+        };
+        (nets, opts)
+    }
+
+    /// **Never worse than the baseline.** `PathfinderRouter` falls back to the
+    /// same ordering search `GridRouter` runs, and keeps the negotiation-guided
+    /// result only when it actually beat the unguided one — so it cannot lose to
+    /// the plain router on any board.
+    ///
+    /// This is a real regression guard, not a formality: an earlier version
+    /// steered the fallback with a history map from a negotiation that never
+    /// settled, and lost 0 conflicts to 1 on the channel board below.
+    #[test]
+    fn pathfinder_is_never_worse_than_the_grid_router() {
+        for (name, (nets, opts)) in [("corridor", corridor_board()), ("channel", channel_board())] {
+            let grid = GridRouter.route(&nets, &opts);
+            let pf = PathfinderRouter::default().route(&nets, &opts);
+            assert!(
+                pf.conflicts.len() <= grid.conflicts.len(),
+                "{name}: pathfinder {:?} lost to grid {:?}",
+                pf.conflicts,
+                grid.conflicts
+            );
+        }
+    }
+
+    #[test]
+    fn pathfinder_clears_a_contested_corridor() {
+        let (nets, opts) = corridor_board();
+        let grid = GridRouter.route(&nets, &opts);
+        let pf = PathfinderRouter::default().route(&nets, &opts);
+        // Negotiation must never do worse than committing in order.
+        assert!(
+            pf.conflicts.len() <= grid.conflicts.len(),
+            "pathfinder {:?} vs grid {:?}",
+            pf.conflicts,
+            grid.conflicts
+        );
+        assert!(
+            pf.conflicts.is_empty(),
+            "both signals should route once the corridor is priced: {:?}",
+            pf.conflicts
+        );
+        for idx in [1, 2] {
+            assert!(
+                pf.tracks.iter().any(|t| t.net_idx == idx),
+                "net {idx} produced no copper"
+            );
+        }
+    }
+
+    /// Emitted copper must never be knowingly shorted: a net that still clashes
+    /// after the last round is reported, not drawn.
+    #[test]
+    fn pathfinder_reports_rather_than_emitting_shorted_copper() {
+        let (nets, opts) = corridor_board();
+        // One round is not enough to negotiate anything — it is a plain
+        // shortest-path solve, so both signals want the same gap.
+        let out = PathfinderRouter { max_iters: 1 }.route(&nets, &opts);
+        let routed: HashSet<usize> = out.tracks.iter().map(|t| t.net_idx).collect();
+        let complained: HashSet<usize> = out
+            .conflicts
+            .iter()
+            .filter_map(|c| c.split_whitespace().nth(1))
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        // Every signal net either shipped copper or was reported — never silently
+        // dropped, and never both.
+        for idx in [1usize, 2] {
+            assert!(
+                routed.contains(&idx) || complained.contains(&idx),
+                "net {idx} vanished: tracks {routed:?} conflicts {complained:?}"
+            );
+        }
+    }
+
+    /// **The router's actual contract.** If a placement is routable at all — every
+    /// connection reachable with the board to itself — then the router must route
+    /// it. Anything left over is the router's fault, not the placement's.
+    ///
+    /// This is the property that the oscillation bug broke and that no test
+    /// caught: with the present-congestion factor saturating ~300,000x above
+    /// history, negotiation thrashed for 24 rounds and shipped a round that was
+    /// not its best. It passed every test there was, because none of them asked
+    /// whether the router had achieved what the placement allowed.
+    #[test]
+    fn pathfinder_routes_everything_the_placement_allows() {
+        for (name, (nets, opts)) in [("corridor", corridor_board()), ("channel", channel_board())] {
+            let impossible = unroutable_by_placement(&nets, &opts).len();
+            let got = PathfinderRouter::default()
+                .route(&nets, &opts)
+                .conflicts
+                .len();
+            assert!(
+                got <= impossible,
+                "{name}: {got} unrouted but only {impossible} are impossible for \
+                 this placement — the difference is the router giving up"
+            );
+        }
+    }
+
+    #[test]
+    fn pathfinder_is_deterministic() {
+        let (nets, opts) = corridor_board();
+        let a = PathfinderRouter::default().route(&nets, &opts);
+        let b = PathfinderRouter::default().route(&nets, &opts);
+        assert_eq!(a.tracks.len(), b.tracks.len());
+        assert_eq!(a.conflicts, b.conflicts);
+        for (x, y) in a.tracks.iter().zip(b.tracks.iter()) {
+            assert_eq!((x.start, x.end, x.net_idx), (y.start, y.end, y.net_idx));
+        }
+    }
+
+    #[test]
+    fn pathfinder_single_pad_net_routes_nothing() {
+        let net = RouteNet {
+            net_idx: 1,
+            name: "NC".into(),
+            pads: vec![pad("R1", "1", 100.0, 100.0)],
+        };
+        let out = PathfinderRouter::default().route(&[net], &RouteOptions::default());
+        assert!(out.tracks.is_empty());
+        assert!(out.conflicts.is_empty());
     }
 
     #[test]

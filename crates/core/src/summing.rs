@@ -232,6 +232,16 @@ pub fn snap(
                 y_mm: target.1 - pad_from_origin.1,
                 ..at
             };
+            // The same guard decouple::snap carries: a shorter node is a
+            // trade-off, a part on another part's copper is not. Through-hole
+            // pads count on BOTH sides, which is the case that cost the slew
+            // limiter its whole -12V net (legion-of-bom-ude).
+            if let Some(blocker) = crate::board::first_overlap(refdes, &moved, placements, facts) {
+                report.skipped.push(format!(
+                    "{refdes}: the spot on {ic}.{pin} is occupied by {blocker}"
+                ));
+                continue;
+            }
             let landed = place_point(moved, local.0, local.1);
             let d = (landed.0 - pin_at.0).hypot(landed.1 - pin_at.1);
             placements.insert(refdes.to_string(), moved);

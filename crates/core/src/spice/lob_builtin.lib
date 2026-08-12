@@ -2,6 +2,13 @@
 * The parts-library stand-in until real device models travel with each part
 * (DESIGN 2.3 / okm). Behavioural, not vendor macro-models — enough to validate
 * topology + slew behaviour, not datasheet-exact.
+*
+* Pin numbers below are taken from the KiCad symbol library that the circuits
+* themselves instantiate — /Applications/KiCad/KiCad.app/Contents/SharedSupport/
+* symbols/Amplifier_Operational.kicad_sym — never from model memory. Every
+* subckt lists all of the package's pins in NUMERIC order, so the resolver's
+* pin map is `1..n` and an unused section is simply left unconnected by the
+* circuit rather than being absent from the model.
 
 * --- Ideal op-amp: high-gain VCVS with a finite output resistance so a unity-
 *     feedback follower has a well-conditioned operating point (a stiff 0-ohm
@@ -12,20 +19,68 @@ Rout ng out 100
 .ends
 
 * --- Dual op-amp (TL072/TL082/…): pins 1..8 = out1 in1- in1+ V- in2+ in2- out2 V+.
+*     (KiCad `LM2904`, which `TL072` extends: unit 1 = 1/2/3, unit 2 = 5/6/7,
+*      unit 3 = power 4=V- 8=V+.)
 .subckt TL072 o1 i1m i1p vm i2p i2m o2 vp
 Xa o1 i1m i1p vm vp OPAMP_IDEAL
 Xb o2 i2m i2p vm vp OPAMP_IDEAL
 .ends
 
-* --- LM13700 OTA + Darlington buffer (channel A terminals). --------------------
-* Pin order: iabc(1) in+(3) in-(4) Iout(5) V-(6) bufin(7) bufout(8) V+(11).
-* OTA: I_out = IABC * tanh((V+ - V-)/(2*Vt)), Vt = 26 mV. IABC is the bias current
-* pushed into the iabc pin (which sits ~2 diode drops above V-).
-.subckt LM13700 iabc inp inn iout vm bufin bufout vp
-Vsense iabc na 0
-Dbias1 na nb DLM
-Dbias2 nb vm DLM
-Bota vm iout I = I(Vsense) * tanh( (V(inp) - V(inn)) / 0.052 )
-Ebuf bufout 0 bufin 0 1
+* --- Quad op-amp (TL074/TL084/LM324/…): pins 1..14 =
+*     out1 in1- in1+ V+ in2+ in2- out2 out3 in3- in3+ V- in4+ in4- out4.
+*     (KiCad `LM2902`, which `TL074` extends: unit 1 = 1/2/3, unit 2 = 5/6/7,
+*      unit 3 = 8/9/10, unit 4 = 12/13/14, unit 5 = power 4=V+ 11=V-.)
+*     NOTE the rails are NOT where the dual has them: V+ moves 8 -> 4 and V-
+*     moves 4 -> 11. Reusing the TL072 model for a quad silently ties section
+*     A's output to a supply.
+.subckt TL074 o1 i1m i1p vp i2p i2m o2 o3 i3m i3p vm i4p i4m o4
+Xa o1 i1m i1p vm vp OPAMP_IDEAL
+Xb o2 i2m i2p vm vp OPAMP_IDEAL
+Xc o3 i3m i3p vm vp OPAMP_IDEAL
+Xd o4 i4m i4p vm vp OPAMP_IDEAL
+.ends
+
+* --- LM13700 dual OTA + Darlington buffers. -----------------------------------
+* Pins 1..16, both channels. The KiCad symbol splits the part into five units:
+*   unit 3 = OTA A     1=IABC 2=DIODE_BIAS 3=In+ 4=In- 5=Iout
+*   unit 4 = buffer A  7=in 8=out
+*   unit 1 = OTA B    16=IABC 15=DIODE_BIAS 14=In+ 13=In- 12=Iout
+*   unit 2 = buffer B 10=in 9=out
+*   unit 5 = power     6=V- 11=V+
+* The two channels are a mirror image of each other, which is exactly why a dual
+* module gets its second channel for free — and why the model has to carry BOTH
+* halves. A channel-A-only model cannot express a dual at all.
+*
+* OTA: I_out = IABC * tanh((V+ - V-)/(2*Vt)), Vt = 26 mV. IABC is the bias
+* current pushed into the IABC pin, which sits ~2 diode drops above V-.
+*
+* MODELLING LIMITS — this is a behavioural model, not the part:
+*   * the output current is drawn from the V- node for both polarities (the real
+*     part sources from V+ when sourcing), so rail-current *magnitudes* are
+*     right but their split between rails is not;
+*   * the Darlington buffer is an ideal follower referenced to 0, so it draws no
+*     rail current at all;
+*   * there is NO die/substrate/thermal coupling term between the two channels.
+*     Channel-to-channel interaction on a shared die is therefore a BENCH
+*     question; this model can only answer the board-level one.
+.subckt LM13700 iabcA dbA inpA innA ioutA vm bufinA bufoutA bufoutB bufinB vp ioutB innB inpB dbB iabcB
+* -- channel A
+VsenseA iabcA naA 0
+DbiasA1 naA nbA DLM
+DbiasA2 nbA vm DLM
+BotaA vm ioutA I = I(VsenseA) * tanh( (V(inpA) - V(innA)) / 0.052 )
+EbufA bufoutA 0 bufinA 0 1
+* -- channel B
+VsenseB iabcB naB 0
+DbiasB1 naB nbB DLM
+DbiasB2 nbB vm DLM
+BotaB vm ioutB I = I(VsenseB) * tanh( (V(inpB) - V(innB)) / 0.052 )
+EbufB bufoutB 0 bufinB 0 1
+* -- terminals the model does not use, given a defined node so a circuit that
+*    leaves them open (the diode-linearisation pins are open in normal use, per
+*    the datasheet's own test configuration) stays well-conditioned.
+RdbA dbA vm 1T
+RdbB dbB vm 1T
+Rvp vp vm 1T
 .model DLM D(Is=1e-14)
 .ends

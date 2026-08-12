@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use crate::board::{place_point, PartFacts, Placement};
+use crate::board::{first_overlap, place_point, PartFacts, Placement};
 use crate::source::CircuitSource;
 
 /// Clearance (mm) between the cap's pad edge and the pin's, once snapped. Small,
@@ -119,6 +119,18 @@ pub fn snap(
             y_mm: target.1 - pad_from_origin.1,
             ..cap_at
         };
+        // "There is no competing claim on that exact spot" is only true if you
+        // check. When a panel control is anchored across the IC's power pin, the
+        // spot is already taken, and setting the cap there anyway buries its pad
+        // under the control's copper: on the slew limiter that put an 0603 1.1mm
+        // from a 3.5mm jack and made every pad of the -12V net unreachable by any
+        // router. A worse-decoupled cap is a trade-off; an unroutable net is not.
+        if let Some(blocker) = first_overlap(&cap, &moved, placements, facts) {
+            report.skipped.push(format!(
+                "{cap}: the spot against {ic}'s rail pin is occupied by {blocker}"
+            ));
+            continue;
+        }
         let landed = place_point(moved, cap_local.0, cap_local.1);
         let d = (landed.0 - pin.0).hypot(landed.1 - pin.1);
         placements.insert(cap.clone(), moved);
@@ -221,6 +233,148 @@ mod tests {
             ),
         ]
         .into()
+    }
+
+    /// **Reproduces legion-of-bom's P0 placement bug.**
+    ///
+    /// `snap` is documented as "set, not scored" because "there is no competing
+    /// claim on that exact spot". That is false whenever an anchored panel
+    /// control already sits across the IC's power pin — and unlike
+    /// [`crate::summing::snap`], this pass is not given the anchored set at all,
+    /// so it cannot know.
+    ///
+    /// On the real slew limiter this drops an 0603 (C3) 1.10mm from a 3.5mm jack
+    /// (J1) — concentric, for practical purposes. C3.1 is pad 0 of the -12V net,
+    /// so burying it makes every other -12V pad unreachable by ANY router: six
+    /// connections dead from one placement move.
+    #[test]
+    fn a_bypass_cap_is_not_snapped_on_top_of_an_anchored_control() {
+        let mut facts = facts_for();
+        // A Thonkiconn-sized panel jack: ~10mm across the body.
+        facts.insert(
+            "J1".to_string(),
+            PartFacts {
+                extent: (10.0, 10.0),
+                body_extent: (10.0, 10.0),
+                origin_offset: (0.0, 0.0),
+                side: crate::model::Side::Front,
+                height_mm: 12.0,
+                standoff_mm: None,
+                tht_pads: Vec::new(),
+                pin_offsets: HashMap::new(),
+            },
+        );
+        let mut circuit = circuit();
+        let mut j1 = Part::new("J1", "Thonkiconn");
+        j1.footprint = Some("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical".into());
+        circuit.parts.push(j1);
+
+        let at = |x: f64, y: f64| Placement {
+            x_mm: x,
+            y_mm: y,
+            rotation_deg: 0.0,
+            back: false,
+        };
+        let mut placements: HashMap<String, Placement> = [
+            ("U1".to_string(), at(50.0, 50.0)),
+            // The jack is anchored to its panel cutout, sitting right across
+            // U1's +12V pin (pin 11, offset (0, -5) => 50, 45).
+            ("J1".to_string(), at(50.0, 45.0)),
+            // The cap starts somewhere legal and empty.
+            ("C2".to_string(), at(50.0, 62.0)),
+        ]
+        .into();
+
+        snap(&mut placements, &circuit, &facts);
+
+        let (c, j) = (placements["C2"], placements["J1"]);
+        let (dx, dy) = ((c.x_mm - j.x_mm).abs(), (c.y_mm - j.y_mm).abs());
+        // Half-extents: the jack is 10mm across, the 0603 1.6 x 0.8.
+        let (need_x, need_y) = ((10.0 + 1.6) / 2.0, (10.0 + 0.8) / 2.0);
+        assert!(
+            dx >= need_x || dy >= need_y,
+            "C2 was snapped inside the anchored jack: centres {dx:.2},{dy:.2} mm apart, \
+             need {need_x:.2} or {need_y:.2}. A part cannot be placed where another \
+             part already is, whatever the decoupling gain."
+        );
+    }
+
+    /// **The bug that actually killed the slew limiter's -12V net.**
+    ///
+    /// The cap is on the BACK, the jack on the FRONT — so a side-aware collision
+    /// test says they cannot clash. They can: the jack's pads are THROUGH-HOLE
+    /// and exist on both copper layers. On the real board this put C3's pad 2
+    /// 0.67 x 0.29mm into the back annulus of J1's pin, walling in pad 0 of -12V
+    /// and making six connections unreachable by any router.
+    ///
+    /// The fixture is built empirically — snap once with no jack to learn where
+    /// the cap lands, then put the jack's through-hole pad exactly there. A
+    /// hand-guessed position made this test pass while exercising nothing.
+    #[test]
+    fn a_back_side_cap_is_not_snapped_onto_a_front_parts_through_hole_pad() {
+        let at = |x: f64, y: f64, back: bool| Placement {
+            x_mm: x,
+            y_mm: y,
+            rotation_deg: 0.0,
+            back,
+        };
+        let mut facts = facts_for();
+        if let Some(f) = facts.get_mut("C2") {
+            f.side = crate::model::Side::Back;
+        }
+
+        // Where does the cap want to go when nothing is in the way?
+        let mut solo: HashMap<String, Placement> = [
+            ("U1".to_string(), at(50.0, 50.0, true)),
+            ("C2".to_string(), at(50.0, 62.0, true)),
+        ]
+        .into();
+        snap(&mut solo, &circuit(), &facts);
+        let landed = solo["C2"];
+        assert_ne!(
+            (landed.x_mm, landed.y_mm),
+            (50.0, 62.0),
+            "fixture is inert — snap did not move the cap at all"
+        );
+
+        // Now put a FRONT-side jack whose through-hole pin is exactly there.
+        facts.insert(
+            "J1".to_string(),
+            PartFacts {
+                extent: (10.0, 15.38),
+                body_extent: (10.0, 14.4),
+                origin_offset: (0.0, 5.775),
+                side: crate::model::Side::Front,
+                height_mm: 12.0,
+                standoff_mm: None,
+                tht_pads: vec![(-0.97, -0.92, 0.97, 0.92)],
+                pin_offsets: HashMap::new(),
+            },
+        );
+        let mut circuit = circuit();
+        let mut j1 = Part::new("J1", "Thonkiconn");
+        j1.footprint = Some("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical".into());
+        circuit.parts.push(j1);
+
+        let mut placements: HashMap<String, Placement> = [
+            ("U1".to_string(), at(50.0, 50.0, true)),
+            ("J1".to_string(), at(landed.x_mm, landed.y_mm, false)),
+            ("C2".to_string(), at(50.0, 62.0, true)),
+        ]
+        .into();
+        snap(&mut placements, &circuit, &facts);
+
+        let c = placements["C2"];
+        let body = facts["C2"].keepout_at_rot(c.x_mm, c.y_mm, c.back, c.rotation_deg);
+        let j = placements["J1"];
+        for pad in facts["J1"].tht_pads_at(j.x_mm, j.y_mm, j.back, j.rotation_deg) {
+            let clash = body.0 < pad.2 && pad.0 < body.2 && body.1 < pad.3 && pad.1 < body.3;
+            assert!(
+                !clash,
+                "back-side cap {body:?} landed on the front jack's through-hole pad \
+                 {pad:?} — a THT pad is copper on BOTH layers"
+            );
+        }
     }
 
     fn circuit() -> Circuit {

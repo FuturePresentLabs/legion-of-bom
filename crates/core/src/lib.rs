@@ -42,10 +42,12 @@ pub mod parts;
 pub mod pdf;
 pub mod photo;
 pub mod placement;
+pub mod placement_edit;
 pub mod project;
 pub mod resistor;
 pub mod route;
 pub mod rules;
+pub mod scaffold;
 pub mod schematic;
 mod sexpr;
 pub mod skidl;
@@ -131,16 +133,21 @@ pub use placement::{
     Column as PlacementColumn, Grid as PlacementGrid, PlacementError, PlacementFile, Point,
     Row as PlacementRow,
 };
+pub use placement_edit::{
+    apply_placement_edit_str, edit_placement, ops_for_targets, ops_to_reach, Moved,
+    PlacementEditError, PlacementEditResult, PlacementOp,
+};
 pub use project::{ArtifactKind, ArtifactStatus, ArtifactView, CircuitView, ProjectView, RepoView};
 pub use resistor::{color_code, parse_ohms, Band, ColorCode};
 pub use route::{
-    GridRouter, MstRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput, Router, Track,
-    Via,
+    unroutable_by_placement, GridRouter, MstRouter, PadLayer, PadPoint, PathfinderRouter, RouteNet,
+    RouteOptions, RouteOutput, Router, Track, Via,
 };
 pub use rules::{
     derive as derive_rules, evaluate as evaluate_rules, penalty as rule_penalty, Rule, Tier,
     Violation,
 };
+pub use scaffold::{ignore_block, is_generated, merge_gitignore, IgnoreRule};
 pub use schematic::schematic_to_svg;
 pub use skidl::{SkidlRun, SkidlRunner};
 pub use source::CircuitSource;
@@ -149,12 +156,14 @@ pub use sourcing::{
     SourcingClients,
 };
 pub use spice::{
-    simulate_ac, simulate_tran, simulate_tran_drive, AcPoint, AcResult, SimConfig, TranAnalysis,
-    TranDrive, TranPoint, TranResult,
+    signal_channels, simulate_ac, simulate_tran, simulate_tran_drive, AcPoint, AcResult, SimConfig,
+    TranAnalysis, TranDrive, TranPoint, TranResult,
 };
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
 pub use thonk::{product_image_url as thonk_image_url, search as thonk_search, ThonkProduct};
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
 pub use validate::validate_erc;
-pub use verify::{analytic_check, check_noninverting_gain, check_rc_cutoff};
+pub use verify::{
+    analytic_check, check_channel_crosstalk, check_noninverting_gain, check_rc_cutoff,
+};

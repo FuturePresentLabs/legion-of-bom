@@ -1196,3 +1196,195 @@ table.bom tfoot td {
   gap: 8px;
   margin-top: 14px;
 }
+
+/* --- Control-surface placement editor (cll) ------------------------------- */
+
+.place {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.place-bar,
+.place-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.place-sel {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.place-tool-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-right: 0.25rem;
+}
+
+.place-tag {
+  font-size: 0.7rem;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: var(--off-bg);
+  color: var(--off-fg);
+}
+.place-tag.warn {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+
+.place-pitch,
+.place-cols {
+  font: inherit;
+  font-size: 0.75rem;
+  width: 4.5rem;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.place-cols {
+  width: 3rem;
+}
+.place-unit {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.place-gap {
+  width: 0.6rem;
+}
+.btn.tiny.ghost {
+  font-family: var(--mono);
+  color: var(--muted);
+  border-style: dashed;
+}
+
+.place-canvas {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 0.5rem;
+  outline: none;
+  display: flex;
+  justify-content: center;
+}
+.place-canvas:focus-visible {
+  border-color: var(--accent);
+}
+.place-canvas svg {
+  height: min(72vh, 760px);
+  width: 100%;
+  touch-action: none;
+  user-select: none;
+}
+
+.place-panel {
+  fill: var(--off-bg);
+  stroke: var(--border);
+  stroke-width: 0.3;
+}
+.place-grid {
+  stroke: var(--border);
+  stroke-width: 0.08;
+}
+
+/* Board internals: visible enough to place around, quiet enough to ignore. */
+.place-internal {
+  fill: var(--muted);
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.place-part {
+  cursor: grab;
+}
+.place-part .place-env {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 0.15;
+  stroke-dasharray: 0.8 0.6;
+  opacity: 0.55;
+}
+.place-part .place-hole {
+  fill: var(--surface);
+  stroke: var(--fg);
+  stroke-width: 0.35;
+}
+.place-part.k-pot .place-hole {
+  stroke: #b06f2a;
+}
+.place-part.k-jack .place-hole {
+  stroke: #2f7a53;
+}
+.place-part.k-switch .place-hole {
+  stroke: #6b5bd1;
+}
+.place-part.k-led .place-hole {
+  stroke: #c0392b;
+}
+.place-part.on .place-hole {
+  stroke: var(--accent);
+  stroke-width: 0.6;
+}
+.place-part.on .place-env {
+  stroke: var(--accent);
+  opacity: 1;
+}
+.place-label {
+  font-family: var(--mono);
+  font-size: 2px;
+  text-anchor: middle;
+  fill: var(--muted);
+  pointer-events: none;
+}
+.place-part.on .place-label {
+  fill: var(--accent);
+}
+
+.place-guide {
+  stroke: var(--accent);
+  stroke-width: 0.12;
+  stroke-dasharray: 1.2 0.8;
+}
+.place-marquee {
+  fill: var(--accent);
+  fill-opacity: 0.08;
+  stroke: var(--accent);
+  stroke-width: 0.12;
+}
+
+.place-hint {
+  font-size: 0.75rem;
+  margin: 0;
+}
+.place-error {
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  border-radius: 7px;
+  font-size: 0.8rem;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+.place-moved,
+.place-pending {
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  border-radius: 7px;
+  font-size: 0.8rem;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+.place-file {
+  font-size: 0.72rem;
+  margin: 0;
+}

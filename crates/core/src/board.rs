@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 use crate::logo::Logo;
 use crate::model::Side;
 use crate::route::{
-    track_sexpr, via_sexpr, GridRouter, PadLayer, PadPoint, RouteNet, RouteOptions, RouteOutput,
-    Router, Track, Via,
+    track_sexpr, via_sexpr, PadLayer, PadPoint, PathfinderRouter, RouteNet, RouteOptions,
+    RouteOutput, Router, Track, Via,
 };
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
@@ -112,7 +112,7 @@ impl PartFacts {
     /// around with them — a footprint whose origin isn't its centre (a pot's origin
     /// sits at pin 1, its body several mm away) lands somewhere quite different
     /// once rotated, so the offset must rotate too.
-    fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
+    pub fn keepout_at_rot(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Rect {
         // Mirror the *local* Y before rotating, not the rotated result. A
         // back-side footprint is flipped in its own frame and then turned; doing
         // it the other way round is only harmless at 0°/180°, and put a
@@ -143,7 +143,7 @@ impl PartFacts {
     /// opposite them — and a rotated part's pins move, so the rotation must be
     /// applied here or the placer reserves the wrong squares (a rotated pot's
     /// mounting lugs land on top of a back-side SMD pad).
-    fn tht_pads_at(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Vec<Rect> {
+    pub fn tht_pads_at(&self, x: f64, y: f64, back: bool, rot_deg: f64) -> Vec<Rect> {
         self.tht_pads
             .iter()
             .map(|&r| {
@@ -488,15 +488,32 @@ impl Placer for EurorackPlacer {
             } else {
                 (0.0, (ew, eh))
             };
+            let back = POWER_HEADER_ON_BACK || side_of(r);
+            // Lay it out by keep-out centre, then convert to a footprint origin —
+            // a 2×5 header's origin is pin 1, several mm from its body centre.
+            // See the same correction in `SeededPlacer::place`.
+            let (kox, koy) = facts
+                .get(*r)
+                .map(|f| {
+                    rotate_local(
+                        if back {
+                            (f.origin_offset.0, -f.origin_offset.1)
+                        } else {
+                            f.origin_offset
+                        },
+                        rotation_deg,
+                    )
+                })
+                .unwrap_or((0.0, 0.0));
             let cx = (header_x + w / 2.0).min(self.width_mm - margin - w / 2.0);
             let cy = margin + h / 2.0;
             out.insert(
                 r.to_string(),
                 Placement {
-                    x_mm: self.origin_mm.0 + cx,
-                    y_mm: self.origin_mm.1 + cy,
+                    x_mm: self.origin_mm.0 + cx - kox,
+                    y_mm: self.origin_mm.1 + cy - koy,
                     rotation_deg,
-                    back: POWER_HEADER_ON_BACK || side_of(r),
+                    back,
                 },
             );
             boxes.push(box_of(cx, cy, (w, h)));
@@ -808,23 +825,40 @@ impl Placer for SeededPlacer {
             } else {
                 (0.0, (ew, eh))
             };
+            // Lay the header out by its KEEP-OUT centre and convert back to a
+            // footprint origin, exactly as the anchored and free paths do. A 2×5
+            // header's origin is pin 1, ~5mm from the middle of its body, so
+            // treating the origin as the centre hung its copper 3.6mm off the
+            // left edge of every board this project has built — invisible at
+            // widths where legalize could shuffle it back, and a hard
+            // `[physical] J3 hangs past the board's edge clearance` refusal at
+            // 8 HP.
+            let (kox, koy) = rotate_local(
+                if back {
+                    (f.origin_offset.0, -f.origin_offset.1)
+                } else {
+                    f.origin_offset
+                },
+                rotation_deg,
+            );
             let cx = (header_x + w / 2.0).min(self.width_mm - margin - w / 2.0);
             let cy = margin + h / 2.0;
+            let (px, py) = (cx - kox, cy - koy);
             out.insert(
                 refdes.clone(),
                 Placement {
-                    x_mm: self.origin_mm.0 + cx,
-                    y_mm: self.origin_mm.1 + cy,
+                    x_mm: self.origin_mm.0 + px,
+                    y_mm: self.origin_mm.1 + py,
                     rotation_deg,
                     back,
                 },
             );
             boxes.push(Placed {
-                body: f.keepout_at_rot(cx, cy, back, rotation_deg),
+                body: f.keepout_at_rot(px, py, back, rotation_deg),
                 back,
                 height_mm: f.height_mm,
                 standoff_mm: f.standoff_mm,
-                tht_pads: f.tht_pads_at(cx, cy, back, rotation_deg),
+                tht_pads: f.tht_pads_at(px, py, back, rotation_deg),
             });
             pos.insert(refdes.clone(), (cx, cy));
             placed.insert(refdes.clone());
@@ -884,140 +918,296 @@ impl Placer for SeededPlacer {
             adj.entry(ic).or_default().push((cap, w));
         }
 
-        // Greedy: repeatedly place the unplaced free part most tied to what's down.
-        let mut remaining = free.clone();
-        // Running top of the off-board overflow lane (board-local, below the edge).
-        let mut overflow_top = self.height_mm + OVERFLOW_GAP_MM;
-        while !remaining.is_empty() {
-            let pull_to_placed = |r: &str| -> f64 {
-                adj.get(r)
-                    .map(|v| {
-                        v.iter()
-                            .filter(|(nb, _)| placed.contains(nb))
-                            .map(|(_, w)| *w)
-                            .sum()
+        // The seed every attempt starts from: anchors + power header, which are
+        // not this placer's opinion and never move between attempts.
+        let (seed_out, seed_boxes, seed_pos, seed_placed) = (out, boxes, pos, placed);
+
+        // One greedy pack of the free parts. `first` is placed ahead of
+        // everything else — see the repack loop below for why.
+        let attempt = |first: &HashSet<String>| -> (HashMap<String, Placement>, Vec<String>) {
+            let mut out = seed_out.clone();
+            let mut boxes = seed_boxes.clone();
+            let mut pos = seed_pos.clone();
+            let mut placed = seed_placed.clone();
+            let mut homeless: Vec<String> = Vec::new();
+            // Greedy: repeatedly place the unplaced free part most tied to what's down.
+            let mut remaining = free.clone();
+            // Running top of the off-board overflow lane (board-local, below the edge).
+            let mut overflow_top = self.height_mm + OVERFLOW_GAP_MM;
+            while !remaining.is_empty() {
+                let pull_to_placed = |r: &str| -> f64 {
+                    adj.get(r)
+                        .map(|v| {
+                            v.iter()
+                                .filter(|(nb, _)| placed.contains(nb))
+                                .map(|(_, w)| *w)
+                                .sum()
+                        })
+                        .unwrap_or(0.0)
+                };
+                // Anything in `first` outranks everything else; then highest pull
+                // wins; ties break to the lowest base-order index so the result is
+                // deterministic.
+                let best = (0..remaining.len())
+                    .max_by(|&i, &j| {
+                        let (a, b) = (&remaining[i], &remaining[j]);
+                        first
+                            .contains(a)
+                            .cmp(&first.contains(b))
+                            .then_with(|| {
+                                pull_to_placed(a)
+                                    .partial_cmp(&pull_to_placed(b))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .then(free_index[b].cmp(&free_index[a]))
                     })
-                    .unwrap_or(0.0)
-            };
-            // Highest pull wins; ties break to the lowest base-order index so the
-            // result is deterministic.
-            let best = (0..remaining.len())
-                .max_by(|&i, &j| {
-                    let (a, b) = (&remaining[i], &remaining[j]);
-                    pull_to_placed(a)
-                        .partial_cmp(&pull_to_placed(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(free_index[b].cmp(&free_index[a]))
-                })
-                .unwrap_or(0);
-            let r = remaining.remove(best);
-            let back = side_of(&r);
-            let f = facts_of(&r);
-            // Turn a part portrait only when it's genuinely too wide for the board
-            // — a part wider than half the usable width would otherwise crowd out
-            // its neighbours. A needless rotation of a fine-pitch part (a SOIC on a
-            // roomy board) only hurts its pin fanout, so don't. Rotation uses
-            // KiCad's convention (a point (px,py) → (py,−px)): the keep-out extent
-            // swaps and its origin offset rotates with it.
-            let usable_w = (self.width_mm - 2.0 * margin).max(1.0);
-            // Only turn THROUGH-HOLE parts portrait. Rotating a fine-pitch SMD IC
-            // (a SOIC) hurts pin fanout AND — the j54.25 bug — its rotated pads
-            // trip shorting/soldermask DRC on the back layer; leave SMD unrotated.
-            let rot =
-                if !f.tht_pads.is_empty() && f.extent.0 > f.extent.1 && f.extent.0 > usable_w * 0.5
+                    .unwrap_or(0);
+                let r = remaining.remove(best);
+                let back = side_of(&r);
+                let f = facts_of(&r);
+                // Turn a part portrait only when it's genuinely too wide for the board
+                // — a part wider than half the usable width would otherwise crowd out
+                // its neighbours. A needless rotation of a fine-pitch part (a SOIC on a
+                // roomy board) only hurts its pin fanout, so don't. Rotation uses
+                // KiCad's convention (a point (px,py) → (py,−px)): the keep-out extent
+                // swaps and its origin offset rotates with it.
+                let usable_w = (self.width_mm - 2.0 * margin).max(1.0);
+                // PREFERRED pose. A through-hole part wider than half the usable width
+                // stands portrait so it doesn't crowd out its neighbours; everything
+                // else, SMD especially, stays as drawn — turning a fine-pitch SOIC
+                // hurts its pin fanout, so it is not something to do for fun.
+                let preferred = if !f.tht_pads.is_empty()
+                    && f.extent.0 > f.extent.1
+                    && f.extent.0 > usable_w * 0.5
                 {
                     90.0
                 } else {
                     0.0
                 };
-            // Flip in the footprint's own frame first, then turn it — the same
-            // order as `keepout_at_rot`, so this target agrees with the keep-out
-            // the placer will go on to reserve for the part.
-            let flipped = if back {
-                (f.origin_offset.0, -f.origin_offset.1)
-            } else {
-                f.origin_offset
-            };
-            let (ext, (ox, oy)) = if rot == 90.0 {
-                ((f.extent.1, f.extent.0), rotate_local(flipped, 90.0))
-            } else {
-                (f.extent, flipped)
-            };
+                // …and the OTHER quarter turn, as a fallback. The preference above is
+                // a preference; a part that fits nowhere in it used to be thrown off
+                // the board, and `minimum_hp` read that as "this width is too narrow"
+                // and widened the panel. On the 4 HP slew limiter that dropped exactly
+                // two parts — C5 (pre-turned portrait into a slot no strip was tall
+                // enough for) and U1 (a SOIC that only fits a 20mm board lying down) —
+                // on a board 44% occupied (`legion-of-bom-unc`). Turning a part is a
+                // far smaller concession than giving up on it, so try both before the
+                // overflow lane. Rotated SMD is only safe now that a rotated
+                // footprint's pads carry the rotation; see `turn_pad_with_footprint`.
+                let poses = [preferred, if preferred == 0.0 { 90.0 } else { 0.0 }];
 
-            // Target: weighted centroid of already-placed neighbours, else an
-            // even-spread row (the EurorackPlacer fallback) for the first parts.
-            let mut num = (0.0, 0.0);
-            let mut den = 0.0;
-            if let Some(v) = adj.get(&r) {
-                for (nb, w) in v {
-                    if let Some(&(nx, ny)) = pos.get(nb) {
-                        num.0 += w * nx;
-                        num.1 += w * ny;
-                        den += *w;
+                // Geometry of one pose: keep-out extent (swapped on a quarter turn)
+                // and the keep-out's offset from the footprint origin. Flip in the
+                // footprint's own frame first, then turn it — the same order as
+                // `keepout_at_rot`, so this agrees with the keep-out the placer will
+                // go on to reserve.
+                let flipped = if back {
+                    (f.origin_offset.0, -f.origin_offset.1)
+                } else {
+                    f.origin_offset
+                };
+                let pose_geom = |rot: f64| -> ((f64, f64), (f64, f64)) {
+                    if rot == 0.0 {
+                        (f.extent, flipped)
+                    } else {
+                        ((f.extent.1, f.extent.0), rotate_local(flipped, rot))
+                    }
+                };
+
+                // Target: weighted centroid of already-placed neighbours, else an
+                // even-spread row (the EurorackPlacer fallback) for the first parts.
+                let mut num = (0.0, 0.0);
+                let mut den = 0.0;
+                if let Some(v) = adj.get(&r) {
+                    for (nb, w) in v {
+                        if let Some(&(nx, ny)) = pos.get(nb) {
+                            num.0 += w * nx;
+                            num.1 += w * ny;
+                            den += *w;
+                        }
                     }
                 }
-            }
-            let target = if den > 0.0 {
-                (num.0 / den, num.1 / den)
-            } else {
-                let ty = (y0 + (free_index[&r] as f64 + 0.5) / n * (y1 - y0)).clamp(y0, y1 - ext.1);
-                ((x0 + x1) / 2.0, ty)
-            };
-            let nudge = self.nudges.get(&r).copied().unwrap_or((0.0, 0.0));
-            let target = (target.0 + nudge.0, target.1 + nudge.1);
+                let nudge = self.nudges.get(&r).copied().unwrap_or((0.0, 0.0));
 
-            // Through-hole pins at a candidate keep-out centre (cx,cy): the origin
-            // sits at (cx-ox, cy-oy), and the pins rotate with the part.
-            let cand_tht =
-                |cx: f64, cy: f64| -> Vec<Rect> { f.tht_pads_at(cx - ox, cy - oy, back, rot) };
-            // Nearest spot whose body + pins clash with nothing already placed
-            // (side- and height-aware — 25z.5); if the board is full, drop it just
-            // below the outline where DRC flags it (never overlap).
-            let clear = |cx: f64, cy: f64| {
-                let body = (
-                    cx - ext.0 / 2.0,
-                    cy - ext.1 / 2.0,
-                    cx + ext.0 / 2.0,
-                    cy + ext.1 / 2.0,
+                // Nearest spot whose body + pins clash with nothing already placed
+                // (side- and height-aware — 25z.5), in the first pose that has one.
+                let try_pose = |rot: f64| -> Option<Rect> {
+                    let (ext, (ox, oy)) = pose_geom(rot);
+                    let target = if den > 0.0 {
+                        (num.0 / den, num.1 / den)
+                    } else {
+                        let ty = (y0 + (free_index[&r] as f64 + 0.5) / n * (y1 - y0))
+                            .clamp(y0, y1 - ext.1);
+                        ((x0 + x1) / 2.0, ty)
+                    };
+                    let target = (target.0 + nudge.0, target.1 + nudge.1);
+                    // Through-hole pins at a candidate keep-out centre (cx,cy): the
+                    // origin sits at (cx-ox, cy-oy), and the pins rotate with the part.
+                    let clear = |cx: f64, cy: f64| {
+                        let body = (
+                            cx - ext.0 / 2.0,
+                            cy - ext.1 / 2.0,
+                            cx + ext.0 / 2.0,
+                            cy + ext.1 / 2.0,
+                        );
+                        placement_clear(
+                            &body,
+                            back,
+                            f.height_mm,
+                            f.standoff_mm,
+                            &f.tht_pads_at(cx - ox, cy - oy, back, rot),
+                            &boxes,
+                            clearance,
+                        )
+                    };
+                    nearest_clear_spot(target, ext, bounds, step, clear)
+                };
+                let (rot, found) = poses
+                    .iter()
+                    .find_map(|&rot| try_pose(rot).map(|c| (rot, Some(c))))
+                    // Nowhere in either pose: drop it below the outline in the
+                    // preferred one, where DRC flags it honestly (never overlap).
+                    .unwrap_or((preferred, None));
+                let (ext, (ox, oy)) = pose_geom(rot);
+                // `LOB_PLACE_TRACE=1` prints the packing decision per part —
+                // order, pose, and whether it found a spot. The question "which
+                // part could not be placed, and when" has no other answer from
+                // outside, and asking it is what turned "4 HP is 44% occupied
+                // and fails" into a mechanism (`legion-of-bom-unc`). Pairs with
+                // crates/core/examples/place_probe.rs.
+                if std::env::var_os("LOB_PLACE_TRACE").is_some() {
+                    eprintln!(
+                        "TRACE #{:02} {:<4} ext={:.2}x{:.2} rot={rot:.0} back={back} -> {}",
+                        free.len() - remaining.len(),
+                        r,
+                        ext.0,
+                        ext.1,
+                        match found {
+                            Some(c) =>
+                                format!("({:.2},{:.2})", (c.0 + c.2) / 2.0, (c.1 + c.3) / 2.0),
+                            None => "OVERFLOW".to_string(),
+                        }
+                    );
+                }
+                if found.is_none() {
+                    homeless.push(r.clone());
+                }
+                let cand = found.unwrap_or_else(|| overflow_drop(x0, ext, &mut overflow_top));
+                let (cx, cy) = ((cand.0 + cand.2) / 2.0, (cand.1 + cand.3) / 2.0);
+                out.insert(
+                    r.clone(),
+                    Placement {
+                        x_mm: self.origin_mm.0 + cx - ox,
+                        y_mm: self.origin_mm.1 + cy - oy,
+                        rotation_deg: rot,
+                        back,
+                    },
                 );
-                placement_clear(
-                    &body,
+                boxes.push(Placed {
+                    body: cand,
                     back,
-                    f.height_mm,
-                    f.standoff_mm,
-                    &cand_tht(cx, cy),
-                    &boxes,
-                    clearance,
-                )
-            };
-            let cand = nearest_clear_spot(target, ext, bounds, step, clear)
-                .unwrap_or_else(|| overflow_drop(x0, ext, &mut overflow_top));
-            let (cx, cy) = ((cand.0 + cand.2) / 2.0, (cand.1 + cand.3) / 2.0);
-            out.insert(
-                r.clone(),
-                Placement {
-                    x_mm: self.origin_mm.0 + cx - ox,
-                    y_mm: self.origin_mm.1 + cy - oy,
-                    rotation_deg: rot,
-                    back,
-                },
-            );
-            boxes.push(Placed {
-                body: cand,
-                back,
-                height_mm: f.height_mm,
-                standoff_mm: f.standoff_mm,
-                tht_pads: cand_tht(cx, cy),
-            });
-            pos.insert(r.clone(), (cx, cy));
-            placed.insert(r);
+                    height_mm: f.height_mm,
+                    standoff_mm: f.standoff_mm,
+                    tht_pads: f.tht_pads_at(cx - ox, cy - oy, back, rot),
+                });
+                pos.insert(r.clone(), (cx, cy));
+                placed.insert(r);
+            }
+            (out, homeless)
+        };
+
+        // FAIL-FIRST REPACK. A greedy packer places in order of connectivity and
+        // cannot undo: the two ICs on the 4 HP slew limiter compete for the one
+        // back-side band tall enough to hold either, and U2 wins it because it is
+        // netted to what is already down. U1 is then thrown off the board — and
+        // `minimum_hp` reads that as "20.32mm is too narrow" and silently builds
+        // a 6 HP board instead. Measured: on an *empty* 4 HP board every free
+        // part, U1 included, has a legal spot. So the width was never the
+        // problem; the order was (`legion-of-bom-unc`, `legion-of-bom-d8t`).
+        //
+        // The repair is the standard fail-first one: whoever could not be placed
+        // is the most constrained part, so run it again with those parts placed
+        // ahead of everything else. Each pass learns the names of the parts the
+        // last one could not fit, so it converges or stops learning; and a board
+        // that packs first time never enters the loop, which keeps every
+        // currently-buildable board byte-identical.
+        let mut best: Option<(HashMap<String, Placement>, Vec<String>)> = None;
+        let mut go_first: HashSet<String> = HashSet::new();
+        for _ in 0..=MAX_REPACK_PASSES {
+            let (placements, homeless) = attempt(&go_first);
+            if best.as_ref().is_none_or(|(_, h)| homeless.len() < h.len()) {
+                best = Some((placements, homeless.clone()));
+            }
+            if homeless.is_empty() {
+                break;
+            }
+            let before = go_first.len();
+            go_first.extend(homeless);
+            if go_first.len() == before {
+                break; // nothing new to learn — this is as good as it gets
+            }
         }
-        out
+        best.expect("at least one packing attempt").0
     }
 }
 
+/// How many times to re-pack with the parts that did not fit moved to the front.
+///
+/// Each pass costs a full greedy pack and only runs when something was left off
+/// the board, so this is about how many *different* bottlenecks one board is
+/// allowed to have. Beyond a handful the answer is a different width or a
+/// different circuit, not more passes.
+const MAX_REPACK_PASSES: usize = 4;
+
 /// One placed part's keep-out for placement: its body (on its own side), plus its
 /// through-hole pins (both sides), height, and — if a sub-board — standoff.
+/// The first already-placed part `me` would clash with at `at`, if any.
+///
+/// Mirrors [`crate::board::placement_clear`]'s rules, and the second one is the
+/// one that matters: **bodies clash only on the same side, but through-hole pads
+/// are copper on BOTH layers**, so a back-side part must still avoid a front-side
+/// part's pins. Treating "different side" as "cannot collide" is what soldered a
+/// back-side 0603 onto the back annulus of a front jack's pin and made an entire
+/// power net unroutable.
+///
+/// Deterministic: candidates are visited in sorted order, so a board that skips a
+/// snap skips the same one every run.
+pub(crate) fn first_overlap(
+    me: &str,
+    at: &Placement,
+    placements: &HashMap<String, Placement>,
+    facts: &HashMap<String, PartFacts>,
+) -> Option<String> {
+    let mine = facts.get(me)?;
+    let body = mine.keepout_at_rot(at.x_mm, at.y_mm, at.back, at.rotation_deg);
+    let my_pads = mine.tht_pads_at(at.x_mm, at.y_mm, at.back, at.rotation_deg);
+    let hit = |a: &Rect, b: &Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
+
+    let mut others: Vec<&String> = placements.keys().filter(|r| r.as_str() != me).collect();
+    others.sort();
+    for other in others {
+        let (Some(of), Some(op)) = (facts.get(other), placements.get(other)) else {
+            continue;
+        };
+        let their_body = of.keepout_at_rot(op.x_mm, op.y_mm, op.back, op.rotation_deg);
+        let their_pads = of.tht_pads_at(op.x_mm, op.y_mm, op.back, op.rotation_deg);
+        // Same-side bodies.
+        if op.back == at.back && hit(&body, &their_body) {
+            return Some(other.clone());
+        }
+        // Their pins, through the board, into my body — and mine into theirs.
+        if their_pads.iter().any(|q| hit(&body, q))
+            || my_pads
+                .iter()
+                .any(|c| hit(c, &their_body) || their_pads.iter().any(|q| hit(c, q)))
+        {
+            return Some(other.clone());
+        }
+    }
+    None
+}
+
+#[derive(Clone)]
 struct Placed {
     body: Rect,
     back: bool,
@@ -1243,7 +1433,14 @@ impl BoardOptions {
         BoardOptions {
             footprint_dir: footprint_dir.into(),
             placer: Box::new(GridPlacer::default()),
-            router: Some(Box::new(GridRouter)),
+            // Still GridRouter, deliberately. `PathfinderRouter` is measurably
+            // the better *router* — at a fixed placement it beats this on every
+            // width tried — but end-to-end through the layout loop the two are a
+            // wash on the flagship board, and one of the six placement attempts
+            // wins by a different margin. Switching the default is a decision to
+            // make once that interaction is understood, not a side effect of
+            // landing the algorithm (see legion-of-bom route bench).
+            router: Some(Box::new(PathfinderRouter::default())),
             route_options: RouteOptions::default(),
             ground_net: Some("GND".into()),
             outline_margin_mm: 5.0,
@@ -1534,20 +1731,21 @@ pub fn generate_board_artifacts(
     // competing claim on that exact spot, so this is set, not scored.
     crate::decouple::snap(&mut placements, circuit, &facts);
 
-    // The passives on an op-amp input go against that pin, for the same reason
-    // and by the same mechanism. A summing junction is high-impedance, so the
-    // node wants to be almost no copper; the placer cannot deliver that, because
-    // a resistor tied to both a panel pot and the summing node has its optimum
-    // halfway between the two — measured at 43mm, and identical at 8 HP and
-    // 10 HP, so it is not a space problem. See `crate::summing`.
-    crate::summing::snap(
-        &mut placements,
-        circuit,
-        &facts,
-        &pinned,
-        crate::skidl::kicad_symbol_dir().as_ref().map(|d| d.path()),
-        options.fixed_outline,
-    );
+    // summing::snap is DELIBERATELY NOT CALLED — see legion-of-bom-6yh.
+    //
+    // It was landed to make CTRL_FB/CTRL_SUM routable and it did. But once the
+    // cross-side through-hole collision was fixed (legion-of-bom-ude) those nets
+    // route without it, and with it the flagship board is measurably worse:
+    //
+    //     with     4 unrouted,  7 DRC,  1 connection impossible by placement
+    //     without  2 unrouted,  2 DRC,  0
+    //
+    // Guarding it against occupied space (the fix that rescued decouple::snap)
+    // changed nothing, so the harm is not collisions — it is that a pass which
+    // OVERRIDES placement cannot be traded off, and so wins even when it costs
+    // five DRC errors. The objective is real and belongs in the score instead:
+    // legion-of-bom-tsy.3 replaces it with a high-impedance-node rule. The module
+    // and its reasoning are kept as the record of what was learned.
 
     // Legalization — the middle stage. Global placement decides roughly where
     // things want to be; this moves whatever is physically illegal the minimum
@@ -2293,6 +2491,7 @@ fn transform_footprint(
             }
             Some("pad") => {
                 let pad_num = item.nth_atom(1).unwrap_or_default().to_string();
+                turn_pad_with_footprint(item, placement.rotation_deg);
                 if let Some(l) = item.as_list_mut() {
                     if let Some(&name) = pin_net.get(&(refdes.to_string(), pad_num.clone())) {
                         let idx = net_index.get(name).copied().unwrap_or(0);
@@ -2316,6 +2515,47 @@ fn transform_footprint(
         }
     }
     fp
+}
+
+/// Carry a footprint's rotation into one of its pads' own `at` angle.
+///
+/// In a `.kicad_pcb` a pad's `(at x y angle)` holds its position in the
+/// footprint's *unrotated local* frame but its angle in **board space**. So
+/// rotating a footprint turns the pad positions — KiCad does that from the
+/// footprint's `(at … rot)` — while the pad *shapes* keep whatever angle is
+/// written here. Copy a library pad verbatim into a rotated footprint and the
+/// two disagree: a SOIC-14's 1.95 × 0.6 mm pads end up lying broadside across a
+/// 1.27 mm pitch, overlapping every neighbour.
+///
+/// That is `legion-of-bom-j54.25`, and KiCad was the oracle for it: the shipping
+/// slew limiter with U2 turned 90° reports 10 pad-to-pad `shorting_items` + 10
+/// `solder_mask_bridge` inside that one part, and adding the 90° here takes both
+/// to zero with nothing else changed. The workaround had been to forbid the
+/// placer from ever turning an SMD part — which is what made a 4 HP board
+/// impossible (`legion-of-bom-unc`), because the only pose a SOIC fits a narrow
+/// module in is sideways.
+fn turn_pad_with_footprint(pad: &mut Sexpr, rot_deg: f64) {
+    if rot_deg == 0.0 {
+        return;
+    }
+    let Some(list) = pad.as_list_mut() else {
+        return;
+    };
+    let Some(at) = list
+        .iter_mut()
+        .find(|c| c.head() == Some("at"))
+        .and_then(|c| c.as_list_mut())
+    else {
+        return;
+    };
+    // `(at x y)` means angle 0 — make it explicit before turning it.
+    if at.len() < 4 {
+        at.push(Sexpr::sym("0"));
+    }
+    let base = at[3].as_atom().and_then(|s| s.parse::<f64>().ok());
+    if let Some(base) = base {
+        at[3] = Sexpr::sym(mm((base + rot_deg).rem_euclid(360.0)));
+    }
 }
 
 /// Flip a sided layer name between front and back (`F.SilkS` ↔ `B.SilkS`, …).
@@ -2580,7 +2820,7 @@ fn power_polarity_silk(
 }
 
 /// `(min_x, min_y, max_x, max_y)`.
-type Rect = (f64, f64, f64, f64);
+pub(crate) type Rect = (f64, f64, f64, f64);
 
 /// An `Edge.Cuts` rectangle — the board outline.
 fn edge_cuts_rect((x1, y1, x2, y2): Rect) -> Sexpr {
@@ -3028,6 +3268,179 @@ mod tests {
         // An anchored header is not a free power header.
         let anchored: HashMap<String, (f64, f64)> = [("J3".to_string(), (0.0, 0.0))].into();
         assert!(power_header_refdes(&c, &anchored).is_empty());
+    }
+
+    /// A `.kicad_pcb` footprint pad's `at` angle is **absolute board
+    /// orientation**, not an angle relative to its footprint: rotating a
+    /// footprint turns its pad *positions* and carries the same turn into every
+    /// pad's own `at`. Copying a library pad verbatim into a rotated footprint
+    /// therefore turns the positions and leaves the pad *shapes* facing the old
+    /// way — which on a SOIC-14 lays every 1.95 × 0.6 mm pad across a 1.27 mm
+    /// pitch and shorts each adjacent pair.
+    ///
+    /// Measured with KiCad as the oracle (legion-of-bom-j54.25): the shipping
+    /// slew limiter with U2 turned 90° reports 10 pad-to-pad `shorting_items`
+    /// and 10 `solder_mask_bridge` inside that one part; adding 90° to each
+    /// pad's `at` angle takes both to **zero**, nothing else changed. Never
+    /// rotating SMD was the band-aid over this, and that band-aid is what made
+    /// a 4 HP board impossible (legion-of-bom-unc).
+    #[test]
+    fn a_rotated_footprints_pads_carry_the_rotation() {
+        let lib = Sexpr::parse(
+            r#"(footprint "SOIC-14"
+                 (layer "F.Cu")
+                 (pad "1" smd roundrect (at -2.475 3.81) (size 1.95 0.6) (layers "F.Cu"))
+                 (pad "2" smd roundrect (at -2.475 2.54 45) (size 1.95 0.6) (layers "F.Cu")))"#,
+        )
+        .expect("fixture parses");
+        let angle_of = |s: &Sexpr, num: &str| -> f64 {
+            let pad = s
+                .as_list()
+                .expect("list")
+                .iter()
+                .find(|c| c.head() == Some("pad") && c.nth_atom(1) == Some(num))
+                .expect("pad present");
+            let at = pad
+                .as_list()
+                .expect("list")
+                .iter()
+                .find(|c| c.head() == Some("at"))
+                .expect("pad has an (at …)");
+            at.nth_atom(3)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        let place = |rot: f64, back: bool| {
+            transform_footprint(
+                lib.clone(),
+                "Package_SO:SOIC-14",
+                "U1",
+                "TL074",
+                SilkValues::None,
+                Placement {
+                    x_mm: 100.0,
+                    y_mm: 50.0,
+                    rotation_deg: rot,
+                    back,
+                },
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        // Unrotated: the library angles stand.
+        let flat = place(0.0, false);
+        assert_eq!(angle_of(&flat, "1"), 0.0);
+        assert_eq!(angle_of(&flat, "2"), 45.0);
+
+        // Rotated 90°: every pad's own angle turns with the footprint.
+        let turned = place(90.0, false);
+        assert_eq!(angle_of(&turned, "1"), 90.0, "a 0° pad becomes 90°");
+        assert_eq!(angle_of(&turned, "2"), 135.0, "a 45° pad becomes 135°");
+
+        // On the back the flip has already reversed handedness (45° → −45°),
+        // and the board rotation is added to *that*. Getting this sign wrong is
+        // invisible on the rectangular pads most parts use and wrong on the rest.
+        let back = place(90.0, true);
+        assert_eq!(angle_of(&back, "1"), 90.0);
+        assert_eq!(angle_of(&back, "2"), 45.0, "flip negates, then rotate adds");
+    }
+
+    /// The packer used to pick one pose per part from a width heuristic and
+    /// search only that pose; a part that fit nowhere in it was thrown into the
+    /// off-board overflow lane, and `minimum_hp` read that as "this width is too
+    /// narrow". Both quarter turns are now tried before giving up.
+    ///
+    /// Fixture geometry is derived from the code under test, not guessed: the
+    /// board is exactly as wide as the anchor plus clearance allows, so the only
+    /// free space is a landscape slot the portrait pose cannot use.
+    #[test]
+    fn a_part_that_fits_only_sideways_is_placed_not_dropped_off_the_board() {
+        // Anchor A1 fills the top of a 20mm-wide board. Below it there is a
+        // 6mm-tall strip: room for a 12×2 part lying down, never standing up.
+        let c = Circuit {
+            name: "turn".into(),
+            parts: vec![Part::new("A1", "anchor"), Part::new("C5", "film")],
+            nets: vec![Net::new(
+                "N1",
+                vec![PinRef::new("A1", "1"), PinRef::new("C5", "1")],
+            )],
+        };
+        let (board_w, board_h) = (20.0, 30.0);
+        let mut facts = HashMap::new();
+        // The anchor occupies y 1.5..22.5 across the full usable width, leaving
+        // 22.5 + PLACE_CLEARANCE_MM .. board_h - EDGE_MARGIN_MM = 24..28.5 free.
+        facts.insert("A1".into(), a_fact((17.0, 21.0), (0.0, 0.0), vec![]));
+        // 12 × 2 with a through-hole pad, so the width heuristic (extent.0 >
+        // half the usable width) turns it portrait — into a pose that needs 12mm
+        // of height in a 4.5mm strip.
+        facts.insert(
+            "C5".into(),
+            a_fact((12.0, 2.0), (0.0, 0.0), vec![(-5.0, -0.5, -4.0, 0.5)]),
+        );
+        let anchors: HashMap<String, (f64, f64)> = [("A1".to_string(), (10.0, 12.0))].into();
+        let p = SeededPlacer::new(board_w, board_h, (0.0, 0.0), anchors).place(&c, &facts);
+
+        let c5 = p["C5"];
+        assert!(
+            c5.y_mm <= board_h,
+            "C5 landed in the off-board overflow lane at y={:.2} (board is {board_h}mm tall)",
+            c5.y_mm
+        );
+        assert_eq!(c5.rotation_deg, 0.0, "it fits lying down, so it lies down");
+        let ko = facts["C5"].keepout_at_rot(c5.x_mm, c5.y_mm, c5.back, c5.rotation_deg);
+        assert!(
+            ko.0 >= EDGE_MARGIN_MM - 1e-9 && ko.2 <= board_w - EDGE_MARGIN_MM + 1e-9,
+            "and inside the board: {ko:?}"
+        );
+    }
+
+    /// The power-header lane laid the header out as if its keep-out were centred
+    /// on the footprint origin. A 2×5 header's origin is pin 1, ~5mm from the
+    /// middle of its body, so its copper sat 3.6mm off the left edge of every
+    /// board this project has built — and at 8 HP that became a hard
+    /// `[physical] J3 hangs past the board's edge clearance` refusal.
+    #[test]
+    fn a_power_header_lands_inside_the_board_despite_its_off_centre_origin() {
+        use crate::model::{Circuit, Part, RefDes};
+        let c = Circuit {
+            name: "pwr".into(),
+            parts: vec![Part {
+                refdes: RefDes("J3".into()),
+                value: String::new(),
+                footprint: Some("Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm".into()),
+                library_part: None,
+                mpn: None,
+                sim: None,
+                side: None,
+            }],
+            nets: vec![],
+        };
+        // Origin at pin 1, body centred 5.08mm along +X and 1.27mm along +Y —
+        // the real 2×5 header's geometry.
+        let mut facts = HashMap::new();
+        facts.insert(
+            "J3".into(),
+            a_fact(
+                (6.24, 13.86),
+                (1.27, 5.08),
+                vec![(-1.25, -1.25, 1.25, 1.25)],
+            ),
+        );
+        for width in [20.32f64, 30.48, 40.64] {
+            let p = SeededPlacer::new(width, 128.5, (0.0, 0.0), HashMap::new()).place(&c, &facts);
+            let j3 = p["J3"];
+            let ko = facts["J3"].keepout_at_rot(j3.x_mm, j3.y_mm, j3.back, j3.rotation_deg);
+            assert!(
+                ko.0 >= EDGE_MARGIN_MM - 1e-9 && ko.2 <= width - EDGE_MARGIN_MM + 1e-9,
+                "at {width}mm wide the header keep-out {ko:?} must sit inside the board"
+            );
+            for pad in facts["J3"].tht_pads_at(j3.x_mm, j3.y_mm, j3.back, j3.rotation_deg) {
+                assert!(
+                    pad.0 >= 0.0 && pad.2 <= width,
+                    "at {width}mm wide the header pad {pad:?} must be on the board"
+                );
+            }
+        }
     }
 
     /// A 2×5 Eurorack header, KiCad odd/even numbering: pins 1+2 are one rank,

@@ -165,6 +165,15 @@ enum Command {
         #[command(subcommand)]
         action: ImportCmd,
     },
+    /// Set up (or tidy) a circuits repo: write the .gitignore for lob's
+    /// generated outputs, and report any generated files that are tracked.
+    ///
+    /// Idempotent — safe to re-run after upgrading lob to pick up new patterns.
+    Init {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Panel design: generate DXF, track orders.
     Panel {
         #[command(subcommand)]
@@ -419,6 +428,7 @@ fn main() -> ExitCode {
         Command::Status => status_cmd(),
         Command::Serve { bind } => serve_cmd(bind),
         Command::Doctor => doctor::run(),
+        Command::Init { dry_run } => init_cmd(dry_run),
         Command::Parts { action } => parts_cmd(action),
         Command::Bom {
             circuit,
@@ -541,6 +551,14 @@ fn run(circuit: PathBuf) -> Result<()> {
         ),
     }
 
+    // Stage: crosstalk — a multi-channel circuit has a question a single-channel
+    // one does not: do the channels stay independent? Drive channel 1 with a step
+    // sequence, hold every other channel's input at 0, and probe both outputs
+    // (tus.13 / 9wh). Self-selecting: skipped entirely on a single-channel board.
+    if let Some(outcome) = crosstalk_stage(&model, &sim_config, &work_dir) {
+        report.push(outcome);
+    }
+
     // Stage: verify — assert the simulated response against the textbook value
     // for this topology (RC cutoff, op-amp gain, …).
     report.push(analytic_check(&model, &ac, 0.02));
@@ -572,6 +590,82 @@ fn run(circuit: PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("pipeline reported stage failures")
     }
+}
+
+/// Dwell (s) each step of the crosstalk stimulus is held. Long enough for a slew
+/// limiter at its mid-rate setting (~40 V/s) to finish a 4 V transition.
+const CROSSTALK_DWELL_S: f64 = 0.15;
+
+/// A step *sequence* — a sequencer feeding the module, not a single edge (tus.13).
+/// Each level is held for [`CROSSTALK_DWELL_S`] and reached by a 0.1 ms edge, so
+/// the stimulus asks for far more slew rate than the circuit can deliver and the
+/// output is genuinely rate-limited rather than following the input.
+fn step_sequence(levels: &[f64]) -> Vec<(f64, f64)> {
+    let mut pwl = vec![(0.0, levels[0])];
+    let mut t = CROSSTALK_DWELL_S / 4.0;
+    for level in levels {
+        pwl.push((t, *pwl.last().map(|(_, v)| v).unwrap()));
+        pwl.push((t + 1e-4, *level));
+        t += CROSSTALK_DWELL_S;
+    }
+    pwl.push((t, *levels.last().unwrap()));
+    pwl
+}
+
+/// The crosstalk stage: on a multi-channel circuit, drive channel 1 and measure
+/// how much of it reaches channel 2's output. `None` on a single-channel circuit,
+/// which has no such question.
+///
+/// Two transient runs with an identical, deterministic stimulus — one probing
+/// the driven output, one the undriven one — because a driven transient probes a
+/// single net. Soft-failing on a simulation error: a circuit whose transient
+/// won't converge is surfaced as a warning, matching the step-response stage.
+fn crosstalk_stage(
+    model: &dyn CircuitSource,
+    sim_config: &SimConfig,
+    work_dir: &Path,
+) -> Option<StageOutcome> {
+    let channels = legion_of_bom_core::signal_channels(model);
+    if channels.len() < 2 {
+        return None;
+    }
+    let pwl = step_sequence(&[0.0, 2.0, -2.0, 1.0, 0.0]);
+    let stop_s = pwl.last().map(|(t, _)| *t).unwrap_or(1.0);
+    // Every channel but the first is held at 0 V — nothing patched in, so any
+    // movement on its output arrived from the channel that *is* being driven.
+    let quiet: Vec<(String, Vec<(f64, f64)>)> = channels[1..]
+        .iter()
+        .map(|(input, _)| (input.clone(), vec![(0.0, 0.0), (stop_s, 0.0)]))
+        .collect();
+
+    let probe = |net: &str| {
+        legion_of_bom_core::simulate_tran_drive(
+            model,
+            sim_config,
+            &legion_of_bom_core::TranDrive {
+                step_s: 2e-4,
+                stop_s,
+                pwl: pwl.clone(),
+                cv: quiet.clone(),
+                probe_net: Some(net.to_string()),
+            },
+            work_dir,
+        )
+    };
+
+    let (aggressor, victim) = match (probe(&channels[0].1), probe(&channels[1].1)) {
+        (Ok(a), Ok(v)) => (a, v),
+        (Err(e), _) | (_, Err(e)) => {
+            return Some(
+                StageOutcome::passed("crosstalk").with(Finding::warning(format!(
+                    "crosstalk run did not complete: {e}"
+                ))),
+            );
+        }
+    };
+    // 1e-3 = −60 dB. A netlist with ideal supplies should be orders below that;
+    // anything near it means the channels share a node.
+    legion_of_bom_core::check_channel_crosstalk(model, &aggressor, &victim, 1e-3)
 }
 
 /// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
@@ -787,6 +881,144 @@ fn placement_path(circuit: &Path, stem: &str) -> PathBuf {
         .parent()
         .unwrap_or(Path::new("."))
         .join(format!("{stem}.placement.toml"))
+}
+
+/// Handle `lob init` — make a repo track inputs and ignore outputs.
+///
+/// Two jobs, both idempotent. It merges lob's generated-output patterns into
+/// `.gitignore`, leaving anything the author wrote untouched; and it reports
+/// files that are *already tracked* but generated, because .gitignore does not
+/// retroactively untrack anything and those are the ones churning the diff.
+///
+/// It deliberately does NOT run `git rm --cached` itself: untracking is a change
+/// to somebody's index and belongs to them. It prints the exact command.
+fn init_cmd(dry_run: bool) -> Result<()> {
+    let path = PathBuf::from(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let merged = legion_of_bom_core::merge_gitignore(&existing);
+    let changed = merged != existing;
+
+    if changed && !dry_run {
+        std::fs::write(&path, &merged).with_context(|| format!("writing {}", path.display()))?;
+    }
+    println!(
+        "{} {}",
+        if !changed {
+            "  .gitignore already current:"
+        } else if dry_run {
+            "  would update"
+        } else {
+            "  wrote"
+        },
+        path.display()
+    );
+
+    // Tracked-but-generated: the files .gitignore cannot help with.
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let stale: Vec<&str> = tracked
+        .lines()
+        .filter(|l| legion_of_bom_core::is_generated(l))
+        .collect();
+    if stale.is_empty() {
+        println!("  no generated files are tracked — the repo tracks inputs only");
+        return Ok(());
+    }
+    println!(
+        "\n  {} tracked file(s) are generated by lob and should not be:",
+        stale.len()
+    );
+    let mut shown = 0;
+    for f in &stale {
+        if shown < 12 {
+            println!("    {f}");
+            shown += 1;
+        }
+    }
+    if stale.len() > shown {
+        println!("    … and {} more", stale.len() - shown);
+    }
+    println!("\n  Untracking is a change to your index, so lob will not do it for you:");
+    println!("    git rm -r --cached <paths above> && git commit -m 'untrack generated outputs'");
+    println!("  The files stay on disk; they simply stop being reviewed.");
+    Ok(())
+}
+
+/// Resolve a `lob panel` argument to the spec that should actually be built.
+///
+/// An existing file is used as given — an ad-hoc spec has no circuit to check
+/// against. Otherwise the argument is a circuit **name**: the manifest supplies
+/// its declared panel, and the *cached* netlist (no SKiDL run, no network) says
+/// whether that panel still matches the circuit. A stale one is reported and the
+/// derived substitute is built instead, exactly as the board build does — so the
+/// panel and the board can no longer disagree about how wide the module is.
+fn resolve_panel_spec(arg: &Path) -> Result<PathBuf> {
+    if arg.is_file() {
+        return Ok(arg.to_path_buf());
+    }
+    let resolved = resolve_circuit(arg)?;
+    let declared = resolved.panel.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' declares no panel — pass a spec file instead",
+            resolved.name
+        )
+    })?;
+    let stem = resolved.name.as_str();
+    let work_dir = PathBuf::from("out").join(stem);
+    // The cached netlist keeps this offline and instant; a panel is plotted far
+    // more often than a circuit changes.
+    let net = work_dir.join(format!("{stem}.net"));
+    let Ok(model) = parse_netlist_file(&net) else {
+        println!(
+            "  ⚠ no cached netlist for '{stem}' — plotting the declared panel unchecked\n    run `lob build {stem}` first to have it verified against the circuit"
+        );
+        return Ok(declared);
+    };
+    let footprint_dir = kicad_footprint_dir()
+        .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+    match effective_panel(
+        Some(declared.clone()),
+        &model,
+        &footprint_dir,
+        &work_dir,
+        stem,
+    )? {
+        Some(p) => Ok(p),
+        None => Ok(declared),
+    }
+}
+
+/// Iterations the guide's board gets. Matches `lob fab`'s default, because the
+/// point is that they produce the same board.
+const GUIDE_LAYOUT_ITERS: usize = 6;
+
+/// Generate a board the way every command should: the iterative layout loop when
+/// there is a panel to anchor to, one-shot placement when there is not.
+///
+/// Exists so no command can quietly emit a *different* board from the one the fab
+/// package contains. If you are about to call `generate_board_report` directly,
+/// you probably want this instead.
+fn build_layout(
+    model: &legion_of_bom_core::Circuit,
+    options: BoardOptions,
+    panel: &Option<PathBuf>,
+    iters: usize,
+) -> Result<String> {
+    match (seeded_template(panel)?, iters) {
+        (Some(template), n) if n > 0 => {
+            let cfg = LayoutLoop {
+                max_iters: n,
+                ..LayoutLoop::default()
+            };
+            Ok(run_layout_loop(model, options, template, &cfg)?.board)
+        }
+        _ => Ok(generate_board_report(model, &options)?.0),
+    }
 }
 
 /// The seeded-placer template for the iterative layout loop, when a panel is
@@ -1142,7 +1374,28 @@ fn fab_cmd(
     let placed = export_cpl(&board_path, &cpl_path, &kicad)?;
     let bom = generate_bom(&model);
     let bom_path = pkg.join(format!("{stem}-bom.csv"));
-    std::fs::write(&bom_path, jlc_bom_csv(&bom))
+    // Which parts the fab will NOT place, read off the BOARD's real pads rather
+    // than guessed from footprint names — a part is through-hole if it has a
+    // through-hole pad, and that is a fact about the geometry, not the string.
+    let hand_soldered: std::collections::HashSet<String> = guide::parse_board(&board)
+        .map(|parts| {
+            parts
+                .into_iter()
+                .filter(|p| p.through_hole)
+                .map(|p| p.refdes)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !hand_soldered.is_empty() {
+        let mut hs: Vec<&String> = hand_soldered.iter().collect();
+        hs.sort();
+        println!(
+            "  hand-soldered ({}, withheld from the assembly BOM): {}",
+            hs.len(),
+            hs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")
+        );
+    }
+    std::fs::write(&bom_path, jlc_bom_csv(&bom, &hand_soldered))
         .with_context(|| format!("writing {}", bom_path.display()))?;
 
     println!("fab package: {}", pkg.display());
@@ -1513,7 +1766,15 @@ fn guide_cmd(
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
     let options = board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
-    let (board, _) = generate_board_report(&model, &options)?;
+    // The SAME layout the fab package gets. This used to be a single one-shot
+    // `generate_board_report` — no iteration, no scoring, no best-of — so the
+    // guide's board was a *different, worse* board than the one that ships:
+    // measured on the slew limiter, the guide's had an IC hanging 9mm off the
+    // edge and a through-hole cap colliding with an IC through the board, while
+    // the fab package was clean. Worse, out/<name>/<name>.kicad_pcb is what the
+    // dashboard renders, so the picture everyone looks at was the bad one.
+    // Two boards from one circuit is not a layout problem, it is a trust problem.
+    let board = build_layout(&model, options, &panel, GUIDE_LAYOUT_ITERS)?;
 
     let guide_opts = GuideOptions {
         include_smd: resolved.guide_smd,
@@ -2390,6 +2651,17 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             );
         }
         PanelCmd::Pcb { spec, out, logo } => {
+            // A panel that does not match its board is a module that cannot be
+            // assembled, and this command used to have no way of noticing: it
+            // took a spec path and plotted it verbatim, while `lob fab` quietly
+            // substituted a DERIVED panel whenever the declared one had gone
+            // stale. On the slew limiter that shipped a 5 HP panel for a 6 HP
+            // board (legion-of-bom-m1b). Same inputs, two answers, no complaint.
+            //
+            // So resolve the same way every other command does: a path is used
+            // as given, a NAME goes through the manifest and gets the same
+            // staleness check the board build applies.
+            let spec = resolve_panel_spec(&spec)?;
             let toml = std::fs::read_to_string(&spec)
                 .with_context(|| format!("reading {}", spec.display()))?;
             let file = PanelFile::from_toml(&toml)

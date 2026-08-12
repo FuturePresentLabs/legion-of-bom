@@ -198,6 +198,113 @@ impl PlacementFile {
     }
 }
 
+/// One part of a built board, seen the way the placement editor needs to see it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedControl {
+    pub refdes: String,
+    pub value: String,
+    pub footprint: String,
+    /// The **mount point** in panel space — where the shaft, barrel or lens comes
+    /// through the panel, not where the footprint's origin sits. Those differ by
+    /// several millimetres on an Alpha pot, and this is the one the placement file
+    /// stores, so they must not be confused.
+    pub point: Point,
+    pub rotation_deg: f64,
+    pub back: bool,
+    /// The cutout this part needs, if it is panel hardware. `None` = board-only:
+    /// the placer owns it and the editor draws it as context.
+    pub cutout: Option<crate::panel::CutoutSpec>,
+}
+
+/// A built board expressed in panel space — the read half of hand placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardView {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    /// Panel width in HP, from the board's own outline. The board decides the
+    /// panel width, not the other way round.
+    pub hp: u16,
+    /// Every part, panel hardware and board internals alike, sorted by refdes.
+    pub parts: Vec<PlacedControl>,
+}
+
+impl BoardView {
+    /// Just the panel hardware — the parts a person has an opinion about.
+    pub fn controls(&self) -> impl Iterator<Item = &PlacedControl> {
+        self.parts.iter().filter(|p| p.cutout.is_some())
+    }
+}
+
+/// Read a built board back into panel space.
+///
+/// This is the inverse of [`PlacementFile::anchors`] and it is deliberately
+/// computed the same way [`panel_from_board`](crate::panel::panel_from_board)
+/// computes it — from the hardware's bounding-box centre, relative to the
+/// `Edge.Cuts` outline, with Y flipped. Any other convention would make the
+/// editor show a knob where the board does not have one, or write a placement
+/// that moves a part it was only meant to report.
+///
+/// Board internals are included (with `cutout: None`) rather than filtered out:
+/// the editor draws them dimmed, because placing a jack strip without seeing what
+/// is underneath it is how a control ends up on top of an op-amp.
+pub fn board_view(
+    board_pcb: &str,
+    circuit: &dyn crate::source::CircuitSource,
+    cutouts: &dyn crate::panel::CutoutSource,
+) -> Result<BoardView, String> {
+    /// Eurorack HP. Local to keep this file free of a panel-format dependency it
+    /// does not otherwise need; the panel module owns the same constant.
+    const HP_MM: f64 = 5.08;
+
+    let placed = crate::guide::parse_board(board_pcb)?;
+    let (x0, y0, x1, y1) =
+        crate::guide::board_outline(board_pcb).ok_or("board has no Edge.Cuts outline")?;
+    let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
+    if w <= 0.0 || h <= 0.0 {
+        return Err("board outline has no area".into());
+    }
+
+    let mpn_of = |refdes: &str| {
+        circuit
+            .parts()
+            .iter()
+            .find(|p| p.refdes.0 == refdes)
+            .and_then(|p| p.mpn.clone())
+    };
+
+    let mut parts: Vec<PlacedControl> = placed
+        .iter()
+        .map(|p| {
+            // The hardware sits at the courtyard centre; the footprint origin can
+            // be millimetres away (an Alpha pot's origin is pin 1).
+            let (hx, hy) = ((p.bbox.0 + p.bbox.2) / 2.0, (p.bbox.1 + p.bbox.3) / 2.0);
+            let cutout = crate::guide::is_panel_mounted(p)
+                .then(|| cutouts.cutout(mpn_of(&p.refdes).as_deref(), &p.footprint))
+                .flatten();
+            PlacedControl {
+                refdes: p.refdes.clone(),
+                value: p.value.clone(),
+                footprint: p.footprint.clone(),
+                point: Point {
+                    x: hx - x0,
+                    y: h - (hy - y0),
+                },
+                rotation_deg: p.rotation_deg,
+                back: p.back,
+                cutout,
+            }
+        })
+        .collect();
+    parts.sort_by(|a, b| a.refdes.cmp(&b.refdes));
+
+    Ok(BoardView {
+        width_mm: w,
+        height_mm: h,
+        hp: ((w / HP_MM).round() as u16).max(1),
+        parts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +433,102 @@ pitch_y = 1.0
     fn an_empty_file_is_valid_and_places_nothing() {
         let f = PlacementFile::from_toml("").unwrap();
         assert!(f.positions().unwrap().is_empty());
+    }
+
+    mod view {
+        use super::*;
+        use crate::model::{Circuit, Part};
+        use crate::panel::{panel_from_board, BuiltinCutouts, ControlKind};
+
+        /// A 5 HP board: a jack near the bottom, a pot near the top, and one 0603
+        /// that is nobody's business but the placer's.
+        const BOARD: &str = r#"(kicad_pcb
+          (gr_rect (start 100 40) (end 125.4 168.5) (layer "Edge.Cuts"))
+          (footprint "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical" (layer "F.Cu") (at 106 158 0)
+            (property "Reference" "J1") (pad "1" thru_hole circle (at 0 0) (size 2 2)))
+          (footprint "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical" (layer "F.Cu") (at 118 55 0)
+            (property "Reference" "RV1") (pad "1" thru_hole circle (at 0 0) (size 2 2)))
+          (footprint "Resistor_SMD:R_0603_1608Metric" (layer "F.Cu") (at 110 100 0)
+            (property "Reference" "R1") (pad "1" smd rect (at 0 0) (size 1 1))))"#;
+
+        fn circuit() -> Circuit {
+            Circuit {
+                name: "t".into(),
+                parts: vec![
+                    Part::new("J1", "AudioJack2_SwitchT")
+                        .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+                    Part::new("RV1", "100k").with_footprint(
+                        "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical",
+                    ),
+                    Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0603_1608Metric"),
+                ],
+                nets: vec![],
+            }
+        }
+
+        fn view() -> BoardView {
+            board_view(BOARD, &circuit(), &BuiltinCutouts).expect("view")
+        }
+
+        #[test]
+        fn reads_the_board_into_panel_space() {
+            let v = view();
+            assert_eq!(v.hp, 5);
+            assert!((v.width_mm - 25.4).abs() < 1e-9);
+            assert!((v.height_mm - 128.5).abs() < 1e-9);
+            // Board internals are present, not filtered out — the editor draws
+            // them dimmed so a jack is not placed on top of a resistor.
+            assert_eq!(v.parts.len(), 3);
+            assert_eq!(v.controls().count(), 2);
+            let r1 = v.parts.iter().find(|p| p.refdes == "R1").unwrap();
+            assert!(r1.cutout.is_none(), "an 0603 is not panel hardware");
+        }
+
+        /// The editor and the derived panel must agree to the micron, or a knob
+        /// drawn where the editor thinks it is gets a hole somewhere else.
+        #[test]
+        fn agrees_with_the_panel_derived_from_the_same_board() {
+            let v = view();
+            let p = panel_from_board(BOARD, &circuit(), &BuiltinCutouts).unwrap();
+            assert_eq!(p.cutouts.len(), v.controls().count());
+            for c in &p.cutouts {
+                let refdes = c.refdes.as_deref().unwrap();
+                let got = v.parts.iter().find(|q| q.refdes == refdes).unwrap();
+                assert!((got.point.x - c.x_mm).abs() < 1e-9, "{refdes} x");
+                assert!((got.point.y - c.y_mm).abs() < 1e-9, "{refdes} y");
+            }
+        }
+
+        /// The round trip that keeps the file, the board and the panel describing
+        /// one layout: a position read off the board, written to a placement file
+        /// and flipped back to a board anchor, lands where it started.
+        #[test]
+        fn a_position_read_off_the_board_flips_back_to_the_same_anchor() {
+            let v = view();
+            let j1 = v.parts.iter().find(|p| p.refdes == "J1").unwrap();
+            let mut file = PlacementFile::default();
+            file.controls.insert("J1".into(), j1.point);
+            let anchors = file.anchors(v.height_mm).unwrap();
+            // Board-local: 6mm across, 118mm down from the top edge.
+            assert!((anchors["J1"].0 - 6.0).abs() < 1e-9);
+            assert!((anchors["J1"].1 - 118.0).abs() < 1e-9);
+        }
+
+        #[test]
+        fn carries_the_cutout_envelope_the_editor_needs_for_clearance() {
+            let v = view();
+            let rv = v.parts.iter().find(|p| p.refdes == "RV1").unwrap();
+            let spec = rv.cutout.as_ref().expect("a pot is panel hardware");
+            assert_eq!(spec.kind, ControlKind::Pot);
+            // A knob is bigger than its hole — that gap is the whole reason the
+            // editor needs the envelope and not just the shape.
+            assert!(spec.envelope_mm.0 > 7.0, "{:?}", spec.envelope_mm);
+        }
+
+        #[test]
+        fn a_board_without_an_outline_is_an_error_not_a_guess() {
+            let err = board_view("(kicad_pcb)", &circuit(), &BuiltinCutouts).unwrap_err();
+            assert!(err.contains("Edge.Cuts"), "{err}");
+        }
     }
 }

@@ -648,12 +648,33 @@ pub fn jlc_cpl_from_kicad_pos(pos_csv: &str) -> (String, usize) {
 /// (`Comment,Designator,Footprint,LCSC Part #`). Parts are already grouped by
 /// [`BomLine`](crate::bom::BomLine); the footprint short name (after `lib:`) is
 /// used, and the MPN goes in the LCSC column when present.
-pub fn jlc_bom_csv(bom: &Bom) -> String {
+pub fn jlc_bom_csv(bom: &Bom, hand_soldered: &std::collections::HashSet<String>) -> String {
     let mut out = String::from("Comment,Designator,Footprint,LCSC Part #\n");
     // Components only: a nut has no designator and no machine places it, so
     // loose hardware would be an unmatched row the fab has to query.
     for line in bom.components() {
-        let designators = line.refdes.join(", ");
+        // …and SMT only. This is the file the fab assembles from, and JLCPCB's
+        // economic PCBA places surface-mount parts; through-hole is ours to
+        // solder (the confirmed assembly model). Leaving a 14mm film cap or a
+        // panel jack in here asks the fab for something it will not do, and
+        // those rows carry no LCSC number either, so they cannot be sourced
+        // from this file either way — an unanswerable line the fab has to query.
+        //
+        // A line can mix (same value, some placed, some hand-fitted), so filter
+        // the designators rather than the line.
+        let refdes: Vec<&String> = line
+            .refdes
+            .iter()
+            .filter(|r| !hand_soldered.contains(*r))
+            .collect();
+        if refdes.is_empty() {
+            continue;
+        }
+        let designators = refdes
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let footprint = line
             .footprint
             .as_deref()
@@ -743,11 +764,78 @@ mod tests {
                 },
             ],
         };
-        let csv = jlc_bom_csv(&bom);
+        let csv = jlc_bom_csv(&bom, &std::collections::HashSet::new());
         assert!(csv.starts_with("Comment,Designator,Footprint,LCSC Part #\n"));
         // Multi-designator field is quoted (contains a comma); footprint short name.
         assert!(csv.contains("159n,\"C1, C5\",C_0805_2012Metric,\n"));
         assert!(csv.contains("TL072,U1,SOIC-8,TL072CDR\n"));
+    }
+
+    /// The fab BOM is what JLCPCB assembles from, and it does surface-mount.
+    /// Handing it through-hole parts asks for something it will not do — and on
+    /// the real slew limiter it did exactly that, listing the C4/C5 film caps
+    /// with no LCSC number, so they could not be sourced from the file either.
+    #[test]
+    fn the_fab_bom_withholds_the_parts_we_hand_solder() {
+        let bom = Bom {
+            lines: vec![
+                BomLine {
+                    kind: LineKind::Component,
+                    mpn: Some("C14663".into()),
+                    value: "100nF".into(),
+                    footprint: Some("Capacitor_SMD:C_0603".into()),
+                    refdes: vec!["C2".into(), "C3".into()],
+                    unit_price: None,
+                    ext_price: None,
+                    image_url: None,
+                },
+                // Same value, but one of them is the hand-fitted one: the line
+                // must survive with only the placed designator left on it.
+                BomLine {
+                    kind: LineKind::Component,
+                    mpn: None,
+                    value: "1uF".into(),
+                    footprint: Some("Capacitor_THT:C_Rect".into()),
+                    refdes: vec!["C41".into(), "C99".into()],
+                    unit_price: None,
+                    ext_price: None,
+                    image_url: None,
+                },
+                // Entirely hand-soldered: the whole line goes.
+                BomLine {
+                    kind: LineKind::Component,
+                    mpn: None,
+                    value: "4.7uF".into(),
+                    footprint: Some("Capacitor_THT:C_Rect_L13".into()),
+                    refdes: vec!["C51".into(), "C52".into()],
+                    unit_price: None,
+                    ext_price: None,
+                    image_url: None,
+                },
+            ],
+        };
+        let hand: std::collections::HashSet<String> = ["C41", "C51", "C52"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let csv = jlc_bom_csv(&bom, &hand);
+
+        assert!(
+            csv.contains("100nF,\"C2, C3\""),
+            "SMD line survives intact: {csv}"
+        );
+        assert!(
+            !csv.contains("C51") && !csv.contains("C52"),
+            "an all-hand-soldered line must not reach the fab: {csv}"
+        );
+        assert!(
+            csv.contains("1uF,C99,"),
+            "a mixed line keeps only the placed designator: {csv}"
+        );
+        assert!(
+            !csv.contains("C41"),
+            "the hand-fitted designator is dropped: {csv}"
+        );
     }
 
     #[test]

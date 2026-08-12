@@ -805,7 +805,7 @@ mod tests {
             ext_price: None,
             image_url: None,
         });
-        let csv = crate::fab::jlc_bom_csv(&bom);
+        let csv = crate::fab::jlc_bom_csv(&bom, &std::collections::HashSet::new());
         assert!(
             !csv.contains("jack nut"),
             "no machine places a nut; it must not reach the fab BOM:\n{csv}"
