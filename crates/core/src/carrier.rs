@@ -21,6 +21,8 @@ pub const DEFAULT_CAPACITOR_FOOTPRINT: &str = "Capacitor_SMD:C_0805_2012Metric";
 pub const DEFAULT_DIODE_FOOTPRINT: &str = "Diode_SMD:D_SOD-323";
 pub const DEFAULT_OPAMP_FOOTPRINT: &str = "Package_SO:SOIC-8_3.9x4.9mm";
 pub const DEFAULT_TESTPOINT_FOOTPRINT: &str = "TestPoint:TestPoint_Pad_D1.5mm";
+pub const DEFAULT_EXPANDER_HEADER_FOOTPRINT: &str =
+    "Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm_Vertical";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CarrierPlatform {
@@ -148,6 +150,17 @@ pub fn firmware_pinmap_json(circuit: &dyn CircuitSource) -> String {
                         })
                         .collect();
                     panel_refs.sort();
+                    let mut expander_refs: Vec<String> = net
+                        .pins
+                        .iter()
+                        .filter(|other| other.refdes != part.refdes)
+                        .filter_map(|other| {
+                            let expander = parts.get(other.refdes.0.as_str())?;
+                            is_expander_binding(expander)
+                                .then(|| format!("{}:{}", other.refdes, other.pin))
+                        })
+                        .collect();
+                    expander_refs.sort();
                     bindings.push(json!({
                         "net": net.name,
                         "requested_pin": pin.pin,
@@ -155,6 +168,7 @@ pub fn firmware_pinmap_json(circuit: &dyn CircuitSource) -> String {
                         "pad": profile_pin.pad,
                         "capabilities": profile_pin.capabilities.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
                         "panel_refs": panel_refs,
+                        "expander_refs": expander_refs,
                     }));
                 }
             }
@@ -187,11 +201,43 @@ pub fn firmware_pinmap_json(circuit: &dyn CircuitSource) -> String {
             .unwrap_or_default()
             .cmp(b["refdes"].as_str().unwrap_or_default())
     });
+    let mut expanders = circuit
+        .parts()
+        .iter()
+        .filter(|part| is_expander_binding(part))
+        .map(|part| {
+            let mut pins = Vec::new();
+            for net in circuit.nets() {
+                for pin in net.pins.iter().filter(|pin| pin.refdes == part.refdes) {
+                    pins.push(json!({
+                        "pin": pin.pin,
+                        "net": net.name,
+                    }));
+                }
+            }
+            pins.sort_by(|a, b| {
+                natural_pin_key(a["pin"].as_str().unwrap_or_default())
+                    .cmp(&natural_pin_key(b["pin"].as_str().unwrap_or_default()))
+            });
+            json!({
+                "refdes": part.refdes.0,
+                "footprint": part.footprint,
+                "pins": pins,
+            })
+        })
+        .collect::<Vec<_>>();
+    expanders.sort_by(|a, b| {
+        a["refdes"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["refdes"].as_str().unwrap_or_default())
+    });
 
     serde_json::to_string_pretty(&json!({
         "schema": "legion-of-bom.carrier-pinmap.v1",
         "circuit": circuit.name(),
         "modules": modules,
+        "expanders": expanders,
     }))
     .expect("serializing carrier pinmap cannot fail")
 }
@@ -231,6 +277,21 @@ fn contains_any_ci(haystack: &str, needles: &[&str]) -> bool {
     needles
         .iter()
         .any(|needle| haystack.contains(&needle.to_ascii_lowercase()))
+}
+
+fn is_expander_binding(part: &Part) -> bool {
+    let value = part.value.as_str();
+    let fp = part.footprint.as_deref().unwrap_or_default();
+    contains_any_ci(value, &["expander"])
+        || (contains_any_ci(value, &["bus"])
+            && contains_any_ci(fp, &["PinHeader", "IDC", "Connector"]))
+}
+
+fn natural_pin_key(pin: &str) -> (u8, u32, &str) {
+    match pin.parse::<u32>() {
+        Ok(n) => (0, n, pin),
+        Err(_) => (1, 0, pin),
+    }
 }
 
 /// Builder for a carrier board around one SOM/sub-board.
@@ -306,6 +367,34 @@ impl CarrierBuilder {
             vec![local, PinRef::new(self.module_refdes.clone(), som_pin)],
         );
         Ok(self)
+    }
+
+    pub fn bind_net_to_som(
+        &mut self,
+        net: impl Into<String>,
+        som_pin: impl Into<String>,
+    ) -> Result<&mut Self, CarrierError> {
+        let som_pin = som_pin.into();
+        self.require_som_pin(&som_pin)?;
+        self.connect(net, vec![PinRef::new(self.module_refdes.clone(), som_pin)]);
+        Ok(self)
+    }
+
+    pub fn expander_header<I, P, N>(&mut self, refdes: impl Into<RefDes>, signals: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (P, N)>,
+        P: Into<String>,
+        N: Into<String>,
+    {
+        let refdes = refdes.into();
+        self.circuit.parts.push(
+            Part::new(refdes.clone(), "expander header")
+                .with_footprint(DEFAULT_EXPANDER_HEADER_FOOTPRINT),
+        );
+        for (pin, net) in signals {
+            self.connect(net.into(), vec![PinRef::new(refdes.clone(), pin.into())]);
+        }
+        self
     }
 
     pub fn audio_input(
@@ -1035,6 +1124,56 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|p| p == "TP1:1")
+        }));
+    }
+
+    #[test]
+    fn expander_header_routes_named_bus_and_exports_pinmap() {
+        let mut carrier = CarrierBuilder::patch_sm("handpan-voice", "M1").unwrap();
+        carrier
+            .expander_header(
+                "XP1",
+                [
+                    ("1", "GND"),
+                    ("2", "3V3"),
+                    ("3", "VOICE_VOCT"),
+                    ("4", "VOICE_STRIKE"),
+                    ("5", "VOICE_VELOCITY"),
+                    ("6", "BRAIN_CLOCK"),
+                ],
+            )
+            .bind_net_to_som("GND", "GND")
+            .unwrap()
+            .bind_net_to_som("3V3", "3V3")
+            .unwrap()
+            .bind_net_to_som("VOICE_VOCT", "CV_5")
+            .unwrap()
+            .bind_net_to_som("VOICE_STRIKE", "GATE_IN_1")
+            .unwrap()
+            .bind_net_to_som("VOICE_VELOCITY", "CV_6")
+            .unwrap()
+            .bind_net_to_som("BRAIN_CLOCK", "GATE_IN_2")
+            .unwrap();
+
+        let circuit = carrier.into_circuit();
+        assert!(has_pin(&circuit, "VOICE_VOCT", "XP1", "3"));
+        assert!(has_pin(&circuit, "VOICE_VOCT", "M1", "CV_5"));
+        assert!(has_pin(&circuit, "BRAIN_CLOCK", "XP1", "6"));
+        assert!(has_pin(&circuit, "BRAIN_CLOCK", "M1", "GATE_IN_2"));
+
+        let json = firmware_pinmap_json(&circuit);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["expanders"][0]["refdes"], "XP1");
+        assert_eq!(parsed["expanders"][0]["pins"][2]["net"], "VOICE_VOCT");
+        let bindings = parsed["modules"][0]["bindings"].as_array().unwrap();
+        assert!(bindings.iter().any(|b| {
+            b["net"] == "VOICE_VOCT"
+                && b["pin"] == "CV_5"
+                && b["expander_refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "XP1:3")
         }));
     }
 
