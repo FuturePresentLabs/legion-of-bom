@@ -8,7 +8,10 @@
 
 use std::fmt;
 
+use serde_json::json;
+
 use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+use crate::source::CircuitSource;
 
 pub const DEFAULT_JACK_FOOTPRINT: &str = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
 pub const DEFAULT_POT_FOOTPRINT: &str =
@@ -105,6 +108,130 @@ impl fmt::Display for CarrierError {
 }
 
 impl std::error::Error for CarrierError {}
+
+/// Export a deterministic firmware/Oopsy-facing pinmap for carrier circuits.
+///
+/// The artifact names the SOM profile and every net bound to a SOM pin. It does
+/// not try to infer firmware semantics beyond the circuit's own net names; those
+/// names are the stable bridge from carrier hardware to generated board defs.
+pub fn firmware_pinmap_json(circuit: &dyn CircuitSource) -> String {
+    let parts: std::collections::HashMap<&str, &Part> = circuit
+        .parts()
+        .iter()
+        .map(|p| (p.refdes.0.as_str(), p))
+        .collect();
+    let mut modules = circuit
+        .parts()
+        .iter()
+        .filter_map(|part| {
+            let footprint = part.footprint.as_deref()?;
+            let (lib, name) = footprint.split_once(':')?;
+            (lib == crate::subboard::SUBBOARD_LIB)
+                .then(|| crate::subboard::profile(name).map(|profile| (part, footprint, profile)))
+                .flatten()
+        })
+        .map(|(part, footprint, profile)| {
+            let mut bindings = Vec::new();
+            for net in circuit.nets() {
+                for pin in net.pins.iter().filter(|pin| pin.refdes == part.refdes) {
+                    let Some(profile_pin) = profile.pin_for(&pin.pin) else {
+                        continue;
+                    };
+                    let mut panel_refs: Vec<String> = net
+                        .pins
+                        .iter()
+                        .filter(|other| other.refdes != part.refdes)
+                        .filter_map(|other| {
+                            let panel_part = parts.get(other.refdes.0.as_str())?;
+                            is_panel_firmware_binding(panel_part)
+                                .then(|| format!("{}:{}", other.refdes, other.pin))
+                        })
+                        .collect();
+                    panel_refs.sort();
+                    bindings.push(json!({
+                        "net": net.name,
+                        "requested_pin": pin.pin,
+                        "pin": profile_pin.name,
+                        "pad": profile_pin.pad,
+                        "capabilities": profile_pin.capabilities.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
+                        "panel_refs": panel_refs,
+                    }));
+                }
+            }
+            bindings.sort_by(|a, b| {
+                let ak = (
+                    a["net"].as_str().unwrap_or_default(),
+                    a["pin"].as_str().unwrap_or_default(),
+                    a["requested_pin"].as_str().unwrap_or_default(),
+                );
+                let bk = (
+                    b["net"].as_str().unwrap_or_default(),
+                    b["pin"].as_str().unwrap_or_default(),
+                    b["requested_pin"].as_str().unwrap_or_default(),
+                );
+                ak.cmp(&bk)
+            });
+            json!({
+                "refdes": part.refdes.0,
+                "profile": profile.name,
+                "profile_id": profile.footprint,
+                "footprint": footprint,
+                "eurorack_conditioned": profile.eurorack_conditioned,
+                "bindings": bindings,
+            })
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|a, b| {
+        a["refdes"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["refdes"].as_str().unwrap_or_default())
+    });
+
+    serde_json::to_string_pretty(&json!({
+        "schema": "legion-of-bom.carrier-pinmap.v1",
+        "circuit": circuit.name(),
+        "modules": modules,
+    }))
+    .expect("serializing carrier pinmap cannot fail")
+}
+
+fn is_panel_firmware_binding(part: &Part) -> bool {
+    let fp = part.footprint.as_deref().unwrap_or_default();
+    let value = part.value.as_str();
+    contains_any_ci(
+        fp,
+        &[
+            "Connector_Audio",
+            "Jack_3.5",
+            "PJ398",
+            "Thonkiconn",
+            "Potentiometer",
+            "SW_",
+            "Switch",
+            "TestPoint",
+        ],
+    ) || contains_any_ci(
+        value,
+        &[
+            "jack",
+            "audio in",
+            "audio out",
+            "cv in",
+            "cv out",
+            "gate",
+            "trigger",
+            "test point",
+        ],
+    )
+}
+
+fn contains_any_ci(haystack: &str, needles: &[&str]) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| haystack.contains(&needle.to_ascii_lowercase()))
+}
 
 /// Builder for a carrier board around one SOM/sub-board.
 #[derive(Debug, Clone)]
@@ -849,6 +976,78 @@ mod tests {
                 feature: "Seed2 CV input front-end",
             }
         );
+    }
+
+    #[test]
+    fn firmware_pinmap_exports_patch_sm_panel_bindings_deterministically() {
+        let mut carrier = CarrierBuilder::patch_sm("patch-firmware", "M1").unwrap();
+        carrier
+            .audio_input("J1", AudioChannel::Left)
+            .unwrap()
+            .cv_input("J2", 1)
+            .unwrap()
+            .gate_input("J3", 1)
+            .unwrap();
+
+        let json = firmware_pinmap_json(&carrier.into_circuit());
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["schema"], "legion-of-bom.carrier-pinmap.v1");
+        assert_eq!(parsed["circuit"], "patch-firmware");
+        assert_eq!(parsed["modules"][0]["profile_id"], "DAISY_PATCH_SM");
+        assert_eq!(parsed["modules"][0]["eurorack_conditioned"], true);
+        let bindings = parsed["modules"][0]["bindings"].as_array().unwrap();
+        assert!(bindings.iter().any(|b| {
+            b["pin"] == "AUDIO_IN_L"
+                && b["panel_refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "J1:T")
+        }));
+        assert_eq!(json, firmware_pinmap_json(&parsed_patch_fixture()));
+    }
+
+    #[test]
+    fn firmware_pinmap_exports_seed2_front_end_som_bindings() {
+        let mut carrier = CarrierBuilder::seed2_dfm("seed2-firmware", "M1").unwrap();
+        carrier
+            .seed2_cv_input_front_end("CV1", "J1", "A1")
+            .unwrap()
+            .seed2_audio_output_front_end("AO1", "J2", AudioChannel::Left)
+            .unwrap()
+            .test_point("TP1", "CV1_CV_ADC");
+
+        let json = firmware_pinmap_json(&carrier.into_circuit());
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["modules"][0]["profile_id"], "DAISY_SEED2_DFM");
+        assert_eq!(parsed["modules"][0]["eurorack_conditioned"], false);
+        let bindings = parsed["modules"][0]["bindings"].as_array().unwrap();
+        assert!(bindings
+            .iter()
+            .any(|b| b["requested_pin"] == "A1" && b["pin"] == "D16"));
+        assert!(bindings
+            .iter()
+            .any(|b| { b["requested_pin"] == "AUDIO_OUT_L+" && b["pin"] == "AUDIO_OUT_L_POS" }));
+        assert!(bindings.iter().any(|b| {
+            b["net"] == "CV1_CV_ADC"
+                && b["panel_refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "TP1:1")
+        }));
+    }
+
+    fn parsed_patch_fixture() -> Circuit {
+        let mut carrier = CarrierBuilder::patch_sm("patch-firmware", "M1").unwrap();
+        carrier
+            .audio_input("J1", AudioChannel::Left)
+            .unwrap()
+            .cv_input("J2", 1)
+            .unwrap()
+            .gate_input("J3", 1)
+            .unwrap();
+        carrier.into_circuit()
     }
 
     #[test]

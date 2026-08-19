@@ -76,7 +76,9 @@ pub use bom_repair::{
     classify as classify_comment, fill_mpns, package_key, part_kind_of, plan as plan_repair,
     search_keyword, value_key, Comment, FillReport, Repair,
 };
-pub use carrier::{AudioChannel, CarrierBuilder, CarrierError, CarrierPlatform};
+pub use carrier::{
+    firmware_pinmap_json, AudioChannel, CarrierBuilder, CarrierError, CarrierPlatform,
+};
 pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use eagle::{
