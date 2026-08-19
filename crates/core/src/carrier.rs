@@ -13,6 +13,11 @@ use crate::model::{Circuit, Net, Part, PinRef, RefDes};
 pub const DEFAULT_JACK_FOOTPRINT: &str = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
 pub const DEFAULT_POT_FOOTPRINT: &str =
     "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
+pub const DEFAULT_RESISTOR_FOOTPRINT: &str = "Resistor_SMD:R_0805_2012Metric";
+pub const DEFAULT_CAPACITOR_FOOTPRINT: &str = "Capacitor_SMD:C_0805_2012Metric";
+pub const DEFAULT_DIODE_FOOTPRINT: &str = "Diode_SMD:D_SOD-323";
+pub const DEFAULT_OPAMP_FOOTPRINT: &str = "Package_SO:SOIC-8_3.9x4.9mm";
+pub const DEFAULT_TESTPOINT_FOOTPRINT: &str = "TestPoint:TestPoint_Pad_D1.5mm";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CarrierPlatform {
@@ -68,8 +73,18 @@ impl AudioChannel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CarrierError {
     UnknownProfile(&'static str),
-    UnknownSomPin { platform: &'static str, pin: String },
-    ChannelOutOfRange { kind: &'static str, channel: u8 },
+    UnknownSomPin {
+        platform: &'static str,
+        pin: String,
+    },
+    ChannelOutOfRange {
+        kind: &'static str,
+        channel: u8,
+    },
+    UnsupportedPlatform {
+        platform: &'static str,
+        feature: &'static str,
+    },
 }
 
 impl fmt::Display for CarrierError {
@@ -81,6 +96,9 @@ impl fmt::Display for CarrierError {
             }
             CarrierError::ChannelOutOfRange { kind, channel } => {
                 write!(f, "{kind} channel {channel} is out of range")
+            }
+            CarrierError::UnsupportedPlatform { platform, feature } => {
+                write!(f, "{feature} is not available for {platform}")
             }
         }
     }
@@ -265,10 +283,335 @@ impl CarrierBuilder {
         Ok(self)
     }
 
+    /// Seed2 DFM Eurorack CV input: panel jack -> divider/series impedance ->
+    /// clamped, filtered ADC node -> raw STM32 ADC pin.
+    pub fn seed2_cv_input_front_end(
+        &mut self,
+        block: impl AsRef<str>,
+        jack_refdes: impl Into<RefDes>,
+        som_pin: impl Into<String>,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 CV input front-end")?;
+        let block = block.as_ref();
+        let som_pin = som_pin.into();
+        self.require_som_pin(&som_pin)?;
+
+        let jack = jack_refdes.into();
+        let r_series = prefixed("R", block, "A");
+        let r_div = prefixed("R", block, "B");
+        let c_filter = prefixed("C", block, "A");
+        let d_hi = prefixed("D", block, "H");
+        let d_lo = prefixed("D", block, "L");
+        let panel_net = format!("{block}_CV_PANEL");
+        let adc_net = format!("{block}_CV_ADC");
+
+        self.add_jack(jack.clone(), "cv in");
+        self.add_resistor(r_series.clone(), "100k");
+        self.add_resistor(r_div.clone(), "33k");
+        self.add_capacitor(c_filter.clone(), "1n");
+        self.add_diode(d_hi.clone(), "BAT54");
+        self.add_diode(d_lo.clone(), "BAT54");
+
+        self.connect(
+            panel_net,
+            vec![
+                PinRef::new(jack.clone(), "T"),
+                PinRef::new(r_series.clone(), "1"),
+            ],
+        );
+        self.connect_ground(PinRef::new(jack, "S"));
+        self.bind_to_som(adc_net.clone(), PinRef::new(r_series, "2"), som_pin)?;
+        self.connect(
+            adc_net,
+            vec![
+                PinRef::new(r_div.clone(), "1"),
+                PinRef::new(c_filter.clone(), "1"),
+                PinRef::new(d_hi.clone(), "A"),
+                PinRef::new(d_lo.clone(), "K"),
+            ],
+        );
+        self.connect_ground(PinRef::new(r_div, "2"));
+        self.connect_ground(PinRef::new(c_filter, "2"));
+        self.connect("3V3", vec![PinRef::new(d_hi, "K")]);
+        self.connect_ground(PinRef::new(d_lo, "A"));
+        Ok(self)
+    }
+
+    /// Seed2 DFM audio input: AC-couple the jack, add input impedance, then bias
+    /// the codec input at AUDIO_VCOM.
+    pub fn seed2_audio_input_front_end(
+        &mut self,
+        block: impl AsRef<str>,
+        jack_refdes: impl Into<RefDes>,
+        channel: AudioChannel,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 audio input front-end")?;
+        let block = block.as_ref();
+        let jack = jack_refdes.into();
+        let c_in = prefixed("C", block, "A");
+        let r_in = prefixed("R", block, "A");
+        let r_bias = prefixed("R", block, "B");
+        let panel_net = format!("{block}_AUDIO_IN_PANEL");
+        let ac_net = format!("{block}_AUDIO_IN_AC");
+        let codec_net = format!("{block}_AUDIO_IN_CODEC");
+
+        self.add_jack(jack.clone(), "audio in");
+        self.add_capacitor(c_in.clone(), "1u");
+        self.add_resistor(r_in.clone(), "1k");
+        self.add_resistor(r_bias.clone(), "100k");
+
+        self.connect(
+            panel_net,
+            vec![
+                PinRef::new(jack.clone(), "T"),
+                PinRef::new(c_in.clone(), "1"),
+            ],
+        );
+        self.connect_ground(PinRef::new(jack, "S"));
+        self.connect(
+            ac_net,
+            vec![PinRef::new(c_in, "2"), PinRef::new(r_in.clone(), "1")],
+        );
+        self.bind_to_som(codec_net.clone(), PinRef::new(r_in, "2"), channel.in_pin())?;
+        self.connect(codec_net, vec![PinRef::new(r_bias.clone(), "1")]);
+        self.bind_to_som("AUDIO_VCOM", PinRef::new(r_bias, "2"), "AUDIO_VCOM")?;
+        Ok(self)
+    }
+
+    /// Seed2 DFM audio output: raw codec output -> series resistor -> AC coupling
+    /// cap -> output jack with a bleed resistor.
+    pub fn seed2_audio_output_front_end(
+        &mut self,
+        block: impl AsRef<str>,
+        jack_refdes: impl Into<RefDes>,
+        channel: AudioChannel,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 audio output front-end")?;
+        let block = block.as_ref();
+        let jack = jack_refdes.into();
+        let r_out = prefixed("R", block, "A");
+        let c_out = prefixed("C", block, "A");
+        let r_bleed = prefixed("R", block, "B");
+        let codec_net = format!("{block}_AUDIO_OUT_CODEC");
+        let ac_net = format!("{block}_AUDIO_OUT_AC");
+        let panel_net = format!("{block}_AUDIO_OUT_PANEL");
+
+        self.add_jack(jack.clone(), "audio out");
+        self.add_resistor(r_out.clone(), "100R");
+        self.add_capacitor(c_out.clone(), "10u");
+        self.add_resistor(r_bleed.clone(), "100k");
+
+        self.bind_to_som(
+            codec_net,
+            PinRef::new(r_out.clone(), "1"),
+            seed2_audio_out_pos(channel),
+        )?;
+        self.connect(
+            ac_net,
+            vec![PinRef::new(r_out, "2"), PinRef::new(c_out.clone(), "1")],
+        );
+        self.connect(
+            panel_net,
+            vec![
+                PinRef::new(c_out, "2"),
+                PinRef::new(jack.clone(), "T"),
+                PinRef::new(r_bleed.clone(), "1"),
+            ],
+        );
+        self.connect_ground(PinRef::new(r_bleed, "2"));
+        self.connect_ground(PinRef::new(jack, "S"));
+        Ok(self)
+    }
+
+    /// Seed2 DFM gate/trigger input: panel jack -> series impedance -> clamped,
+    /// pulled-down GPIO node.
+    pub fn seed2_gate_input_front_end(
+        &mut self,
+        block: impl AsRef<str>,
+        jack_refdes: impl Into<RefDes>,
+        som_pin: impl Into<String>,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 gate input front-end")?;
+        let block = block.as_ref();
+        let som_pin = som_pin.into();
+        self.require_som_pin(&som_pin)?;
+        let jack = jack_refdes.into();
+        let r_series = prefixed("R", block, "A");
+        let r_pull = prefixed("R", block, "B");
+        let d_hi = prefixed("D", block, "H");
+        let d_lo = prefixed("D", block, "L");
+        let panel_net = format!("{block}_GATE_PANEL");
+        let gpio_net = format!("{block}_GATE_GPIO");
+
+        self.add_jack(jack.clone(), "gate in");
+        self.add_resistor(r_series.clone(), "100k");
+        self.add_resistor(r_pull.clone(), "100k");
+        self.add_diode(d_hi.clone(), "BAT54");
+        self.add_diode(d_lo.clone(), "BAT54");
+
+        self.connect(
+            panel_net,
+            vec![
+                PinRef::new(jack.clone(), "T"),
+                PinRef::new(r_series.clone(), "1"),
+            ],
+        );
+        self.connect_ground(PinRef::new(jack, "S"));
+        self.bind_to_som(gpio_net.clone(), PinRef::new(r_series, "2"), som_pin)?;
+        self.connect(
+            gpio_net,
+            vec![
+                PinRef::new(r_pull.clone(), "1"),
+                PinRef::new(d_hi.clone(), "A"),
+                PinRef::new(d_lo.clone(), "K"),
+            ],
+        );
+        self.connect_ground(PinRef::new(r_pull, "2"));
+        self.connect("3V3", vec![PinRef::new(d_hi, "K")]);
+        self.connect_ground(PinRef::new(d_lo, "A"));
+        Ok(self)
+    }
+
+    /// Seed2 DFM logic/gate output: GPIO pin -> output resistor -> panel jack.
+    pub fn seed2_gate_output_front_end(
+        &mut self,
+        block: impl AsRef<str>,
+        jack_refdes: impl Into<RefDes>,
+        som_pin: impl Into<String>,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 gate output front-end")?;
+        let block = block.as_ref();
+        let som_pin = som_pin.into();
+        self.require_som_pin(&som_pin)?;
+        let jack = jack_refdes.into();
+        let r_out = prefixed("R", block, "A");
+        let r_pull = prefixed("R", block, "B");
+        let gpio_net = format!("{block}_GATE_GPIO");
+        let panel_net = format!("{block}_GATE_PANEL");
+
+        self.add_jack(jack.clone(), "gate out");
+        self.add_resistor(r_out.clone(), "1k");
+        self.add_resistor(r_pull.clone(), "100k");
+        self.bind_to_som(gpio_net, PinRef::new(r_out.clone(), "1"), som_pin)?;
+        self.connect(
+            panel_net,
+            vec![
+                PinRef::new(r_out, "2"),
+                PinRef::new(jack.clone(), "T"),
+                PinRef::new(r_pull.clone(), "1"),
+            ],
+        );
+        self.connect_ground(PinRef::new(r_pull, "2"));
+        self.connect_ground(PinRef::new(jack, "S"));
+        Ok(self)
+    }
+
+    /// Seed2 DFM CV output: DAC pin -> op-amp buffer/scale block -> panel jack.
+    pub fn seed2_cv_output_front_end(
+        &mut self,
+        block: impl AsRef<str>,
+        jack_refdes: impl Into<RefDes>,
+        som_pin: impl Into<String>,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 CV output front-end")?;
+        let block = block.as_ref();
+        let som_pin = som_pin.into();
+        self.require_som_pin(&som_pin)?;
+        let jack = jack_refdes.into();
+        let opamp = prefixed("U", block, "A");
+        let r_in = prefixed("R", block, "A");
+        let r_fb = prefixed("R", block, "B");
+        let r_out = prefixed("R", block, "C");
+        let dac_net = format!("{block}_DAC_RAW");
+        let op_in_net = format!("{block}_CV_BUF_IN");
+        let op_out_net = format!("{block}_CV_BUF_OUT");
+        let panel_net = format!("{block}_CV_PANEL");
+
+        self.add_jack(jack.clone(), "cv out");
+        self.add_resistor(r_in.clone(), "10k");
+        self.add_resistor(r_fb.clone(), "20k");
+        self.add_resistor(r_out.clone(), "1k");
+        self.circuit.parts.push(
+            Part::new(opamp.clone(), "rail-to-rail op amp").with_footprint(DEFAULT_OPAMP_FOOTPRINT),
+        );
+
+        self.bind_to_som(dac_net, PinRef::new(r_in.clone(), "1"), som_pin)?;
+        self.connect(
+            op_in_net.clone(),
+            vec![PinRef::new(r_in, "2"), PinRef::new(opamp.clone(), "3")],
+        );
+        self.connect_ground(PinRef::new(opamp.clone(), "2"));
+        self.connect(
+            op_out_net,
+            vec![
+                PinRef::new(opamp.clone(), "1"),
+                PinRef::new(r_fb.clone(), "1"),
+                PinRef::new(r_out.clone(), "1"),
+            ],
+        );
+        self.connect(op_in_net, vec![PinRef::new(r_fb, "2")]);
+        self.connect(
+            panel_net,
+            vec![PinRef::new(r_out, "2"), PinRef::new(jack.clone(), "T")],
+        );
+        self.connect("12V", vec![PinRef::new(opamp.clone(), "8")]);
+        self.connect("-12V", vec![PinRef::new(opamp, "4")]);
+        self.connect_ground(PinRef::new(jack, "S"));
+        Ok(self)
+    }
+
+    /// Add local decoupling from Seed2 DFM power pins to the carrier ground net.
+    pub fn seed2_power_hygiene(
+        &mut self,
+        block: impl AsRef<str>,
+    ) -> Result<&mut Self, CarrierError> {
+        self.require_seed2("Seed2 power hygiene")?;
+        let block = block.as_ref();
+        for (suffix, value, net, som_pin) in [
+            ("V", "10u", "VIN", "VIN"),
+            ("D", "100n", "3V3", "3V3_D"),
+            ("A", "100n", "3V3_A", "3V3_A"),
+        ] {
+            let cap = prefixed("C", block, suffix);
+            self.add_capacitor(cap.clone(), value);
+            self.bind_to_som(net, PinRef::new(cap.clone(), "1"), som_pin)?;
+            self.connect_ground(PinRef::new(cap, "2"));
+        }
+        Ok(self)
+    }
+
+    /// Add a named one-pin test point to any carrier net for calibration or bring-up.
+    pub fn test_point(&mut self, refdes: impl Into<RefDes>, net: impl Into<String>) -> &mut Self {
+        let refdes = refdes.into();
+        self.circuit.parts.push(
+            Part::new(refdes.clone(), "test point").with_footprint(DEFAULT_TESTPOINT_FOOTPRINT),
+        );
+        self.connect(net, vec![PinRef::new(refdes, "1")]);
+        self
+    }
+
     fn add_jack(&mut self, refdes: RefDes, value: &str) {
         self.circuit
             .parts
             .push(Part::new(refdes, value).with_footprint(DEFAULT_JACK_FOOTPRINT));
+    }
+
+    fn add_resistor(&mut self, refdes: RefDes, value: &str) {
+        self.circuit
+            .parts
+            .push(Part::new(refdes, value).with_footprint(DEFAULT_RESISTOR_FOOTPRINT));
+    }
+
+    fn add_capacitor(&mut self, refdes: RefDes, value: &str) {
+        self.circuit
+            .parts
+            .push(Part::new(refdes, value).with_footprint(DEFAULT_CAPACITOR_FOOTPRINT));
+    }
+
+    fn add_diode(&mut self, refdes: RefDes, value: &str) {
+        self.circuit
+            .parts
+            .push(Part::new(refdes, value).with_footprint(DEFAULT_DIODE_FOOTPRINT));
     }
 
     fn connect_ground(&mut self, pin: PinRef) {
@@ -295,6 +638,28 @@ impl CarrierBuilder {
                 platform: self.platform.profile_name(),
                 pin: pin.to_string(),
             })
+    }
+
+    fn require_seed2(&self, feature: &'static str) -> Result<(), CarrierError> {
+        if self.platform == CarrierPlatform::Seed2Dfm {
+            Ok(())
+        } else {
+            Err(CarrierError::UnsupportedPlatform {
+                platform: self.platform.profile_name(),
+                feature,
+            })
+        }
+    }
+}
+
+fn prefixed(kind: &str, block: &str, suffix: &str) -> RefDes {
+    RefDes(format!("{kind}{block}{suffix}"))
+}
+
+fn seed2_audio_out_pos(channel: AudioChannel) -> &'static str {
+    match channel {
+        AudioChannel::Left => "AUDIO_OUT_L+",
+        AudioChannel::Right => "AUDIO_OUT_R+",
     }
 }
 
@@ -352,6 +717,7 @@ fn gate_out_pin(channel: u8) -> Result<&'static str, CarrierError> {
 mod tests {
     use super::*;
     use crate::source::CircuitSource;
+    use crate::validate_carrier;
 
     fn has_pin(circuit: &Circuit, net: &str, refdes: &str, pin: &str) -> bool {
         circuit
@@ -431,6 +797,58 @@ mod tests {
         }));
         assert!(has_pin(&circuit, "POT_1", "M1", "A1"));
         assert!(has_pin(&circuit, "OUT_L_P", "M1", "AUDIO_OUT_L+"));
+    }
+
+    #[test]
+    fn seed2_front_end_blocks_break_raw_panel_to_som_nets() {
+        let mut carrier = CarrierBuilder::seed2_dfm("seed2-front-ends", "M1").unwrap();
+        carrier
+            .seed2_cv_input_front_end("CV1", "J1", "A1")
+            .unwrap()
+            .seed2_audio_input_front_end("AI1", "J2", AudioChannel::Left)
+            .unwrap()
+            .seed2_audio_output_front_end("AO1", "J3", AudioChannel::Right)
+            .unwrap()
+            .seed2_gate_input_front_end("GI1", "J4", "D13")
+            .unwrap()
+            .seed2_gate_output_front_end("GO1", "J5", "D14")
+            .unwrap()
+            .seed2_cv_output_front_end("CO1", "J6", "DAC1")
+            .unwrap()
+            .seed2_power_hygiene("PWR")
+            .unwrap()
+            .test_point("TP1", "CV1_CV_ADC");
+
+        let circuit = carrier.into_circuit();
+        let outcome = validate_carrier(&circuit);
+        assert!(outcome.passed, "{:?}", outcome.findings);
+        assert!(has_pin(&circuit, "CV1_CV_ADC", "M1", "A1"));
+        assert!(has_pin(&circuit, "AI1_AUDIO_IN_CODEC", "M1", "AUDIO_IN_L"));
+        assert!(has_pin(
+            &circuit,
+            "AO1_AUDIO_OUT_CODEC",
+            "M1",
+            "AUDIO_OUT_R+"
+        ));
+        assert!(has_pin(&circuit, "GI1_GATE_GPIO", "M1", "D13"));
+        assert!(has_pin(&circuit, "GO1_GATE_GPIO", "M1", "D14"));
+        assert!(has_pin(&circuit, "CO1_DAC_RAW", "M1", "DAC1"));
+        assert!(has_pin(&circuit, "3V3_A", "M1", "3V3_A"));
+        assert!(has_pin(&circuit, "CV1_CV_ADC", "TP1", "1"));
+    }
+
+    #[test]
+    fn seed2_front_end_methods_reject_patch_sm() {
+        let mut carrier = CarrierBuilder::patch_sm("patch", "M1").unwrap();
+        assert_eq!(
+            carrier
+                .seed2_cv_input_front_end("CV1", "J1", "A1")
+                .unwrap_err(),
+            CarrierError::UnsupportedPlatform {
+                platform: "DAISY_PATCH_SM",
+                feature: "Seed2 CV input front-end",
+            }
+        );
     }
 
     #[test]
