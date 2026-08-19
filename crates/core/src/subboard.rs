@@ -93,6 +93,85 @@ pub struct SubboardSpec {
     pub standoff_mm: f64,
 }
 
+/// What a carrier-board pin is allowed to carry. This is deliberately coarse:
+/// the first consumer is validation ("raw CV into GPIO is bad"), not firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinCapability {
+    Power,
+    Ground,
+    AudioIn,
+    AudioOut,
+    AudioReference,
+    CvIn,
+    CvOut,
+    GateIn,
+    GateOut,
+    AnalogIn,
+    Dac,
+    Gpio,
+    Usb,
+    Storage,
+}
+
+/// A named pin on a vendored sub-board footprint. Unlike [`PinLabel`], the pad
+/// id is a string because Electrosmith Patch SM / Seed2 DFM footprints use
+/// alphanumeric pads (`A1`, `B2`, ...), not numeric DIP pins.
+#[derive(Debug, Clone, Copy)]
+pub struct ProfilePin {
+    pub pad: &'static str,
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    pub capabilities: &'static [PinCapability],
+}
+
+impl ProfilePin {
+    pub fn has_capability(&self, capability: PinCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+}
+
+/// A vendored module profile: semantic pin names and carrier-board capabilities
+/// layered over a real embedded footprint.
+#[derive(Debug, Clone, Copy)]
+pub struct SubboardProfile {
+    pub name: &'static str,
+    pub footprint: &'static str,
+    pub pins: &'static [ProfilePin],
+    pub body_w_mm: Option<f64>,
+    pub body_h_mm: Option<f64>,
+    pub standoff_mm: Option<f64>,
+    /// True when the module owns the Eurorack-level analog conditioning. Patch SM
+    /// does; lower-level SOMs such as Seed2 DFM should not.
+    pub eurorack_conditioned: bool,
+}
+
+impl SubboardProfile {
+    /// The physical pad id for a function name or alias.
+    pub fn pad_for(&self, name: &str) -> Option<&'static str> {
+        self.pins
+            .iter()
+            .find(|p| {
+                p.name.eq_ignore_ascii_case(name)
+                    || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
+            })
+            .map(|p| p.pad)
+    }
+
+    /// The canonical function name of a pad, if named.
+    pub fn pin_name(&self, pad: &str) -> Option<&'static str> {
+        self.pins
+            .iter()
+            .find(|p| p.pad.eq_ignore_ascii_case(pad))
+            .map(|p| p.name)
+    }
+
+    pub fn pins_with(&self, capability: PinCapability) -> impl Iterator<Item = &ProfilePin> + '_ {
+        self.pins
+            .iter()
+            .filter(move |p| p.has_capability(capability))
+    }
+}
+
 impl SubboardSpec {
     /// Every header pad as `(pad_number, x_mm, y_mm)`, in row-then-pin order.
     pub fn pads(&self) -> Vec<(usize, f64, f64)> {
@@ -185,6 +264,158 @@ impl SubboardSpec {
         }
         s.push_str(")\n");
         s
+    }
+}
+
+/// Electrosmith Patch Submodule pin names, matching the published Patch SM
+/// pinout and libDaisy's `daisy_patch_sm.h` names.
+#[rustfmt::skip]
+const PATCH_SM_PINS: &[ProfilePin] = &[
+    ProfilePin { pad: "A1", name: "-12V", aliases: &["VEE", "VNEG"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A2", name: "ADC_9", aliases: &["ADC9", "AUX_ADC_9"], capabilities: &[PinCapability::AnalogIn] },
+    ProfilePin { pad: "A3", name: "ADC_10", aliases: &["ADC10", "AUX_ADC_10"], capabilities: &[PinCapability::AnalogIn] },
+    ProfilePin { pad: "A4", name: "GND", aliases: &["AGND"], capabilities: &[PinCapability::Ground] },
+    ProfilePin { pad: "A5", name: "+12V", aliases: &["12V", "VCC"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A6", name: "5V", aliases: &["V5"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A7", name: "GND", aliases: &["DGND"], capabilities: &[PinCapability::Ground] },
+    ProfilePin { pad: "A8", name: "USB_DM", aliases: &["MIDI_TX", "USART1_TX"], capabilities: &[PinCapability::Usb] },
+    ProfilePin { pad: "A9", name: "USB_DP", aliases: &["MIDI_RX", "USART1_RX"], capabilities: &[PinCapability::Usb] },
+    ProfilePin { pad: "A10", name: "3V3", aliases: &["3V3_DIG", "3V3D"], capabilities: &[PinCapability::Power] },
+
+    ProfilePin { pad: "B1", name: "AUDIO_OUT_R", aliases: &["AUDIO_OUT_RIGHT", "AUDIO_OUT_2", "OUT_R"], capabilities: &[PinCapability::AudioOut] },
+    ProfilePin { pad: "B2", name: "AUDIO_OUT_L", aliases: &["AUDIO_OUT_LEFT", "AUDIO_OUT_1", "OUT_L"], capabilities: &[PinCapability::AudioOut] },
+    ProfilePin { pad: "B3", name: "AUDIO_IN_R", aliases: &["AUDIO_IN_RIGHT", "AUDIO_IN_2", "IN_R"], capabilities: &[PinCapability::AudioIn] },
+    ProfilePin { pad: "B4", name: "AUDIO_IN_L", aliases: &["AUDIO_IN_LEFT", "AUDIO_IN_1", "IN_L"], capabilities: &[PinCapability::AudioIn] },
+    ProfilePin { pad: "B5", name: "GATE_OUT_1", aliases: &["GATEOUT1", "GATE_OUT1"], capabilities: &[PinCapability::GateOut] },
+    ProfilePin { pad: "B6", name: "GATE_OUT_2", aliases: &["GATEOUT2", "GATE_OUT2"], capabilities: &[PinCapability::GateOut] },
+    ProfilePin { pad: "B7", name: "I2C1_SCL", aliases: &["SCL", "SW1", "BUTTON"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B8", name: "I2C1_SDA", aliases: &["SDA", "SW2", "TOGGLE"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B9", name: "GATE_IN_2", aliases: &["GATE2", "GATE_IN2"], capabilities: &[PinCapability::GateIn] },
+    ProfilePin { pad: "B10", name: "GATE_IN_1", aliases: &["GATE1", "GATE_IN1", "GATE"], capabilities: &[PinCapability::GateIn] },
+
+    ProfilePin { pad: "C1", name: "CV_OUT_2", aliases: &["CVOUT2", "CV_OUT2"], capabilities: &[PinCapability::CvOut] },
+    ProfilePin { pad: "C2", name: "CV_4", aliases: &["CV4", "CTRL_4", "KNOB4"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C3", name: "CV_3", aliases: &["CV3", "CTRL_3", "KNOB3"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C4", name: "CV_2", aliases: &["CV2", "CTRL_2", "KNOB2"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C5", name: "CV_1", aliases: &["CV1", "CTRL_1", "KNOB1", "KNOB"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C6", name: "CV_5", aliases: &["CV5", "CTRL_5", "KNOB5"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C7", name: "CV_6", aliases: &["CV6", "CTRL_6", "KNOB6"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C8", name: "CV_7", aliases: &["CV7", "CTRL_7", "KNOB7"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C9", name: "CV_8", aliases: &["CV8", "CTRL_8", "KNOB8"], capabilities: &[PinCapability::CvIn] },
+    ProfilePin { pad: "C10", name: "CV_OUT_1", aliases: &["CVOUT1", "CV_OUT1", "CVOUT"], capabilities: &[PinCapability::CvOut] },
+
+    ProfilePin { pad: "D1", name: "SPI2_CS", aliases: &["GPIO_D1"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "D2", name: "SDMMC1_D3", aliases: &["SD_D3", "USART3_RX"], capabilities: &[PinCapability::Storage] },
+    ProfilePin { pad: "D3", name: "SDMMC1_D2", aliases: &["SD_D2", "USART3_TX"], capabilities: &[PinCapability::Storage] },
+    ProfilePin { pad: "D4", name: "SDMMC1_D1", aliases: &["SD_D1"], capabilities: &[PinCapability::Storage] },
+    ProfilePin { pad: "D5", name: "SDMMC1_D0", aliases: &["SD_D0"], capabilities: &[PinCapability::Storage] },
+    ProfilePin { pad: "D6", name: "SDMMC1_CLK", aliases: &["SD_CLK", "UART5_TX"], capabilities: &[PinCapability::Storage] },
+    ProfilePin { pad: "D7", name: "SDMMC1_CMD", aliases: &["SD_CMD", "UART5_RX"], capabilities: &[PinCapability::Storage] },
+    ProfilePin { pad: "D8", name: "ADC_12", aliases: &["ADC12"], capabilities: &[PinCapability::AnalogIn] },
+    ProfilePin { pad: "D9", name: "ADC_11", aliases: &["ADC11"], capabilities: &[PinCapability::AnalogIn] },
+    ProfilePin { pad: "D10", name: "SPI2_SCK", aliases: &["GPIO_D10"], capabilities: &[PinCapability::Gpio] },
+];
+
+/// Electrosmith Seed2 DFM pin names from the published Seed2 DFM pinout CSV /
+/// datasheet v1.0.12. The module exposes raw codec I/O and MCU pins; the carrier
+/// is responsible for application-level analog conditioning.
+#[rustfmt::skip]
+const SEED2_DFM_PINS: &[ProfilePin] = &[
+    ProfilePin { pad: "A1", name: "VIN", aliases: &["VIN_1"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A2", name: "VIN", aliases: &["VIN_2"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A3", name: "3V3_D", aliases: &["3V3D", "+3V3D", "+3V3_D"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A4", name: "3V3_D", aliases: &["3V3D_2", "+3V3D_2", "+3V3_D_2"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A5", name: "3V3_A", aliases: &["3V3A", "+3V3A", "+3V3_A"], capabilities: &[PinCapability::Power] },
+    ProfilePin { pad: "A6", name: "GND", aliases: &["GND_1"], capabilities: &[PinCapability::Ground] },
+    ProfilePin { pad: "A7", name: "GND", aliases: &["GND_2"], capabilities: &[PinCapability::Ground] },
+    ProfilePin { pad: "A8", name: "GND", aliases: &["GND_3"], capabilities: &[PinCapability::Ground] },
+    ProfilePin { pad: "A9", name: "GND", aliases: &["GND_4"], capabilities: &[PinCapability::Ground] },
+    ProfilePin { pad: "A10", name: "GND", aliases: &["GND_5"], capabilities: &[PinCapability::Ground] },
+
+    ProfilePin { pad: "B1", name: "D9", aliases: &["PB4", "SPI1_MISO", "UART7_TX", "I2S1_SDI", "SPI3_MISO", "I2S3_SDI", "SPI6_MISO"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B2", name: "D8", aliases: &["PG11", "SPI1_SCK", "I2S1_CK", "LPTIM1_IN2", "HRTIM_EEV4"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B3", name: "D13", aliases: &["PB6", "USART1_TX", "LPUART1_TX", "UART5_TX", "I2C1_SCL", "I2C4_SCL", "TIM16_CH1N", "TIM4_CH1"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B4", name: "D10", aliases: &["PB5", "SPI1_MOSI", "UART5_RX", "I2S1_SDO", "SPI3_MOSI", "I2S3_SDO", "SPI6_MOSI", "I2C4_SMBA", "TIM17_BKIN"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B5", name: "D14", aliases: &["PB7", "USART1_RX", "LPUART1_RX", "I2C1_SDA", "I2C4_SDA", "TIM17_CH1N", "TIM4_CH2"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B6", name: "D7", aliases: &["PG10", "SPI1_NSS", "I2S1_WS", "HRTIM_FLT5"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B7", name: "D11", aliases: &["PB8", "I2C1_SCL", "UART4_RX", "I2C4_SCL", "TIM16_CH1", "TIM4_CH3"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B8", name: "D12", aliases: &["PB9", "I2C1_SDA", "UART4_TX", "SPI2_NSS", "I2S2_WS", "I2C4_SDA", "I2C4_SMBA", "TIM17_CH1", "TIM4_CH4"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "B9", name: "D30", aliases: &["PB15", "USB_HS_D+", "USB_HS_DP", "USART1_RX"], capabilities: &[PinCapability::Gpio, PinCapability::Usb] },
+    ProfilePin { pad: "B10", name: "D29", aliases: &["PB14", "USB_HS_D-", "USB_HS_DM", "USART_1_TX", "USART1_TX", "TIM1_CH2N"], capabilities: &[PinCapability::Gpio, PinCapability::Usb] },
+
+    ProfilePin { pad: "C1", name: "D16", aliases: &["A1", "PA3", "ADC1", "USART2_RX", "TIM2_CH4", "TIM5_CH4"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C2", name: "D19", aliases: &["A4", "PA6", "ADC4", "SPI1_MISO", "I2S1_SDI", "SPI6_MISO", "TIM1_BKIN", "TIM3_CH1"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C3", name: "D20", aliases: &["A5", "PC1", "ADC5"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C4", name: "D18", aliases: &["A3", "PA7", "ADC3", "SPI1_MOSI", "I2S1_SDO", "SPI6_MOSI", "TIM1_CH1N", "TIM3_CH2"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C5", name: "D17", aliases: &["A2", "PB1", "ADC2", "TIM1_CH3N", "TIM3_CH4"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C6", name: "D21", aliases: &["A6", "PC4", "ADC6", "I2S1_MCK"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C7", name: "D15", aliases: &["A0", "PC0", "ADC0", "SAI2_FS_B"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "C8", name: "D23", aliases: &["A8", "PA4", "DAC1", "ADC8", "SPI1_NSS", "I2S1_WS", "SPI3_NSS", "I2S3_WS", "SPI6_NSS", "D1PWREN"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn, PinCapability::Dac] },
+    ProfilePin { pad: "C9", name: "D22", aliases: &["A7", "PA5", "DAC2", "ADC7", "SPI1_SCK", "I2S1_CK", "SPI6_SCK", "D2PWREN", "TIM2_CH1"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn, PinCapability::Dac] },
+    ProfilePin { pad: "C10", name: "D31", aliases: &["A12", "PC2", "SPI2_MISO", "ADC12"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+
+    ProfilePin { pad: "D1", name: "AUDIO_IN_L", aliases: &["AUDIO_IN_LEFT", "IN_L"], capabilities: &[PinCapability::AudioIn] },
+    ProfilePin { pad: "D2", name: "AUDIO_IN_R", aliases: &["AUDIO_IN_RIGHT", "IN_R"], capabilities: &[PinCapability::AudioIn] },
+    ProfilePin { pad: "D3", name: "AUDIO_VCOM", aliases: &["VCOM", "AUDIO_COMMON"], capabilities: &[PinCapability::AudioReference] },
+    ProfilePin { pad: "D4", name: "AUDIO_OUT_L_NEG", aliases: &["AUDIO_OUT_L-", "AUDIO_OUT_L_N", "AUDIO_OUT_LEFT_NEG"], capabilities: &[PinCapability::AudioOut] },
+    ProfilePin { pad: "D5", name: "AUDIO_OUT_L_POS", aliases: &["AUDIO_OUT_L+", "AUDIO_OUT_L_P", "AUDIO_OUT_LEFT_POS"], capabilities: &[PinCapability::AudioOut] },
+    ProfilePin { pad: "D6", name: "AUDIO_OUT_R_POS", aliases: &["AUDIO_OUT_R+", "AUDIO_OUT_R_P", "AUDIO_OUT_RIGHT_POS"], capabilities: &[PinCapability::AudioOut] },
+    ProfilePin { pad: "D7", name: "AUDIO_OUT_R_NEG", aliases: &["AUDIO_OUT_R-", "AUDIO_OUT_R_N", "AUDIO_OUT_RIGHT_NEG"], capabilities: &[PinCapability::AudioOut] },
+    ProfilePin { pad: "D8", name: "D32", aliases: &["A13", "PC3", "SPI2_MOSI", "ADC13"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "D9", name: "D0", aliases: &["PB12", "USB_HS_ID", "UART5_RX", "USART3_CK", "TIM1_BKIN"], capabilities: &[PinCapability::Gpio, PinCapability::Usb] },
+    ProfilePin { pad: "D10", name: "D27", aliases: &["PG9", "SAI2_FS_B", "USART6_RX", "SPI1_MISO", "I2S1_SDI"], capabilities: &[PinCapability::Gpio] },
+
+    ProfilePin { pad: "E1", name: "D24", aliases: &["A9", "PA1", "ADC9", "SAI2_MCLK_B", "UART4_RX", "TIM2_CH2", "TIM5_CH2"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "E2", name: "D25", aliases: &["A10", "PA0", "ADC10", "SAI2_SD_B", "UART4_TX", "TIM2_CH1", "TIM2_ETR", "TIM5_CH1"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "E3", name: "D26", aliases: &["PD11", "SAI2_SD_A", "I2C4_SMBA", "LPTIM2_IN2"], capabilities: &[PinCapability::Gpio] },
+    ProfilePin { pad: "E4", name: "D28", aliases: &["A11", "PA2", "ADC11", "SAI2_SCK_B", "USART2_TX", "TIM2_CH3", "TIM5_CH3"], capabilities: &[PinCapability::Gpio, PinCapability::AnalogIn] },
+    ProfilePin { pad: "E5", name: "D6", aliases: &["PC12", "SDMMC_CK", "SD_CLK", "UART5_TX", "USART3_CK", "SPI3_MOSI", "I2S3_SDO"], capabilities: &[PinCapability::Gpio, PinCapability::Storage] },
+    ProfilePin { pad: "E6", name: "D5", aliases: &["PD2", "SDMMC_CMD", "SD_CMD", "UART5_RX"], capabilities: &[PinCapability::Gpio, PinCapability::Storage] },
+    ProfilePin { pad: "E7", name: "D4", aliases: &["PC8", "SDMMC_D0", "SD_D0", "UART5_CTS"], capabilities: &[PinCapability::Gpio, PinCapability::Storage] },
+    ProfilePin { pad: "E8", name: "D3", aliases: &["PC9", "SDMMC_D1", "SD_D1", "UART5_CTS", "I2S_CKIN", "MCO2"], capabilities: &[PinCapability::Gpio, PinCapability::Storage] },
+    ProfilePin { pad: "E9", name: "D2", aliases: &["PC10", "SDMMC_D2", "SD_D2", "USART3_TX", "UART4_TX", "SPI3_SCK", "I2S3_CK", "HRTIM_EEV1"], capabilities: &[PinCapability::Gpio, PinCapability::Storage] },
+    ProfilePin { pad: "E10", name: "D1", aliases: &["PC11", "SDMMC_D3", "SD_D3", "USART3_RX", "UART4_RX", "SPI3_MISO", "I2S3_SDI", "HRTIM_FLT2"], capabilities: &[PinCapability::Gpio, PinCapability::Storage] },
+];
+
+pub fn profile(name: &str) -> Option<SubboardProfile> {
+    match name {
+        "DAISY_PATCH_SM" => Some(SubboardProfile {
+            name: "Daisy Patch SM",
+            footprint: "DAISY_PATCH_SM",
+            pins: PATCH_SM_PINS,
+            body_w_mm: None,
+            body_h_mm: None,
+            standoff_mm: Some(8.5),
+            eurorack_conditioned: true,
+        }),
+        "DAISY_PATCH_SM_SMT" => Some(SubboardProfile {
+            name: "Daisy Patch SM",
+            footprint: "DAISY_PATCH_SM_SMT",
+            pins: PATCH_SM_PINS,
+            body_w_mm: None,
+            body_h_mm: None,
+            standoff_mm: Some(8.5),
+            eurorack_conditioned: true,
+        }),
+        "DAISY_SEED2_DFM" => Some(SubboardProfile {
+            name: "Daisy Seed2 DFM",
+            footprint: "DAISY_SEED2_DFM",
+            pins: SEED2_DFM_PINS,
+            body_w_mm: Some(55.0),
+            body_h_mm: Some(28.0),
+            standoff_mm: None,
+            eurorack_conditioned: false,
+        }),
+        "DAISY_SEED2_DFM_PTH" => Some(SubboardProfile {
+            name: "Daisy Seed2 DFM",
+            footprint: "DAISY_SEED2_DFM_PTH",
+            pins: SEED2_DFM_PINS,
+            body_w_mm: Some(55.0),
+            body_h_mm: Some(28.0),
+            standoff_mm: None,
+            eurorack_conditioned: false,
+        }),
+        _ => None,
     }
 }
 
@@ -348,6 +579,69 @@ mod tests {
         assert_eq!(d.pad_for("nope"), None);
         // Reverse lookup.
         assert_eq!(d.pin_name(18), Some("AUDIO_OUT_L"));
+    }
+
+    #[test]
+    fn patch_sm_profile_resolves_carrier_signal_names() {
+        let p = profile("DAISY_PATCH_SM").expect("Patch SM has a profile");
+        assert_eq!(p.footprint, "DAISY_PATCH_SM");
+        assert!(p.eurorack_conditioned);
+        assert_eq!(p.pins.len(), 40);
+
+        assert_eq!(p.pad_for("AUDIO_IN_L"), Some("B4"));
+        assert_eq!(p.pad_for("audio_out_left"), Some("B2"));
+        assert_eq!(p.pad_for("CV_1"), Some("C5"));
+        assert_eq!(p.pad_for("knob1"), Some("C5"));
+        assert_eq!(p.pad_for("GATE"), Some("B10"));
+        assert_eq!(p.pin_name("C10"), Some("CV_OUT_1"));
+
+        assert_eq!(p.pins_with(PinCapability::AudioIn).count(), 2);
+        assert_eq!(p.pins_with(PinCapability::AudioOut).count(), 2);
+        assert_eq!(p.pins_with(PinCapability::CvIn).count(), 8);
+        assert_eq!(p.pins_with(PinCapability::CvOut).count(), 2);
+        assert_eq!(p.pins_with(PinCapability::GateIn).count(), 2);
+        assert_eq!(p.pins_with(PinCapability::GateOut).count(), 2);
+    }
+
+    #[test]
+    fn seed2_dfm_profile_resolves_carrier_signal_names() {
+        let p = profile("DAISY_SEED2_DFM").expect("Seed2 DFM has a profile");
+        assert_eq!(p.footprint, "DAISY_SEED2_DFM");
+        assert_eq!(p.body_w_mm, Some(55.0));
+        assert_eq!(p.body_h_mm, Some(28.0));
+        assert_eq!(p.standoff_mm, None);
+        assert!(!p.eurorack_conditioned);
+        assert_eq!(p.pins.len(), 50);
+
+        assert_eq!(p.pad_for("VIN"), Some("A1"));
+        assert_eq!(p.pad_for("D16"), Some("C1"));
+        assert_eq!(p.pad_for("A1"), Some("C1"));
+        assert_eq!(p.pad_for("ADC13"), Some("D8"));
+        assert_eq!(p.pad_for("DAC1"), Some("C8"));
+        assert_eq!(p.pad_for("AUDIO_OUT_L+"), Some("D5"));
+        assert_eq!(p.pad_for("USB_HS_DP"), Some("B9"));
+        assert_eq!(p.pad_for("SDMMC_D3"), Some("E10"));
+        assert_eq!(p.pin_name("D4"), Some("AUDIO_OUT_L_NEG"));
+
+        assert_eq!(p.pins_with(PinCapability::Power).count(), 5);
+        assert_eq!(p.pins_with(PinCapability::Ground).count(), 5);
+        assert_eq!(p.pins_with(PinCapability::AudioIn).count(), 2);
+        assert_eq!(p.pins_with(PinCapability::AudioOut).count(), 4);
+        assert_eq!(p.pins_with(PinCapability::AudioReference).count(), 1);
+        assert_eq!(p.pins_with(PinCapability::AnalogIn).count(), 14);
+        assert_eq!(p.pins_with(PinCapability::Dac).count(), 2);
+        assert_eq!(p.pins_with(PinCapability::Gpio).count(), 33);
+        assert_eq!(p.pins_with(PinCapability::Usb).count(), 3);
+        assert_eq!(p.pins_with(PinCapability::Storage).count(), 6);
+    }
+
+    #[test]
+    fn seed2_dfm_pth_profile_uses_the_same_pin_map() {
+        let p = profile("DAISY_SEED2_DFM_PTH").expect("Seed2 DFM PTH has a profile");
+        assert_eq!(p.footprint, "DAISY_SEED2_DFM_PTH");
+        assert_eq!(p.pins.len(), 50);
+        assert_eq!(p.pad_for("D32"), Some("D8"));
+        assert_eq!(p.pad_for("A13"), Some("D8"));
     }
 
     #[test]

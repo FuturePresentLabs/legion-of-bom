@@ -1677,6 +1677,17 @@ pub fn generate_board_artifacts(
                     })
                     .collect();
                 pin_labels.insert(refdes.to_string(), map);
+            } else if let Some(profile) = crate::subboard::profile(name) {
+                let map: HashMap<String, Vec<String>> = profile
+                    .pins
+                    .iter()
+                    .map(|p| {
+                        let mut names = vec![p.name.to_string()];
+                        names.extend(p.aliases.iter().map(|a| a.to_string()));
+                        (p.pad.to_string(), names)
+                    })
+                    .collect();
+                pin_labels.insert(refdes.to_string(), map);
             }
         }
         let fp = load_footprint(&options.footprint_dir, lib_part)?;
@@ -2330,9 +2341,12 @@ fn detect_collisions(parts: &[PlacedPart]) -> Vec<String> {
 /// sub-board; `None` for an ordinary footprint.
 fn subboard_standoff(lib_part: &str) -> Option<f64> {
     let (lib, name) = lib_part.split_once(':')?;
-    (lib == crate::subboard::SUBBOARD_LIB)
-        .then(|| crate::subboard::from_name(name).map(|s| s.standoff_mm))
-        .flatten()
+    if lib != crate::subboard::SUBBOARD_LIB {
+        return None;
+    }
+    crate::subboard::from_name(name)
+        .map(|s| s.standoff_mm)
+        .or_else(|| crate::subboard::profile(name).and_then(|p| p.standoff_mm))
 }
 
 /// Rough component height (mm) by footprint family — enough to tell a low-profile
@@ -3815,6 +3829,90 @@ mod tests {
             art.pcb.contains("(segment"),
             "the function-named net becomes copper — resolution worked"
         );
+    }
+
+    #[test]
+    fn patch_sm_net_wires_to_vendored_pad_by_function_name() {
+        // Patch SM is a vendored Electrosmith footprint whose pads are A1..D10.
+        // The carrier circuit should still speak in functions: audio/CV/gate.
+        let patch = Circuit {
+            name: "patch-carrier".into(),
+            parts: vec![
+                Part::new("M1", "DAISY_PATCH_SM").with_footprint("LobModule:DAISY_PATCH_SM")
+            ],
+            nets: vec![
+                Net::new(
+                    "AUDIO",
+                    vec![
+                        PinRef::new("M1", "AUDIO_IN_L"),
+                        PinRef::new("M1", "AUDIO_OUT_L"),
+                    ],
+                ),
+                Net::new(
+                    "CONTROL",
+                    vec![PinRef::new("M1", "CV_1"), PinRef::new("M1", "CV_OUT_1")],
+                ),
+            ],
+        };
+
+        let art = generate_board_artifacts(&patch, &BoardOptions::new("/nonexistent"))
+            .expect("Patch SM carrier generates");
+        assert!(
+            art.route.conflicts.is_empty(),
+            "semantic Patch SM nets route: {:?}",
+            art.route.conflicts
+        );
+        assert!(
+            art.pcb.contains("(segment"),
+            "semantic Patch SM names become routed copper"
+        );
+        assert!(art.pcb.contains(r#"(pad "B4""#), "AUDIO_IN_L maps to B4");
+        assert!(art.pcb.contains(r#"(pad "C5""#), "CV_1 maps to C5");
+        assert_eq!(subboard_standoff("LobModule:DAISY_PATCH_SM"), Some(8.5));
+    }
+
+    #[test]
+    fn seed2_dfm_net_wires_to_vendored_pad_by_function_name() {
+        // Seed2 DFM is lower-level than Patch SM: names are MCU pins, codec pins,
+        // and alternate functions from the official pinout, mapped to A1..E10.
+        let seed2 = Circuit {
+            name: "seed2-carrier".into(),
+            parts: vec![
+                Part::new("M1", "DAISY_SEED2_DFM").with_footprint("LobModule:DAISY_SEED2_DFM")
+            ],
+            nets: vec![
+                Net::new(
+                    "CONTROL",
+                    vec![
+                        PinRef::new("M1", "D16"),
+                        PinRef::new("M1", "A1"),
+                        PinRef::new("M1", "ADC1"),
+                    ],
+                ),
+                Net::new(
+                    "AUDIO_DIFF",
+                    vec![
+                        PinRef::new("M1", "AUDIO_OUT_L+"),
+                        PinRef::new("M1", "AUDIO_OUT_L-"),
+                    ],
+                ),
+            ],
+        };
+
+        let art = generate_board_artifacts(&seed2, &BoardOptions::new("/nonexistent"))
+            .expect("Seed2 DFM carrier generates");
+        assert!(
+            art.route.conflicts.is_empty(),
+            "semantic Seed2 DFM nets route: {:?}",
+            art.route.conflicts
+        );
+        assert!(
+            art.pcb.contains("(segment"),
+            "semantic Seed2 DFM names become routed copper"
+        );
+        assert!(art.pcb.contains(r#"(pad "C1""#), "D16/A1/ADC1 maps to C1");
+        assert!(art.pcb.contains(r#"(pad "D5""#), "AUDIO_OUT_L+ maps to D5");
+        assert_eq!(subboard_standoff("LobModule:DAISY_SEED2_DFM"), None);
     }
 
     #[test]

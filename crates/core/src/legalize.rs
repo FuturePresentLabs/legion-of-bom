@@ -94,7 +94,8 @@ pub fn legalize_pinning(
             let Some(current) = placements.get(&refdes).copied() else {
                 continue;
             };
-            let Some(spot) = nearest_free(&refdes, target, current, placements, facts) else {
+            let Some(spot) = nearest_free(&refdes, target, current, placements, facts, rules)
+            else {
                 continue;
             };
             let step = (spot.0 - current.x_mm).hypot(spot.1 - current.y_mm);
@@ -140,6 +141,7 @@ fn nearest_free(
     current: Placement,
     placements: &HashMap<String, Placement>,
     facts: &HashMap<String, PartFacts>,
+    rules: &[Rule],
 ) -> Option<(f64, f64)> {
     // A part with no measured facts used to short-circuit to `Some(target)` —
     // moved with NO collision check at all. We cannot check its own body without
@@ -192,7 +194,22 @@ fn nearest_free(
             crate::rules::gap_between(mine, theirs) < -crate::rules::TOLERANCE_MM
         })
     };
-    if !clashes(target.0, target.1) {
+    let satisfies_rules = |x: f64, y: f64| {
+        let mut trial = placements.clone();
+        trial.insert(
+            refdes.to_string(),
+            Placement {
+                x_mm: x,
+                y_mm: y,
+                ..current
+            },
+        );
+        !crate::rules::assess(rules, &trial)
+            .into_iter()
+            .any(|a| a.tier == Tier::Physical && a.subject == refdes && !a.ok())
+    };
+    let accepts = |x: f64, y: f64| satisfies_rules(x, y) && !clashes(x, y);
+    if accepts(target.0, target.1) {
         return Some(target);
     }
     // Rings outward. Eight directions is enough to find a neighbouring gap
@@ -202,7 +219,7 @@ fn nearest_free(
         for k in 0..8 {
             let a = std::f64::consts::FRAC_PI_4 * k as f64;
             let (x, y) = (target.0 + r * a.cos(), target.1 + r * a.sin());
-            if !clashes(x, y) {
+            if accepts(x, y) {
                 return Some((x, y));
             }
         }
@@ -410,6 +427,33 @@ mod tests {
         );
         // …but still near where it was asked to go, not across the board.
         assert!((j1.x_mm - 33.5).hypot(j1.y_mm - 50.0) < 12.0, "{j1:?}");
+    }
+
+    #[test]
+    fn occupied_edge_target_does_not_make_ring_search_pick_an_off_board_spot() {
+        let bounds = (0.0, 0.0, 20.0, 20.0);
+        let rules = vec![edge_rule("J1", (4.0, 4.0), bounds)];
+        let facts: HashMap<String, PartFacts> = [
+            ("J1".to_string(), fact(4.0, 4.0)),
+            ("U1".to_string(), fact(4.0, 4.0)),
+        ]
+        .into();
+        let mut p: HashMap<String, Placement> = [
+            ("J1".to_string(), at(22.0, 10.0)),
+            // J1's edge repair target is x=17.0. With no rule check in
+            // nearest_free, the first non-clashing ring point was east at
+            // x=21.0: clear of U1, but still off the board.
+            ("U1".to_string(), at(17.0, 10.0)),
+        ]
+        .into();
+
+        let r = legalize(&mut p, &rules, &facts);
+        assert!(r.is_clean(), "{r:?} left {:?}", p["J1"]);
+        assert!(
+            p["J1"].x_mm <= 17.0 + 1e-6,
+            "ring search accepted an off-board candidate: {:?}",
+            p["J1"]
+        );
     }
 
     /// A part anchored to a panel cutout is never moved, however illegal it is.
