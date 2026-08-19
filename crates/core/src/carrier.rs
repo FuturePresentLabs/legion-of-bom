@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::model::{Circuit, Net, Part, PinRef, RefDes};
@@ -24,7 +25,7 @@ pub const DEFAULT_TESTPOINT_FOOTPRINT: &str = "TestPoint:TestPoint_Pad_D1.5mm";
 pub const DEFAULT_EXPANDER_HEADER_FOOTPRINT: &str =
     "Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm_Vertical";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CarrierPlatform {
     PatchSm,
     Seed2Dfm,

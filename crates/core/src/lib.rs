@@ -17,6 +17,7 @@ pub mod bom_repair;
 pub mod carrier;
 pub mod decouple;
 pub mod drc;
+pub mod dsp_import;
 pub mod eagle;
 pub mod easyeda;
 pub mod edit;
@@ -82,6 +83,9 @@ pub use carrier::{
 };
 pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
+pub use dsp_import::{
+    DspCore, DspImportManifest, DspImportProblem, DspModule, DspPackage, TargetRef,
+};
 pub use eagle::{
     map_footprint, map_footprint_for, parse_board as parse_eagle_board,
     parse_schematic as parse_eagle_schematic, to_skidl, EagleImport, EaglePlacement,
