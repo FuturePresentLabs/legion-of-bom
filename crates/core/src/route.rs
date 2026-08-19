@@ -2324,29 +2324,39 @@ mod tests {
     #[test]
     fn routing_refuses_to_enter_the_board_edge_band() {
         // When `bounds` is the board outline, the router keeps copper an
-        // edge-clearance inset inside it. A net whose only path runs through the
-        // edge band (here: a wall sealing the board except a gap hard against the
-        // bottom edge) must NOT be routed into the band — that trips
-        // copper_edge_clearance DRC. It is surfaced as a conflict instead.
-        let opts = RouteOptions {
-            bounds: Some((0.0, 0.0, 20.0, 10.0)),
-            ..RouteOptions::default()
+        // edge-clearance inset inside it. This fixture has a vertical wall whose
+        // only crossing is the bottom edge band: no edge clearance can use it,
+        // but KiCad's default clearance must refuse it.
+        let route_with_edge_clearance = |edge_clearance_mm| {
+            let opts = RouteOptions {
+                bounds: Some((0.0, 0.0, 20.0, 10.0)),
+                edge_clearance_mm,
+                ..RouteOptions::default()
+            };
+            let mut nets = vec![RouteNet {
+                net_idx: 1,
+                name: "SIG".into(),
+                pads: vec![pad("A", "1", 5.0, 0.6), pad("B", "1", 15.0, 0.6)],
+            }];
+            // A vertical wall at x = 10 starts at y = 2. The path at y ~= 0.6 is
+            // deliberately available only when the router may use the edge band.
+            for y in 2..=10 {
+                nets.push(RouteNet {
+                    net_idx: 0,
+                    name: String::new(),
+                    pads: vec![pad_on("W", "1", 10.0, y as f64, PadLayer::Both)],
+                });
+            }
+            GridRouter.route(&nets, &opts)
         };
-        let mut nets = vec![RouteNet {
-            net_idx: 1,
-            name: "SIG".into(),
-            pads: vec![pad("A", "1", 5.0, 5.0), pad("B", "1", 15.0, 5.0)],
-        }];
-        // A solid vertical wall of through-hole obstacle pads at x = 10, spanning
-        // y = 1..=10 (the top edge). The only crossing is y < 1 — inside the band.
-        for y in 1..=10 {
-            nets.push(RouteNet {
-                net_idx: 0,
-                name: String::new(),
-                pads: vec![pad_on("W", "1", 10.0, y as f64, PadLayer::Both)],
-            });
-        }
-        let out = GridRouter.route(&nets, &opts);
+
+        let unguarded = route_with_edge_clearance(0.0);
+        assert!(
+            unguarded.conflicts.is_empty() && unguarded.tracks.iter().any(|t| t.net_idx == 1),
+            "fixture must be routable before edge clearance is applied: {unguarded:?}"
+        );
+
+        let out = route_with_edge_clearance(0.5);
         assert!(
             !out.conflicts.is_empty(),
             "a net routable only through the edge band must be surfaced, not routed into it"

@@ -423,10 +423,24 @@ mod tests {
     #[test]
     fn analytic_check_runs_the_matching_check() {
         // Op-amp circuit → gain check applies and passes.
-        assert!(analytic_check(&opamp_amp("9k", "1k"), &flat_response(20.0), 0.02).passed);
+        let gain = analytic_check(&opamp_amp("9k", "1k"), &flat_response(20.0), 0.02);
+        assert!(gain.passed, "{:?}", gain.findings);
+        assert!(
+            gain.findings
+                .iter()
+                .any(|f| f.message.contains("non-inverting gain")),
+            "gain check did not contribute its finding: {:?}",
+            gain.findings
+        );
         // RC circuit → cutoff check applies and passes.
         let rc = rc_circuit("1k", "159n");
-        assert!(analytic_check(&rc, &response_with_cutoff(1000.97), 0.02).passed);
+        let cutoff = analytic_check(&rc, &response_with_cutoff(1000.97), 0.02);
+        assert!(cutoff.passed, "{:?}", cutoff.findings);
+        assert!(
+            cutoff.findings.iter().any(|f| f.message.contains("cutoff")),
+            "RC cutoff check did not contribute its finding: {:?}",
+            cutoff.findings
+        );
     }
 
     fn dual_circuit() -> Circuit {

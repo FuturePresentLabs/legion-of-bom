@@ -353,9 +353,22 @@ mod tests {
         ]
         .into();
 
-        snap(&mut placements, &circuit, &facts);
+        let start = placements["C2"];
+        let report = snap(&mut placements, &circuit, &facts);
 
         let (c, j) = (placements["C2"], placements["J1"]);
+        assert_ne!(
+            (c.x_mm, c.y_mm),
+            (start.x_mm, start.y_mm),
+            "fixture is inert — snap did not move the cap at all: {report:?}"
+        );
+        assert!(
+            report
+                .snapped
+                .iter()
+                .any(|(cap, ic, _)| cap == "C2" && ic == "U1"),
+            "C2 should be snapped to the IC, not skipped: {report:?}"
+        );
         let (dx, dy) = ((c.x_mm - j.x_mm).abs(), (c.y_mm - j.y_mm).abs());
         // Half-extents: the jack is 10mm across, the 0603 1.6 x 0.8.
         let (need_x, need_y) = ((10.0 + 1.6) / 2.0, (10.0 + 0.8) / 2.0);

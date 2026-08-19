@@ -451,16 +451,26 @@ mod tests {
     /// and not so hard that the cap is the only thing the solve can see.
     #[test]
     fn the_decoupling_bond_outweighs_a_signal_net() {
+        let ordinary = solve(
+            &["C1".to_string()],
+            &fixed(&[("U1", 0.0, 0.0), ("J1", 100.0, 0.0)]),
+            &[edge("C1", "U1", 1.0), edge("C1", "J1", 1.0)],
+            &home(50.0, 0.0),
+        );
         let p = solve(
             &["C1".to_string()],
             &fixed(&[("U1", 0.0, 0.0), ("J1", 100.0, 0.0)]),
             &[edge("C1", "U1", DECOUPLE_PULL), edge("C1", "J1", 1.0)],
             &home(50.0, 0.0),
         );
-        let (to_ic, to_jack) = (p["C1"].0, 100.0 - p["C1"].0);
         assert!(
-            to_jack / to_ic >= DECOUPLE_PULL,
-            "cap should sit {DECOUPLE_PULL}x nearer U1, got {:?}",
+            near(ordinary["C1"].0, 50.0),
+            "ordinary equal pulls should split the difference, got {:?}",
+            ordinary["C1"]
+        );
+        assert!(
+            near(p["C1"].0, 25.0) && p["C1"].0 < ordinary["C1"].0,
+            "decoupling pull should put the cap on the IC side of an ordinary signal pull, got {:?}",
             p["C1"]
         );
     }
@@ -517,9 +527,13 @@ mod tests {
                 edge("D", "P3", 0.25),
                 edge("D", "A", 2.0),
             ],
-            &home(20.0, 64.0),
+            &home(200.0, -50.0),
         );
         for (r, q) in &p {
+            assert!(
+                !near(q.0, 200.0) || !near(q.1, -50.0),
+                "{r} fell back to the outside home instead of solving: {q:?}"
+            );
             assert!(q.0 >= 2.0 - 1e-6 && q.0 <= 38.0 + 1e-6, "{r} {q:?}");
             assert!(q.1 >= 3.0 - 1e-6 && q.1 <= 120.0 + 1e-6, "{r} {q:?}");
         }
@@ -626,16 +640,20 @@ mod tests {
     #[test]
     fn a_two_pin_net_pulls_harder_than_a_rail() {
         let e = attractors(&a_circuit());
-        let w = |a: &str, b: &str| {
-            e.iter()
+        let weights = |a: &str, b: &str| {
+            let mut got: Vec<f64> = e
+                .iter()
                 .filter(|(x, y, _)| (x == a && y == b) || (x == b && y == a))
                 .map(|(_, _, w)| *w)
-                .sum::<f64>()
+                .collect();
+            got.sort_by(f64::total_cmp);
+            got
         };
         // SIG is a 2-pin net: full strength. GND touches three parts: half.
-        assert!(near(w("C1", "U1"), 1.0 + 0.5), "{}", w("C1", "U1"));
+        assert_eq!(weights("C1", "U1"), vec![0.5, 1.0]);
+        assert_eq!(weights("C1", "C2"), vec![0.5]);
         // A critical net pulls CRITICAL_PULL× harder than an ordinary 2-pin one.
-        assert!(near(w("R1", "U1"), CRITICAL_PULL));
+        assert_eq!(weights("R1", "U1"), vec![CRITICAL_PULL]);
     }
 
     /// Moved from `board.rs` with the edge model. C2 bridges +12V↔GND so it is
