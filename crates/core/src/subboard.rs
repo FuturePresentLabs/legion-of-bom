@@ -146,15 +146,20 @@ pub struct SubboardProfile {
 }
 
 impl SubboardProfile {
-    /// The physical pad id for a function name or alias.
-    pub fn pad_for(&self, name: &str) -> Option<&'static str> {
+    /// The named profile pin for a function name, alias, or physical pad id.
+    pub fn pin_for(&self, name: &str) -> Option<&ProfilePin> {
         self.pins
             .iter()
             .find(|p| {
                 p.name.eq_ignore_ascii_case(name)
                     || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
             })
-            .map(|p| p.pad)
+            .or_else(|| self.pins.iter().find(|p| p.pad.eq_ignore_ascii_case(name)))
+    }
+
+    /// The physical pad id for a function name or alias.
+    pub fn pad_for(&self, name: &str) -> Option<&'static str> {
+        self.pin_for(name).map(|p| p.pad)
     }
 
     /// The canonical function name of a pad, if named.

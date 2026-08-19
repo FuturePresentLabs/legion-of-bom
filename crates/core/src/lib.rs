@@ -165,7 +165,7 @@ pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutco
 pub use thonk::{product_image_url as thonk_image_url, search as thonk_search, ThonkProduct};
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
-pub use validate::validate_erc;
+pub use validate::{validate_carrier, validate_erc};
 pub use verify::{
     analytic_check, check_channel_crosstalk, check_noninverting_gain, check_rc_cutoff,
 };
