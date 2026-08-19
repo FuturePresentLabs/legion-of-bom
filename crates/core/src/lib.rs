@@ -34,6 +34,7 @@ pub mod legalize;
 pub mod logo;
 pub mod manifest;
 pub mod model;
+pub mod module_port;
 pub mod mouser;
 pub mod netlist;
 pub mod package;
@@ -117,6 +118,11 @@ pub use legalize::{legalize, Report as LegalizeReport};
 pub use logo::Logo;
 pub use manifest::{BuildCopy, CircuitEntry, Defaults, Manifest, ManifestError, RepoMeta};
 pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
+pub use module_port::{
+    ControlCombine, ControlPath, ControlSource, ControlTransform, ExpanderBinding, ModuleInterface,
+    ModulePort, ModuleRole, NormalledSource, PortConditioning, PortDirection, PortExposure,
+    PortKind, PortRange,
+};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use package::{body_mm as package_body_mm, short_name as package_short_name};
