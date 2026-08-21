@@ -11,6 +11,7 @@
 //! library — anything one surface can do, the other can too.
 
 pub mod analytical;
+pub mod api500;
 pub mod board;
 pub mod bom;
 pub mod bom_repair;
@@ -68,6 +69,14 @@ pub mod units;
 pub mod validate;
 pub mod verify;
 
+pub use api500::{
+    card_edge_pin_ref, pin_by_net as api500_pin_by_net, pin_by_number as api500_pin_by_number,
+    pin_spec as api500_pin_spec, pins_by_class as api500_pins_by_class, validate_api500_bindings,
+    validate_api500_circuit, validate_api500_circuit_with, Api500Pin, Api500PinClass,
+    Api500PinSpec, Api500PortBinding, Api500PowerBudget, Api500ValidationOptions,
+    API500_CARD_EDGE_FOOTPRINT, API500_CARD_EDGE_VALUE, API500_MINUS_16_LIMIT_MA,
+    API500_PHANTOM_LIMIT_MA, API500_PIN_COUNT, API500_PIN_PITCH_MM, API500_PLUS_16_LIMIT_MA,
+};
 pub use board::{
     build_facts, decoupling_pairs, generate_board, generate_board_artifacts, generate_board_report,
     minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
