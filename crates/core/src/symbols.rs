@@ -73,6 +73,19 @@ pub fn resolve_models(
     Ok(models)
 }
 
+/// Resolve models for a circuit when no KiCad symbol library is available:
+/// only the built-in behavioural catalogue applies (step 3 of
+/// [`resolve_models`] — parts carrying their own `Sim.*` model still win, but
+/// without a symbol dir there is nothing to expand it against, so a carried
+/// model is skipped loudly at deck-generation time instead).
+pub fn catalog_models(circuit: &dyn CircuitSource) -> HashMap<String, SpiceModel> {
+    circuit
+        .parts()
+        .iter()
+        .filter_map(|part| builtin_model(part).map(|m| (part.refdes.0.clone(), m)))
+        .collect()
+}
+
 /// Build a [`SpiceModel`] from a part-carried [`SimModel`] (its `Sim.*` fields).
 fn model_from_sim(
     sim: &SimModel,
@@ -340,8 +353,26 @@ fn builtin_model(part: &crate::model::Part) -> Option<SpiceModel> {
         subckt: subckt.into(),
         include: PathBuf::from(BUILTIN_LIB_NAME),
         pin_order: pins.iter().map(|s| s.to_string()).collect(),
-        params: None,
+        params: opamp_params(&hay).map(str::to_string),
     })
+}
+
+/// Per-part op-amp parameters for the [`OPAMP_SLEW`] macro, sourced from
+/// pedalkernel's curated opamps.model registry (ef4.2). Matched on the part's
+/// library id / value; `None` → the subckt's own defaults (TL072). Values are
+/// datasheet facts: A0 V/V, GBW Hz, SR V/s (pedalkernel lists V/us), RO ohm.
+fn opamp_params(hay: &str) -> Option<&'static str> {
+    if hay.contains("TL082") {
+        Some("A0=200k GBW=4000000 SR=13000000 RO=75")
+    } else if hay.contains("NE5532") {
+        Some("A0=100k GBW=10000000 SR=9000000 RO=50")
+    } else if hay.contains("TL072") {
+        // Matches the OPAMP_SLEW/TL072 subckt defaults; stated explicitly so
+        // every instantiation carries its full sourced parameter set.
+        Some("A0=200k GBW=3000000 SR=13000000 RO=75")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -369,6 +400,21 @@ mod tests {
         assert_eq!(subckt("U1"), Some("LM13700"));
         assert_eq!(subckt("U2"), Some("TL072"));
         assert!(!models.contains_key("R1"), "a resistor carries no model");
+    }
+
+    #[test]
+    fn opamp_models_carry_sourced_slew_params() {
+        // ef4.2: TL072/TL082/NE5532 ride the OPAMP_SLEW macro with parameters
+        // sourced from pedalkernel's opamps.model registry; other parts get
+        // none (subckt defaults or the GENERIC ideal fallback).
+        for (mpn, want) in [
+            ("TL072CDR", Some("A0=200k GBW=3000000 SR=13000000 RO=75")),
+            ("TL082ACP", Some("A0=200k GBW=4000000 SR=13000000 RO=75")),
+            ("NE5532DR", Some("A0=100k GBW=10000000 SR=9000000 RO=50")),
+            ("LM13700AN", None),
+        ] {
+            assert_eq!(opamp_params(mpn), want, "{mpn}");
+        }
     }
 
     #[test]

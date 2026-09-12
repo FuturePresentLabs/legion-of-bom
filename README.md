@@ -36,6 +36,11 @@ values — so the loop is trustworthy before a real board depends on it.
   (pinout, ratings, SPICE models) keyed by MPN; cross-project and version-
   controlled. Requires [`dolt`](https://github.com/dolthub/dolt). Try
   `lob parts add <MPN> --manufacturer …`, `lob parts show <MPN>`.
+- **Enclosures** (`crates/core/src/enclosure.rs`) — the Guitar Pedal format
+  profile. Derives a hole layout from a circuit (controls on top, jacks on the
+  sides, power at the back), checks it mechanically, and exports a STEP solid,
+  1:1 drill templates, and a machining plan. `lob enclosure sizes` lists the
+  standard boxes; see `examples/pedal_125b.toml`.
 - **MCP server** — next interface after the CLI, over the same core library.
 - **Web backend / UI** — deferred (axum + Slint/React later); nothing is web-only.
 

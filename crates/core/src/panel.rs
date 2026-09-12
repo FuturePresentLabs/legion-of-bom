@@ -4,7 +4,12 @@
 //!
 //! The [`PanelSpec`] trait is the format-agnostic seam: dimensions in mm,
 //! mounting holes, and anchored cutouts. The only v1 implementation is
-//! Eurorack; pedal/rack/500-series are deliberately unimplemented.
+//! Eurorack; rack/500-series are deliberately unimplemented.
+//!
+//! Guitar Pedal is handled by [`crate::enclosure`] rather than by a `PanelSpec`
+//! impl — a pedal's holes land on four faces in three planes, so it is a solid
+//! with faces, not a plate with one working side. What the two share is the
+//! [`CutoutSource`] seam, so the same part mechanical data drives both.
 //!
 //! DXF export consumes any `&dyn PanelSpec` — it does not know about HP, U,
 //! or enclosure size classes.
@@ -27,6 +32,43 @@ pub struct MountingHole {
     pub x_mm: f64,
     pub y_mm: f64,
     pub diameter_mm: f64,
+    /// Hole shape: a plain round hole, or an oval slot allowing horizontal
+    /// adjustment in the rack (the real-Eurorack convention; hqt).
+    pub shape: MountingHoleShape,
+}
+
+/// A mounting hole's opening shape.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MountingHoleShape {
+    /// A plain round hole.
+    #[default]
+    Round,
+    /// A horizontal oval slot: a `diameter_mm` circle stretched horizontally
+    /// (slot length = `slot_length_mm`), so horizontal position adjusts.
+    Oval { slot_length_mm: f64 },
+}
+
+/// Which mounting holes a panel gets (hqt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MountingHolePattern {
+    /// The two left-side holes only.
+    Left2,
+    /// Top-left + bottom-right (the real-Eurorack diagonal; the default).
+    #[default]
+    Diagonal,
+    /// All four corners (right pair only for panels wide enough).
+    All4,
+}
+
+impl MountingHole {
+    /// The hole's full opening width (mm) — slot length for an oval, diameter
+    /// for a round hole. What Edge.Cuts/DXF rendering and keep-outs need.
+    pub fn width_mm(&self) -> f64 {
+        match self.shape {
+            MountingHoleShape::Round => self.diameter_mm,
+            MountingHoleShape::Oval { slot_length_mm } => self.diameter_mm.max(slot_length_mm),
+        }
+    }
 }
 
 /// An anchored cutout (jack, pot, switch, LED, etc.).
@@ -61,7 +103,7 @@ pub enum CutoutShape {
 /// Thonkiconn / PJ301M panel barrel-hole diameter (mm): the threaded barrel
 /// passes through and a nut tightens on the front, so the cutout is this hole,
 /// not the jack body.
-const JACK_BARREL_MM: f64 = 6.0;
+pub(crate) const JACK_BARREL_MM: f64 = 6.0;
 /// Alpha 9 mm pot bushing hole diameter (mm).
 const POT_BUSHING_MM: f64 = 7.0;
 /// Toggle switch bushing hole diameter (mm).
@@ -177,6 +219,8 @@ mod silk {
     /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
     pub const LABEL_FONT_MM: f64 = 1.8;
     pub const LABEL_OFFSET_MM: f64 = 6.5;
+    /// Clearance between a silk label's text edge and a neighbouring cutout.
+    pub const LABEL_CLEARANCE_MM: f64 = 0.5;
     /// Brand logo: fraction of panel width, the minimum width worth drawing, and
     /// the clearances keeping it off the lowest cutout and the bottom edge/holes.
     pub const LOGO_WIDTH_FRAC: f64 = 0.4;
@@ -219,7 +263,13 @@ const EURORACK_HEIGHT_MM: f64 = 128.5;
 const HP_MM: f64 = 5.08;
 const EURORACK_HOLE_DIAMETER_MM: f64 = 3.2;
 const EURORACK_HOLE_INSET_X_MM: f64 = 7.5;
+/// Doepfer spec: the two mounting-hole rows sit 122.5 mm apart — centres
+/// 3.0 mm from the top/bottom edges of the 128.5 mm panel (the Doepfer A-100
+/// mechanical spec, j54.22; the 122.5 mm row spacing is the primary fact).
 const EURORACK_HOLE_INSET_Y_MM: f64 = 3.0;
+/// Default oval-slot length (community template: 3.2 mm high, 7 mm wide for
+/// rack alignment tolerance).
+const EURORACK_SLOT_LENGTH_MM: f64 = 7.0;
 
 /// A Eurorack panel.
 ///
@@ -231,19 +281,28 @@ pub struct EurorackPanel {
     thickness_mm: f64,
     extra_holes: Vec<MountingHole>,
     cutouts: Vec<Cutout>,
+    /// Hole shape and placement pattern (hqt). Defaults: oval slots in the
+    /// diagonal — the real-Eurorack convention.
+    hole_shape: MountingHoleShape,
+    hole_pattern: MountingHolePattern,
 }
 
 impl EurorackPanel {
     /// Create a new Eurorack panel of the given HP width.
     ///
     /// Standard height (128.5 mm) and thickness (2.0 mm) are applied.
-    /// Default mounting holes are added automatically based on HP width.
+    /// Default mounting holes (oval slots in the diagonal) are added
+    /// automatically based on HP width.
     pub fn new(hp: u16) -> Self {
         let mut panel = EurorackPanel {
             hp,
             thickness_mm: 2.0,
             extra_holes: Vec::new(),
             cutouts: Vec::new(),
+            hole_shape: MountingHoleShape::Oval {
+                slot_length_mm: EURORACK_SLOT_LENGTH_MM,
+            },
+            hole_pattern: MountingHolePattern::Diagonal,
         };
         panel.rebuild_default_holes();
         panel
@@ -252,6 +311,16 @@ impl EurorackPanel {
     /// Override the default thickness (mm).
     pub fn with_thickness(mut self, mm: f64) -> Self {
         self.thickness_mm = mm;
+        self
+    }
+
+    /// Override the mounting-hole shape and placement pattern (hqt). Rebuilds
+    /// the default hole set.
+    pub fn with_mounting(mut self, shape: MountingHoleShape, pattern: MountingHolePattern) -> Self {
+        self.hole_shape = shape;
+        self.hole_pattern = pattern;
+        self.extra_holes.clear();
+        self.rebuild_default_holes();
         self
     }
 
@@ -303,29 +372,44 @@ impl EurorackPanel {
     fn rebuild_default_holes(&mut self) {
         let w = self.width_mm_value();
         let h = EURORACK_HEIGHT_MM;
-        // Left side holes (always present).
-        self.extra_holes.push(MountingHole {
-            x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: h - EURORACK_HOLE_INSET_Y_MM,
-            diameter_mm: EURORACK_HOLE_DIAMETER_MM,
-        });
-        self.extra_holes.push(MountingHole {
-            x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: EURORACK_HOLE_INSET_Y_MM,
-            diameter_mm: EURORACK_HOLE_DIAMETER_MM,
-        });
-        // Right side holes for panels ≥ 8 HP.
-        if self.hp >= 8 {
+        let mut hole = |x_mm: f64, y_mm: f64, seed: &str| {
             self.extra_holes.push(MountingHole {
-                x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: h - EURORACK_HOLE_INSET_Y_MM,
+                x_mm,
+                y_mm,
                 diameter_mm: EURORACK_HOLE_DIAMETER_MM,
+                shape: self.hole_shape,
             });
-            self.extra_holes.push(MountingHole {
-                x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: EURORACK_HOLE_INSET_Y_MM,
-                diameter_mm: EURORACK_HOLE_DIAMETER_MM,
-            });
+            let _ = seed;
+        };
+        // The right pair only fits on panels wide enough for the insets
+        // (narrow panels use their left pair only, in every pattern).
+        let right_side_fits = self.hp >= 8;
+        // Which holes the pattern wants: (x from left, y from bottom).
+        let left_top = (EURORACK_HOLE_INSET_X_MM, h - EURORACK_HOLE_INSET_Y_MM);
+        let left_bottom = (EURORACK_HOLE_INSET_X_MM, EURORACK_HOLE_INSET_Y_MM);
+        let right_top = (w - EURORACK_HOLE_INSET_X_MM, h - EURORACK_HOLE_INSET_Y_MM);
+        let right_bottom = (w - EURORACK_HOLE_INSET_X_MM, EURORACK_HOLE_INSET_Y_MM);
+        match self.hole_pattern {
+            MountingHolePattern::Left2 => {
+                hole(left_top.0, left_top.1, "lt");
+                hole(left_bottom.0, left_bottom.1, "lb");
+            }
+            MountingHolePattern::Diagonal => {
+                hole(left_top.0, left_top.1, "lt");
+                if right_side_fits {
+                    hole(right_bottom.0, right_bottom.1, "rb");
+                } else {
+                    hole(left_bottom.0, left_bottom.1, "lb");
+                }
+            }
+            MountingHolePattern::All4 => {
+                hole(left_top.0, left_top.1, "lt");
+                hole(left_bottom.0, left_bottom.1, "lb");
+                if right_side_fits {
+                    hole(right_top.0, right_top.1, "rt");
+                    hole(right_bottom.0, right_bottom.1, "rb");
+                }
+            }
         }
     }
 }
@@ -378,6 +462,60 @@ pub struct PanelFile {
     pub thickness_mm: f64,
     #[serde(default)]
     pub cutouts: Vec<CutoutFile>,
+    /// Mounting-hole shape and placement pattern (hqt). `None` → the
+    /// real-Eurorack default: oval slots in the diagonal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounting: Option<MountingFile>,
+}
+
+/// The mounting options in a panel TOML file.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct MountingFile {
+    /// `oval` (rack-adjustable slots) or `round`.
+    #[serde(default = "default_mounting_shape")]
+    pub shape: String,
+    /// `diagonal` (TL + BR; the default), `all4`, or `left2`.
+    #[serde(default = "default_pattern")]
+    pub pattern: String,
+    /// Oval slot length (mm); ignored for round holes.
+    #[serde(default = "default_slot_length")]
+    pub slot_length_mm: f64,
+}
+
+fn default_slot_length() -> f64 {
+    6.0
+}
+
+fn default_mounting_shape() -> String {
+    "oval".to_string()
+}
+
+fn default_pattern() -> String {
+    "diagonal".to_string()
+}
+
+impl MountingFile {
+    /// Parse into the shape/pattern pair the panel needs.
+    pub fn to_shape_pattern(&self) -> Result<(MountingHoleShape, MountingHolePattern), String> {
+        let shape = match self.shape.as_str() {
+            "oval" => MountingHoleShape::Oval {
+                slot_length_mm: self.slot_length_mm,
+            },
+            "round" => MountingHoleShape::Round,
+            other => return Err(format!("unknown mounting shape '{other}' (oval | round)")),
+        };
+        let pattern = match self.pattern.as_str() {
+            "diagonal" => MountingHolePattern::Diagonal,
+            "all4" => MountingHolePattern::All4,
+            "left2" => MountingHolePattern::Left2,
+            other => {
+                return Err(format!(
+                    "unknown mounting pattern '{other}' (diagonal | all4 | left2)"
+                ))
+            }
+        };
+        Ok((shape, pattern))
+    }
 }
 
 fn default_thickness() -> f64 {
@@ -413,6 +551,10 @@ impl PanelFile {
             "eurorack" => {
                 let hp = self.hp.ok_or("eurorack panel requires `hp`")?;
                 let mut panel = EurorackPanel::new(hp).with_thickness(self.thickness_mm);
+                if let Some(mounting) = &self.mounting {
+                    let (shape, pattern) = mounting.to_shape_pattern()?;
+                    panel = panel.with_mounting(shape, pattern);
+                }
                 for c in &self.cutouts {
                     panel = panel.with_cutout_rotated(
                         c.x_mm,
@@ -433,6 +575,18 @@ impl PanelFile {
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+}
+
+/// The result of HP-minimizing (jiv): the smallest HP the module fits in, with
+/// the panel derived at that width and the board that laid out there.
+#[derive(Debug)]
+pub struct HpMinimized {
+    /// The chosen HP.
+    pub hp: u16,
+    /// The derived, editable panel spec at that width.
+    pub panel: PanelFile,
+    /// The layout report from the winning width.
+    pub report: crate::layout::LayoutReport,
 }
 
 /// House rules for the derived layout (DESIGN §7.9), designed once. The pitches
@@ -521,6 +675,7 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
         hp: Some(hp),
         thickness_mm: derive_rules::THICKNESS_MM,
         cutouts: out,
+        mounting: None, // real-Eurorack default (oval, diagonal)
     }
 }
 
@@ -539,7 +694,7 @@ fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
 }
 
 /// Whether a net is a power rail / ground (so it isn't used as a control label).
-fn is_power_net(name: &str) -> bool {
+pub(crate) fn is_power_net(name: &str) -> bool {
     let u = name.to_ascii_uppercase();
     u == "GND"
         || u.ends_with("GND")
@@ -549,10 +704,78 @@ fn is_power_net(name: &str) -> bool {
 
 /// Shorten a net name into a control label: drop a `SIG_` prefix / `_CV` suffix,
 /// spaces for underscores, upper-cased.
-fn label_from_net(net: &str) -> String {
+pub(crate) fn label_from_net(net: &str) -> String {
     let s = net.strip_prefix("SIG_").unwrap_or(net);
     let s = s.strip_suffix("_CV").unwrap_or(s);
     s.replace('_', " ").to_uppercase()
+}
+
+// ---------------------------------------------------------------------------
+//  HP-minimizing mode (jiv)
+// ---------------------------------------------------------------------------
+
+/// Find the smallest HP the module fits in: try successively narrower widths,
+/// derive the panel and place+route the board at each, and pick the smallest
+/// HP whose board routes with **no unresolved criticals** and whose control
+/// stack fits the clear zone (no panel overflow). Unrouted non-criticals are
+/// acceptable (surfaced as manual-routing warnings); the board still has to
+/// route.
+///
+/// `options` and `cfg` configure the board pipeline (footprint dir, router)
+/// and the loop, exactly as in [`crate::layout::run_layout_loop`]. Returns the
+/// winning width's panel + report. `min_hp == max_hp` → that width.
+/// Find the smallest HP the module fits in: try successively narrower widths,
+/// derive the panel and place+route the board at each, and pick the smallest
+/// HP whose board routes with **no unresolved criticals** and whose control
+/// stack fits the clear zone (no panel overflow). Unrouted non-criticals are
+/// acceptable (surfaced as manual-routing warnings); the board still has to
+/// route.
+///
+/// `make_options(hp)` builds the board pipeline options (footprint dir,
+/// router) for each candidate width, and `cfg` configures the loop, exactly
+/// as in [`crate::layout::run_layout_loop`]. Returns the winning width's
+/// panel + report. `min_hp == max_hp` → that width.
+pub fn minimize_hp(
+    circuit: &dyn crate::source::CircuitSource,
+    cutouts: &dyn CutoutSource,
+    min_hp: u16,
+    max_hp: u16,
+    make_options: impl Fn(u16) -> crate::board::BoardOptions,
+    cfg: &crate::layout::LayoutLoop,
+) -> Result<HpMinimized, crate::board::BoardError> {
+    // The search: narrowest first — the first width that routes without
+    // unresolved criticals wins (the panel stack packs the same at any width;
+    // the board's routability is what narrows).
+    let mut widest: Option<(u16, PanelFile, crate::layout::LayoutReport)> = None;
+    for hp in (min_hp..=max_hp).rev() {
+        let panel = derive_panel(circuit, hp, cutouts);
+        let spec = panel.to_spec().map_err(crate::board::BoardError::Other)?;
+        let (w, h) = (spec.width_mm(), spec.height_mm());
+        let mut anchors = std::collections::HashMap::new();
+        for c in spec.cutouts() {
+            if let Some(refdes) = &c.refdes {
+                anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
+            }
+        }
+        let template =
+            crate::board::SeededPlacer::new(w, h, (0.0, 0.0), std::mem::take(&mut anchors));
+        let report = crate::layout::run_layout_loop(circuit, make_options(hp), template, cfg)?;
+        let has_unresolved_criticals = report.findings.iter().any(|f| {
+            f.severity == crate::stage::Severity::Error
+                && f.message.contains("critical net unresolved")
+        });
+        if !has_unresolved_criticals {
+            return Ok(HpMinimized { hp, panel, report });
+        }
+        // Too narrow to route — remember the best (widest) fallback.
+        if widest.is_none() {
+            widest = Some((hp, panel, report));
+        }
+    }
+    // Nothing routed clean: report the largest width's failure.
+    let (hp, panel, report) =
+        widest.ok_or_else(|| crate::board::BoardError::Other("no HP candidate".into()))?;
+    Ok(HpMinimized { hp, panel, report })
 }
 
 // ---------------------------------------------------------------------------
@@ -626,9 +849,27 @@ pub fn write_dxf<W: std::fmt::Write>(w: &mut W, panel: &dyn PanelSpec) -> std::f
     // Panel outline.
     write_lwpolyline_rect(w, 0.0, 0.0, width, height)?;
 
-    // Mounting holes.
+    // Mounting holes: round holes as circles, oval slots as a capsule (two
+    // 180° arcs joined by two lines) so the rack can adjust horizontal fit.
     for hole in panel.mounting_holes() {
-        write_circle(w, hole.x_mm, hole.y_mm, hole.diameter_mm / 2.0)?;
+        let r = hole.diameter_mm / 2.0;
+        match hole.shape {
+            MountingHoleShape::Round => {
+                write_circle(w, hole.x_mm, hole.y_mm, r)?;
+            }
+            MountingHoleShape::Oval { slot_length_mm } => {
+                let half_len = (slot_length_mm - hole.diameter_mm).max(0.0) / 2.0;
+                let (lx, rx) = (hole.x_mm - half_len, hole.x_mm + half_len);
+                // Right end: semicircle from bottom (270°) CCW through 0° to top (90°).
+                write_arc(w, rx, hole.y_mm, r, 270.0, 90.0)?;
+                // Top edge, right → left.
+                write_line(w, rx, hole.y_mm + r, lx, hole.y_mm + r)?;
+                // Left end: semicircle from top (90°) CCW through 180° to 270°.
+                write_arc(w, lx, hole.y_mm, r, 90.0, 270.0)?;
+                // Bottom edge, left → right.
+                write_line(w, lx, hole.y_mm - r, rx, hole.y_mm - r)?;
+            }
+        }
     }
 
     // Cutouts.
@@ -725,14 +966,52 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
     );
     // Panel outline.
     s.push_str(&edge_rect(ox, oy, ox + w, oy + h, "panel.outline"));
-    // Mounting holes.
+    // Mounting holes: round holes as circles, oval slots as a closed capsule
+    // loop (two straight edges + two 180° arcs) so the rack can adjust the
+    // horizontal fit (hqt).
     for (i, hole) in panel.mounting_holes().iter().enumerate() {
-        s.push_str(&edge_circle(
-            fx(hole.x_mm),
-            fy(hole.y_mm),
-            hole.diameter_mm / 2.0,
-            &format!("panel.hole.{i}"),
-        ));
+        let (cx, cy) = (fx(hole.x_mm), fy(hole.y_mm));
+        let r = hole.diameter_mm / 2.0;
+        match hole.shape {
+            MountingHoleShape::Round => {
+                s.push_str(&edge_circle(cx, cy, r, &format!("panel.hole.{i}")));
+            }
+            MountingHoleShape::Oval { slot_length_mm } => {
+                // Capsule: half-length offset between the two end-circle centers.
+                let half_len = (slot_length_mm - hole.diameter_mm).max(0.0) / 2.0;
+                let (lx, rx) = (cx - half_len, cx + half_len);
+                let arc = |sx: f64, sy: f64, mx: f64, my: f64, ex: f64, ey: f64, tag: &str| {
+                    format!(
+                        "  (gr_arc (start {} {}) (mid {} {}) (end {} {}) \
+                         (stroke (width 0.15) (type solid)) (uuid \"{}\"))\n",
+                        mm(sx),
+                        mm(sy),
+                        mm(mx),
+                        mm(my),
+                        mm(ex),
+                        mm(ey),
+                        det_uuid(&format!("panel.hole.{i}.{tag}"))
+                    )
+                };
+                let line = |sx: f64, sy: f64, ex: f64, ey: f64, tag: &str| {
+                    format!(
+                        "  (gr_line (start {} {}) (end {} {}) \
+                         (stroke (width 0.15) (type solid)) (uuid \"{}\"))\n",
+                        mm(sx),
+                        mm(sy),
+                        mm(ex),
+                        mm(ey),
+                        det_uuid(&format!("panel.hole.{i}.{tag}"))
+                    )
+                };
+                // Top edge, right end arc, bottom edge (right→left), left arc —
+                // closed in KiCad's y-down frame.
+                s.push_str(&line(lx, cy - r, rx, cy - r, "top"));
+                s.push_str(&arc(rx, cy - r, rx + r, cy, rx, cy + r, "right"));
+                s.push_str(&line(rx, cy + r, lx, cy + r, "bottom"));
+                s.push_str(&arc(lx, cy + r, lx - r, cy, lx, cy - r, "left"));
+            }
+        }
     }
     // Cutouts (jack rects, pot/LED circles), as inner Edge.Cuts loops.
     for (i, c) in panel.cutouts().iter().enumerate() {
@@ -755,15 +1034,39 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
             )),
             None => s.push_str(&edge_circle(cx, cy, 1.5, &seed)),
         }
-        // Control label (IN / OUT / RATE), horizontal, just above the cutout so
-        // it reads with the module upright (DESIGN 6.10 / j54.21).
+        // Control label (IN / OUT / RATE), horizontal. Placed just above the
+        // cutout so it reads with the module upright (DESIGN 6.10 / j54.21),
+        // unless that side is occupied by the neighbouring cutout above — then
+        // it drops just below, the other clear side (the "writing hitting a
+        // jack" bug, 6f8: text must never land on a hole).
         if let Some(label) = &c.label {
+            // Nearest cutout above/below this one (KiCad y grows downward).
+            let half = |footprint: &str| match footprint_shape(footprint) {
+                Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
+                Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
+                None => 1.5,
+            };
+            let y = fy(c.y_mm);
+            let above_edge = panel
+                .cutouts()
+                .iter()
+                .filter(|o| !std::ptr::eq(*o, c))
+                .map(|o| fy(o.y_mm) + half(&o.footprint))
+                .filter(|edge| *edge < y - half(&c.footprint))
+                .fold(f64::MIN, f64::max);
+            let label_top = y - silk::LABEL_OFFSET_MM - silk::LABEL_FONT_MM / 2.0;
+            let fits_above = label_top > above_edge + silk::LABEL_CLEARANCE_MM;
+            let label_y = if fits_above {
+                y - silk::LABEL_OFFSET_MM
+            } else {
+                y + silk::LABEL_OFFSET_MM // flip below — the other clear side
+            };
             s.push_str(&format!(
                 "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
                  (effects (font (size {f} {f}) (thickness 0.3))))\n",
                 label,
                 mm(cx),
-                mm(cy - silk::LABEL_OFFSET_MM),
+                mm(label_y),
                 det_uuid(&format!("panel.label.{i}")),
                 f = silk::LABEL_FONT_MM,
             ));
@@ -832,6 +1135,53 @@ fn write_circle<W: std::fmt::Write>(w: &mut W, cx: f64, cy: f64, r: f64) -> std:
     writeln!(w, "{cy}")?;
     writeln!(w, "40")?;
     writeln!(w, "{r}")
+}
+
+/// A DXF LINE entity (two points).
+fn write_line<W: std::fmt::Write>(
+    w: &mut W,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> std::fmt::Result {
+    writeln!(w, "0")?;
+    writeln!(w, "LINE")?;
+    writeln!(w, "8")?;
+    writeln!(w, "0")?;
+    writeln!(w, "10")?;
+    writeln!(w, "{x1}")?;
+    writeln!(w, "20")?;
+    writeln!(w, "{y1}")?;
+    writeln!(w, "11")?;
+    writeln!(w, "{x2}")?;
+    writeln!(w, "21")?;
+    writeln!(w, "{y2}")
+}
+
+/// A DXF ARC: center, radius, start/end angle in degrees, CCW from start to end.
+fn write_arc<W: std::fmt::Write>(
+    w: &mut W,
+    cx: f64,
+    cy: f64,
+    r: f64,
+    start_deg: f64,
+    end_deg: f64,
+) -> std::fmt::Result {
+    writeln!(w, "0")?;
+    writeln!(w, "ARC")?;
+    writeln!(w, "8")?;
+    writeln!(w, "0")?;
+    writeln!(w, "10")?;
+    writeln!(w, "{cx}")?;
+    writeln!(w, "20")?;
+    writeln!(w, "{cy}")?;
+    writeln!(w, "40")?;
+    writeln!(w, "{r}")?;
+    writeln!(w, "50")?;
+    writeln!(w, "{start_deg}")?;
+    writeln!(w, "51")?;
+    writeln!(w, "{end_deg}")
 }
 
 fn write_lwpolyline_rect<W: std::fmt::Write>(
@@ -1113,6 +1463,74 @@ fn sql_opt(s: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::LayoutLoop;
+    use crate::model::{Net, Part, PinRef};
+
+    /// A tiny circuit: two 2-pin nets, one tagged critical, wired through a
+    /// stub router that always leaves the critical net open (for the jiv test).
+    struct Toy {
+        parts: Vec<Part>,
+        nets: Vec<Net>,
+    }
+    impl crate::source::CircuitSource for Toy {
+        fn name(&self) -> &str {
+            "toy"
+        }
+        fn parts(&self) -> &[Part] {
+            &self.parts
+        }
+        fn nets(&self) -> &[Net] {
+            &self.nets
+        }
+    }
+
+    fn toy() -> Toy {
+        Toy {
+            parts: vec![
+                Part::new("U1", "opamp").with_footprint("Foo:U1"),
+                Part::new("C1", "47n").with_footprint("Foo:C1"),
+                Part::new("R1", "10k").with_footprint("Foo:R1"),
+            ],
+            nets: vec![
+                Net::new("SLEW", vec![PinRef::new("U1", "5"), PinRef::new("C1", "1")])
+                    .with_class("Critical"),
+                Net::new("OUT", vec![PinRef::new("U1", "1"), PinRef::new("R1", "2")]),
+            ],
+        }
+    }
+
+    /// Writes a minimal two-pad footprint for each part into `dir`.
+    fn write_footprints(dir: &std::path::Path) {
+        for (lib, name) in [("Foo", "U1"), ("Foo", "C1"), ("Foo", "R1")] {
+            let dir_lib = dir.join(format!("{lib}.pretty"));
+            std::fs::create_dir_all(&dir_lib).unwrap();
+            std::fs::write(
+                dir_lib.join(format!("{name}.kicad_mod")),
+                "(footprint \"x\" (layer \"F.Cu\") \
+                 (pad \"1\" smd rect (at -1 0) (size 1 1)) \
+                 (pad \"2\" smd rect (at 1 0) (size 1 1)))",
+            )
+            .unwrap();
+        }
+    }
+
+    /// A router that leaves every net unrouted — the board never finishes.
+    struct BlockedRouter;
+    impl crate::route::Router for BlockedRouter {
+        fn route(
+            &self,
+            nets: &[crate::route::RouteNet],
+            _opts: &crate::route::RouteOptions,
+        ) -> crate::route::RouteOutput {
+            crate::route::RouteOutput {
+                conflicts: nets
+                    .iter()
+                    .map(|n| format!("no path found for ({name}):", name = n.name))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+    }
 
     #[test]
     fn eurorack_dimensions_in_mm() {
@@ -1163,122 +1581,240 @@ mod tests {
     }
 
     #[test]
-    fn eurorack_small_panel_two_holes() {
-        let panel = EurorackPanel::new(4);
-        assert_eq!(panel.mounting_holes().len(), 2);
+    fn label_flips_below_when_the_cutout_above_is_too_close() {
+        // 6f8: text must never land on a hole. Two labelled controls at LED
+        // pitch (9 mm centre-to-centre): the lower one's above-side label would
+        // overlap the cutout above it, so it flips below its own cutout.
+        let panel = EurorackPanel::new(4)
+            .with_cutout_rotated(
+                10.0,
+                30.0,
+                0.0,
+                "LED_5mm",
+                Some("LED1".into()),
+                Some("CLK".into()),
+            )
+            .with_cutout_rotated(
+                10.0,
+                21.0,
+                0.0,
+                "LED_5mm",
+                Some("LED2".into()),
+                Some("GATE".into()),
+            );
+        let pcb = panel_to_kicad_pcb(&panel, "Demo", None);
+        // Parse every rendered gr_text/gr_circle: the invariant is that no
+        // silk label's text band overlaps any cutout circle.
+        let text_ys: Vec<f64> = pcb
+            .split("(gr_text ")
+            .skip(1)
+            .filter_map(|chunk| chunk.split_whitespace().nth(3).and_then(|v| v.parse().ok()))
+            .collect();
+        let circles: Vec<(f64, f64)> = pcb
+            .split("gr_circle (center ")
+            .skip(1)
+            .filter_map(|chunk| {
+                let mut it = chunk.split_whitespace();
+                let x: f64 = it.next()?.trim_end_matches(')').parse().ok()?;
+                let y: f64 = it.next()?.trim_end_matches(')').parse().ok()?;
+                Some((x, y))
+            })
+            .collect();
+        assert_eq!(circles.len(), 2, "{circles:?}"); // the 2 LED cutouts (mounting holes are capsule arcs now)
+        for y in text_ys {
+            for (_, cy) in &circles {
+                assert!(
+                    (y - cy).abs() > 2.25 + 0.9,
+                    "label text at {y} overlaps hole at {cy}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn eurorack_large_panel_four_holes() {
-        let panel = EurorackPanel::new(10);
-        assert_eq!(panel.mounting_holes().len(), 4);
+    fn eurorack_default_diagonal_two_holes() {
+        // hqt: the real-Eurorack default is oval slots in the diagonal — two
+        // holes whatever the width (narrow panels fall back to both left).
+        for hp in [4, 10] {
+            let panel = EurorackPanel::new(hp);
+            assert_eq!(panel.mounting_holes().len(), 2, "{hp} HP");
+            assert!(panel.mounting_holes().iter().all(|h| h.shape
+                == MountingHoleShape::Oval {
+                    slot_length_mm: 7.0
+                }));
+        }
     }
 
     #[test]
-    fn eurorack_cutouts_round_trip() {
-        let panel = EurorackPanel::new(8)
-            .with_cutout(10.0, 50.0, "Thonkiconn")
-            .with_cutout(25.0, 50.0, "Alpha9mm");
-        assert_eq!(panel.cutouts().len(), 2);
-        assert_eq!(panel.cutouts()[0].footprint, "Thonkiconn");
-        assert_eq!(panel.cutouts()[1].footprint, "Alpha9mm");
-    }
-
-    #[test]
-    fn footprint_shape_lookup() {
-        assert!(matches!(
-            footprint_shape("Thonkiconn"),
-            Some(CutoutShape::Circle { diameter_mm: 6.0 })
-        ));
-        assert!(matches!(
-            footprint_shape("Alpha9mm"),
-            Some(CutoutShape::Circle { diameter_mm: 7.0 })
-        ));
-        assert!(matches!(
-            footprint_shape("LED_3mm"),
-            Some(CutoutShape::Circle { diameter_mm: 3.0 })
-        ));
-        assert!(footprint_shape("UnknownThing").is_none());
-    }
-
-    #[test]
-    fn builtin_cutouts_classify_real_footprints() {
-        let c = BuiltinCutouts;
-        // Full KiCad footprints a circuit part carries → control + barrel geometry.
-        let jack = c
-            .cutout(None, "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM")
-            .unwrap();
-        assert_eq!(jack.kind, ControlKind::Jack);
-        assert!(matches!(
-            jack.shape,
-            CutoutShape::Circle { diameter_mm } if (diameter_mm - JACK_BARREL_MM).abs() < 1e-9
-        ));
-        assert_eq!(
-            c.cutout(None, "Potentiometer_THT:Potentiometer_Alpha_RD901F")
-                .unwrap()
-                .kind,
-            ControlKind::Pot
+    fn eurorack_hole_rows_match_the_doepfer_rail_spec() {
+        // j54.22 / Doepfer A-100 mechanical spec: the two mounting-hole rows
+        // are 122.5 mm apart — centres 3.0 mm from the top and bottom edges.
+        let panel = EurorackPanel::new(8);
+        let ys: Vec<f64> = panel.mounting_holes().iter().map(|h| h.y_mm).collect();
+        let (bottom, top) = (3.0, EURORACK_HEIGHT_MM - 3.0);
+        assert!(
+            ys.iter()
+                .all(|y| (*y - bottom).abs() < 1e-9 || (*y - top).abs() < 1e-9),
+            "rows at {bottom}/{top}, got {ys:?}"
         );
-        // Board-only parts are not panel-facing.
-        assert!(c.cutout(None, "Package_DIP:DIP-16_W7.62mm").is_none());
-        assert!(c
-            .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
-            .is_none());
+        assert!((top - bottom - 122.5).abs() < 1e-9);
     }
 
     #[test]
-    fn derive_panel_classifies_labels_and_orders() {
-        use crate::model::{Circuit, Net, Part, PinRef};
-        let mut circ = Circuit::new("m");
-        circ.parts = vec![
-            Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
-            Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
-            Part::new("U1", "TL072").with_footprint("Package_SO:SOIC-8"), // board-only
-        ];
-        circ.nets = vec![
-            Net::new("RATE_CV", vec![PinRef::new("RV1", "2")]),
-            Net::new("SIG_IN", vec![PinRef::new("J1", "T")]),
-            Net::new("GND", vec![PinRef::new("J1", "S")]),
-        ];
-        let panel = derive_panel(&circ, 8, &BuiltinCutouts);
-        // Only the pot + jack; the IC is skipped.
-        assert_eq!(panel.cutouts.len(), 2);
-        let rv1 = panel
-            .cutouts
-            .iter()
-            .find(|c| c.refdes.as_deref() == Some("RV1"))
-            .unwrap();
-        assert_eq!(rv1.footprint, "Alpha9mm");
-        assert_eq!(rv1.label.as_deref(), Some("RATE")); // RATE_CV → RATE
-        let j1 = panel
-            .cutouts
-            .iter()
-            .find(|c| c.refdes.as_deref() == Some("J1"))
-            .unwrap();
-        assert_eq!(j1.footprint, "Thonkiconn");
-        assert_eq!(j1.label.as_deref(), Some("IN")); // SIG_IN (not GND) → IN
-                                                     // The knob sits above the jack (larger y in panel bottom-up coords).
-        assert!(rv1.y_mm > j1.y_mm);
-        // The derived spec round-trips through TOML.
-        assert!(panel.to_toml().unwrap().contains("Thonkiconn"));
+    fn mounting_patterns_select_the_hole_set() {
+        let all4 = EurorackPanel::new(10)
+            .with_mounting(MountingHoleShape::Round, MountingHolePattern::All4);
+        assert_eq!(all4.mounting_holes().len(), 4);
+
+        let left2 = EurorackPanel::new(10)
+            .with_mounting(MountingHoleShape::Round, MountingHolePattern::Left2);
+        assert_eq!(left2.mounting_holes().len(), 2);
+
+        // Narrow panels: the right side never fits, in any pattern.
+        let narrow = EurorackPanel::new(4)
+            .with_mounting(MountingHoleShape::Round, MountingHolePattern::All4);
+        assert_eq!(narrow.mounting_holes().len(), 2);
     }
 
     #[test]
-    fn dxf_contains_entities() {
-        let panel = EurorackPanel::new(8)
-            .with_cutout(10.0, 50.0, "Thonkiconn")
-            .with_cutout(25.0, 50.0, "Alpha9mm");
-        let dxf = panel_to_dxf(&panel);
-        assert!(dxf.contains("LWPOLYLINE"));
-        assert!(dxf.contains("CIRCLE"));
-        assert!(dxf.contains("EOF"));
-        // Mounting holes + Alpha9mm = at least 5 circles (4 holes + 1 cutout).
-        assert!(dxf.matches("CIRCLE").count() >= 5);
+    fn minimize_hp_picks_the_narrowest_width_that_routes() {
+        // jiv: with a router that always leaves the critical net open, no width
+        // routes clean — the widest candidate is reported (failure surfaced,
+        // not a panic). The panel is derived at each width regardless.
+        let dir = std::env::temp_dir().join(format!("lob-minhp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_footprints(&dir);
+        let circuit = toy();
+        let cfg = LayoutLoop::default();
+        let result = minimize_hp(
+            &circuit,
+            &BuiltinCutouts,
+            4,
+            10,
+            |_| {
+                let mut options = crate::board::BoardOptions::new(&dir);
+                options.router = Some(Box::new(BlockedRouter));
+                options
+            },
+            &cfg,
+        )
+        .unwrap();
+        // Every width leaves the critical net unresolved (blocked router), so
+        // the search falls back to the widest candidate's failure state.
+        assert_eq!(result.hp, 10);
+        assert!(!result.report.unresolved.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
+}
 
-    #[test]
-    fn panel_file_roundtrip() {
-        let toml = r#"
+#[test]
+fn eurorack_cutouts_round_trip() {
+    let panel = EurorackPanel::new(8)
+        .with_cutout(10.0, 50.0, "Thonkiconn")
+        .with_cutout(25.0, 50.0, "Alpha9mm");
+    assert_eq!(panel.cutouts().len(), 2);
+    assert_eq!(panel.cutouts()[0].footprint, "Thonkiconn");
+    assert_eq!(panel.cutouts()[1].footprint, "Alpha9mm");
+}
+
+#[test]
+fn footprint_shape_lookup() {
+    assert!(matches!(
+        footprint_shape("Thonkiconn"),
+        Some(CutoutShape::Circle { diameter_mm: 6.0 })
+    ));
+    assert!(matches!(
+        footprint_shape("Alpha9mm"),
+        Some(CutoutShape::Circle { diameter_mm: 7.0 })
+    ));
+    assert!(matches!(
+        footprint_shape("LED_3mm"),
+        Some(CutoutShape::Circle { diameter_mm: 3.0 })
+    ));
+    assert!(footprint_shape("UnknownThing").is_none());
+}
+
+#[test]
+fn builtin_cutouts_classify_real_footprints() {
+    let c = BuiltinCutouts;
+    // Full KiCad footprints a circuit part carries → control + barrel geometry.
+    let jack = c
+        .cutout(None, "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM")
+        .unwrap();
+    assert_eq!(jack.kind, ControlKind::Jack);
+    assert!(matches!(
+        jack.shape,
+        CutoutShape::Circle { diameter_mm } if (diameter_mm - JACK_BARREL_MM).abs() < 1e-9
+    ));
+    assert_eq!(
+        c.cutout(None, "Potentiometer_THT:Potentiometer_Alpha_RD901F")
+            .unwrap()
+            .kind,
+        ControlKind::Pot
+    );
+    // Board-only parts are not panel-facing.
+    assert!(c.cutout(None, "Package_DIP:DIP-16_W7.62mm").is_none());
+    assert!(c
+        .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
+        .is_none());
+}
+
+#[test]
+fn derive_panel_classifies_labels_and_orders() {
+    use crate::model::{Circuit, Net, Part, PinRef};
+    let mut circ = Circuit::new("m");
+    circ.parts = vec![
+        Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+        Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
+        Part::new("U1", "TL072").with_footprint("Package_SO:SOIC-8"), // board-only
+    ];
+    circ.nets = vec![
+        Net::new("RATE_CV", vec![PinRef::new("RV1", "2")]),
+        Net::new("SIG_IN", vec![PinRef::new("J1", "T")]),
+        Net::new("GND", vec![PinRef::new("J1", "S")]),
+    ];
+    let panel = derive_panel(&circ, 8, &BuiltinCutouts);
+    // Only the pot + jack; the IC is skipped.
+    assert_eq!(panel.cutouts.len(), 2);
+    let rv1 = panel
+        .cutouts
+        .iter()
+        .find(|c| c.refdes.as_deref() == Some("RV1"))
+        .unwrap();
+    assert_eq!(rv1.footprint, "Alpha9mm");
+    assert_eq!(rv1.label.as_deref(), Some("RATE")); // RATE_CV → RATE
+    let j1 = panel
+        .cutouts
+        .iter()
+        .find(|c| c.refdes.as_deref() == Some("J1"))
+        .unwrap();
+    assert_eq!(j1.footprint, "Thonkiconn");
+    assert_eq!(j1.label.as_deref(), Some("IN")); // SIG_IN (not GND) → IN
+                                                 // The knob sits above the jack (larger y in panel bottom-up coords).
+    assert!(rv1.y_mm > j1.y_mm);
+    // The derived spec round-trips through TOML.
+    assert!(panel.to_toml().unwrap().contains("Thonkiconn"));
+}
+
+#[test]
+fn dxf_contains_entities() {
+    let panel = EurorackPanel::new(8)
+        .with_cutout(10.0, 50.0, "Thonkiconn")
+        .with_cutout(25.0, 50.0, "Alpha9mm");
+    let dxf = panel_to_dxf(&panel);
+    assert!(dxf.contains("LWPOLYLINE"));
+    assert!(dxf.contains("CIRCLE"));
+    assert!(dxf.contains("EOF"));
+    // hqt: the default mounting holes are oval slots — capsule arcs + lines.
+    // Circles: 2 cutouts; arcs: 2 per slot × 2 slots = 4; lines: 4.
+    assert_eq!(dxf.matches("CIRCLE").count(), 2);
+    assert_eq!(dxf.matches("\nARC").count(), 4);
+    assert_eq!(dxf.matches("\nLINE").count(), 4);
+}
+
+#[test]
+fn panel_file_roundtrip() {
+    let toml = r#"
 format = "eurorack"
 hp = 8
 thickness_mm = 2.0
@@ -1293,79 +1829,78 @@ x_mm = 25.0
 y_mm = 50.0
 footprint = "Alpha9mm"
 "#;
-        let file = PanelFile::from_toml(toml).unwrap();
-        assert_eq!(file.format, "eurorack");
-        assert_eq!(file.hp, Some(8));
-        assert_eq!(file.cutouts.len(), 2);
+    let file = PanelFile::from_toml(toml).unwrap();
+    assert_eq!(file.format, "eurorack");
+    assert_eq!(file.hp, Some(8));
+    assert_eq!(file.cutouts.len(), 2);
 
-        let spec = file.to_spec().unwrap();
-        assert_eq!(spec.width_mm(), 8.0 * 5.08);
-        assert_eq!(spec.cutouts().len(), 2);
+    let spec = file.to_spec().unwrap();
+    assert_eq!(spec.width_mm(), 8.0 * 5.08);
+    assert_eq!(spec.cutouts().len(), 2);
+}
+
+#[test]
+fn panel_file_rejects_unknown_format() {
+    let toml = r#"format = "pedal""#;
+    let file = PanelFile::from_toml(toml).unwrap();
+    assert!(file.to_spec().is_err());
+}
+
+#[test]
+fn panel_order_status_roundtrip() {
+    assert_eq!(
+        "not_ordered".parse::<PanelOrderStatus>().unwrap(),
+        PanelOrderStatus::NotOrdered
+    );
+    assert_eq!(
+        "ordered".parse::<PanelOrderStatus>().unwrap(),
+        PanelOrderStatus::Ordered
+    );
+    assert!("bogus".parse::<PanelOrderStatus>().is_err());
+}
+
+/// Full round-trip against a real Dolt repo. Skipped if `dolt` is absent.
+#[test]
+fn panel_orders_roundtrip_when_dolt_available() {
+    if find_on_path("dolt").is_none() {
+        return;
     }
+    let root = std::env::temp_dir().join(format!("lob-panel-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = PanelOrders::open(&root).expect("open");
 
-    #[test]
-    fn panel_file_rejects_unknown_format() {
-        let toml = r#"format = "pedal""#;
-        let file = PanelFile::from_toml(toml).unwrap();
-        assert!(file.to_spec().is_err());
-    }
+    let id = store
+        .create(
+            "crossfader-v1",
+            "/tmp/crossfader.dxf",
+            Some("sendcutsend"),
+            None,
+        )
+        .expect("create");
+    assert!(id >= 0);
 
-    #[test]
-    fn panel_order_status_roundtrip() {
-        assert_eq!(
-            "not_ordered".parse::<PanelOrderStatus>().unwrap(),
-            PanelOrderStatus::NotOrdered
-        );
-        assert_eq!(
-            "ordered".parse::<PanelOrderStatus>().unwrap(),
-            PanelOrderStatus::Ordered
-        );
-        assert!("bogus".parse::<PanelOrderStatus>().is_err());
-    }
+    let latest = store
+        .latest("crossfader-v1")
+        .expect("latest")
+        .expect("present");
+    assert_eq!(latest.module, "crossfader-v1");
+    assert_eq!(latest.dxf_path, "/tmp/crossfader.dxf");
+    assert_eq!(latest.vendor.as_deref(), Some("sendcutsend"));
+    assert_eq!(latest.status, PanelOrderStatus::NotOrdered);
 
-    /// Full round-trip against a real Dolt repo. Skipped if `dolt` is absent.
-    #[test]
-    fn panel_orders_roundtrip_when_dolt_available() {
-        if find_on_path("dolt").is_none() {
-            return;
-        }
-        let root = std::env::temp_dir().join(format!("lob-panel-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = PanelOrders::open(&root).expect("open");
+    store
+        .mark_ordered("crossfader-v1", "sendcutsend", Some("TRK-12345"))
+        .expect("mark ordered");
 
-        let id = store
-            .create(
-                "crossfader-v1",
-                "/tmp/crossfader.dxf",
-                Some("sendcutsend"),
-                None,
-            )
-            .expect("create");
-        assert!(id >= 0);
+    let ordered = store
+        .latest("crossfader-v1")
+        .expect("latest")
+        .expect("present");
+    assert_eq!(ordered.status, PanelOrderStatus::Ordered);
+    assert_eq!(ordered.tracking_ref.as_deref(), Some("TRK-12345"));
 
-        let latest = store
-            .latest("crossfader-v1")
-            .expect("latest")
-            .expect("present");
-        assert_eq!(latest.module, "crossfader-v1");
-        assert_eq!(latest.dxf_path, "/tmp/crossfader.dxf");
-        assert_eq!(latest.vendor.as_deref(), Some("sendcutsend"));
-        assert_eq!(latest.status, PanelOrderStatus::NotOrdered);
+    let all = store.list("crossfader-v1").expect("list");
+    assert_eq!(all.len(), 1);
 
-        store
-            .mark_ordered("crossfader-v1", "sendcutsend", Some("TRK-12345"))
-            .expect("mark ordered");
-
-        let ordered = store
-            .latest("crossfader-v1")
-            .expect("latest")
-            .expect("present");
-        assert_eq!(ordered.status, PanelOrderStatus::Ordered);
-        assert_eq!(ordered.tracking_ref.as_deref(), Some("TRK-12345"));
-
-        let all = store.list("crossfader-v1").expect("list");
-        assert_eq!(all.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
+    let _ = std::fs::remove_dir_all(&root);
 }

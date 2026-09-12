@@ -1,0 +1,27 @@
+[idea]
+name = "slew-limiter-phase1"
+raw_statement = "Validate the end-to-end legion-of-bom pipeline on a real Eurorack module"
+hypothesis = "The complete SKiDL → ngspice → BOM → placement → 3D enclosure pipeline produces a manufacturable slew limiter on the first pass."
+null_hypothesis = "Critical steps are missing, incorrect, or produce unmanufacturable output."
+why_it_matters = "Proves the pipeline works for real hardware before scaling to the full module catalog."
+confidence_before = "medium"
+graduation_condition = "Slew limiter PCB files pass JLCPCB DRC; ngspice sim confirms specs; BOM sources are verified; 3D model renders in Transmog."
+
+[[experiment]]
+name = "pipeline_validation"
+tier = "$?"
+independent_variable = "Run the legion-of-bom pipeline end-to-end on the slew limiter module."
+dependent_variable = "All pipeline stages produce valid output (SKiDL passes ERC, ngspice meets specs, BOM is sourceable, placement files are DRC-clean, 3D model renders)."
+data_source = "legion-of-bom Beads legion-of-bom-tus.15 through .17 and the Alfalfa run ledger."
+metric = "Count of pipeline stages that pass on the first attempt; any failure is a finding."
+stop_condition = "Slew limiter pipeline is fully validated or all blockers are resolved."
+escalation_trigger = "Pipeline stage fails repeatedly, source material is missing, or Transmog integration is blocked."
+decision_rule_if_h1 = "Pipeline is validated — generalize to other modules."
+decision_rule_if_h0 = "Identify and fix the failing stage, then retry."
+
+[experiment.resources]
+existing_tools = ["SKiDL", "ngspice", "JLCPCB", "Transmog"]
+git_repos = ["https://github.com/FuturePresentLabs/legion-of-bom", "https://github.com/FuturePresentLabs/transmog"]
+models_or_apis = []
+data_access_needed = ["Puget Audio mechanical specs", "JLCPCB library access"]
+explicitly_not_needed = []

@@ -9,8 +9,13 @@ mod doctor;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use legion_of_bom_core::cam::{plan_cam, CamOptions, ALUMINIUM_6061, DIECAST_ALUMINIUM};
+use legion_of_bom_core::enclosure::{
+    check_enclosure, derive_enclosure, enclosure_face_dxf, enclosure_to_step, standard_size,
+    DeriveOptions, EnclosureFile, Face, STANDARD_SIZES,
+};
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_guide, default_image_cache_dir, default_panel_orders_dir,
@@ -76,6 +81,25 @@ enum Command {
         /// keyless), with through-hole resistors shown as their color code.
         #[arg(long)]
         visual: bool,
+        /// Enforce verification (zya.4): fail when parts aren't library-verified
+        /// (the gate real ordering runs under; without it, findings print only).
+        #[arg(long)]
+        gate: bool,
+    },
+    /// Emit a pedalkernel .pedal file from a circuit (cross-engine validation
+    /// input; ef4.3).
+    Pedal {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Write the .pedal here (default: out/<name>/<name>.pedal).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Cross-engine transient check: ngspice step response vs pedalkernel
+    /// process, measured and compared (ef4.4).
+    Crosscheck {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
     },
     /// Generate a .kicad_pcb board file (footprints placed + routed) from a circuit.
     Board {
@@ -148,6 +172,74 @@ enum Command {
         #[command(subcommand)]
         action: PanelCmd,
     },
+    /// Guitar-pedal enclosure: derive a spec, export a 3D solid, plan the cuts.
+    Enclosure {
+        #[command(subcommand)]
+        action: EnclosureCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnclosureCmd {
+    /// List the standard enclosure sizes and their nominal dimensions.
+    Sizes,
+    /// Derive an editable enclosure spec (TOML) from a circuit's panel-facing
+    /// parts: controls on top, jacks on the sides, power at the back.
+    Derive {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Enclosure size class (see `lob enclosure sizes`).
+        #[arg(long, default_value = "125B")]
+        size: String,
+        /// Skip the true-bypass footswitch that is otherwise added by default.
+        #[arg(long)]
+        no_footswitch: bool,
+        /// Skip the status LED that is otherwise added by default.
+        #[arg(long)]
+        no_led: bool,
+        /// Output TOML path (default: <circuit>_enclosure.toml).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Check a spec for holes that run off a face, collide, or have no wall
+    /// behind them.
+    Check {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+    },
+    /// Export the enclosure as a STEP (AP214) solid.
+    Step {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+        /// Output .step path (default: same name with .step).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Write 1:1 drill templates (DXF) for every drilled face.
+    Template {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+        /// Only this face (top | front | back | left | right).
+        #[arg(long)]
+        face: Option<String>,
+        /// Output directory (default: alongside the spec).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Plan the machining: setup sheet (Markdown) plus per-setup G-code.
+    Cam {
+        /// Path to the enclosure spec TOML.
+        spec: PathBuf,
+        /// Stock material: diecast | 6061.
+        #[arg(long, default_value = "diecast")]
+        material: String,
+        /// Spindle speed ceiling (RPM).
+        #[arg(long, default_value_t = 5000.0)]
+        max_rpm: f64,
+        /// Output directory (default: alongside the spec).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,6 +291,37 @@ enum PartsCmd {
         mpn: String,
         /// Ordered note lines; each argument is one step.
         notes: Vec<String>,
+    },
+    /// Set a part's panel/enclosure mechanical cutout (okm.14): the opening the
+    /// panel needs, the body envelope for crowding checks, and the mounting
+    /// depth. Either --bore (round) or --rect WxH (rounded rect) is required.
+    SetCutout {
+        /// Manufacturer part number to attach the geometry to.
+        mpn: String,
+        /// What the control is: jack | pot | switch | led.
+        #[arg(long)]
+        kind: String,
+        /// Round opening diameter in mm (jacks, pots, LEDs).
+        #[arg(long)]
+        bore: Option<f64>,
+        /// Rectangular opening as WxH in mm (e.g. `6.2x5.4`).
+        #[arg(long)]
+        rect: Option<String>,
+        /// Corner radius for a rectangular opening (mm).
+        #[arg(long, default_value = "0.0")]
+        corner: f64,
+        /// Anti-rotation feature: flat | notch | dshaft.
+        #[arg(long)]
+        anti_rotation: Option<String>,
+        /// Body/knob envelope diameter for crowding checks (mm).
+        #[arg(long)]
+        body: Option<f64>,
+        /// Mounting depth below the panel surface (mm).
+        #[arg(long)]
+        depth: Option<f64>,
+        /// Citation: source of this geometry (datasheet section / "measured").
+        #[arg(long)]
+        cited_source: Option<String>,
     },
     /// Resolve a circuit's parts against the library by MPN.
     Resolve {
@@ -283,7 +406,8 @@ fn main() -> ExitCode {
             price,
             out,
             visual,
-        } => bom_cmd(circuit, price, out, visual),
+            gate,
+        } => bom_cmd(circuit, price, out, visual, gate),
         Command::Board {
             circuit,
             out,
@@ -292,6 +416,8 @@ fn main() -> ExitCode {
             iterations,
             logo,
         } => board_cmd(circuit, out, panel, mode, iterations, logo),
+        Command::Pedal { circuit, out } => pedal_cmd(circuit, out),
+        Command::Crosscheck { circuit } => crosscheck_cmd(circuit),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab {
             circuit,
@@ -309,6 +435,7 @@ fn main() -> ExitCode {
             kit,
         } => guide_cmd(circuit, out, panel, kit),
         Command::Panel { action } => panel_cmd(action),
+        Command::Enclosure { action } => enclosure_cmd(action),
     };
 
     match result {
@@ -536,6 +663,81 @@ fn load_logo(path: &Option<PathBuf>) -> Result<Option<Logo>> {
 fn parse_mode(mode: &str) -> Result<LayoutMode> {
     LayoutMode::parse(mode)
         .ok_or_else(|| anyhow::anyhow!("unknown --mode '{mode}' (analog | digital | mixed)"))
+}
+
+/// Handle `lob pedal <circuit> [--out]` — circuit → pedalkernel .pedal file
+/// (ef4.3): SKiDL → netlist → model → .pedal text. The cross-engine harness
+/// (ef4.4) feeds this to the pedalkernel CLI.
+fn pedal_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let sim_config = SimConfig::infer(&model);
+    let text = legion_of_bom_core::pedal::emit_pedal(&model, &sim_config)?;
+    let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.pedal")));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, &text)?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Handle `lob crosscheck <circuit>` — the differential-validation loop
+/// (ef4.4): run both engines' step responses and compare. Fails the command
+/// when the engines disagree; a missing pedalkernel binary downgrades the
+/// cross-engine leg to a warning.
+fn crosscheck_cmd(circuit: PathBuf) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let sim_config = SimConfig::infer(&model);
+    let tran = TranAnalysis::default();
+    let tol = legion_of_bom_core::crosscheck::Tolerances::default();
+    let report = legion_of_bom_core::crosscheck::crosscheck_tran(
+        &model,
+        &sim_config,
+        &tran,
+        &work_dir,
+        &tol,
+    )?;
+    let mut failed = false;
+    for f in &report.findings {
+        let mark = match f.severity {
+            Severity::Info => " ",
+            Severity::Warning => "!",
+            Severity::Error => "✗",
+        };
+        println!("  {mark} {}", f.message);
+        failed |= f.severity == Severity::Error;
+    }
+    match report.pedalkernel {
+        Some(_) if !failed => println!("✓ crosscheck: engines agree"),
+        Some(_) => bail!("crosscheck: engines disagree beyond tolerance"),
+        None => println!("? crosscheck: ngspice only (pedalkernel binary unavailable)"),
+    }
+    if failed {
+        anyhow::bail!("cross-engine check failed")
+    }
+    Ok(())
 }
 
 fn board_cmd(
@@ -908,7 +1110,7 @@ fn build_cmd(name: Option<String>) -> Result<()> {
         let arg = || PathBuf::from(name);
         let steps: [(&str, Result<()>); 3] = [
             ("guide", guide_cmd(arg(), None, None, "auto".into())),
-            ("bom", bom_cmd(arg(), false, None, true)),
+            ("bom", bom_cmd(arg(), false, None, true, false)),
             (
                 "fab",
                 fab_cmd(arg(), None, None, "analog".into(), 6, false, None),
@@ -1132,7 +1334,13 @@ fn guide_cmd(
 }
 
 /// Handle `lob bom <circuit> [--price] [--out] [--visual]`.
-fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) -> Result<()> {
+fn bom_cmd(
+    circuit: PathBuf,
+    price: bool,
+    out: Option<PathBuf>,
+    visual: bool,
+    gate: bool,
+) -> Result<()> {
     let resolved = resolve_circuit(&circuit)?;
     let stem = resolved.name.clone();
     let circuit = resolved
@@ -1144,7 +1352,47 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) ->
     let run = SkidlRunner::discover(&work_dir)
         .run(&circuit)
         .with_context(|| "SKiDL failed (try `lob doctor`)")?;
-    let mut bom = generate_bom(&parse_netlist_file(&run.netlist_path)?);
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let mut bom = generate_bom(&model);
+
+    // Verification against the parts library (zya.4): findings always print;
+    // `--gate` makes blockers fatal (the posture real ordering runs under).
+    {
+        let mut blockers = 0usize;
+        match PartsLibrary::open(default_parts_dir()) {
+            Ok(lib) => {
+                let resolutions = lib.resolve_circuit(&model)?;
+                let findings = bom.verify(&resolutions);
+                if !findings.is_empty() {
+                    println!("\nVerification");
+                    for f in &findings {
+                        let mark = match f.severity {
+                            legion_of_bom_core::stage::Severity::Error => "✗",
+                            legion_of_bom_core::stage::Severity::Warning => "!",
+                            legion_of_bom_core::stage::Severity::Info => " ",
+                        };
+                        println!("  {mark} {}", f.message);
+                        blockers +=
+                            (f.severity == legion_of_bom_core::stage::Severity::Error) as usize;
+                    }
+                    if gate {
+                        if blockers > 0 {
+                            bail!("verification gate FAILED: {blockers} part(s) not orderable");
+                        }
+                        println!("  ✓ verification gate passed");
+                    }
+                } else if gate {
+                    println!("  ✓ verification gate passed (all parts library-verified)");
+                }
+            }
+            Err(e) => {
+                println!("\nVerification: parts library unavailable ({e}) — not verified");
+                if gate {
+                    bail!("verification gate FAILED: parts library unavailable");
+                }
+            }
+        }
+    }
 
     if price {
         let client = MouserClient::from_env()
@@ -1303,7 +1551,12 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         }
         PartsCmd::Show { mpn } => match lib.get_part(&mpn)? {
             None => println!("not found: {mpn}"),
-            Some(part) => print_part(&part),
+            Some(part) => {
+                print_part(&part);
+                if let Some(cutout) = lib.get_cutout(&mpn)? {
+                    print_cutout(&cutout);
+                }
+            }
         },
         PartsCmd::Add {
             mpn,
@@ -1351,6 +1604,55 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                     println!("  {}. {n}", i + 1);
                 }
             }
+        }
+        PartsCmd::SetCutout {
+            mpn,
+            kind,
+            bore,
+            rect,
+            corner,
+            anti_rotation,
+            body,
+            depth,
+            cited_source,
+        } => {
+            let shape = match (bore, &rect) {
+                (Some(d), None) => {
+                    legion_of_bom_core::parts::CutoutGeometry::Circle { diameter_mm: d }
+                }
+                (None, Some(r)) => {
+                    let (w, h) = r
+                        .split_once('x')
+                        .with_context(|| format!("--rect {r}: expected WxH (e.g. 6.2x5.4)"))?;
+                    legion_of_bom_core::parts::CutoutGeometry::RoundedRect {
+                        width_mm: w.trim().parse().with_context(|| format!("--rect {r}"))?,
+                        height_mm: h.parse().with_context(|| format!("--rect {r}"))?,
+                        corner_radius_mm: corner,
+                    }
+                }
+                _ => bail!("exactly one of --bore or --rect is required"),
+            };
+            let anti = match anti_rotation.as_deref() {
+                None => None,
+                Some("flat") => Some(legion_of_bom_core::parts::AntiRotation::FlatShaft),
+                Some("notch") => Some(legion_of_bom_core::parts::AntiRotation::NotchedShaft),
+                Some("dshaft") => Some(legion_of_bom_core::parts::AntiRotation::DShaft),
+                Some(other) => bail!("unknown --anti-rotation '{other}' (flat | notch | dshaft)"),
+            };
+            let kind = legion_of_bom_core::parts::CutoutKind::parse(&kind)
+                .with_context(|| format!("unknown --kind '{kind}' (jack | pot | switch | led)"))?;
+            lib.set_cutout(&legion_of_bom_core::parts::CutoutRecord {
+                mpn: mpn.clone(),
+                kind,
+                shape,
+                anti_rotation: anti,
+                body_diameter_mm: body,
+                body_depth_mm: depth,
+                cited_page: None,
+                cited_source,
+            })?;
+            lib.commit(&format!("parts: set cutout {mpn}"))?;
+            println!("set cutout for {mpn}");
         }
         PartsCmd::Resolve { circuit } => {
             print_resolutions(&resolve_circuit_file(&lib, circuit)?);
@@ -1601,6 +1903,42 @@ fn merge_fetched(existing: Option<PartRecord>, fetched: PartRecord) -> PartRecor
     merged
 }
 
+/// Print a part's mechanical cutout record (okm.14).
+fn print_cutout(c: &legion_of_bom_core::parts::CutoutRecord) {
+    use legion_of_bom_core::parts::CutoutGeometry;
+    let shape = match c.shape {
+        CutoutGeometry::Circle { diameter_mm } => format!("circle ⌀{diameter_mm} mm"),
+        CutoutGeometry::RoundedRect {
+            width_mm,
+            height_mm,
+            corner_radius_mm,
+        } => format!("rect {width_mm}x{height_mm} mm, r{corner_radius_mm}"),
+    };
+    let anti = c
+        .anti_rotation
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|| "-".into());
+    let cite = c
+        .cited_source
+        .as_deref()
+        .map(|s| {
+            c.cited_page
+                .map(|p| format!("[{s} p.{p}]"))
+                .unwrap_or_else(|| format!("[{s}]"))
+        })
+        .unwrap_or_default();
+    println!(
+        "cutout:       {} {shape}, anti-rotation: {anti} {cite}",
+        c.kind.as_str()
+    );
+    if let Some(d) = c.body_diameter_mm {
+        println!("body:         ⌀{d} mm");
+    }
+    if let Some(d) = c.body_depth_mm {
+        println!("depth:        {d} mm");
+    }
+}
+
 fn print_part(part: &PartRecord) {
     println!("MPN:          {}", part.mpn);
     println!(
@@ -1734,4 +2072,210 @@ fn init_tracing(verbose: u8) {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+// ---------------------------------------------------------------------------
+//  Enclosure
+// ---------------------------------------------------------------------------
+
+/// Load a spec file and resolve it, reporting the file path on any failure.
+fn load_enclosure(spec: &Path) -> Result<legion_of_bom_core::enclosure::Enclosure> {
+    let toml =
+        std::fs::read_to_string(spec).with_context(|| format!("reading {}", spec.display()))?;
+    let file =
+        EnclosureFile::from_toml(&toml).with_context(|| format!("parsing {}", spec.display()))?;
+    file.to_enclosure()
+        .map_err(|e| anyhow::anyhow!("invalid enclosure spec: {e}"))
+}
+
+/// Print a check outcome the same way the pipeline prints a stage.
+fn print_outcome(outcome: &StageOutcome) {
+    for finding in &outcome.findings {
+        let prefix = match finding.severity {
+            Severity::Info => "",
+            Severity::Warning => "warning: ",
+            Severity::Error => "error: ",
+        };
+        println!("  {prefix}{}", finding.message);
+    }
+}
+
+fn enclosure_cmd(action: EnclosureCmd) -> Result<()> {
+    match action {
+        EnclosureCmd::Sizes => {
+            println!(
+                "{:<9} {:>7} {:>7} {:>7} {:>6} {:>7}",
+                "size", "width", "depth", "height", "wall", "corner"
+            );
+            for s in STANDARD_SIZES {
+                println!(
+                    "{:<9} {:>7.1} {:>7.1} {:>7.1} {:>6.1} {:>7.1}",
+                    s.name, s.width_mm, s.depth_mm, s.height_mm, s.wall_mm, s.corner_radius_mm
+                );
+            }
+            println!("\nAll mm. Width runs left-to-right, depth front-to-back.");
+            println!("Nominal catalogue values — measure your box before machining.");
+        }
+
+        EnclosureCmd::Derive {
+            circuit,
+            size,
+            no_footswitch,
+            no_led,
+            out,
+        } => {
+            let size_spec = standard_size(&size).ok_or_else(|| {
+                anyhow::anyhow!("unknown size {size} (try `lob enclosure sizes`)")
+            })?;
+            let circuit = circuit
+                .canonicalize()
+                .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+            let stem = circuit
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("circuit");
+            let work_dir = PathBuf::from("out").join(stem);
+            let run = SkidlRunner::discover(&work_dir)
+                .run(&circuit)
+                .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+            let model = parse_netlist_file(&run.netlist_path)?;
+            let enc = derive_enclosure(
+                &model,
+                size_spec,
+                &BuiltinCutouts,
+                DeriveOptions {
+                    footswitch: !no_footswitch,
+                    led: !no_led,
+                },
+            );
+            let file = EnclosureFile::from_enclosure(&enc, size_spec.name);
+            let toml = file
+                .to_toml()
+                .map_err(|e| anyhow::anyhow!("serialising enclosure: {e}"))?;
+            let out_path =
+                out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_enclosure.toml")));
+            std::fs::write(&out_path, toml)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("wrote {}", out_path.display());
+            print_outcome(&check_enclosure(&enc));
+            println!(
+                "\nEdit the positions by hand, then `lob enclosure step {}`.",
+                out_path.display()
+            );
+        }
+
+        EnclosureCmd::Check { spec } => {
+            let enc = load_enclosure(&spec)?;
+            let outcome = check_enclosure(&enc);
+            print_outcome(&outcome);
+            if !outcome.passed {
+                anyhow::bail!("enclosure spec has errors");
+            }
+            println!("\n✓ enclosure checks passed");
+        }
+
+        EnclosureCmd::Step { spec, out } => {
+            let enc = load_enclosure(&spec)?;
+            let outcome = check_enclosure(&enc);
+            print_outcome(&outcome);
+            if !outcome.passed {
+                // Rejected holes are skipped rather than emitted as broken
+                // geometry, so the solid would silently disagree with the spec.
+                anyhow::bail!(
+                    "fix the errors above before exporting — the solid would omit those holes"
+                );
+            }
+            let out_path = out.unwrap_or_else(|| spec.with_extension("step"));
+            std::fs::write(&out_path, enclosure_to_step(&enc))
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("\nwrote {}", out_path.display());
+        }
+
+        EnclosureCmd::Template { spec, face, out } => {
+            let enc = load_enclosure(&spec)?;
+            let dir =
+                out.unwrap_or_else(|| spec.parent().map(Path::to_path_buf).unwrap_or_default());
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let stem = spec
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("enclosure");
+            let faces: Vec<Face> = match face {
+                Some(f) => vec![f.parse().map_err(|e: String| anyhow::anyhow!(e))?],
+                None => enc.drilled_faces(),
+            };
+            if faces.is_empty() {
+                println!("no drilled faces — nothing to template");
+                return Ok(());
+            }
+            for f in faces {
+                let path = dir.join(format!("{stem}-{}-drill.dxf", f.as_str()));
+                std::fs::write(&path, enclosure_face_dxf(&enc, f))
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!(
+                    "wrote {} ({} hole(s))",
+                    path.display(),
+                    enc.holes_on(f).count()
+                );
+            }
+            println!("\nPrint at 1:1 — check the outline against the box before trusting it.");
+        }
+
+        EnclosureCmd::Cam {
+            spec,
+            material,
+            max_rpm,
+            out,
+        } => {
+            let enc = load_enclosure(&spec)?;
+            let outcome = check_enclosure(&enc);
+            print_outcome(&outcome);
+            if !outcome.passed {
+                anyhow::bail!("fix the errors above before planning cuts");
+            }
+            let opts = CamOptions {
+                material: match material.as_str() {
+                    "diecast" => DIECAST_ALUMINIUM,
+                    "6061" => ALUMINIUM_6061,
+                    other => anyhow::bail!("unknown material {other} (diecast | 6061)"),
+                },
+                max_rpm,
+                ..Default::default()
+            };
+            let plan = plan_cam(&enc, &opts);
+            if plan.setups.is_empty() {
+                println!("no drilled faces — nothing to machine");
+                return Ok(());
+            }
+            let dir =
+                out.unwrap_or_else(|| spec.parent().map(Path::to_path_buf).unwrap_or_default());
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let stem = spec
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("enclosure");
+
+            let sheet = dir.join(format!("{stem}-setup.md"));
+            std::fs::write(&sheet, plan.to_markdown())
+                .with_context(|| format!("writing {}", sheet.display()))?;
+            println!("\nwrote {}", sheet.display());
+            for (i, setup) in plan.setups.iter().enumerate() {
+                let path = dir.join(format!("{stem}-{}-{}.nc", i + 1, setup.face.as_str()));
+                let gcode = plan
+                    .to_gcode(i, &opts)
+                    .expect("setup index came from the plan itself");
+                std::fs::write(&path, gcode)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                println!("wrote {}", path.display());
+            }
+            println!(
+                "\n{} setup(s), {} tool(s), ~{:.0} min cutting.",
+                plan.setups.len(),
+                plan.tools.len(),
+                plan.estimated_minutes()
+            );
+            println!("G-code is a generic ISO starting point — simulate it before you cut.");
+        }
+    }
+    Ok(())
 }

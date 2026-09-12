@@ -247,6 +247,11 @@ struct Kind {
 // `prefix_of` yields the whole letter prefix, so `RV`/`SW` never collide with
 // `R`/`S`. Each kind carries its own assembly copy — THT-first, since few DIY
 // kits are surface-mount; a per-part note from the parts library overrides it.
+/// Centre-to-centre distance below which a taller same-kind part is considered
+/// to block a shorter neighbour's pads (dqk.6). Generous: a THT body overhangs
+/// well beyond its own footprint.
+const BLOCK_MM: f64 = 15.0;
+
 const KINDS: &[Kind] = &[
     Kind {
         prefix: "R",
@@ -355,7 +360,10 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
     // Group into ordered steps by side then kind: the BACK side first (mostly SMD
     // + the power header on our boards), then the front — each side low-profile →
     // tall (KINDS order). Anything unmatched becomes a per-side "remaining" step
-    // so nothing is silently dropped.
+    // so nothing is silently dropped. Within a kind step, the order refines by
+    // ACCESS (dqk.6): parts hemmed in by neighbours (close, same-side parts that
+    // are as tall or taller) solder first, while the workspace around them is
+    // clearest; a part next to a taller LATER part has no such constraint.
     let mut steps = Vec::new();
     let mut used = vec![false; parts.len()];
     for back in [true, false] {
@@ -370,6 +378,34 @@ pub fn build_guide(circuit: &dyn CircuitSource, board_pcb: &str) -> Result<Build
             if group.is_empty() {
                 continue;
             }
+            let mut group = group;
+            // Access-aware within a kind (dqk.6): a taller same-kind part
+            // soldered over a shorter CLOSE neighbour overhangs that
+            // neighbour's pads — so parts that would block a close shorter
+            // neighbour go AFTER the parts they'd block. Proximity is centre
+            // distance, heights from the footprint-family table (DESIGN 6.7
+            // heuristic). Computed against the pre-sort group (the membership
+            // doesn't change, only the order).
+            let pre_sort: Vec<PlacedPart> = group.clone();
+            group.sort_by(|a, b| {
+                let (h_a, h_b) = (
+                    crate::board::part_height_mm(&a.footprint),
+                    crate::board::part_height_mm(&b.footprint),
+                );
+                let blocks = |p: &PlacedPart, h: f64| {
+                    pre_sort
+                        .iter()
+                        .filter(|o| {
+                            o.refdes != p.refdes
+                                && crate::board::part_height_mm(&o.footprint) < h - 0.5
+                                && (p.cx - o.cx).hypot(p.cy - o.cy) < BLOCK_MM
+                        })
+                        .count()
+                };
+                blocks(a, h_a)
+                    .cmp(&blocks(b, h_b))
+                    .then_with(|| refdes_key(&a.refdes).cmp(&refdes_key(&b.refdes)))
+            });
             steps.push(BuildStep {
                 assembly: Some(kind_note(kind, &group)),
                 part_notes: Vec::new(),
@@ -1425,6 +1461,32 @@ mod tests {
         assert_eq!(g.steps[0].parts.len(), 2);
         assert!(g.steps[0].parts.iter().any(|p| p.value == "9k"));
         assert_eq!(g.outline, (95.0, 95.0, 130.0, 105.0));
+    }
+
+    #[test]
+    fn taller_same_kind_parts_go_after_the_close_shorter_neighbour() {
+        // dqk.6: a tall capacitor soldered right next to a short one overhangs
+        // the short one's pads — the short one goes first. Two identical-
+        // height parts (or far-apart parts) keep refdes order.
+        let board = r#"(kicad_pcb
+          (gr_rect (start 95 95) (end 140 105) (layer "Edge.Cuts"))
+          (footprint "Capacitor_THT:CP_Radial_D6.3mm_P2.50mm" (layer "F.Cu") (at 100 100 0)
+            (property "Reference" "C1") (pad "1" thru_hole circle (at -1 0) (size 1 1)) (pad "2" thru_hole circle (at 1 0) (size 1 1)))
+          (footprint "Capacitor_SMD:C_0805_2012Metric" (layer "F.Cu") (at 105 100 0)
+            (property "Reference" "C2") (pad "1" smd rect (at -1 0) (size 1 1)) (pad "2" smd rect (at 1 0) (size 1 1))))"#;
+        let circuit = Circuit {
+            name: "c".into(),
+            parts: vec![Part::new("C1", "47u"), Part::new("C2", "47n")],
+            nets: vec![Net::new("N", vec![PinRef::new("C1", "1")])],
+        };
+        let g = build_guide(&circuit, board).unwrap();
+        let caps = &g.steps[0].parts;
+        assert_eq!(caps.len(), 2);
+        let pos = |r: &str| caps.iter().position(|p| p.refdes == r).unwrap();
+        // C1 is the tall electrolytic-class part, C2 the short MLCC 5 mm away:
+        // C2 first.
+        assert_eq!(pos("C2"), 0, "short close neighbour first");
+        assert_eq!(pos("C1"), 1);
     }
 
     #[test]

@@ -12,8 +12,11 @@
 
 pub mod board;
 pub mod bom;
+pub mod cam;
+pub mod crosscheck;
 pub mod drc;
 pub mod easyeda;
+pub mod enclosure;
 pub mod fab;
 pub mod fetch;
 pub mod guide;
@@ -28,6 +31,7 @@ pub mod netlist;
 pub mod panel;
 pub mod parts;
 pub mod pdf;
+pub mod pedal;
 pub mod resistor;
 pub mod route;
 mod sexpr;
@@ -35,6 +39,7 @@ pub mod skidl;
 pub mod source;
 pub mod spice;
 pub mod stage;
+pub mod step;
 pub mod subboard;
 mod symbols;
 pub mod theme;
@@ -48,8 +53,19 @@ pub use board::{
     BoardOptions, EurorackPlacer, GridPlacer, PartFacts, Placement, Placer, SeededPlacer,
 };
 pub use bom::{generate_bom, Bom, BomLine};
+// `Tool` is already the external-CLI-tool type at this level, so the cutting
+// tool keeps its distinct name here.
+pub use cam::{
+    plan_cam, CamOptions, CamPlan, Material, Op, OpKind, Setup, Tool as CuttingTool,
+    ToolKind as CuttingToolKind,
+};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use easyeda::product_image_url;
+pub use enclosure::{
+    check_enclosure, derive_enclosure, enclosure_brep, enclosure_face_dxf, enclosure_to_step,
+    standard_size, DeriveOptions, Enclosure, EnclosureFile, EnclosureSize, Face, FeatureKind, Hole,
+    STANDARD_SIZES,
+};
 pub use fab::{
     export_board_svg, export_cpl, export_gerbers, jlc_bom_csv, jlc_cpl_from_kicad_pos, png_to_jpeg,
     render_board_jpeg, render_board_png, zip_dir,
@@ -71,9 +87,10 @@ pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use panel::{
-    default_panel_orders_dir, derive_panel, footprint_shape, panel_to_dxf, panel_to_kicad_pcb,
-    BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec, EurorackPanel,
-    MountingHole, PanelFile, PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
+    default_panel_orders_dir, derive_panel, footprint_shape, minimize_hp, panel_to_dxf,
+    panel_to_kicad_pcb, BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec,
+    EurorackPanel, HpMinimized, MountingHole, MountingHolePattern, MountingHoleShape, PanelFile,
+    PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
 };
 pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
@@ -90,7 +107,10 @@ pub use spice::{
     simulate_ac, simulate_tran, AcPoint, AcResult, SimConfig, TranAnalysis, TranPoint, TranResult,
 };
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
+pub use step::Brep;
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
 pub use validate::validate_erc;
-pub use verify::{analytic_check, check_noninverting_gain, check_rc_cutoff};
+pub use verify::{
+    analytic_check, check_noninverting_gain, check_rc_cutoff, check_slew_scales_with_cv,
+};

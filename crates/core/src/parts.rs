@@ -48,7 +48,101 @@ CREATE TABLE IF NOT EXISTS part_assembly_steps (\
   mpn VARCHAR(64) NOT NULL,\
   step_order INT NOT NULL,\
   text TEXT,\
-  PRIMARY KEY (mpn, step_order));";
+  PRIMARY KEY (mpn, step_order));\
+CREATE TABLE IF NOT EXISTS part_cutouts (\
+  mpn VARCHAR(64) PRIMARY KEY,\
+  kind VARCHAR(16) NOT NULL,\
+  shape VARCHAR(16) NOT NULL,\
+  bore_diameter_mm REAL,\
+  rect_w_mm REAL,\
+  rect_h_mm REAL,\
+  corner_radius_mm REAL,\
+  anti_rotation VARCHAR(16),\
+  body_diameter_mm REAL,\
+  body_depth_mm REAL,\
+  cited_page INT,\
+  cited_source TEXT);";
+
+/// How a part mounts to a panel (okm.14) — mirrors [`crate::panel::ControlKind`]
+/// without a cross-module type dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoutKind {
+    Jack,
+    Pot,
+    Switch,
+    Led,
+}
+
+impl CutoutKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CutoutKind::Jack => "jack",
+            CutoutKind::Pot => "pot",
+            CutoutKind::Switch => "switch",
+            CutoutKind::Led => "led",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "jack" => CutoutKind::Jack,
+            "pot" => CutoutKind::Pot,
+            "switch" => CutoutKind::Switch,
+            "led" => CutoutKind::Led,
+            _ => return None,
+        })
+    }
+}
+
+/// The panel opening a part's cutout shape needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CutoutGeometry {
+    /// A round bore (LED, pot bushing, jack barrel).
+    Circle { diameter_mm: f64 },
+    /// A rounded rectangle (rectangular jacks, some switches).
+    RoundedRect {
+        width_mm: f64,
+        height_mm: f64,
+        corner_radius_mm: f64,
+    },
+}
+
+/// How a part is kept from rotating in its panel hole (pots mainly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiRotation {
+    FlatShaft,
+    NotchedShaft,
+    DShaft,
+}
+
+impl AntiRotation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AntiRotation::FlatShaft => "flat",
+            AntiRotation::NotchedShaft => "notch",
+            AntiRotation::DShaft => "dshaft",
+        }
+    }
+}
+
+/// A part's panel/enclosure mechanical data (okm.14): the opening its panel
+/// mount needs, the body envelope for crowding checks, and the mounting depth.
+/// Travels with the part like its pinout — the generator never special-cases
+/// per part. Consumed through [`crate::panel::CutoutSource`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutoutRecord {
+    pub mpn: String,
+    pub kind: CutoutKind,
+    pub shape: CutoutGeometry,
+    pub anti_rotation: Option<AntiRotation>,
+    /// Body/knob envelope diameter (mm) — spacing/crowding checks.
+    pub body_diameter_mm: Option<f64>,
+    /// How deep below the panel surface the body extends (mm).
+    pub body_depth_mm: Option<f64>,
+    /// Citation: where this geometry came from (datasheet page / measured).
+    pub cited_page: Option<i64>,
+    pub cited_source: Option<String>,
+}
 
 /// One pin of a part, with a citation back to the source page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +406,111 @@ impl PartsLibrary {
         ))
     }
 
+    /// Store a part's panel/enclosure mechanical data (okm.14). Creates a
+    /// minimal stub row if the MPN is new — mechanical data may be the only
+    /// thing known about a boutique part — without touching verified status.
+    pub fn set_cutout(&self, cutout: &CutoutRecord) -> Result<(), PartsError> {
+        let key = sql_str(&cutout.mpn);
+        let (_, bore, w, h, r) = match cutout.shape {
+            CutoutGeometry::Circle { diameter_mm } => {
+                ("circle", Some(diameter_mm), None, None, None)
+            }
+            CutoutGeometry::RoundedRect {
+                width_mm,
+                height_mm,
+                corner_radius_mm,
+            } => (
+                "rect",
+                None,
+                Some(width_mm),
+                Some(height_mm),
+                Some(corner_radius_mm),
+            ),
+        };
+        let stmts = [
+            format!("INSERT IGNORE INTO parts (mpn) VALUES ({key});"),
+            format!(
+                "INSERT INTO part_cutouts (mpn, kind, shape, bore_diameter_mm, rect_w_mm, rect_h_mm, \
+                 corner_radius_mm, anti_rotation, body_diameter_mm, body_depth_mm, cited_page, cited_source) \
+                 VALUES ({key}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+                 ON DUPLICATE KEY UPDATE kind=VALUES(kind), shape=VALUES(shape), \
+                 bore_diameter_mm=VALUES(bore_diameter_mm), rect_w_mm=VALUES(rect_w_mm), \
+                 rect_h_mm=VALUES(rect_h_mm), corner_radius_mm=VALUES(corner_radius_mm), \
+                 anti_rotation=VALUES(anti_rotation), body_diameter_mm=VALUES(body_diameter_mm), \
+                 body_depth_mm=VALUES(body_depth_mm), cited_page=VALUES(cited_page), \
+                 cited_source=VALUES(cited_source);",
+                sql_str(cutout.kind.as_str()),
+                sql_str(match cutout.shape {
+                    CutoutGeometry::Circle { .. } => "circle",
+                    CutoutGeometry::RoundedRect { .. } => "rect",
+                }),
+                sql_opt(bore.map(|v| v.to_string()).as_deref()),
+                sql_opt(w.map(|v| v.to_string()).as_deref()),
+                sql_opt(h.map(|v| v.to_string()).as_deref()),
+                sql_opt(r.map(|v| v.to_string()).as_deref()),
+                sql_opt(cutout.anti_rotation.map(|a| a.as_str())),
+                sql_opt(cutout.body_diameter_mm.map(|v| v.to_string()).as_deref()),
+                sql_opt(cutout.body_depth_mm.map(|v| v.to_string()).as_deref()),
+                sql_int(cutout.cited_page),
+                sql_opt(cutout.cited_source.as_deref()),
+            ),
+        ];
+        self.sql(&stmts.join("\n"))
+    }
+
+    /// Fetch a part's mechanical cutout, or `None` if absent.
+    pub fn get_cutout(&self, mpn: &str) -> Result<Option<CutoutRecord>, PartsError> {
+        let rows = self.query(&format!(
+            "SELECT kind, shape, bore_diameter_mm, rect_w_mm, rect_h_mm, corner_radius_mm, \
+             anti_rotation, body_diameter_mm, body_depth_mm, cited_page, cited_source \
+             FROM part_cutouts WHERE mpn={}",
+            sql_str(mpn)
+        ))?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(kind) = str_field(&row, "kind").and_then(|s| CutoutKind::parse(&s)) else {
+            return Ok(None);
+        };
+        let shape = match str_field(&row, "shape").as_deref() {
+            Some("circle") => float_field(&row, "bore_diameter_mm")
+                .map(|d| CutoutGeometry::Circle { diameter_mm: d }),
+            Some("rect") => {
+                let (w, h) = (
+                    float_field(&row, "rect_w_mm"),
+                    float_field(&row, "rect_h_mm"),
+                );
+                match (w, h) {
+                    (Some(w), Some(h)) => Some(CutoutGeometry::RoundedRect {
+                        width_mm: w,
+                        height_mm: h,
+                        corner_radius_mm: float_field(&row, "corner_radius_mm").unwrap_or(0.0),
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(shape) = shape else {
+            return Ok(None);
+        };
+        Ok(Some(CutoutRecord {
+            mpn: mpn.to_string(),
+            kind,
+            shape,
+            anti_rotation: str_field(&row, "anti_rotation").and_then(|s| match s.as_str() {
+                "flat" => Some(AntiRotation::FlatShaft),
+                "notch" => Some(AntiRotation::NotchedShaft),
+                "dshaft" => Some(AntiRotation::DShaft),
+                _ => None,
+            }),
+            body_diameter_mm: float_field(&row, "body_diameter_mm"),
+            body_depth_mm: float_field(&row, "body_depth_mm"),
+            cited_page: int_field(&row, "cited_page"),
+            cited_source: str_field(&row, "cited_source"),
+        }))
+    }
+
     /// Commit the current state to Dolt history (no-op if nothing changed).
     pub fn commit(&self, message: &str) -> Result<(), PartsError> {
         self.dolt(&["add", "-A"], "add")?;
@@ -444,6 +643,61 @@ impl PartsLibrary {
     }
 }
 
+/// A parts-library-backed [`CutoutSource`](crate::panel::CutoutSource) (okm.14):
+/// a verified part's mechanical data rides with it, replacing the built-in
+/// fallback table. Unknown/unverified parts fall back to
+/// [`BuiltinCutouts`](crate::panel::BuiltinCutouts) so current behaviour holds
+/// until the library is populated; a library entry always wins when present.
+pub struct LibraryCutouts<'a> {
+    pub library: &'a PartsLibrary,
+    pub fallback: crate::panel::BuiltinCutouts,
+}
+
+impl CutoutKind {
+    /// The matching panel control kind.
+    pub fn control_kind(self) -> crate::panel::ControlKind {
+        match self {
+            CutoutKind::Jack => crate::panel::ControlKind::Jack,
+            CutoutKind::Pot => crate::panel::ControlKind::Pot,
+            CutoutKind::Switch => crate::panel::ControlKind::Switch,
+            CutoutKind::Led => crate::panel::ControlKind::Led,
+        }
+    }
+}
+
+impl<'a> crate::panel::CutoutSource for LibraryCutouts<'a> {
+    fn cutout(&self, mpn: Option<&str>, footprint: &str) -> Option<crate::panel::CutoutSpec> {
+        if let Some(mpn) = mpn {
+            if let Ok(Some(cutout)) = self.library.get_cutout(mpn) {
+                // Only a human-verified part's geometry is trusted.
+                if let Ok(Some(record)) = self.library.get_part(mpn) {
+                    if record.verified_by_human {
+                        let shape = match cutout.shape {
+                            CutoutGeometry::Circle { diameter_mm } => {
+                                crate::panel::CutoutShape::Circle { diameter_mm }
+                            }
+                            CutoutGeometry::RoundedRect {
+                                width_mm,
+                                height_mm,
+                                corner_radius_mm,
+                            } => crate::panel::CutoutShape::RoundedRect {
+                                width_mm,
+                                height_mm,
+                                corner_radius_mm,
+                            },
+                        };
+                        return Some(crate::panel::CutoutSpec {
+                            shape,
+                            kind: cutout.kind.control_kind(),
+                        });
+                    }
+                }
+            }
+        }
+        self.fallback.cutout(mpn, footprint)
+    }
+}
+
 /// The default cross-project parts-library location (override with `LOB_PARTS_DIR`).
 pub fn default_parts_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOB_PARTS_DIR") {
@@ -484,6 +738,10 @@ fn str_field(row: &serde_json::Value, key: &str) -> Option<String> {
 
 fn int_field(row: &serde_json::Value, key: &str) -> Option<i64> {
     row.get(key).and_then(serde_json::Value::as_i64)
+}
+
+fn float_field(row: &serde_json::Value, key: &str) -> Option<f64> {
+    row.get(key).and_then(|v| v.as_f64())
 }
 
 fn bool_field(row: &serde_json::Value, key: &str) -> bool {
@@ -621,6 +879,85 @@ mod tests {
         assert_eq!(status("U2"), ResolutionStatus::Unverified);
         assert_eq!(status("U3"), ResolutionStatus::Unknown);
         assert_eq!(status("R1"), ResolutionStatus::NoMpn);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Mechanical cutout data round-trips and gates through verification
+    /// (okm.14). Skipped if no dolt.
+    #[test]
+    fn cutout_roundtrip_and_verified_source_when_dolt_available() {
+        use crate::model::{Circuit, Part};
+        use crate::panel::{ControlKind, CutoutShape, CutoutSource as _};
+
+        if find_on_path("dolt").is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lob-cutout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = PartsLibrary::open(&root).expect("open");
+
+        let record = CutoutRecord {
+            mpn: "WQP-PJ398SM".into(),
+            kind: CutoutKind::Jack,
+            shape: CutoutGeometry::RoundedRect {
+                width_mm: 6.2,
+                height_mm: 5.4,
+                corner_radius_mm: 0.4,
+            },
+            anti_rotation: None,
+            body_diameter_mm: Some(13.0),
+            body_depth_mm: Some(12.5),
+            cited_page: Some(3),
+            cited_source: Some("manufacturer datasheet".into()),
+        };
+        lib.set_cutout(&record).expect("set cutout");
+        let got = lib
+            .get_cutout("WQP-PJ398SM")
+            .expect("get")
+            .expect("present");
+        assert_eq!(got, record);
+
+        // The library-backed CutoutSource: geometry only for VERIFIED parts,
+        // builtin fallback otherwise.
+        lib.upsert_part(&PartRecord::new("WQP-PJ398SM"))
+            .expect("stub part");
+        let source = LibraryCutouts {
+            library: &lib,
+            fallback: crate::panel::BuiltinCutouts,
+        };
+        let circuit = Circuit {
+            name: "c".into(),
+            parts: vec![Part::new("J1", "Thonkiconn")
+                .with_mpn("WQP-PJ398SM")
+                .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical")],
+            nets: vec![],
+        };
+        let part = &circuit.parts[0];
+        // Unverified → falls back to the builtin jack bore.
+        let via_builtin = source
+            .cutout(part.mpn.as_deref(), part.footprint.as_deref().unwrap_or(""))
+            .expect("fallback");
+        assert_eq!(
+            via_builtin.shape,
+            CutoutShape::Circle {
+                diameter_mm: crate::panel::JACK_BARREL_MM,
+            }
+        );
+        // Verified → library geometry wins.
+        lib.mark_verified("WQP-PJ398SM", "tester").expect("verify");
+        let via_lib = source
+            .cutout(part.mpn.as_deref(), part.footprint.as_deref().unwrap_or(""))
+            .expect("library");
+        assert_eq!(
+            via_lib.shape,
+            CutoutShape::RoundedRect {
+                width_mm: 6.2,
+                height_mm: 5.4,
+                corner_radius_mm: 0.4,
+            }
+        );
+        assert_eq!(via_lib.kind, ControlKind::Jack);
 
         let _ = std::fs::remove_dir_all(&root);
     }

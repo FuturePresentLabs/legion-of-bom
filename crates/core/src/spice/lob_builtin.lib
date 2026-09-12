@@ -2,19 +2,47 @@
 * The parts-library stand-in until real device models travel with each part
 * (DESIGN 2.3 / okm). Behavioural, not vendor macro-models — enough to validate
 * topology + slew behaviour, not datasheet-exact.
+*
+* Op-amp parameters (A0/GBW/SR/RO) are sourced from pedalkernel's curated
+* opamps.model registry (github.com/ajmwagar/pedalkernel, pedalkernel/models/
+* opamps.model) — see legion-of-bom-ef4.2. Values are datasheet facts; the
+* subckt below is legion-of-bom's own 1-pole slew-limited macro.
 
-* --- Ideal op-amp: high-gain VCVS with a finite output resistance so a unity-
-*     feedback follower has a well-conditioned operating point (a stiff 0-ohm
-*     source in a 1e5 loop does not converge). Signals stay within the rails.
+* --- Ideal op-amp (GENERIC fallback): high-gain VCVS with a finite output
+*     resistance so a unity-feedback follower has a well-conditioned operating
+*     point (a stiff 0-ohm source in a 1e5 loop does not converge). No slew
+*     limiting — used for parts with no sourced parameters.
 .subckt OPAMP_IDEAL out inm inp vminus vplus
 Eg ng 0 inp inm 1e5
 Rout ng out 100
 .ends
 
-* --- Dual op-amp (TL072/TL082/…): pins 1..8 = out1 in1- in1+ V- in2+ in2- out2 V+.
-.subckt TL072 o1 i1m i1p vm i2p i2m o2 vp
-Xa o1 i1m i1p vm vp OPAMP_IDEAL
-Xb o2 i2m i2p vm vp OPAMP_IDEAL
+* --- 1-pole slew-limited op-amp macro, parameterised by (A0, GBW, SR, RO).
+*     Rails are read from the vp/vn supply pins (not parameters), so the clamp
+*     follows whatever the circuit actually powers the part with.
+*     Topology: differential input -> current-limited transconductor (tanh,
+*     Imax = SR*C1) into a diode-clamped integrator (C1 = 1 pF, R1 = A0/gm —
+*     DC gain A0, dominant pole at GBW/A0) -> unity buffer -> RO.
+*     Validated (ngspice-47): gain-2 DC = 2.0000 V, unity-follower slew =
+*     13.0 V/us with TL072 params, AC f3dB = 1.514 MHz vs textbook 1.5 MHz.
+.subckt OPAMP_SLEW out inm inp vn vp params: A0=200k GBW=3000000 SR=13000000 RO=75
+B1 0 n1 I = {SR*1p} * tanh( {6.283185*GBW*1p/(SR*1p)} * (V(inp)-V(inm)) )
+C1 n1 0 1p
+R1 n1 0 {A0/(6.283185*GBW*1p)}
+Ehp hp 0 VALUE = { V(vp) - 0.5 }
+Elp lp 0 VALUE = { V(vn) + 0.5 }
+Dhi n1 hp DCLIP
+Dlo lp n1 DCLIP
+Ebuf n2 0 VALUE = { V(n1) }
+Rout n2 out {RO}
+.model DCLIP D(Is=1e-14)
+.ends
+
+* --- Dual op-amp (TL072/TL082/NE5532/…): pins 1..8 = out1 in1- in1+ V- in2+
+*     in2- out2 V+. Defaults are TL072; per-part values ride in on the X line.
+.subckt TL072 o1 i1m i1p vm i2p i2m o2 vp params: A0=200k GBW=3000000 SR=13000000 RO=75
+Xa o1 i1m i1p vm vp OPAMP_SLEW A0={A0} GBW={GBW} SR={SR} RO={RO}
+Xb o2 i2m i2p vm vp OPAMP_SLEW A0={A0} GBW={GBW} SR={SR} RO={RO}
 .ends
 
 * --- LM13700 OTA + Darlington buffer (channel A terminals). --------------------

@@ -170,3 +170,56 @@ the shortest path to a working end-to-end loop.
   `StageError`. Keep that distinction.
 - External-tool stages (SKiDL, ngspice, KiCad) shell out and must fail gracefully
   when the tool is absent — never panic.
+
+<!-- BEGIN FPL DESIGN TENETS (managed by fpl) -->
+
+# FPL Systems Design Tenets
+
+These tenets apply across all FPL / Puget Audio codebases and automation. Every agent session (Claude Code, Codex, or otherwise) should treat these as load-bearing defaults, not suggestions — deviate only with an explicit, stated reason.
+
+---
+
+### 1. DRY (Don't Repeat Yourself)
+One source of truth per fact. If the same schema, constant, or logic exists in two places, one of them is already wrong and just hasn't been noticed yet. Prefer a shared crate/module/service over copy-paste, even across repo boundaries in the FPL ecosystem (e.g. call `lob`'s Mouser integration — don't re-implement it in the workflow layer).
+
+### 2. Loose Coupling
+Modules and services talk through narrow, explicit interfaces — not shared internal state, not reaching into another project's guts. A project should be replaceable without its neighbors caring, as long as the interface contract holds. This is what keeps the "loose tools" (Quotron2, legion-of-bom, mesh-to-step, Panopticon, etc.) glueable instead of tangled.
+
+### 3. Infer/Calculate Over Static/Configured (Good Dynamism)
+Derive values from source-of-truth data at the point of use rather than hand-maintaining config that can drift out of sync. If a number can be computed from something else that already exists, compute it — don't cache a stale copy in a config file or constant.
+
+### 4. Design Good Interfaces
+Spend real thought on the boundary before implementing what's behind it. A good interface is boring, hard to misuse, and survives its internals being rewritten. Interfaces, persistence formats, and contracts are the genuine one-way doors — get these right up front even when you're moving fast on everything else.
+
+### 5. Commit Early, Commit Often
+Small, frequent, reversible commits. History should read as a trail of intent, not a single monolithic diff. This is what makes rollback, bisect, and review actually usable later.
+
+### 6. Test Everything
+No behavior ships un-verified. Tests are how a system stays trustworthy as an agent (human or LLM) keeps modifying it — they're the guardrail that lets you move fast without re-deriving correctness by hand every time.
+
+### 7. Deterministic Orchestration, Narrow LLM-Assist
+Workflows are discrete, deterministic, and reproducible by default (state machines, scripted flows) — not unstructured agent loops deciding what happens next. LLMs assist at specific, bounded points inside a workflow (drafting, scoring, summarizing), never as the thing deciding control flow. If the orchestrator's behavior can't be predicted from reading the code, it's not a workflow, it's a gamble.
+
+### 8. Runbook Parity
+Any automated workflow should still be describable as a manual runbook a human could execute if the automation broke. If you can't say "here's how a person would do this step by step," the workflow is probably hiding a business process you don't actually understand yet.
+
+### 9. Self-Validating Over Human-Gated
+Default to systems that catch their own mistakes, not systems that add a human review checkpoint. A review gate is a scaling liability disguised as a safety feature. Build the validation into the loop; don't outsource it to future-you's attention.
+
+### 10. Call, Don't Rebuild
+If a capability is already owned by another project in the ecosystem, invoke it as a tool — don't fork the logic into the caller. Ownership of a capability lives in exactly one place; everything else is a client of it.
+
+### 11. Boring Technology, Deliberate Sprawl
+New tools/services/dependencies earn their place — prefer the boring, already-adopted option over a novel one unless there's a concrete reason. Every new moving part is something that has to be audited, secured, and kept alive; unexamined sprawl is debt, not progress.
+
+### 12. Fail Loud, Fail Fast
+Errors surface immediately and visibly — no silent fallbacks, no swallowed exceptions, no "probably fine." A system that fails quietly just moves the cost of the bug to whoever debugs it in production three weeks later.
+
+### 13. Cadence Beats Polish (Where Cadence Is the Point)
+For anything whose value comes from consistency over time — content, reporting, outreach — a steady mediocre output beats a sporadic polished one. Save the polish budget for the genuine one-way doors (tenet #4); don't spend it gold-plating things that just need to keep showing up.
+
+---
+
+*Living document — extend as new patterns prove themselves, don't just accumulate opinions. If a tenet stops being true of how FPL actually builds things, cut it rather than let it rot into aspirational fiction.*
+
+<!-- END FPL DESIGN TENETS -->

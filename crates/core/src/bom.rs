@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::parts::{PartResolution, ResolutionStatus};
 use crate::source::CircuitSource;
+use crate::stage::{Finding, Severity};
 use crate::theme::{self, esc};
 
 /// One line of a BOM: a group of identical parts.
@@ -97,6 +99,86 @@ impl Bom {
     pub fn total(&self) -> Option<f64> {
         let priced: Vec<f64> = self.lines.iter().filter_map(|l| l.ext_price).collect();
         (!priced.is_empty()).then(|| priced.iter().sum())
+    }
+
+    /// Cross-check the BOM against the parts library's resolutions (zya.4,
+    /// DESIGN 9.4): every part must be a known, human-verified MPN before a
+    /// real order is placed. Split lines (one MPN across several lines with
+    /// different values/footprints) and missing footprints are flagged too.
+    ///
+    /// Returns findings with severities: `Error` = ordering blocker (unknown or
+    /// unverified MPN), `Warning` = suspicious but orderable (no MPN on a
+    /// passive, split lines, missing footprint). Blocks nothing by itself —
+    /// the caller decides what to gate on.
+    pub fn verify(&self, resolutions: &[PartResolution]) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        let by_refdes: BTreeMap<&String, &PartResolution> =
+            resolutions.iter().map(|r| (&r.refdes, r)).collect();
+
+        for line in &self.lines {
+            for refdes in &line.refdes {
+                let Some(r) = by_refdes.get(refdes) else {
+                    findings.push(Finding::warning(format!(
+                        "{refdes}: no parts-library resolution — verification skipped"
+                    )));
+                    continue;
+                };
+                match r.status {
+                    ResolutionStatus::NoMpn => findings.push(Finding {
+                        severity: Severity::Warning,
+                        message: format!(
+                            "{refdes}: no MPN (value '{}') — cannot be priced or library-verified",
+                            line.value
+                        ),
+                    }),
+                    ResolutionStatus::Unknown => findings.push(Finding {
+                        severity: Severity::Error,
+                        message: format!(
+                            "{refdes}: MPN {} is not in the parts library — ordering blocked",
+                            r.mpn.as_deref().unwrap_or("?")
+                        ),
+                    }),
+                    ResolutionStatus::Unverified => findings.push(Finding {
+                        severity: Severity::Error,
+                        message: format!(
+                            "{refdes}: MPN {} is in the library but not human-verified — ordering blocked",
+                            r.mpn.as_deref().unwrap_or("?")
+                        ),
+                    }),
+                    ResolutionStatus::Verified => {}
+                }
+            }
+            if line.footprint.is_none() {
+                findings.push(Finding::warning(format!(
+                    "{}: no footprint — cannot check package fit",
+                    line.refdes.join("/")
+                )));
+            }
+        }
+
+        // One MPN spread across multiple lines is a correctness smell: the
+        // same physical part split by a value/footprint typo fragments an
+        // order (or worse, silently splits a real design difference).
+        let mut by_mpn: BTreeMap<&String, Vec<&BomLine>> = BTreeMap::new();
+        for line in &self.lines {
+            if let Some(mpn) = &line.mpn {
+                by_mpn.entry(mpn).or_default().push(line);
+            }
+        }
+        for (mpn, lines) in by_mpn {
+            if lines.len() > 1 {
+                let refs = lines
+                    .iter()
+                    .flat_map(|l| l.refdes.clone())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                findings.push(Finding::warning(format!(
+                    "MPN {mpn} appears on {} lines ({refs}) with different value/footprint — check for a typo or a real split",
+                    lines.len()
+                )));
+            }
+        }
+        findings
     }
 
     /// CSV rendering: `refdes,qty,mpn,value,footprint,unit_price,ext_price`.
@@ -357,6 +439,76 @@ mod tests {
     fn flags_missing_footprints() {
         let bom = generate_bom(&circuit());
         assert_eq!(bom.parts_without_footprint(), vec!["U1"]);
+    }
+
+    #[test]
+    fn verification_flags_unknown_unverified_and_clean_passes() {
+        let bom = generate_bom(&circuit());
+        // R1/R2 verified, C1 unknown MPN, U1 in the library but unverified.
+        let res = |refdes: &str, mpn: &str, status: ResolutionStatus| PartResolution {
+            refdes: refdes.into(),
+            mpn: Some(mpn.into()),
+            record: None,
+            status,
+        };
+        let resolutions = vec![
+            res("R1", "RC0805FR-071KL", ResolutionStatus::Verified),
+            res("R2", "RC0805FR-071KL", ResolutionStatus::Verified),
+            res("C1", "C0G-159N", ResolutionStatus::Unknown),
+            res("U1", "LM13700M/NOPB", ResolutionStatus::Unverified),
+        ];
+        let findings = bom.verify(&resolutions);
+        // C1: unknown → error. U1: unverified → error + no-footprint warning.
+        assert!(findings.iter().any(|f| f.severity == Severity::Error
+            && f.message.contains("C1")
+            && f.message.contains("not in the parts library")));
+        assert!(findings.iter().any(|f| f.severity == Severity::Error
+            && f.message.contains("U1")
+            && f.message.contains("not human-verified")));
+        assert!(findings.iter().any(|f| f.severity == Severity::Warning
+            && f.message.contains("U1")
+            && f.message.contains("no footprint")));
+        // No findings for the verified resistors.
+        assert!(!findings.iter().any(|f| f.message.contains("R1")));
+        assert!(!findings.iter().any(|f| f.message.contains("R2")));
+    }
+
+    #[test]
+    fn verification_flags_no_mpn_and_split_mpn_lines() {
+        let c = Circuit {
+            name: "split".into(),
+            parts: vec![
+                Part::new("R1", "1k"), // no MPN, no footprint
+                Part::new("R2", "1k"),
+                Part::new("C1", "159n").with_mpn("C1005X7R1E159M"),
+                Part::new("C2", "160n").with_mpn("C1005X7R1E159M"), // same MPN, other value
+            ],
+            nets: vec![],
+        };
+        let bom = generate_bom(&c);
+        let resolutions: Vec<PartResolution> = c
+            .parts
+            .iter()
+            .map(|p| PartResolution {
+                refdes: p.refdes.0.clone(),
+                mpn: p.mpn.clone(),
+                record: None,
+                status: if p.mpn.is_some() {
+                    ResolutionStatus::Verified
+                } else {
+                    ResolutionStatus::NoMpn
+                },
+            })
+            .collect();
+        let findings = bom.verify(&resolutions);
+        assert!(findings.iter().any(|f| f.severity == Severity::Warning
+            && f.message.contains("R1")
+            && f.message.contains("no MPN")));
+        assert!(findings
+            .iter()
+            .any(|f| f.severity == Severity::Warning && f.message.contains("appears on 2 lines")));
+        // And nothing else: C1/C2 have footprints? No — MPN parts with no
+        // footprint also warn.
     }
 
     #[test]

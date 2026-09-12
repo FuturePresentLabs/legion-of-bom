@@ -40,6 +40,26 @@ pub fn kicad_footprint_dir() -> Option<std::path::PathBuf> {
     default.is_dir().then(|| default.to_path_buf())
 }
 
+/// The env var for KiCad 3D model libraries (`.step`/`.wrl`, the packaged
+/// `packages3d` set), and the macOS default. j54.9's decided source for the 3D
+/// models collision checks (DESIGN 6.7) consume.
+pub const MODEL3D_ENV: &str = "KICAD9_3DMODEL_DIR";
+pub const MACOS_KICAD_3DMODELS: &str =
+    "/Applications/KiCad/KiCad.app/Contents/SharedSupport/packages3d";
+
+/// Resolve the KiCad 3D-model directory: `KICAD9_3DMODEL_DIR` if it points at a
+/// real directory, else the macOS default if it exists.
+pub fn kicad_3dmodel_dir() -> Option<std::path::PathBuf> {
+    if let Some(val) = std::env::var_os(MODEL3D_ENV) {
+        let p = std::path::PathBuf::from(val);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let default = std::path::Path::new(MACOS_KICAD_3DMODELS);
+    default.is_dir().then(|| default.to_path_buf())
+}
+
 /// A Python interpreter and whether it came from the project venv.
 #[derive(Debug, Clone)]
 pub struct PythonInfo {
@@ -272,5 +292,25 @@ mod tests {
     fn tail_keeps_last_lines() {
         assert_eq!(tail("a\nb\nc\nd", 2), "c\nd");
         assert_eq!(tail("only", 5), "only");
+    }
+
+    #[test]
+    fn three_d_model_dir_respects_the_env_override() {
+        // j54.9: the decided 3D-model source resolves like symbols/footprints —
+        // env override first, then the macOS app-bundle default. Point the env
+        // at a real temp dir and it must win; unset, it degrades to None.
+        let dir = std::env::temp_dir().join(format!("lob-3dmodel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY of intent: tests in this crate run single-threaded per-binary
+        // for these env reads (same pattern as KICAD9_SYMBOL_DIR use elsewhere).
+        std::env::set_var(MODEL3D_ENV, &dir);
+        // The resolver returns the path as given (no canonicalization) — env
+        // wins verbatim when it points at a real directory.
+        assert_eq!(kicad_3dmodel_dir(), Some(dir.clone()));
+        std::env::remove_var(MODEL3D_ENV);
+        // Not asserting the fallback on this machine (depends on KiCad being
+        // installed); the resolver returns None cleanly either way.
+        let _ = kicad_3dmodel_dir();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
