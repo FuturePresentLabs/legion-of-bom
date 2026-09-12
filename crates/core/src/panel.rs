@@ -32,6 +32,43 @@ pub struct MountingHole {
     pub x_mm: f64,
     pub y_mm: f64,
     pub diameter_mm: f64,
+    /// Hole shape: a plain round hole, or an oval slot allowing horizontal
+    /// adjustment in the rack (the real-Eurorack convention; hqt).
+    pub shape: MountingHoleShape,
+}
+
+/// A mounting hole's opening shape.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MountingHoleShape {
+    /// A plain round hole.
+    #[default]
+    Round,
+    /// A horizontal oval slot: a `diameter_mm` circle stretched horizontally
+    /// (slot length = `slot_length_mm`), so horizontal position adjusts.
+    Oval { slot_length_mm: f64 },
+}
+
+/// Which mounting holes a panel gets (hqt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MountingHolePattern {
+    /// The two left-side holes only.
+    Left2,
+    /// Top-left + bottom-right (the real-Eurorack diagonal; the default).
+    #[default]
+    Diagonal,
+    /// All four corners (right pair only for panels wide enough).
+    All4,
+}
+
+impl MountingHole {
+    /// The hole's full opening width (mm) — slot length for an oval, diameter
+    /// for a round hole. What Edge.Cuts/DXF rendering and keep-outs need.
+    pub fn width_mm(&self) -> f64 {
+        match self.shape {
+            MountingHoleShape::Round => self.diameter_mm,
+            MountingHoleShape::Oval { slot_length_mm } => self.diameter_mm.max(slot_length_mm),
+        }
+    }
 }
 
 /// An anchored cutout (jack, pot, switch, LED, etc.).
@@ -238,19 +275,28 @@ pub struct EurorackPanel {
     thickness_mm: f64,
     extra_holes: Vec<MountingHole>,
     cutouts: Vec<Cutout>,
+    /// Hole shape and placement pattern (hqt). Defaults: oval slots in the
+    /// diagonal — the real-Eurorack convention.
+    hole_shape: MountingHoleShape,
+    hole_pattern: MountingHolePattern,
 }
 
 impl EurorackPanel {
     /// Create a new Eurorack panel of the given HP width.
     ///
     /// Standard height (128.5 mm) and thickness (2.0 mm) are applied.
-    /// Default mounting holes are added automatically based on HP width.
+    /// Default mounting holes (oval slots in the diagonal) are added
+    /// automatically based on HP width.
     pub fn new(hp: u16) -> Self {
         let mut panel = EurorackPanel {
             hp,
             thickness_mm: 2.0,
             extra_holes: Vec::new(),
             cutouts: Vec::new(),
+            hole_shape: MountingHoleShape::Oval {
+                slot_length_mm: 6.0,
+            },
+            hole_pattern: MountingHolePattern::Diagonal,
         };
         panel.rebuild_default_holes();
         panel
@@ -259,6 +305,16 @@ impl EurorackPanel {
     /// Override the default thickness (mm).
     pub fn with_thickness(mut self, mm: f64) -> Self {
         self.thickness_mm = mm;
+        self
+    }
+
+    /// Override the mounting-hole shape and placement pattern (hqt). Rebuilds
+    /// the default hole set.
+    pub fn with_mounting(mut self, shape: MountingHoleShape, pattern: MountingHolePattern) -> Self {
+        self.hole_shape = shape;
+        self.hole_pattern = pattern;
+        self.extra_holes.clear();
+        self.rebuild_default_holes();
         self
     }
 
@@ -310,29 +366,44 @@ impl EurorackPanel {
     fn rebuild_default_holes(&mut self) {
         let w = self.width_mm_value();
         let h = EURORACK_HEIGHT_MM;
-        // Left side holes (always present).
-        self.extra_holes.push(MountingHole {
-            x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: h - EURORACK_HOLE_INSET_Y_MM,
-            diameter_mm: EURORACK_HOLE_DIAMETER_MM,
-        });
-        self.extra_holes.push(MountingHole {
-            x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: EURORACK_HOLE_INSET_Y_MM,
-            diameter_mm: EURORACK_HOLE_DIAMETER_MM,
-        });
-        // Right side holes for panels ≥ 8 HP.
-        if self.hp >= 8 {
+        let mut hole = |x_mm: f64, y_mm: f64, seed: &str| {
             self.extra_holes.push(MountingHole {
-                x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: h - EURORACK_HOLE_INSET_Y_MM,
+                x_mm,
+                y_mm,
                 diameter_mm: EURORACK_HOLE_DIAMETER_MM,
+                shape: self.hole_shape,
             });
-            self.extra_holes.push(MountingHole {
-                x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: EURORACK_HOLE_INSET_Y_MM,
-                diameter_mm: EURORACK_HOLE_DIAMETER_MM,
-            });
+            let _ = seed;
+        };
+        // The right pair only fits on panels wide enough for the insets
+        // (narrow panels use their left pair only, in every pattern).
+        let right_side_fits = self.hp >= 8;
+        // Which holes the pattern wants: (x from left, y from bottom).
+        let left_top = (EURORACK_HOLE_INSET_X_MM, h - EURORACK_HOLE_INSET_Y_MM);
+        let left_bottom = (EURORACK_HOLE_INSET_X_MM, EURORACK_HOLE_INSET_Y_MM);
+        let right_top = (w - EURORACK_HOLE_INSET_X_MM, h - EURORACK_HOLE_INSET_Y_MM);
+        let right_bottom = (w - EURORACK_HOLE_INSET_X_MM, EURORACK_HOLE_INSET_Y_MM);
+        match self.hole_pattern {
+            MountingHolePattern::Left2 => {
+                hole(left_top.0, left_top.1, "lt");
+                hole(left_bottom.0, left_bottom.1, "lb");
+            }
+            MountingHolePattern::Diagonal => {
+                hole(left_top.0, left_top.1, "lt");
+                if right_side_fits {
+                    hole(right_bottom.0, right_bottom.1, "rb");
+                } else {
+                    hole(left_bottom.0, left_bottom.1, "lb");
+                }
+            }
+            MountingHolePattern::All4 => {
+                hole(left_top.0, left_top.1, "lt");
+                hole(left_bottom.0, left_bottom.1, "lb");
+                if right_side_fits {
+                    hole(right_top.0, right_top.1, "rt");
+                    hole(right_bottom.0, right_bottom.1, "rb");
+                }
+            }
         }
     }
 }
@@ -385,6 +456,60 @@ pub struct PanelFile {
     pub thickness_mm: f64,
     #[serde(default)]
     pub cutouts: Vec<CutoutFile>,
+    /// Mounting-hole shape and placement pattern (hqt). `None` → the
+    /// real-Eurorack default: oval slots in the diagonal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounting: Option<MountingFile>,
+}
+
+/// The mounting options in a panel TOML file.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct MountingFile {
+    /// `oval` (rack-adjustable slots) or `round`.
+    #[serde(default = "default_mounting_shape")]
+    pub shape: String,
+    /// `diagonal` (TL + BR; the default), `all4`, or `left2`.
+    #[serde(default = "default_pattern")]
+    pub pattern: String,
+    /// Oval slot length (mm); ignored for round holes.
+    #[serde(default = "default_slot_length")]
+    pub slot_length_mm: f64,
+}
+
+fn default_slot_length() -> f64 {
+    6.0
+}
+
+fn default_mounting_shape() -> String {
+    "oval".to_string()
+}
+
+fn default_pattern() -> String {
+    "diagonal".to_string()
+}
+
+impl MountingFile {
+    /// Parse into the shape/pattern pair the panel needs.
+    pub fn to_shape_pattern(&self) -> Result<(MountingHoleShape, MountingHolePattern), String> {
+        let shape = match self.shape.as_str() {
+            "oval" => MountingHoleShape::Oval {
+                slot_length_mm: self.slot_length_mm,
+            },
+            "round" => MountingHoleShape::Round,
+            other => return Err(format!("unknown mounting shape '{other}' (oval | round)")),
+        };
+        let pattern = match self.pattern.as_str() {
+            "diagonal" => MountingHolePattern::Diagonal,
+            "all4" => MountingHolePattern::All4,
+            "left2" => MountingHolePattern::Left2,
+            other => {
+                return Err(format!(
+                    "unknown mounting pattern '{other}' (diagonal | all4 | left2)"
+                ))
+            }
+        };
+        Ok((shape, pattern))
+    }
 }
 
 fn default_thickness() -> f64 {
@@ -420,6 +545,10 @@ impl PanelFile {
             "eurorack" => {
                 let hp = self.hp.ok_or("eurorack panel requires `hp`")?;
                 let mut panel = EurorackPanel::new(hp).with_thickness(self.thickness_mm);
+                if let Some(mounting) = &self.mounting {
+                    let (shape, pattern) = mounting.to_shape_pattern()?;
+                    panel = panel.with_mounting(shape, pattern);
+                }
                 for c in &self.cutouts {
                     panel = panel.with_cutout_rotated(
                         c.x_mm,
@@ -528,6 +657,7 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
         hp: Some(hp),
         thickness_mm: derive_rules::THICKNESS_MM,
         cutouts: out,
+        mounting: None, // real-Eurorack default (oval, diagonal)
     }
 }
 
@@ -633,9 +763,27 @@ pub fn write_dxf<W: std::fmt::Write>(w: &mut W, panel: &dyn PanelSpec) -> std::f
     // Panel outline.
     write_lwpolyline_rect(w, 0.0, 0.0, width, height)?;
 
-    // Mounting holes.
+    // Mounting holes: round holes as circles, oval slots as a capsule (two
+    // 180° arcs joined by two lines) so the rack can adjust horizontal fit.
     for hole in panel.mounting_holes() {
-        write_circle(w, hole.x_mm, hole.y_mm, hole.diameter_mm / 2.0)?;
+        let r = hole.diameter_mm / 2.0;
+        match hole.shape {
+            MountingHoleShape::Round => {
+                write_circle(w, hole.x_mm, hole.y_mm, r)?;
+            }
+            MountingHoleShape::Oval { slot_length_mm } => {
+                let half_len = (slot_length_mm - hole.diameter_mm).max(0.0) / 2.0;
+                let (lx, rx) = (hole.x_mm - half_len, hole.x_mm + half_len);
+                // Right end: semicircle from bottom (270°) CCW through 0° to top (90°).
+                write_arc(w, rx, hole.y_mm, r, 270.0, 90.0)?;
+                // Top edge, right → left.
+                write_line(w, rx, hole.y_mm + r, lx, hole.y_mm + r)?;
+                // Left end: semicircle from top (90°) CCW through 180° to 270°.
+                write_arc(w, lx, hole.y_mm, r, 90.0, 270.0)?;
+                // Bottom edge, left → right.
+                write_line(w, lx, hole.y_mm - r, rx, hole.y_mm - r)?;
+            }
+        }
     }
 
     // Cutouts.
@@ -732,14 +880,52 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
     );
     // Panel outline.
     s.push_str(&edge_rect(ox, oy, ox + w, oy + h, "panel.outline"));
-    // Mounting holes.
+    // Mounting holes: round holes as circles, oval slots as a closed capsule
+    // loop (two straight edges + two 180° arcs) so the rack can adjust the
+    // horizontal fit (hqt).
     for (i, hole) in panel.mounting_holes().iter().enumerate() {
-        s.push_str(&edge_circle(
-            fx(hole.x_mm),
-            fy(hole.y_mm),
-            hole.diameter_mm / 2.0,
-            &format!("panel.hole.{i}"),
-        ));
+        let (cx, cy) = (fx(hole.x_mm), fy(hole.y_mm));
+        let r = hole.diameter_mm / 2.0;
+        match hole.shape {
+            MountingHoleShape::Round => {
+                s.push_str(&edge_circle(cx, cy, r, &format!("panel.hole.{i}")));
+            }
+            MountingHoleShape::Oval { slot_length_mm } => {
+                // Capsule: half-length offset between the two end-circle centers.
+                let half_len = (slot_length_mm - hole.diameter_mm).max(0.0) / 2.0;
+                let (lx, rx) = (cx - half_len, cx + half_len);
+                let arc = |sx: f64, sy: f64, mx: f64, my: f64, ex: f64, ey: f64, tag: &str| {
+                    format!(
+                        "  (gr_arc (start {} {}) (mid {} {}) (end {} {}) \
+                         (stroke (width 0.15) (type solid)) (uuid \"{}\"))\n",
+                        mm(sx),
+                        mm(sy),
+                        mm(mx),
+                        mm(my),
+                        mm(ex),
+                        mm(ey),
+                        det_uuid(&format!("panel.hole.{i}.{tag}"))
+                    )
+                };
+                let line = |sx: f64, sy: f64, ex: f64, ey: f64, tag: &str| {
+                    format!(
+                        "  (gr_line (start {} {}) (end {} {}) \
+                         (stroke (width 0.15) (type solid)) (uuid \"{}\"))\n",
+                        mm(sx),
+                        mm(sy),
+                        mm(ex),
+                        mm(ey),
+                        det_uuid(&format!("panel.hole.{i}.{tag}"))
+                    )
+                };
+                // Top edge, right end arc, bottom edge (right→left), left arc —
+                // closed in KiCad's y-down frame.
+                s.push_str(&line(lx, cy - r, rx, cy - r, "top"));
+                s.push_str(&arc(rx, cy - r, rx + r, cy, rx, cy + r, "right"));
+                s.push_str(&line(rx, cy + r, lx, cy + r, "bottom"));
+                s.push_str(&arc(lx, cy + r, lx - r, cy, lx, cy - r, "left"));
+            }
+        }
     }
     // Cutouts (jack rects, pot/LED circles), as inner Edge.Cuts loops.
     for (i, c) in panel.cutouts().iter().enumerate() {
@@ -863,6 +1049,53 @@ fn write_circle<W: std::fmt::Write>(w: &mut W, cx: f64, cy: f64, r: f64) -> std:
     writeln!(w, "{cy}")?;
     writeln!(w, "40")?;
     writeln!(w, "{r}")
+}
+
+/// A DXF LINE entity (two points).
+fn write_line<W: std::fmt::Write>(
+    w: &mut W,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> std::fmt::Result {
+    writeln!(w, "0")?;
+    writeln!(w, "LINE")?;
+    writeln!(w, "8")?;
+    writeln!(w, "0")?;
+    writeln!(w, "10")?;
+    writeln!(w, "{x1}")?;
+    writeln!(w, "20")?;
+    writeln!(w, "{y1}")?;
+    writeln!(w, "11")?;
+    writeln!(w, "{x2}")?;
+    writeln!(w, "21")?;
+    writeln!(w, "{y2}")
+}
+
+/// A DXF ARC: center, radius, start/end angle in degrees, CCW from start to end.
+fn write_arc<W: std::fmt::Write>(
+    w: &mut W,
+    cx: f64,
+    cy: f64,
+    r: f64,
+    start_deg: f64,
+    end_deg: f64,
+) -> std::fmt::Result {
+    writeln!(w, "0")?;
+    writeln!(w, "ARC")?;
+    writeln!(w, "8")?;
+    writeln!(w, "0")?;
+    writeln!(w, "10")?;
+    writeln!(w, "{cx}")?;
+    writeln!(w, "20")?;
+    writeln!(w, "{cy}")?;
+    writeln!(w, "40")?;
+    writeln!(w, "{r}")?;
+    writeln!(w, "50")?;
+    writeln!(w, "{start_deg}")?;
+    writeln!(w, "51")?;
+    writeln!(w, "{end_deg}")
 }
 
 fn write_lwpolyline_rect<W: std::fmt::Write>(
@@ -1233,7 +1466,7 @@ mod tests {
                 Some((x, y))
             })
             .collect();
-        assert_eq!(circles.len(), 4, "{circles:?}"); // 2 mounting + 2 cutout holes
+        assert_eq!(circles.len(), 2, "{circles:?}"); // the 2 LED cutouts (mounting holes are capsule arcs now)
         for y in text_ys {
             for (_, cy) in &circles {
                 assert!(
@@ -1245,15 +1478,33 @@ mod tests {
     }
 
     #[test]
-    fn eurorack_small_panel_two_holes() {
-        let panel = EurorackPanel::new(4);
-        assert_eq!(panel.mounting_holes().len(), 2);
+    fn eurorack_default_diagonal_two_holes() {
+        // hqt: the real-Eurorack default is oval slots in the diagonal — two
+        // holes whatever the width (narrow panels fall back to both left).
+        for hp in [4, 10] {
+            let panel = EurorackPanel::new(hp);
+            assert_eq!(panel.mounting_holes().len(), 2, "{hp} HP");
+            assert!(panel.mounting_holes().iter().all(|h| h.shape
+                == MountingHoleShape::Oval {
+                    slot_length_mm: 6.0
+                }));
+        }
     }
 
     #[test]
-    fn eurorack_large_panel_four_holes() {
-        let panel = EurorackPanel::new(10);
-        assert_eq!(panel.mounting_holes().len(), 4);
+    fn mounting_patterns_select_the_hole_set() {
+        let all4 = EurorackPanel::new(10)
+            .with_mounting(MountingHoleShape::Round, MountingHolePattern::All4);
+        assert_eq!(all4.mounting_holes().len(), 4);
+
+        let left2 = EurorackPanel::new(10)
+            .with_mounting(MountingHoleShape::Round, MountingHolePattern::Left2);
+        assert_eq!(left2.mounting_holes().len(), 2);
+
+        // Narrow panels: the right side never fits, in any pattern.
+        let narrow = EurorackPanel::new(4)
+            .with_mounting(MountingHoleShape::Round, MountingHolePattern::All4);
+        assert_eq!(narrow.mounting_holes().len(), 2);
     }
 
     #[test]
@@ -1354,8 +1605,11 @@ mod tests {
         assert!(dxf.contains("LWPOLYLINE"));
         assert!(dxf.contains("CIRCLE"));
         assert!(dxf.contains("EOF"));
-        // Mounting holes + Alpha9mm = at least 5 circles (4 holes + 1 cutout).
-        assert!(dxf.matches("CIRCLE").count() >= 5);
+        // hqt: the default mounting holes are oval slots — capsule arcs + lines.
+        // Circles: 2 cutouts; arcs: 2 per slot × 2 slots = 4; lines: 4.
+        assert_eq!(dxf.matches("CIRCLE").count(), 2);
+        assert_eq!(dxf.matches("\nARC").count(), 4);
+        assert_eq!(dxf.matches("\nLINE").count(), 4);
     }
 
     #[test]
