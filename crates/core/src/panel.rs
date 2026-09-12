@@ -182,6 +182,8 @@ mod silk {
     /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
     pub const LABEL_FONT_MM: f64 = 1.8;
     pub const LABEL_OFFSET_MM: f64 = 6.5;
+    /// Clearance between a silk label's text edge and a neighbouring cutout.
+    pub const LABEL_CLEARANCE_MM: f64 = 0.5;
     /// Brand logo: fraction of panel width, the minimum width worth drawing, and
     /// the clearances keeping it off the lowest cutout and the bottom edge/holes.
     pub const LOGO_WIDTH_FRAC: f64 = 0.4;
@@ -760,15 +762,39 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
             )),
             None => s.push_str(&edge_circle(cx, cy, 1.5, &seed)),
         }
-        // Control label (IN / OUT / RATE), horizontal, just above the cutout so
-        // it reads with the module upright (DESIGN 6.10 / j54.21).
+        // Control label (IN / OUT / RATE), horizontal. Placed just above the
+        // cutout so it reads with the module upright (DESIGN 6.10 / j54.21),
+        // unless that side is occupied by the neighbouring cutout above — then
+        // it drops just below, the other clear side (the "writing hitting a
+        // jack" bug, 6f8: text must never land on a hole).
         if let Some(label) = &c.label {
+            // Nearest cutout above/below this one (KiCad y grows downward).
+            let half = |footprint: &str| match footprint_shape(footprint) {
+                Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
+                Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
+                None => 1.5,
+            };
+            let y = fy(c.y_mm);
+            let above_edge = panel
+                .cutouts()
+                .iter()
+                .filter(|o| !std::ptr::eq(*o, c))
+                .map(|o| fy(o.y_mm) + half(&o.footprint))
+                .filter(|edge| *edge < y - half(&c.footprint))
+                .fold(f64::MIN, f64::max);
+            let label_top = y - silk::LABEL_OFFSET_MM - silk::LABEL_FONT_MM / 2.0;
+            let fits_above = label_top > above_edge + silk::LABEL_CLEARANCE_MM;
+            let label_y = if fits_above {
+                y - silk::LABEL_OFFSET_MM
+            } else {
+                y + silk::LABEL_OFFSET_MM // flip below — the other clear side
+            };
             s.push_str(&format!(
                 "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
                  (effects (font (size {f} {f}) (thickness 0.3))))\n",
                 label,
                 mm(cx),
-                mm(cy - silk::LABEL_OFFSET_MM),
+                mm(label_y),
                 det_uuid(&format!("panel.label.{i}")),
                 f = silk::LABEL_FONT_MM,
             ));
@@ -1165,6 +1191,57 @@ mod tests {
         );
         // Only the title + the one labelled cutout produce silk text.
         assert_eq!(pcb.matches("gr_text").count(), 2);
+    }
+
+    #[test]
+    fn label_flips_below_when_the_cutout_above_is_too_close() {
+        // 6f8: text must never land on a hole. Two labelled controls at LED
+        // pitch (9 mm centre-to-centre): the lower one's above-side label would
+        // overlap the cutout above it, so it flips below its own cutout.
+        let panel = EurorackPanel::new(4)
+            .with_cutout_rotated(
+                10.0,
+                30.0,
+                0.0,
+                "LED_5mm",
+                Some("LED1".into()),
+                Some("CLK".into()),
+            )
+            .with_cutout_rotated(
+                10.0,
+                21.0,
+                0.0,
+                "LED_5mm",
+                Some("LED2".into()),
+                Some("GATE".into()),
+            );
+        let pcb = panel_to_kicad_pcb(&panel, "Demo", None);
+        // Parse every rendered gr_text/gr_circle: the invariant is that no
+        // silk label's text band overlaps any cutout circle.
+        let text_ys: Vec<f64> = pcb
+            .split("(gr_text ")
+            .skip(1)
+            .filter_map(|chunk| chunk.split_whitespace().nth(3).and_then(|v| v.parse().ok()))
+            .collect();
+        let circles: Vec<(f64, f64)> = pcb
+            .split("gr_circle (center ")
+            .skip(1)
+            .filter_map(|chunk| {
+                let mut it = chunk.split_whitespace();
+                let x: f64 = it.next()?.trim_end_matches(')').parse().ok()?;
+                let y: f64 = it.next()?.trim_end_matches(')').parse().ok()?;
+                Some((x, y))
+            })
+            .collect();
+        assert_eq!(circles.len(), 4, "{circles:?}"); // 2 mounting + 2 cutout holes
+        for y in text_ys {
+            for (_, cy) in &circles {
+                assert!(
+                    (y - cy).abs() > 2.25 + 0.9,
+                    "label text at {y} overlaps hole at {cy}"
+                );
+            }
+        }
     }
 
     #[test]
