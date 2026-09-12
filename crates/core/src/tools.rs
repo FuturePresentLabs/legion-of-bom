@@ -100,6 +100,22 @@ pub fn phase0_tools() -> Vec<Tool> {
     ]
 }
 
+/// Env var pointing at the `pedalkernel` binary (`PATH` is checked first).
+pub const PEDALKERNEL_BIN_ENV: &str = "PEDALKERNEL_BIN";
+
+/// Resolve the `pedalkernel` CLI binary for the cross-engine harness (ef4.4):
+/// `PEDALKERNEL_BIN` env override, else `PATH`. `None` → the harness reports
+/// the tool as missing; it never panics.
+pub fn pedalkernel_path() -> Option<PathBuf> {
+    if let Some(p) = env::var_os(PEDALKERNEL_BIN_ENV) {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    find_on_path("pedalkernel")
+}
+
 /// Resolve the `kicad-cli` executable (`PATH`, then the macOS app-bundle
 /// fallback), for the DRC-readback + export steps.
 pub fn kicad_cli_path() -> Option<PathBuf> {

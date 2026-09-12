@@ -19,3 +19,6 @@ base64.workspace = true
 [dev-dependencies]
 ruststep = "0.4"
 truck-stepio = { version = "0.3", features = ["in"] }
+# pedalkernel writes 32-bit float WAVs via hound; this fixture writes the same
+# format so the cross-engine reader is tested against the real thing (ef4.4).
+hound = "3.5"

@@ -13,6 +13,7 @@
 pub mod board;
 pub mod bom;
 pub mod cam;
+pub mod crosscheck;
 pub mod drc;
 pub mod easyeda;
 pub mod enclosure;

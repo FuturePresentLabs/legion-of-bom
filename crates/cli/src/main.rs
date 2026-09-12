@@ -9,7 +9,7 @@ mod doctor;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::cam::{plan_cam, CamOptions, ALUMINIUM_6061, DIECAST_ALUMINIUM};
 use legion_of_bom_core::enclosure::{
@@ -90,6 +90,12 @@ enum Command {
         /// Write the .pedal here (default: out/<name>/<name>.pedal).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Cross-engine transient check: ngspice step response vs pedalkernel
+    /// process, measured and compared (ef4.4).
+    Crosscheck {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
     },
     /// Generate a .kicad_pcb board file (footprints placed + routed) from a circuit.
     Board {
@@ -375,6 +381,7 @@ fn main() -> ExitCode {
             logo,
         } => board_cmd(circuit, out, panel, mode, iterations, logo),
         Command::Pedal { circuit, out } => pedal_cmd(circuit, out),
+        Command::Crosscheck { circuit } => crosscheck_cmd(circuit),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab {
             circuit,
@@ -646,6 +653,54 @@ fn pedal_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
     }
     std::fs::write(&path, &text)?;
     println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Handle `lob crosscheck <circuit>` — the differential-validation loop
+/// (ef4.4): run both engines' step responses and compare. Fails the command
+/// when the engines disagree; a missing pedalkernel binary downgrades the
+/// cross-engine leg to a warning.
+fn crosscheck_cmd(circuit: PathBuf) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let sim_config = SimConfig::infer(&model);
+    let tran = TranAnalysis::default();
+    let tol = legion_of_bom_core::crosscheck::Tolerances::default();
+    let report = legion_of_bom_core::crosscheck::crosscheck_tran(
+        &model,
+        &sim_config,
+        &tran,
+        &work_dir,
+        &tol,
+    )?;
+    let mut failed = false;
+    for f in &report.findings {
+        let mark = match f.severity {
+            Severity::Info => " ",
+            Severity::Warning => "!",
+            Severity::Error => "✗",
+        };
+        println!("  {mark} {}", f.message);
+        failed |= f.severity == Severity::Error;
+    }
+    match report.pedalkernel {
+        Some(_) if !failed => println!("✓ crosscheck: engines agree"),
+        Some(_) => bail!("crosscheck: engines disagree beyond tolerance"),
+        None => println!("? crosscheck: ngspice only (pedalkernel binary unavailable)"),
+    }
+    if failed {
+        anyhow::bail!("cross-engine check failed")
+    }
     Ok(())
 }
 
