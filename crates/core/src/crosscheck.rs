@@ -446,6 +446,8 @@ mod tests {
             step_at_s: 5e-4,
             from_v: 0.0,
             to_v: 1.0,
+            sequence: Vec::new(),
+            cv: None,
         };
         write_step_wav(&path, 48_000, &tran).unwrap();
         let pts = read_wav(&path, 48_000).unwrap();

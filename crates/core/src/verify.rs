@@ -207,6 +207,77 @@ pub fn analytic_check(circuit: &dyn CircuitSource, ac: &AcResult, rel_tol: f64) 
     }
 }
 
+/// Gate a rate-modulated circuit's transient responses: the boosted-CV run's
+/// peak slew must scale by `want_ratio` relative to the base run (tus.13).
+///
+/// The expected ratio is the circuit's own CV law (e.g. CV +5 V doubling the
+/// rate into IABC → 2.0). Also asserts both runs settle — the output must
+/// actually reach each step, not just move. Not self-selecting: the caller
+/// runs it when the circuit carries a CV net (see `spice::CvStimulus`).
+pub fn check_slew_scales_with_cv(
+    base: &crate::spice::TranResult,
+    boosted: &crate::spice::TranResult,
+    want_ratio: f64,
+    rel_tol: f64,
+) -> StageOutcome {
+    let outcome = |passed: bool, findings: Vec<Finding>| StageOutcome {
+        stage: STAGE.to_string(),
+        passed,
+        findings,
+    };
+    let (Some(base_slew), Some(boost_slew)) = (base.max_slew_v_per_s(), boosted.max_slew_v_per_s())
+    else {
+        return outcome(
+            false,
+            vec![Finding::error(
+                "peak slew not measurable on one engine run — no transient data?",
+            )],
+        );
+    };
+    let ratio = boost_slew / base_slew;
+    let err = (ratio - want_ratio).abs() / want_ratio;
+    if err > rel_tol {
+        return outcome(
+            false,
+            vec![Finding::error(format!(
+                "slew scaling {ratio:.2}x off expectation {want_ratio:.2}x by {err:.1}% (tol {:.1}%): base {base_slew:.0} vs boosted {boost_slew:.0} V/s",
+                rel_tol * 100.0
+            ))],
+        );
+    }
+    // Both runs must SETTLE toward their final value: the last point close to
+    // the settled level, approached from further away (not oscillating past it).
+    let settles = |r: &crate::spice::TranResult| {
+        let (Some(v0), Some(v1)) = (r.points.first().map(|p| p.v), r.points.last().map(|p| p.v))
+        else {
+            return false;
+        };
+        let span = (v1 - v0).abs();
+        span > 1e-6
+            && r.points
+                .last()
+                .zip(r.points.iter().rev().nth(1))
+                .is_some_and(|(last, prev)| {
+                    ((last.v - v1).abs() <= 0.02 * span)
+                        && ((prev.v - v1).abs() >= (last.v - v1).abs())
+                })
+    };
+    if !settles(base) || !settles(boosted) {
+        return outcome(
+            false,
+            vec![Finding::error(
+                "transient does not settle toward the step(s) — check the slew topology",
+            )],
+        );
+    }
+    outcome(
+        true,
+        vec![Finding::info(format!(
+            "slew scales {ratio:.2}x with CV (want {want_ratio:.2}x): base {base_slew:.0} → boosted {boost_slew:.0} V/s"
+        ))],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +438,41 @@ mod tests {
         let outcome = analytic_check(&circuit, &flat_response(0.0), 0.02);
         assert!(outcome.passed);
         assert!(!outcome.has_errors());
+    }
+
+    #[test]
+    fn slew_cv_check_passes_at_expected_ratio() {
+        use crate::spice::{TranPoint, TranResult};
+        // Two clean exponential step responses with known peak slews — the
+        // hand-proven envelope (base 2.13, boosted 4.21 V/ms ≈ 1.98x).
+        let mk = |slew: f64| TranResult {
+            points: (0..=10)
+                .map(|n| TranPoint {
+                    t_s: n as f64 * 1e-4,
+                    v: 5.0 * (1.0 - (-slew * n as f64 * 1e-4 / 5.0).exp()),
+                })
+                .collect(),
+        };
+        let base = mk(2_130.0);
+        let boosted = mk(4_210.0);
+        let outcome = check_slew_scales_with_cv(&base, &boosted, 1.98, 0.05);
+        assert!(outcome.passed, "{:?}", outcome.findings);
+
+        // Off-ratio → fails loudly with the measured numbers.
+        let slow = mk(2_600.0);
+        let outcome = check_slew_scales_with_cv(&base, &slow, 1.98, 0.05);
+        assert!(!outcome.passed);
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.message.contains("slew scaling")),
+            "{:?}",
+            outcome.findings
+        );
+
+        // No data → error, not a panic.
+        let empty = TranResult { points: vec![] };
+        assert!(!check_slew_scales_with_cv(&empty, &empty, 2.0, 0.05).passed);
     }
 }

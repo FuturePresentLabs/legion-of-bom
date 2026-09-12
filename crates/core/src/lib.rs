@@ -110,4 +110,6 @@ pub use step::Brep;
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
 pub use validate::validate_erc;
-pub use verify::{analytic_check, check_noninverting_gain, check_rc_cutoff};
+pub use verify::{
+    analytic_check, check_noninverting_gain, check_rc_cutoff, check_slew_scales_with_cv,
+};

@@ -444,6 +444,28 @@ pub struct TranAnalysis {
     /// Input voltage before / after the step.
     pub from_v: f64,
     pub to_v: f64,
+    /// Multi-step input sequence: (time_s, voltage) breakpoints — a step
+    /// SEQUENCER rather than one step (tus.13). When non-empty, overrides the
+    /// single `from_v`/`to_v` step: the source holds each voltage from its
+    /// breakpoint until the next one, and the last holds to `stop_s`.
+    pub sequence: Vec<(f64, f64)>,
+    /// A CV input driven during the transient, so the sim exercises rate
+    /// modulation (tus.13). Run the deck twice (CV low / CV high) and gate on
+    /// the slew scaling (see `verify::check_slew_scales_with_cv`).
+    pub cv: Option<CvStimulus>,
+}
+
+/// A CV input ramped during the transient, so a rate-modulated circuit (a VC
+/// slew limiter's RATE CV into IABC) exercises its control law (tus.13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CvStimulus {
+    /// The circuit net the CV drives (e.g. `CV` or `RATE_CV`).
+    pub net: String,
+    /// CV voltage before / after its own step.
+    pub from_v: f64,
+    pub to_v: f64,
+    /// When the CV steps (s) — usually before the input sequence begins.
+    pub step_at_s: f64,
 }
 
 impl Default for TranAnalysis {
@@ -454,7 +476,43 @@ impl Default for TranAnalysis {
             step_at_s: 1e-4,
             from_v: 0.0,
             to_v: 5.0,
+            sequence: Vec::new(),
+            cv: None,
         }
+    }
+}
+
+impl TranAnalysis {
+    /// The input waveform as (time, voltage) breakpoints: the explicit
+    /// sequence when set, else the single from/to step (with a sharp edge).
+    fn waveform(&self) -> Vec<(f64, f64)> {
+        if self.sequence.is_empty() {
+            let edge = self.step_s.clamp(1e-9, 1e-6);
+            return vec![
+                (0.0, self.from_v),
+                (self.step_at_s, self.from_v),
+                (self.step_at_s + edge, self.to_v),
+                (self.stop_s, self.to_v),
+            ];
+        }
+        // Insert a sharp edge at every breakpoint so each step stays sharp at
+        // the deck's time resolution.
+        let edge = self.step_s.clamp(1e-9, 1e-6);
+        let mut out = Vec::with_capacity(self.sequence.len() * 2 + 2);
+        for (t, v) in &self.sequence {
+            if *t > 0.0 {
+                out.push((*t, *v)); // hold level into the edge (segment end)
+                out.push((*t + edge, *v)); // then the new level starts
+            } else {
+                out.push((*t, *v));
+            }
+        }
+        if let (Some((t0, v0)), Some((_, _))) = (self.sequence.first(), self.sequence.last()) {
+            if *t0 > 0.0 {
+                out.insert(0, (0.0, *v0));
+            }
+        }
+        out
     }
 }
 
@@ -514,6 +572,9 @@ pub fn generate_tran_deck(
     let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
     require_net(circuit, &net_names, &config.input_net)?;
     require_net(circuit, &net_names, &config.output_net)?;
+    if let Some(cv) = &tran.cv {
+        require_net(circuit, &net_names, &cv.net)?;
+    }
 
     let (includes, components) = netlist_body(circuit, config, models)?;
 
@@ -537,18 +598,27 @@ pub fn generate_tran_deck(
     }
     lines.extend(supply_lines(config, &net_names));
     lines.extend(components);
-    // Input step as a sharp PWL ramp at step_at_s.
-    let edge = tran.step_s.clamp(1e-9, 1e-6);
-    lines.push(format!(
-        "Vlob_src {in_node} 0 PWL(0 {} {} {} {} {} {} {})",
-        fmt_num(tran.from_v),
-        fmt_num(tran.step_at_s),
-        fmt_num(tran.from_v),
-        fmt_num(tran.step_at_s + edge),
-        fmt_num(tran.to_v),
-        fmt_num(tran.stop_s),
-        fmt_num(tran.to_v),
-    ));
+    // Input step/sequence as a sharp PWL waveform.
+    let wave = tran
+        .waveform()
+        .iter()
+        .map(|(t, v)| format!("{} {}", fmt_num(*t), fmt_num(*v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    lines.push(format!("Vlob_src {in_node} 0 PWL({wave})"));
+    // The CV source, when the analysis drives one (tus.13).
+    if let Some(cv) = &tran.cv {
+        let edge = tran.step_s.clamp(1e-9, 1e-6);
+        lines.push(format!(
+            "Vlob_cv {node} 0 PWL(0 {v0} {t0} {v0} {t1} {v1} {stop} {v1})",
+            node = config.node(&cv.net),
+            v0 = fmt_num(cv.from_v),
+            t0 = fmt_num(cv.step_at_s),
+            t1 = fmt_num(cv.step_at_s + edge),
+            v1 = fmt_num(cv.to_v),
+            stop = fmt_num(tran.stop_s),
+        ));
+    }
     lines.push(".control".into());
     lines.push(format!(
         "tran {} {}",
@@ -932,6 +1002,8 @@ mod tests {
             step_at_s: 1e-4,
             from_v: 0.0,
             to_v: 5.0,
+            sequence: Vec::new(),
+            cv: None,
         };
         let deck = generate_tran_deck(
             &c,
@@ -945,6 +1017,49 @@ mod tests {
         assert!(deck.contains("Vlob_src IN 0 PWL("), "step source:\n{deck}");
         assert!(deck.contains("\ntran "), "tran analysis:\n{deck}");
         assert!(deck.contains("wrdata /tmp/x.dat v(OUT)"), "probe:\n{deck}");
+    }
+
+    #[test]
+    fn tran_deck_emits_step_sequence_and_cv_source() {
+        // tus.13: a multi-step input sequence overrides the single step, and a
+        // CV stimulus emits its own PWL source on the CV net.
+        let c = Circuit {
+            name: "vc_slew".into(),
+            parts: vec![Part::new("R1", "1k")],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("R1", "1")]),
+                Net::new("OUT", vec![PinRef::new("R1", "2")]),
+                Net::new("CV", vec![]),
+            ],
+        };
+        let tran = TranAnalysis {
+            step_s: 1e-6,
+            stop_s: 1e-3,
+            step_at_s: 1e-4,
+            from_v: 0.0,
+            to_v: 5.0,
+            sequence: vec![(0.0, 0.0), (2e-4, 3.0), (6e-4, 5.0)],
+            cv: Some(CvStimulus {
+                net: "CV".into(),
+                from_v: 0.0,
+                to_v: 5.0,
+                step_at_s: 5e-5,
+            }),
+        };
+        let deck = generate_tran_deck(
+            &c,
+            &SimConfig::default(),
+            &tran,
+            &HashMap::new(),
+            Path::new("/tmp/x.dat"),
+        )
+        .unwrap();
+        // Sequence breakpoints present (sharp-edged: each level appears twice
+        // — hold into the edge, then the new level).
+        assert!(deck.contains("0.0002 3 "), "sequence step:\n{deck}");
+        assert!(deck.contains("0.0006 5 "), "sequence final:\n{deck}");
+        // CV source on its own net.
+        assert!(deck.contains("Vlob_cv CV 0 PWL("), "cv source:\n{deck}");
     }
 
     #[test]
@@ -986,6 +1101,8 @@ mod tests {
             step_at_s: 1e-4,
             from_v: 0.0,
             to_v: 1.0,
+            sequence: Vec::new(),
+            cv: None,
         };
         let dir = std::env::temp_dir().join("lob-tran-test");
         let r = simulate_tran(&c, &SimConfig::default(), &tran, &dir).unwrap();
@@ -1051,6 +1168,8 @@ mod tests {
             step_at_s: 1e-7,
             from_v: 0.0,
             to_v: 1.0,
+            sequence: Vec::new(),
+            cv: None,
         };
         let dir = std::env::temp_dir().join("lob-tl072-tran-test");
         let r = simulate_tran(&c, &config, &tran, &dir).unwrap();
