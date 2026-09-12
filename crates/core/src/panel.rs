@@ -66,7 +66,7 @@ pub enum CutoutShape {
 /// Thonkiconn / PJ301M panel barrel-hole diameter (mm): the threaded barrel
 /// passes through and a nut tightens on the front, so the cutout is this hole,
 /// not the jack body.
-const JACK_BARREL_MM: f64 = 6.0;
+pub(crate) const JACK_BARREL_MM: f64 = 6.0;
 /// Alpha 9 mm pot bushing hole diameter (mm).
 const POT_BUSHING_MM: f64 = 7.0;
 /// Toggle switch bushing hole diameter (mm).

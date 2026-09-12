@@ -292,6 +292,37 @@ enum PartsCmd {
         /// Ordered note lines; each argument is one step.
         notes: Vec<String>,
     },
+    /// Set a part's panel/enclosure mechanical cutout (okm.14): the opening the
+    /// panel needs, the body envelope for crowding checks, and the mounting
+    /// depth. Either --bore (round) or --rect WxH (rounded rect) is required.
+    SetCutout {
+        /// Manufacturer part number to attach the geometry to.
+        mpn: String,
+        /// What the control is: jack | pot | switch | led.
+        #[arg(long)]
+        kind: String,
+        /// Round opening diameter in mm (jacks, pots, LEDs).
+        #[arg(long)]
+        bore: Option<f64>,
+        /// Rectangular opening as WxH in mm (e.g. `6.2x5.4`).
+        #[arg(long)]
+        rect: Option<String>,
+        /// Corner radius for a rectangular opening (mm).
+        #[arg(long, default_value = "0.0")]
+        corner: f64,
+        /// Anti-rotation feature: flat | notch | dshaft.
+        #[arg(long)]
+        anti_rotation: Option<String>,
+        /// Body/knob envelope diameter for crowding checks (mm).
+        #[arg(long)]
+        body: Option<f64>,
+        /// Mounting depth below the panel surface (mm).
+        #[arg(long)]
+        depth: Option<f64>,
+        /// Citation: source of this geometry (datasheet section / "measured").
+        #[arg(long)]
+        cited_source: Option<String>,
+    },
     /// Resolve a circuit's parts against the library by MPN.
     Resolve {
         circuit: PathBuf,
@@ -1520,7 +1551,12 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         }
         PartsCmd::Show { mpn } => match lib.get_part(&mpn)? {
             None => println!("not found: {mpn}"),
-            Some(part) => print_part(&part),
+            Some(part) => {
+                print_part(&part);
+                if let Some(cutout) = lib.get_cutout(&mpn)? {
+                    print_cutout(&cutout);
+                }
+            }
         },
         PartsCmd::Add {
             mpn,
@@ -1568,6 +1604,55 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                     println!("  {}. {n}", i + 1);
                 }
             }
+        }
+        PartsCmd::SetCutout {
+            mpn,
+            kind,
+            bore,
+            rect,
+            corner,
+            anti_rotation,
+            body,
+            depth,
+            cited_source,
+        } => {
+            let shape = match (bore, &rect) {
+                (Some(d), None) => {
+                    legion_of_bom_core::parts::CutoutGeometry::Circle { diameter_mm: d }
+                }
+                (None, Some(r)) => {
+                    let (w, h) = r
+                        .split_once('x')
+                        .with_context(|| format!("--rect {r}: expected WxH (e.g. 6.2x5.4)"))?;
+                    legion_of_bom_core::parts::CutoutGeometry::RoundedRect {
+                        width_mm: w.trim().parse().with_context(|| format!("--rect {r}"))?,
+                        height_mm: h.parse().with_context(|| format!("--rect {r}"))?,
+                        corner_radius_mm: corner,
+                    }
+                }
+                _ => bail!("exactly one of --bore or --rect is required"),
+            };
+            let anti = match anti_rotation.as_deref() {
+                None => None,
+                Some("flat") => Some(legion_of_bom_core::parts::AntiRotation::FlatShaft),
+                Some("notch") => Some(legion_of_bom_core::parts::AntiRotation::NotchedShaft),
+                Some("dshaft") => Some(legion_of_bom_core::parts::AntiRotation::DShaft),
+                Some(other) => bail!("unknown --anti-rotation '{other}' (flat | notch | dshaft)"),
+            };
+            let kind = legion_of_bom_core::parts::CutoutKind::parse(&kind)
+                .with_context(|| format!("unknown --kind '{kind}' (jack | pot | switch | led)"))?;
+            lib.set_cutout(&legion_of_bom_core::parts::CutoutRecord {
+                mpn: mpn.clone(),
+                kind,
+                shape,
+                anti_rotation: anti,
+                body_diameter_mm: body,
+                body_depth_mm: depth,
+                cited_page: None,
+                cited_source,
+            })?;
+            lib.commit(&format!("parts: set cutout {mpn}"))?;
+            println!("set cutout for {mpn}");
         }
         PartsCmd::Resolve { circuit } => {
             print_resolutions(&resolve_circuit_file(&lib, circuit)?);
@@ -1816,6 +1901,42 @@ fn merge_fetched(existing: Option<PartRecord>, fetched: PartRecord) -> PartRecor
         merged.ratings = fetched.ratings;
     }
     merged
+}
+
+/// Print a part's mechanical cutout record (okm.14).
+fn print_cutout(c: &legion_of_bom_core::parts::CutoutRecord) {
+    use legion_of_bom_core::parts::CutoutGeometry;
+    let shape = match c.shape {
+        CutoutGeometry::Circle { diameter_mm } => format!("circle ⌀{diameter_mm} mm"),
+        CutoutGeometry::RoundedRect {
+            width_mm,
+            height_mm,
+            corner_radius_mm,
+        } => format!("rect {width_mm}x{height_mm} mm, r{corner_radius_mm}"),
+    };
+    let anti = c
+        .anti_rotation
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|| "-".into());
+    let cite = c
+        .cited_source
+        .as_deref()
+        .map(|s| {
+            c.cited_page
+                .map(|p| format!("[{s} p.{p}]"))
+                .unwrap_or_else(|| format!("[{s}]"))
+        })
+        .unwrap_or_default();
+    println!(
+        "cutout:       {} {shape}, anti-rotation: {anti} {cite}",
+        c.kind.as_str()
+    );
+    if let Some(d) = c.body_diameter_mm {
+        println!("body:         ⌀{d} mm");
+    }
+    if let Some(d) = c.body_depth_mm {
+        println!("depth:        {d} mm");
+    }
 }
 
 fn print_part(part: &PartRecord) {
