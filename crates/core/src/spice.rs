@@ -345,8 +345,9 @@ fn netlist_body(
 /// Whether a part is an electrical no-op for simulation — a connector or
 /// mechanical part (jack, header, mounting hole, test point) that contributes no
 /// SPICE device, only net junctions. Recognised by the `J` reference prefix or a
-/// connector/mechanical footprint.
-fn is_electrical_noop(part: &crate::model::Part) -> bool {
+/// connector/mechanical footprint. Shared with the .pedal emitter, which skips
+/// the same parts (ef4.3).
+pub(crate) fn is_electrical_noop(part: &crate::model::Part) -> bool {
     if part.refdes.0.starts_with('J') {
         return true;
     }

@@ -82,6 +82,15 @@ enum Command {
         #[arg(long)]
         visual: bool,
     },
+    /// Emit a pedalkernel .pedal file from a circuit (cross-engine validation
+    /// input; ef4.3).
+    Pedal {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Write the .pedal here (default: out/<name>/<name>.pedal).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Generate a .kicad_pcb board file (footprints placed + routed) from a circuit.
     Board {
         /// Path to the circuit definition (e.g. a SKiDL script).
@@ -365,6 +374,7 @@ fn main() -> ExitCode {
             iterations,
             logo,
         } => board_cmd(circuit, out, panel, mode, iterations, logo),
+        Command::Pedal { circuit, out } => pedal_cmd(circuit, out),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab {
             circuit,
@@ -610,6 +620,33 @@ fn load_logo(path: &Option<PathBuf>) -> Result<Option<Logo>> {
 fn parse_mode(mode: &str) -> Result<LayoutMode> {
     LayoutMode::parse(mode)
         .ok_or_else(|| anyhow::anyhow!("unknown --mode '{mode}' (analog | digital | mixed)"))
+}
+
+/// Handle `lob pedal <circuit> [--out]` — circuit → pedalkernel .pedal file
+/// (ef4.3): SKiDL → netlist → model → .pedal text. The cross-engine harness
+/// (ef4.4) feeds this to the pedalkernel CLI.
+fn pedal_cmd(circuit: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let sim_config = SimConfig::infer(&model);
+    let text = legion_of_bom_core::pedal::emit_pedal(&model, &sim_config)?;
+    let path = out.unwrap_or_else(|| work_dir.join(format!("{stem}.pedal")));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, &text)?;
+    println!("wrote {}", path.display());
+    Ok(())
 }
 
 fn board_cmd(

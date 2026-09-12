@@ -30,6 +30,7 @@ pub mod netlist;
 pub mod panel;
 pub mod parts;
 pub mod pdf;
+pub mod pedal;
 pub mod resistor;
 pub mod route;
 mod sexpr;
