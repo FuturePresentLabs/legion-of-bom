@@ -1,0 +1,32 @@
+version = 1
+resource = [
+    { id = "code", kind = "repo", title = "Legion of BOM source", uri = "https://github.com/FuturePresentLabs/legion-of-bom" },
+    { id = "beads", kind = "tracker", title = "Legion of BOM task tracker", uri = "bds:." },
+    { id = "transmog", kind = "repo", title = "3D modeling for enclosures and accessories", uri = "https://github.com/FuturePresentLabs/transmog" },
+    { id = "fab", kind = "repo", title = "CI/CD for building and validating hardware pipelines", uri = "https://github.com/FuturePresentLabs/fab" },
+    { id = "shroud", kind = "repo", title = "MicroVM isolation for simulation and rendering", uri = "https://github.com/FuturePresentLabs/shroud" },
+    { id = "spec", kind = "repo", title = "Alfalfa spec tree for circuit pipeline requirements", uri = ".alfalfa/spec" },
+]
+experiments = [
+    ".alfalfa/experiments/slew-limiter-phase1.toml",
+]
+groups = ["puget-audio"]
+
+[project]
+id = "legion-of-bom"
+name = "Legion of BOM"
+purpose = "End-to-end electronics design pipeline: SKiDL circuit-as-code → netlist → ERC → ngspice simulation → BOM → JLCPCB placement → firmware integration → 3D enclosure via Transmog. One pipeline instead of scattered tools for Puget Audio Eurorack boards."
+owner = "Avery Wagar"
+status = "active"
+
+[[goals]]
+id = "complete-slew-limiter"
+outcome = "Phase 1 slew limiter Eurorack module is fully designed, simulated, and ready for manufacturing"
+success_criteria = "SKiDL schematic passes ERC; ngspice simulation confirms risetime < 5ms, overshoot < 10%; BOM with DigiKey/Mouser sources generated; JLCPCB placement files produced; 3D enclosure model in Transmog matches mechanical specs"
+status = "active"
+tracker_id = "beads"
+beads = ["legion-of-bom-tus", "legion-of-bom-tus.15", "legion-of-bom-tus.16", "legion-of-bom-tus.17"]
+evidence = []
+
+[appearance]
+colorway = "forest"
