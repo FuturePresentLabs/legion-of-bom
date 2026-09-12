@@ -425,9 +425,9 @@ mod tests {
     fn toy() -> Toy {
         Toy {
             parts: vec![
-                Part::new("U1", "opamp"),
-                Part::new("C1", "47n"),
-                Part::new("R1", "10k"),
+                Part::new("U1", "opamp").with_footprint("Foo:U1"),
+                Part::new("C1", "47n").with_footprint("Foo:C1"),
+                Part::new("R1", "10k").with_footprint("Foo:R1"),
             ],
             nets: vec![
                 Net::new("SLEW", vec![PinRef::new("U1", "5"), PinRef::new("C1", "1")])
@@ -536,5 +536,70 @@ mod tests {
 
     fn mag((x, y): &(f64, f64)) -> f64 {
         x.hypot(*y)
+    }
+
+    /// A router that leaves everything unrouted, reporting each net as a
+    /// conflict — simulating a board the loop can't finish (§6.5 exit).
+    struct BlockedRouter;
+    impl crate::route::Router for BlockedRouter {
+        fn route(
+            &self,
+            nets: &[crate::route::RouteNet],
+            _opts: &crate::route::RouteOptions,
+        ) -> RouteOutput {
+            RouteOutput {
+                conflicts: nets
+                    .iter()
+                    .map(|n| format!("no path found for ({name}):", name = n.name))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_criticals_surface_as_manual_routing_items() {
+        // §6.8: nets the loop can't resolve are surfaced for manual routing —
+        // criticals as errors, the rest as warnings — never forced through a
+        // heuristic, and distinct from a hard stage failure.
+        let dir = std::env::temp_dir().join(format!("lob-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (lib, name) in [("Foo", "U1"), ("Foo", "C1"), ("Foo", "R1")] {
+            let dir_lib = dir.join(format!("{lib}.pretty"));
+            std::fs::create_dir_all(&dir_lib).unwrap();
+            std::fs::write(
+                dir_lib.join(format!("{name}.kicad_mod")),
+                format!(
+                    "(footprint \"{name}\" (layer \"F.Cu\") \
+                     (pad \"1\" smd rect (at -1 0) (size 1 1)) \
+                     (pad \"2\" smd rect (at 1 0) (size 1 1)))"
+                ),
+            )
+            .unwrap();
+        }
+        let circuit = toy();
+        let mut options = BoardOptions::new(&dir);
+        options.router = Some(Box::new(BlockedRouter));
+        let cfg = LayoutLoop::default();
+        let template = SeededPlacer::new(40.0, 100.0, (0.0, 0.0), HashMap::new());
+        let report = run_layout_loop(&circuit, options, template, &cfg).unwrap();
+        assert!(!report.unresolved.is_empty());
+        assert!(
+            report.findings.iter().any(
+                |f| f.message.contains("critical net unresolved") && f.message.contains("SLEW")
+            ),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.message.contains("unresolved (route manually)")
+                    && f.message.contains("OUT")),
+            "{:?}",
+            report.findings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
