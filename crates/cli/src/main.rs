@@ -81,6 +81,10 @@ enum Command {
         /// keyless), with through-hole resistors shown as their color code.
         #[arg(long)]
         visual: bool,
+        /// Enforce verification (zya.4): fail when parts aren't library-verified
+        /// (the gate real ordering runs under; without it, findings print only).
+        #[arg(long)]
+        gate: bool,
     },
     /// Emit a pedalkernel .pedal file from a circuit (cross-engine validation
     /// input; ef4.3).
@@ -371,7 +375,8 @@ fn main() -> ExitCode {
             price,
             out,
             visual,
-        } => bom_cmd(circuit, price, out, visual),
+            gate,
+        } => bom_cmd(circuit, price, out, visual, gate),
         Command::Board {
             circuit,
             out,
@@ -1074,7 +1079,7 @@ fn build_cmd(name: Option<String>) -> Result<()> {
         let arg = || PathBuf::from(name);
         let steps: [(&str, Result<()>); 3] = [
             ("guide", guide_cmd(arg(), None, None, "auto".into())),
-            ("bom", bom_cmd(arg(), false, None, true)),
+            ("bom", bom_cmd(arg(), false, None, true, false)),
             (
                 "fab",
                 fab_cmd(arg(), None, None, "analog".into(), 6, false, None),
@@ -1298,7 +1303,13 @@ fn guide_cmd(
 }
 
 /// Handle `lob bom <circuit> [--price] [--out] [--visual]`.
-fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) -> Result<()> {
+fn bom_cmd(
+    circuit: PathBuf,
+    price: bool,
+    out: Option<PathBuf>,
+    visual: bool,
+    gate: bool,
+) -> Result<()> {
     let resolved = resolve_circuit(&circuit)?;
     let stem = resolved.name.clone();
     let circuit = resolved
@@ -1310,7 +1321,47 @@ fn bom_cmd(circuit: PathBuf, price: bool, out: Option<PathBuf>, visual: bool) ->
     let run = SkidlRunner::discover(&work_dir)
         .run(&circuit)
         .with_context(|| "SKiDL failed (try `lob doctor`)")?;
-    let mut bom = generate_bom(&parse_netlist_file(&run.netlist_path)?);
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let mut bom = generate_bom(&model);
+
+    // Verification against the parts library (zya.4): findings always print;
+    // `--gate` makes blockers fatal (the posture real ordering runs under).
+    {
+        let mut blockers = 0usize;
+        match PartsLibrary::open(default_parts_dir()) {
+            Ok(lib) => {
+                let resolutions = lib.resolve_circuit(&model)?;
+                let findings = bom.verify(&resolutions);
+                if !findings.is_empty() {
+                    println!("\nVerification");
+                    for f in &findings {
+                        let mark = match f.severity {
+                            legion_of_bom_core::stage::Severity::Error => "✗",
+                            legion_of_bom_core::stage::Severity::Warning => "!",
+                            legion_of_bom_core::stage::Severity::Info => " ",
+                        };
+                        println!("  {mark} {}", f.message);
+                        blockers +=
+                            (f.severity == legion_of_bom_core::stage::Severity::Error) as usize;
+                    }
+                    if gate {
+                        if blockers > 0 {
+                            bail!("verification gate FAILED: {blockers} part(s) not orderable");
+                        }
+                        println!("  ✓ verification gate passed");
+                    }
+                } else if gate {
+                    println!("  ✓ verification gate passed (all parts library-verified)");
+                }
+            }
+            Err(e) => {
+                println!("\nVerification: parts library unavailable ({e}) — not verified");
+                if gate {
+                    bail!("verification gate FAILED: parts library unavailable");
+                }
+            }
+        }
+    }
 
     if price {
         let client = MouserClient::from_env()
