@@ -263,7 +263,13 @@ const EURORACK_HEIGHT_MM: f64 = 128.5;
 const HP_MM: f64 = 5.08;
 const EURORACK_HOLE_DIAMETER_MM: f64 = 3.2;
 const EURORACK_HOLE_INSET_X_MM: f64 = 7.5;
+/// Doepfer spec: the two mounting-hole rows sit 122.5 mm apart — centres
+/// 3.0 mm from the top/bottom edges of the 128.5 mm panel (the Doepfer A-100
+/// mechanical spec, j54.22; the 122.5 mm row spacing is the primary fact).
 const EURORACK_HOLE_INSET_Y_MM: f64 = 3.0;
+/// Default oval-slot length (community template: 3.2 mm high, 7 mm wide for
+/// rack alignment tolerance).
+const EURORACK_SLOT_LENGTH_MM: f64 = 7.0;
 
 /// A Eurorack panel.
 ///
@@ -294,7 +300,7 @@ impl EurorackPanel {
             extra_holes: Vec::new(),
             cutouts: Vec::new(),
             hole_shape: MountingHoleShape::Oval {
-                slot_length_mm: 6.0,
+                slot_length_mm: EURORACK_SLOT_LENGTH_MM,
             },
             hole_pattern: MountingHolePattern::Diagonal,
         };
@@ -1634,9 +1640,24 @@ mod tests {
             assert_eq!(panel.mounting_holes().len(), 2, "{hp} HP");
             assert!(panel.mounting_holes().iter().all(|h| h.shape
                 == MountingHoleShape::Oval {
-                    slot_length_mm: 6.0
+                    slot_length_mm: 7.0
                 }));
         }
+    }
+
+    #[test]
+    fn eurorack_hole_rows_match_the_doepfer_rail_spec() {
+        // j54.22 / Doepfer A-100 mechanical spec: the two mounting-hole rows
+        // are 122.5 mm apart — centres 3.0 mm from the top and bottom edges.
+        let panel = EurorackPanel::new(8);
+        let ys: Vec<f64> = panel.mounting_holes().iter().map(|h| h.y_mm).collect();
+        let (bottom, top) = (3.0, EURORACK_HEIGHT_MM - 3.0);
+        assert!(
+            ys.iter()
+                .all(|y| (*y - bottom).abs() < 1e-9 || (*y - top).abs() < 1e-9),
+            "rows at {bottom}/{top}, got {ys:?}"
+        );
+        assert!((top - bottom - 122.5).abs() < 1e-9);
     }
 
     #[test]
