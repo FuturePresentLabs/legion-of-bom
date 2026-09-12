@@ -87,9 +87,10 @@ pub use model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
 pub use panel::{
-    default_panel_orders_dir, derive_panel, footprint_shape, panel_to_dxf, panel_to_kicad_pcb,
-    BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec, EurorackPanel,
-    MountingHole, PanelFile, PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
+    default_panel_orders_dir, derive_panel, footprint_shape, minimize_hp, panel_to_dxf,
+    panel_to_kicad_pcb, BuiltinCutouts, ControlKind, Cutout, CutoutShape, CutoutSource, CutoutSpec,
+    EurorackPanel, HpMinimized, MountingHole, MountingHolePattern, MountingHoleShape, PanelFile,
+    PanelOrder, PanelOrderStatus, PanelOrders, PanelSpec,
 };
 pub use parts::{
     default_parts_dir, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,

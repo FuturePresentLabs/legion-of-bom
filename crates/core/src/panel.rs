@@ -571,6 +571,18 @@ impl PanelFile {
     }
 }
 
+/// The result of HP-minimizing (jiv): the smallest HP the module fits in, with
+/// the panel derived at that width and the board that laid out there.
+#[derive(Debug)]
+pub struct HpMinimized {
+    /// The chosen HP.
+    pub hp: u16,
+    /// The derived, editable panel spec at that width.
+    pub panel: PanelFile,
+    /// The layout report from the winning width.
+    pub report: crate::layout::LayoutReport,
+}
+
 /// House rules for the derived layout (DESIGN §7.9), designed once. The pitches
 /// are minimum centre-to-centre spacings by the control's physical body/knob (not
 /// its panel hole), so anchored footprints don't overlap — the failure the tight
@@ -690,6 +702,74 @@ pub(crate) fn label_from_net(net: &str) -> String {
     let s = net.strip_prefix("SIG_").unwrap_or(net);
     let s = s.strip_suffix("_CV").unwrap_or(s);
     s.replace('_', " ").to_uppercase()
+}
+
+// ---------------------------------------------------------------------------
+//  HP-minimizing mode (jiv)
+// ---------------------------------------------------------------------------
+
+/// Find the smallest HP the module fits in: try successively narrower widths,
+/// derive the panel and place+route the board at each, and pick the smallest
+/// HP whose board routes with **no unresolved criticals** and whose control
+/// stack fits the clear zone (no panel overflow). Unrouted non-criticals are
+/// acceptable (surfaced as manual-routing warnings); the board still has to
+/// route.
+///
+/// `options` and `cfg` configure the board pipeline (footprint dir, router)
+/// and the loop, exactly as in [`crate::layout::run_layout_loop`]. Returns the
+/// winning width's panel + report. `min_hp == max_hp` → that width.
+/// Find the smallest HP the module fits in: try successively narrower widths,
+/// derive the panel and place+route the board at each, and pick the smallest
+/// HP whose board routes with **no unresolved criticals** and whose control
+/// stack fits the clear zone (no panel overflow). Unrouted non-criticals are
+/// acceptable (surfaced as manual-routing warnings); the board still has to
+/// route.
+///
+/// `make_options(hp)` builds the board pipeline options (footprint dir,
+/// router) for each candidate width, and `cfg` configures the loop, exactly
+/// as in [`crate::layout::run_layout_loop`]. Returns the winning width's
+/// panel + report. `min_hp == max_hp` → that width.
+pub fn minimize_hp(
+    circuit: &dyn crate::source::CircuitSource,
+    cutouts: &dyn CutoutSource,
+    min_hp: u16,
+    max_hp: u16,
+    make_options: impl Fn(u16) -> crate::board::BoardOptions,
+    cfg: &crate::layout::LayoutLoop,
+) -> Result<HpMinimized, crate::board::BoardError> {
+    // The search: narrowest first — the first width that routes without
+    // unresolved criticals wins (the panel stack packs the same at any width;
+    // the board's routability is what narrows).
+    let mut widest: Option<(u16, PanelFile, crate::layout::LayoutReport)> = None;
+    for hp in (min_hp..=max_hp).rev() {
+        let panel = derive_panel(circuit, hp, cutouts);
+        let spec = panel.to_spec().map_err(crate::board::BoardError::Other)?;
+        let (w, h) = (spec.width_mm(), spec.height_mm());
+        let mut anchors = std::collections::HashMap::new();
+        for c in spec.cutouts() {
+            if let Some(refdes) = &c.refdes {
+                anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
+            }
+        }
+        let template =
+            crate::board::SeededPlacer::new(w, h, (0.0, 0.0), std::mem::take(&mut anchors));
+        let report = crate::layout::run_layout_loop(circuit, make_options(hp), template, cfg)?;
+        let has_unresolved_criticals = report.findings.iter().any(|f| {
+            f.severity == crate::stage::Severity::Error
+                && f.message.contains("critical net unresolved")
+        });
+        if !has_unresolved_criticals {
+            return Ok(HpMinimized { hp, panel, report });
+        }
+        // Too narrow to route — remember the best (widest) fallback.
+        if widest.is_none() {
+            widest = Some((hp, panel, report));
+        }
+    }
+    // Nothing routed clean: report the largest width's failure.
+    let (hp, panel, report) =
+        widest.ok_or_else(|| crate::board::BoardError::Other("no HP candidate".into()))?;
+    Ok(HpMinimized { hp, panel, report })
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1457,74 @@ fn sql_opt(s: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::LayoutLoop;
+    use crate::model::{Net, Part, PinRef};
+
+    /// A tiny circuit: two 2-pin nets, one tagged critical, wired through a
+    /// stub router that always leaves the critical net open (for the jiv test).
+    struct Toy {
+        parts: Vec<Part>,
+        nets: Vec<Net>,
+    }
+    impl crate::source::CircuitSource for Toy {
+        fn name(&self) -> &str {
+            "toy"
+        }
+        fn parts(&self) -> &[Part] {
+            &self.parts
+        }
+        fn nets(&self) -> &[Net] {
+            &self.nets
+        }
+    }
+
+    fn toy() -> Toy {
+        Toy {
+            parts: vec![
+                Part::new("U1", "opamp").with_footprint("Foo:U1"),
+                Part::new("C1", "47n").with_footprint("Foo:C1"),
+                Part::new("R1", "10k").with_footprint("Foo:R1"),
+            ],
+            nets: vec![
+                Net::new("SLEW", vec![PinRef::new("U1", "5"), PinRef::new("C1", "1")])
+                    .with_class("Critical"),
+                Net::new("OUT", vec![PinRef::new("U1", "1"), PinRef::new("R1", "2")]),
+            ],
+        }
+    }
+
+    /// Writes a minimal two-pad footprint for each part into `dir`.
+    fn write_footprints(dir: &std::path::Path) {
+        for (lib, name) in [("Foo", "U1"), ("Foo", "C1"), ("Foo", "R1")] {
+            let dir_lib = dir.join(format!("{lib}.pretty"));
+            std::fs::create_dir_all(&dir_lib).unwrap();
+            std::fs::write(
+                dir_lib.join(format!("{name}.kicad_mod")),
+                "(footprint \"x\" (layer \"F.Cu\") \
+                 (pad \"1\" smd rect (at -1 0) (size 1 1)) \
+                 (pad \"2\" smd rect (at 1 0) (size 1 1)))",
+            )
+            .unwrap();
+        }
+    }
+
+    /// A router that leaves every net unrouted — the board never finishes.
+    struct BlockedRouter;
+    impl crate::route::Router for BlockedRouter {
+        fn route(
+            &self,
+            nets: &[crate::route::RouteNet],
+            _opts: &crate::route::RouteOptions,
+        ) -> crate::route::RouteOutput {
+            crate::route::RouteOutput {
+                conflicts: nets
+                    .iter()
+                    .map(|n| format!("no path found for ({name}):", name = n.name))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+    }
 
     #[test]
     fn eurorack_dimensions_in_mm() {
@@ -1508,113 +1656,144 @@ mod tests {
     }
 
     #[test]
-    fn eurorack_cutouts_round_trip() {
-        let panel = EurorackPanel::new(8)
-            .with_cutout(10.0, 50.0, "Thonkiconn")
-            .with_cutout(25.0, 50.0, "Alpha9mm");
-        assert_eq!(panel.cutouts().len(), 2);
-        assert_eq!(panel.cutouts()[0].footprint, "Thonkiconn");
-        assert_eq!(panel.cutouts()[1].footprint, "Alpha9mm");
+    fn minimize_hp_picks_the_narrowest_width_that_routes() {
+        // jiv: with a router that always leaves the critical net open, no width
+        // routes clean — the widest candidate is reported (failure surfaced,
+        // not a panic). The panel is derived at each width regardless.
+        let dir = std::env::temp_dir().join(format!("lob-minhp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_footprints(&dir);
+        let circuit = toy();
+        let cfg = LayoutLoop::default();
+        let result = minimize_hp(
+            &circuit,
+            &BuiltinCutouts,
+            4,
+            10,
+            |_| {
+                let mut options = crate::board::BoardOptions::new(&dir);
+                options.router = Some(Box::new(BlockedRouter));
+                options
+            },
+            &cfg,
+        )
+        .unwrap();
+        // Every width leaves the critical net unresolved (blocked router), so
+        // the search falls back to the widest candidate's failure state.
+        assert_eq!(result.hp, 10);
+        assert!(!result.report.unresolved.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
+}
 
-    #[test]
-    fn footprint_shape_lookup() {
-        assert!(matches!(
-            footprint_shape("Thonkiconn"),
-            Some(CutoutShape::Circle { diameter_mm: 6.0 })
-        ));
-        assert!(matches!(
-            footprint_shape("Alpha9mm"),
-            Some(CutoutShape::Circle { diameter_mm: 7.0 })
-        ));
-        assert!(matches!(
-            footprint_shape("LED_3mm"),
-            Some(CutoutShape::Circle { diameter_mm: 3.0 })
-        ));
-        assert!(footprint_shape("UnknownThing").is_none());
-    }
+#[test]
+fn eurorack_cutouts_round_trip() {
+    let panel = EurorackPanel::new(8)
+        .with_cutout(10.0, 50.0, "Thonkiconn")
+        .with_cutout(25.0, 50.0, "Alpha9mm");
+    assert_eq!(panel.cutouts().len(), 2);
+    assert_eq!(panel.cutouts()[0].footprint, "Thonkiconn");
+    assert_eq!(panel.cutouts()[1].footprint, "Alpha9mm");
+}
 
-    #[test]
-    fn builtin_cutouts_classify_real_footprints() {
-        let c = BuiltinCutouts;
-        // Full KiCad footprints a circuit part carries → control + barrel geometry.
-        let jack = c
-            .cutout(None, "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM")
-            .unwrap();
-        assert_eq!(jack.kind, ControlKind::Jack);
-        assert!(matches!(
-            jack.shape,
-            CutoutShape::Circle { diameter_mm } if (diameter_mm - JACK_BARREL_MM).abs() < 1e-9
-        ));
-        assert_eq!(
-            c.cutout(None, "Potentiometer_THT:Potentiometer_Alpha_RD901F")
-                .unwrap()
-                .kind,
-            ControlKind::Pot
-        );
-        // Board-only parts are not panel-facing.
-        assert!(c.cutout(None, "Package_DIP:DIP-16_W7.62mm").is_none());
-        assert!(c
-            .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
-            .is_none());
-    }
+#[test]
+fn footprint_shape_lookup() {
+    assert!(matches!(
+        footprint_shape("Thonkiconn"),
+        Some(CutoutShape::Circle { diameter_mm: 6.0 })
+    ));
+    assert!(matches!(
+        footprint_shape("Alpha9mm"),
+        Some(CutoutShape::Circle { diameter_mm: 7.0 })
+    ));
+    assert!(matches!(
+        footprint_shape("LED_3mm"),
+        Some(CutoutShape::Circle { diameter_mm: 3.0 })
+    ));
+    assert!(footprint_shape("UnknownThing").is_none());
+}
 
-    #[test]
-    fn derive_panel_classifies_labels_and_orders() {
-        use crate::model::{Circuit, Net, Part, PinRef};
-        let mut circ = Circuit::new("m");
-        circ.parts = vec![
-            Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
-            Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
-            Part::new("U1", "TL072").with_footprint("Package_SO:SOIC-8"), // board-only
-        ];
-        circ.nets = vec![
-            Net::new("RATE_CV", vec![PinRef::new("RV1", "2")]),
-            Net::new("SIG_IN", vec![PinRef::new("J1", "T")]),
-            Net::new("GND", vec![PinRef::new("J1", "S")]),
-        ];
-        let panel = derive_panel(&circ, 8, &BuiltinCutouts);
-        // Only the pot + jack; the IC is skipped.
-        assert_eq!(panel.cutouts.len(), 2);
-        let rv1 = panel
-            .cutouts
-            .iter()
-            .find(|c| c.refdes.as_deref() == Some("RV1"))
-            .unwrap();
-        assert_eq!(rv1.footprint, "Alpha9mm");
-        assert_eq!(rv1.label.as_deref(), Some("RATE")); // RATE_CV → RATE
-        let j1 = panel
-            .cutouts
-            .iter()
-            .find(|c| c.refdes.as_deref() == Some("J1"))
-            .unwrap();
-        assert_eq!(j1.footprint, "Thonkiconn");
-        assert_eq!(j1.label.as_deref(), Some("IN")); // SIG_IN (not GND) → IN
-                                                     // The knob sits above the jack (larger y in panel bottom-up coords).
-        assert!(rv1.y_mm > j1.y_mm);
-        // The derived spec round-trips through TOML.
-        assert!(panel.to_toml().unwrap().contains("Thonkiconn"));
-    }
+#[test]
+fn builtin_cutouts_classify_real_footprints() {
+    let c = BuiltinCutouts;
+    // Full KiCad footprints a circuit part carries → control + barrel geometry.
+    let jack = c
+        .cutout(None, "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM")
+        .unwrap();
+    assert_eq!(jack.kind, ControlKind::Jack);
+    assert!(matches!(
+        jack.shape,
+        CutoutShape::Circle { diameter_mm } if (diameter_mm - JACK_BARREL_MM).abs() < 1e-9
+    ));
+    assert_eq!(
+        c.cutout(None, "Potentiometer_THT:Potentiometer_Alpha_RD901F")
+            .unwrap()
+            .kind,
+        ControlKind::Pot
+    );
+    // Board-only parts are not panel-facing.
+    assert!(c.cutout(None, "Package_DIP:DIP-16_W7.62mm").is_none());
+    assert!(c
+        .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
+        .is_none());
+}
 
-    #[test]
-    fn dxf_contains_entities() {
-        let panel = EurorackPanel::new(8)
-            .with_cutout(10.0, 50.0, "Thonkiconn")
-            .with_cutout(25.0, 50.0, "Alpha9mm");
-        let dxf = panel_to_dxf(&panel);
-        assert!(dxf.contains("LWPOLYLINE"));
-        assert!(dxf.contains("CIRCLE"));
-        assert!(dxf.contains("EOF"));
-        // hqt: the default mounting holes are oval slots — capsule arcs + lines.
-        // Circles: 2 cutouts; arcs: 2 per slot × 2 slots = 4; lines: 4.
-        assert_eq!(dxf.matches("CIRCLE").count(), 2);
-        assert_eq!(dxf.matches("\nARC").count(), 4);
-        assert_eq!(dxf.matches("\nLINE").count(), 4);
-    }
+#[test]
+fn derive_panel_classifies_labels_and_orders() {
+    use crate::model::{Circuit, Net, Part, PinRef};
+    let mut circ = Circuit::new("m");
+    circ.parts = vec![
+        Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+        Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
+        Part::new("U1", "TL072").with_footprint("Package_SO:SOIC-8"), // board-only
+    ];
+    circ.nets = vec![
+        Net::new("RATE_CV", vec![PinRef::new("RV1", "2")]),
+        Net::new("SIG_IN", vec![PinRef::new("J1", "T")]),
+        Net::new("GND", vec![PinRef::new("J1", "S")]),
+    ];
+    let panel = derive_panel(&circ, 8, &BuiltinCutouts);
+    // Only the pot + jack; the IC is skipped.
+    assert_eq!(panel.cutouts.len(), 2);
+    let rv1 = panel
+        .cutouts
+        .iter()
+        .find(|c| c.refdes.as_deref() == Some("RV1"))
+        .unwrap();
+    assert_eq!(rv1.footprint, "Alpha9mm");
+    assert_eq!(rv1.label.as_deref(), Some("RATE")); // RATE_CV → RATE
+    let j1 = panel
+        .cutouts
+        .iter()
+        .find(|c| c.refdes.as_deref() == Some("J1"))
+        .unwrap();
+    assert_eq!(j1.footprint, "Thonkiconn");
+    assert_eq!(j1.label.as_deref(), Some("IN")); // SIG_IN (not GND) → IN
+                                                 // The knob sits above the jack (larger y in panel bottom-up coords).
+    assert!(rv1.y_mm > j1.y_mm);
+    // The derived spec round-trips through TOML.
+    assert!(panel.to_toml().unwrap().contains("Thonkiconn"));
+}
 
-    #[test]
-    fn panel_file_roundtrip() {
-        let toml = r#"
+#[test]
+fn dxf_contains_entities() {
+    let panel = EurorackPanel::new(8)
+        .with_cutout(10.0, 50.0, "Thonkiconn")
+        .with_cutout(25.0, 50.0, "Alpha9mm");
+    let dxf = panel_to_dxf(&panel);
+    assert!(dxf.contains("LWPOLYLINE"));
+    assert!(dxf.contains("CIRCLE"));
+    assert!(dxf.contains("EOF"));
+    // hqt: the default mounting holes are oval slots — capsule arcs + lines.
+    // Circles: 2 cutouts; arcs: 2 per slot × 2 slots = 4; lines: 4.
+    assert_eq!(dxf.matches("CIRCLE").count(), 2);
+    assert_eq!(dxf.matches("\nARC").count(), 4);
+    assert_eq!(dxf.matches("\nLINE").count(), 4);
+}
+
+#[test]
+fn panel_file_roundtrip() {
+    let toml = r#"
 format = "eurorack"
 hp = 8
 thickness_mm = 2.0
@@ -1629,79 +1808,78 @@ x_mm = 25.0
 y_mm = 50.0
 footprint = "Alpha9mm"
 "#;
-        let file = PanelFile::from_toml(toml).unwrap();
-        assert_eq!(file.format, "eurorack");
-        assert_eq!(file.hp, Some(8));
-        assert_eq!(file.cutouts.len(), 2);
+    let file = PanelFile::from_toml(toml).unwrap();
+    assert_eq!(file.format, "eurorack");
+    assert_eq!(file.hp, Some(8));
+    assert_eq!(file.cutouts.len(), 2);
 
-        let spec = file.to_spec().unwrap();
-        assert_eq!(spec.width_mm(), 8.0 * 5.08);
-        assert_eq!(spec.cutouts().len(), 2);
+    let spec = file.to_spec().unwrap();
+    assert_eq!(spec.width_mm(), 8.0 * 5.08);
+    assert_eq!(spec.cutouts().len(), 2);
+}
+
+#[test]
+fn panel_file_rejects_unknown_format() {
+    let toml = r#"format = "pedal""#;
+    let file = PanelFile::from_toml(toml).unwrap();
+    assert!(file.to_spec().is_err());
+}
+
+#[test]
+fn panel_order_status_roundtrip() {
+    assert_eq!(
+        "not_ordered".parse::<PanelOrderStatus>().unwrap(),
+        PanelOrderStatus::NotOrdered
+    );
+    assert_eq!(
+        "ordered".parse::<PanelOrderStatus>().unwrap(),
+        PanelOrderStatus::Ordered
+    );
+    assert!("bogus".parse::<PanelOrderStatus>().is_err());
+}
+
+/// Full round-trip against a real Dolt repo. Skipped if `dolt` is absent.
+#[test]
+fn panel_orders_roundtrip_when_dolt_available() {
+    if find_on_path("dolt").is_none() {
+        return;
     }
+    let root = std::env::temp_dir().join(format!("lob-panel-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = PanelOrders::open(&root).expect("open");
 
-    #[test]
-    fn panel_file_rejects_unknown_format() {
-        let toml = r#"format = "pedal""#;
-        let file = PanelFile::from_toml(toml).unwrap();
-        assert!(file.to_spec().is_err());
-    }
+    let id = store
+        .create(
+            "crossfader-v1",
+            "/tmp/crossfader.dxf",
+            Some("sendcutsend"),
+            None,
+        )
+        .expect("create");
+    assert!(id >= 0);
 
-    #[test]
-    fn panel_order_status_roundtrip() {
-        assert_eq!(
-            "not_ordered".parse::<PanelOrderStatus>().unwrap(),
-            PanelOrderStatus::NotOrdered
-        );
-        assert_eq!(
-            "ordered".parse::<PanelOrderStatus>().unwrap(),
-            PanelOrderStatus::Ordered
-        );
-        assert!("bogus".parse::<PanelOrderStatus>().is_err());
-    }
+    let latest = store
+        .latest("crossfader-v1")
+        .expect("latest")
+        .expect("present");
+    assert_eq!(latest.module, "crossfader-v1");
+    assert_eq!(latest.dxf_path, "/tmp/crossfader.dxf");
+    assert_eq!(latest.vendor.as_deref(), Some("sendcutsend"));
+    assert_eq!(latest.status, PanelOrderStatus::NotOrdered);
 
-    /// Full round-trip against a real Dolt repo. Skipped if `dolt` is absent.
-    #[test]
-    fn panel_orders_roundtrip_when_dolt_available() {
-        if find_on_path("dolt").is_none() {
-            return;
-        }
-        let root = std::env::temp_dir().join(format!("lob-panel-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = PanelOrders::open(&root).expect("open");
+    store
+        .mark_ordered("crossfader-v1", "sendcutsend", Some("TRK-12345"))
+        .expect("mark ordered");
 
-        let id = store
-            .create(
-                "crossfader-v1",
-                "/tmp/crossfader.dxf",
-                Some("sendcutsend"),
-                None,
-            )
-            .expect("create");
-        assert!(id >= 0);
+    let ordered = store
+        .latest("crossfader-v1")
+        .expect("latest")
+        .expect("present");
+    assert_eq!(ordered.status, PanelOrderStatus::Ordered);
+    assert_eq!(ordered.tracking_ref.as_deref(), Some("TRK-12345"));
 
-        let latest = store
-            .latest("crossfader-v1")
-            .expect("latest")
-            .expect("present");
-        assert_eq!(latest.module, "crossfader-v1");
-        assert_eq!(latest.dxf_path, "/tmp/crossfader.dxf");
-        assert_eq!(latest.vendor.as_deref(), Some("sendcutsend"));
-        assert_eq!(latest.status, PanelOrderStatus::NotOrdered);
+    let all = store.list("crossfader-v1").expect("list");
+    assert_eq!(all.len(), 1);
 
-        store
-            .mark_ordered("crossfader-v1", "sendcutsend", Some("TRK-12345"))
-            .expect("mark ordered");
-
-        let ordered = store
-            .latest("crossfader-v1")
-            .expect("latest")
-            .expect("present");
-        assert_eq!(ordered.status, PanelOrderStatus::Ordered);
-        assert_eq!(ordered.tracking_ref.as_deref(), Some("TRK-12345"));
-
-        let all = store.list("crossfader-v1").expect("list");
-        assert_eq!(all.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
+    let _ = std::fs::remove_dir_all(&root);
 }
