@@ -1409,7 +1409,7 @@ fn subboard_standoff(lib_part: &str) -> Option<f64> {
 /// SMD part (fine under a stacked sub-board) from a tall through-hole /
 /// electrolytic / connector one that would hit it. A heuristic pending real
 /// 3D-model heights (DESIGN 6.7); deliberately errs toward flagging.
-fn part_height_mm(lib_part: &str) -> f64 {
+pub(crate) fn part_height_mm(lib_part: &str) -> f64 {
     let f = lib_part.to_ascii_lowercase();
     let has = |s: &str| f.contains(s);
     if has("pinheader")
