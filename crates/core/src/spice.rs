@@ -591,7 +591,7 @@ pub fn simulate_tran(
 
     let models = match crate::skidl::kicad_symbol_dir() {
         Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
-        None => HashMap::new(),
+        None => crate::symbols::catalog_models(circuit),
     };
 
     let deck = generate_tran_deck(circuit, config, tran, &models, &data_path)?;
@@ -649,7 +649,7 @@ pub fn simulate_ac(
     // (R/C/L) can be simulated.
     let models = match crate::skidl::kicad_symbol_dir() {
         Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
-        None => HashMap::new(),
+        None => crate::symbols::catalog_models(circuit),
     };
 
     let deck = generate_ac_deck(circuit, config, &models, &data_path)?;
@@ -992,5 +992,76 @@ mod tests {
         assert!(r.points.last().unwrap().v > 0.9, "charges toward 1V");
         let sr = r.max_slew_v_per_s().unwrap();
         assert!((3000.0..12000.0).contains(&sr), "RC step slew {sr} V/s");
+    }
+
+    /// Non-inverting gain-2 TL072 circuit, built directly (no SKiDL) so the
+    /// built-in model catalogue is what resolves the op-amp. TL072 pins:
+    /// 1=out1 2=in1- 3=in1+ 4=V- 5=in2+ 6=in2- 7=out2 8=V+.
+    fn tl072_gain2() -> Circuit {
+        Circuit {
+            name: "tl072_gain2".into(),
+            parts: vec![
+                Part::new("U1", "TL072"),
+                Part::new("R1", "10k"),
+                Part::new("R2", "10k"),
+            ],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("U1", "3")]),
+                Net::new("OUT", vec![PinRef::new("U1", "1"), PinRef::new("R1", "1")]),
+                Net::new(
+                    "FB",
+                    vec![
+                        PinRef::new("U1", "2"),
+                        PinRef::new("R1", "2"),
+                        PinRef::new("R2", "1"),
+                    ],
+                ),
+                Net::new("VCC", vec![PinRef::new("U1", "8")]),
+                Net::new("VEE", vec![PinRef::new("U1", "4")]),
+                // Unused second unit: inputs tied low, output parked on GND.
+                Net::new(
+                    "GND",
+                    vec![
+                        PinRef::new("U1", "5"),
+                        PinRef::new("U1", "6"),
+                        PinRef::new("U1", "7"),
+                        PinRef::new("R2", "2"),
+                    ],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn tran_tl072_slew_limiting_when_ngspice_available() {
+        // ef4.2: the builtin catalogue resolves a TL072 (no Sim.* model) to the
+        // OPAMP_SLEW macro with pedalkernel-sourced params, and ngspice shows
+        // REAL slew limiting: a gain-2 0→1 V step ramps at ≈ SR·tanh(1.45·1)
+        // ≈ 11.6 V/µs and settles at exactly 2 V — not the old ideal model's
+        // instantaneous jump.
+        if crate::tools::find_on_path("ngspice").is_none() {
+            return;
+        }
+        let c = tl072_gain2();
+        let config = SimConfig::default();
+        let tran = TranAnalysis {
+            step_s: 2e-8,
+            stop_s: 2e-6,
+            step_at_s: 1e-7,
+            from_v: 0.0,
+            to_v: 1.0,
+        };
+        let dir = std::env::temp_dir().join("lob-tl072-tran-test");
+        let r = simulate_tran(&c, &config, &tran, &dir).unwrap();
+        let final_v = r.points.last().unwrap().v;
+        assert!(
+            (1.9..2.1).contains(&final_v),
+            "gain-2 settles at 2 V, got {final_v}"
+        );
+        let sr = r.max_slew_v_per_s().unwrap();
+        assert!(
+            (8.0e6..14.0e6).contains(&sr),
+            "TL072 slew-limited ramp expected ~11.6 V/µs, got {sr} V/s"
+        );
     }
 }
