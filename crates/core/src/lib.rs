@@ -68,6 +68,7 @@ pub mod symbols;
 pub mod theme;
 pub mod thonk;
 pub mod tools;
+pub mod topology;
 pub mod units;
 pub mod validate;
 pub mod verify;
@@ -194,6 +195,9 @@ pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutco
 pub use svg2pdf::{svg_to_pdf_bytes, Svg2PdfError};
 pub use thonk::{product_image_url as thonk_image_url, search as thonk_search, ThonkProduct};
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
+pub use topology::{
+    generate_fuzz_chain, render_chain_skidl, FuzzChain, FuzzConstraints, GainStage,
+};
 pub use units::parse_eng_value;
 pub use validate::{validate_carrier, validate_erc};
 pub use verify::{

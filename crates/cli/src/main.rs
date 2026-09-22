@@ -16,19 +16,20 @@ use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
-    fuzz_pedal_panel_file, generate_board_artifacts, generate_bom, generate_fuzz_pedal_spec, guide,
-    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
-    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
-    render_board_png, render_skidl, render_spec_text, rules, run_drc, run_layout_loop,
-    schematic_to_svg, simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns,
-    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
-    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding,
-    FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo,
-    Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord, PartResolution,
-    PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality, Repair,
-    ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients,
-    StageOutcome, TranAnalysis,
+    fuzz_pedal_panel_file, generate_board_artifacts, generate_bom, generate_fuzz_chain,
+    generate_fuzz_pedal_spec, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom,
+    jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
+    package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
+    part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, render_chain_skidl,
+    render_skidl, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg, simulate_ac,
+    simulate_tran, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key,
+    zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
+    BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, Finding, FuzzChain,
+    FuzzConstraints, FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
+    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
+    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
+    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -219,6 +220,32 @@ enum Command {
         out: PathBuf,
         /// Also write the full decision trace (JSON: key/type/chosen/confidence)
         /// here, for eval scoring (e.g. PCBBench).
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+    /// Concept -> spec, DAG variant: assemble a fuzz-pedal circuit as a
+    /// chain of gain-stage nodes via sequential typed decisions ("add
+    /// another stage, or stop?") instead of picking from one fixed
+    /// two-stage template -- "rail -> node -> node -> ... -> output".
+    /// Supply voltage and enclosure size are constraints on the request
+    /// (specified, not decided); chain length, per-stage voicing, current
+    /// budget, and tone-stack presence are real decisions. Needs
+    /// OODA_API_KEY, same as `lob spec`.
+    SpecChain {
+        /// Free-text design brief, carried as decision context.
+        #[arg(long)]
+        brief: String,
+        /// Supply rail voltage -- a constraint, not a decision (9.0 for a
+        /// standard battery/adapter pedal, 18.0 for a two-battery/boosted one).
+        #[arg(long, default_value_t = 9.0)]
+        vcc: f64,
+        /// Enclosure size class -- a constraint, not a decision: 1590b | 1590bb | 125b.
+        #[arg(long, default_value = "1590b")]
+        enclosure: String,
+        /// Base output path (no extension): writes "<out>.json" and "<out>.txt".
+        #[arg(long)]
+        out: PathBuf,
+        /// Also write the full decision trace (JSON) here.
         #[arg(long)]
         trace: Option<PathBuf>,
     },
@@ -539,6 +566,13 @@ fn main() -> ExitCode {
             out,
             trace,
         } => spec_cmd(family, brief, out, trace),
+        Command::SpecChain {
+            brief,
+            vcc,
+            enclosure,
+            out,
+            trace,
+        } => spec_chain_cmd(brief, vcc, enclosure, out, trace),
         Command::Schematic { spec, out, panel } => schematic_cmd(spec, out, panel),
     };
 
@@ -730,22 +764,129 @@ fn spec_cmd(
     Ok(())
 }
 
+/// Concept -> spec, DAG variant. See [`Command::SpecChain`]'s docs.
+fn spec_chain_cmd(
+    brief: String,
+    vcc: f64,
+    enclosure: String,
+    out: PathBuf,
+    trace_path: Option<PathBuf>,
+) -> Result<()> {
+    let enclosure_size = parse_enclosure(&enclosure)?;
+    let client = ooda::HttpClient::from_env().with_context(|| {
+        "OODA_API_KEY not set (see .env.example) -- lob spec-chain needs a Jev/System One-compatible endpoint"
+    })?;
+    let mut trace = ooda::Trace::new();
+
+    let constraints = FuzzConstraints {
+        vcc,
+        enclosure_size,
+    };
+    let chain = generate_fuzz_chain(&client, &mut trace, &brief, constraints)
+        .with_context(|| "chain generation failed")?;
+
+    let json_path = with_extension_appended(&out, "json");
+    let text_path = with_extension_appended(&out, "txt");
+
+    let json = serde_json::to_string_pretty(&chain).with_context(|| "serializing chain")?;
+    std::fs::write(&json_path, json).with_context(|| format!("writing {}", json_path.display()))?;
+
+    let mut text = String::new();
+    text.push_str("FUZZ PEDAL SPEC (DAG chain)\n===========================\n\n");
+    text.push_str(&format!("Brief: {brief}\n\n"));
+    text.push_str(&format!(
+        "Constraints (not decisions): vcc={vcc}V enclosure={}\n\n",
+        enclosure_size.key()
+    ));
+    text.push_str("Decisions (System One / Jev/Laya-compatible, via ooda):\n");
+    for record in trace.records() {
+        text.push_str(&format!(
+            "  - {:<20} [{}] {} (confidence {:.2})\n",
+            record.key,
+            format!("{:?}", record.kind).to_lowercase(),
+            record.chosen,
+            record.confidence
+        ));
+    }
+    text.push_str(&format!(
+        "\nResolved design: {} gain stage(s), ic={:.3}mA, tone_stack={}\n",
+        chain.stages.len(),
+        chain.ic_ma,
+        chain.tone_stack
+    ));
+    text.push_str(
+        "\nNext: `lob schematic <this>.json --out <circuit>.py` to render the circuit.\n",
+    );
+    std::fs::write(&text_path, &text)
+        .with_context(|| format!("writing {}", text_path.display()))?;
+
+    println!("lob spec-chain: {}", text_path.display());
+    println!("  spec (machine-readable): {}", json_path.display());
+    println!("  stages: {}", chain.stages.len());
+    println!("  decisions made: {}", trace.records().len());
+    for record in trace.records() {
+        println!(
+            "    {:<20} {:<8} {} (confidence {:.2})",
+            record.key,
+            format!("{:?}", record.kind).to_lowercase(),
+            record.chosen,
+            record.confidence
+        );
+    }
+
+    if let Some(trace_path) = trace_path {
+        let json =
+            serde_json::to_string_pretty(&trace).with_context(|| "serializing decision trace")?;
+        std::fs::write(&trace_path, json)
+            .with_context(|| format!("writing {}", trace_path.display()))?;
+        println!("wrote decision trace: {}", trace_path.display());
+    }
+
+    println!(
+        "\nNext: `lob schematic {} --out <circuit>.py` to render the circuit \
+         from exactly these decisions (no further System One calls).",
+        json_path.display()
+    );
+    Ok(())
+}
+
+fn parse_enclosure(key: &str) -> Result<EnclosureSize> {
+    match key.to_ascii_lowercase().as_str() {
+        "1590b" => Ok(EnclosureSize::Size1590B),
+        "1590bb" => Ok(EnclosureSize::Size1590BB),
+        "125b" => Ok(EnclosureSize::Size125B),
+        other => anyhow::bail!("unknown enclosure '{other}' (1590b | 1590bb | 125b)"),
+    }
+}
+
 /// Spec -> design: read a spec JSON and render its SKiDL schematic. A pure
 /// function of the spec file's contents -- makes no decision calls, so
 /// running it twice on the same spec always produces the same circuit.
+/// Detects whether the file is a fixed two-stage [`FuzzPedalSpec`] or a
+/// DAG-assembled [`FuzzChain`] by peeking at its shape (a chain has a
+/// `stages` array; the fixed spec has a `topology` field) -- both write
+/// through the same command, since both are just "spec -> design" either way.
 fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Result<()> {
     let json = std::fs::read_to_string(&spec_path)
         .with_context(|| format!("reading spec {}", spec_path.display()))?;
-    let spec: FuzzPedalSpec = serde_json::from_str(&json)
+    let value: serde_json::Value = serde_json::from_str(&json)
         .with_context(|| format!("parsing spec {}", spec_path.display()))?;
 
-    let py = render_skidl(&spec);
+    let (py, enclosure_size) = if value.get("stages").is_some() {
+        let chain: FuzzChain = serde_json::from_value(value)
+            .with_context(|| format!("parsing chain spec {}", spec_path.display()))?;
+        (render_chain_skidl(&chain), chain.enclosure_size)
+    } else {
+        let spec: FuzzPedalSpec = serde_json::from_value(value)
+            .with_context(|| format!("parsing spec {}", spec_path.display()))?;
+        (render_skidl(&spec), spec.enclosure_size)
+    };
     std::fs::write(&out, &py).with_context(|| format!("writing {}", out.display()))?;
 
     println!("lob schematic {}: {}", spec_path.display(), out.display());
 
     if let Some(panel_path) = panel {
-        let panel_file = fuzz_pedal_panel_file(spec.enclosure_size, ("RV1", "RV2"), 1.6);
+        let panel_file = fuzz_pedal_panel_file(enclosure_size, ("RV1", "RV2"), 1.6);
         let toml = panel_file
             .to_toml()
             .with_context(|| "serializing panel spec")?;
@@ -753,7 +894,7 @@ fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Re
             .with_context(|| format!("writing {}", panel_path.display()))?;
         println!(
             "  panel ({}): {}",
-            spec.enclosure_size.key(),
+            enclosure_size.key(),
             panel_path.display()
         );
     }

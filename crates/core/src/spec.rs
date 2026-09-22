@@ -87,7 +87,7 @@ impl Topology {
 /// How hard stage 2's collector bias sits off center — the clipping-asymmetry
 /// control. Stage 1 always biases near center; stage 2 carries the "voice".
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-enum BiasVoice {
+pub enum BiasVoice {
     /// Collector at ~35% VCC: clips the positive half sooner — brighter, more
     /// aggressive top end.
     BrightAsymmetric,
@@ -98,7 +98,7 @@ enum BiasVoice {
 }
 
 impl BiasVoice {
-    fn vc_fraction(self) -> f64 {
+    pub(crate) fn vc_fraction(self) -> f64 {
         match self {
             BiasVoice::BrightAsymmetric => 0.35,
             BiasVoice::Symmetric => 0.5,
@@ -106,7 +106,7 @@ impl BiasVoice {
         }
     }
 
-    const CHOICES: &'static [(&'static str, &'static str)] = &[
+    pub(crate) const CHOICES: &'static [(&'static str, &'static str)] = &[
         (
             "bright_asymmetric",
             "Stage-2 collector biased ~35% VCC — clips the positive half sooner, brighter/more aggressive top end",
@@ -121,7 +121,7 @@ impl BiasVoice {
         ),
     ];
 
-    fn from_key(key: &str) -> BiasVoice {
+    pub(crate) fn from_key(key: &str) -> BiasVoice {
         match key {
             "bright_asymmetric" => BiasVoice::BrightAsymmetric,
             "dark_asymmetric" => BiasVoice::DarkAsymmetric,
@@ -134,7 +134,7 @@ impl BiasVoice {
 /// the "how unstable can this get" control. Lower floor = higher achievable
 /// gain (less emitter degeneration at full clockwise).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-enum GainCharacter {
+pub enum GainCharacter {
     Tame,
     Balanced,
     Aggressive,
@@ -142,9 +142,10 @@ enum GainCharacter {
 }
 
 impl GainCharacter {
-    const LEVELS: &'static [&'static str] = &["tame", "balanced", "aggressive", "unstable"];
+    pub(crate) const LEVELS: &'static [&'static str] =
+        &["tame", "balanced", "aggressive", "unstable"];
 
-    fn floor_ohms(self) -> f64 {
+    pub(crate) fn floor_ohms(self) -> f64 {
         match self {
             GainCharacter::Tame => 680.0,
             GainCharacter::Balanced => 330.0,
@@ -155,7 +156,7 @@ impl GainCharacter {
 
     /// Snap a `score` rubric position (0-indexed into [`Self::LEVELS`]) to the
     /// nearest level — deterministic, no interpolation.
-    fn from_score(score: f64) -> GainCharacter {
+    pub(crate) fn from_score(score: f64) -> GainCharacter {
         match score.round().clamp(0.0, 3.0) as i64 {
             0 => GainCharacter::Tame,
             1 => GainCharacter::Balanced,
@@ -216,7 +217,7 @@ impl EnclosureSize {
 /// exact-but-unbuyable arithmetic results.
 const E12: [f64; 12] = [1.0, 1.2, 1.5, 1.8, 2.2, 2.7, 3.3, 3.9, 4.7, 5.6, 6.8, 8.2];
 
-fn round_e12(value: f64) -> f64 {
+pub(crate) fn round_e12(value: f64) -> f64 {
     if value <= 0.0 {
         return 0.0;
     }
@@ -237,7 +238,7 @@ fn round_e12(value: f64) -> f64 {
 
 /// Format an ohm value the way the rest of this repo's circuits do (`"9k"`,
 /// `"680"`, `"1.5M"`) — SKiDL/KiCad accept engineering suffixes directly.
-fn fmt_ohms(v: f64) -> String {
+pub(crate) fn fmt_ohms(v: f64) -> String {
     if v >= 1e6 {
         format!("{}M", trim_trailing_zero(v / 1e6))
     } else if v >= 1e3 {
@@ -255,7 +256,7 @@ fn trim_trailing_zero(v: f64) -> String {
 /// Common-emitter voltage-divider bias, computed from first principles (not
 /// recalled from a specific published schematic) — see the module docs.
 /// Returns `(rc_ohms, r_top_ohms, r_bottom_ohms)`, each already E12-rounded.
-fn bias_network(
+pub(crate) fn bias_network(
     vcc: f64,
     vc_fraction: f64,
     ic_ma: f64,
@@ -275,16 +276,16 @@ fn bias_network(
     (rc, r_top, r_bottom)
 }
 
-const VCC_V: f64 = 9.0;
-const IC_MA: f64 = 0.5;
-const BETA: f64 = 200.0;
+pub(crate) const VCC_V: f64 = 9.0;
+pub(crate) const IC_MA: f64 = 0.5;
+pub(crate) const BETA: f64 = 200.0;
 const VBE_V: f64 = 0.6;
 /// Divider-current multiple of base current — keeps the bias point stiff
 /// against hFE spread without wasting excessive battery current.
 const DIV_CURRENT_MULT: f64 = 20.0;
 
-const FUZZ_POT_MAX_OHMS: f64 = 500.0;
-const STAGE2_EMITTER_OHMS: f64 = 1000.0;
+pub(crate) const FUZZ_POT_MAX_OHMS: f64 = 500.0;
+pub(crate) const STAGE2_EMITTER_OHMS: f64 = 1000.0;
 
 /// Every value chosen for one fuzz-pedal design run, plus the resistor/cap
 /// values derived from them. `Serialize`/`Deserialize` so a spec is a real
@@ -312,7 +313,7 @@ pub struct FuzzPedalSpec {
 /// and erroring loud (never guessing) if it's missing or came back as the
 /// wrong answer kind — which would mean this module's own question-building
 /// code is broken, not that the caller did anything wrong.
-fn expect_choice(
+pub(crate) fn expect_choice(
     outcome: &ooda::Outcome,
     trace: &mut Trace,
     key: &str,
@@ -327,7 +328,11 @@ fn expect_choice(
 }
 
 /// Pull a `noul` answer by key — see [`expect_choice`].
-fn expect_noul(outcome: &ooda::Outcome, trace: &mut Trace, key: &str) -> Result<f64, SpecError> {
+pub(crate) fn expect_noul(
+    outcome: &ooda::Outcome,
+    trace: &mut Trace,
+    key: &str,
+) -> Result<f64, SpecError> {
     match outcome.recorded_answer(key, trace)? {
         Answer::Noul { noul } => Ok(*noul),
         _ => Err(SpecError::Decision(ooda::Error::WrongAnswerKind {
@@ -338,7 +343,11 @@ fn expect_noul(outcome: &ooda::Outcome, trace: &mut Trace, key: &str) -> Result<
 }
 
 /// Pull a `score` answer's numeric value by key — see [`expect_choice`].
-fn expect_score(outcome: &ooda::Outcome, trace: &mut Trace, key: &str) -> Result<f64, SpecError> {
+pub(crate) fn expect_score(
+    outcome: &ooda::Outcome,
+    trace: &mut Trace,
+    key: &str,
+) -> Result<f64, SpecError> {
     let answer = outcome.recorded_answer(key, trace)?;
     match answer {
         Answer::Score { .. } => answer.score_as_f64().ok_or_else(|| {

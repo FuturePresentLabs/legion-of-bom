@@ -96,3 +96,13 @@ Rvp vp vm 1T
 Q1 c b e QNPN_GENERIC
 .model QNPN_GENERIC NPN(Is=1e-14 Bf=200 Vaf=100 Ikf=0.1 Cjc=5p Cje=8p)
 .ends
+* --- Generic LED (bypass/status indicator). ----------------------------------
+* A generic diode model (Is=1e-14), self-contained rather than reusing DLM
+* above (that one is scoped inside LM13700's own subckt, not globally
+* visible) -- not a real LED's forward-voltage/emission curve, but enough to
+* prove the SPICE deck builds and the indicator branch is electrically sane.
+* NOT tied to any specific real LED's datasheet.
+.subckt LED_GENERIC a k
+D1 a k DLED_GENERIC
+.model DLED_GENERIC D(Is=1e-14)
+.ends
