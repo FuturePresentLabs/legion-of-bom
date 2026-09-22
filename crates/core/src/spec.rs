@@ -1,7 +1,8 @@
 //! Concept → spec → design, kept as three genuinely separate artifacts.
 //!
-//! **Spec** ([`generate_fuzz_pedal_spec`]) asks every typed [`crate::decision`]
-//! call once and produces a [`FuzzPedalSpec`] — decisions in, nothing else.
+//! **Spec** ([`generate_fuzz_pedal_spec`]) asks every typed decision (via the
+//! shared [`ooda`] client) once and produces a [`FuzzPedalSpec`] — decisions
+//! in, nothing else.
 //! It is renderable as raw text ([`render_spec_text`], for a human to read) or
 //! as JSON (`FuzzPedalSpec` is `Serialize`/`Deserialize`, for a machine to
 //! replay). It contains no schematic.
@@ -34,17 +35,27 @@
 //! — `lob parts gate` still blocks real board/BOM generation on it, same as
 //! any other unverified MPN (DESIGN.md §3.5/§4.3).
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
-use crate::decision::{Answer, DecisionClient, DecisionError, DecisionRecord, NamedQuestion};
+use ooda::{Answer, Client, Criteria, Question, Request, Trace};
 
 /// Errors generating a spec.
 #[derive(Debug, thiserror::Error)]
 pub enum SpecError {
     #[error("decision failed: {0}")]
-    Decision(#[from] DecisionError),
+    Decision(#[from] ooda::Error),
+}
+
+/// A question kind's lowercase tag, for display — [`ooda::Kind`] has no
+/// `Display` impl (only `Debug`, which prints `Choice`/`Score`/`Noul`), and
+/// this repo's spec text/CLI output convention predates ooda and is
+/// lowercase (`choice`/`score`/`noul`), matching the wire's own `type` tag.
+fn kind_str(kind: ooda::Kind) -> &'static str {
+    match kind {
+        ooda::Kind::Choice => "choice",
+        ooda::Kind::Score => "score",
+        ooda::Kind::Noul => "noul",
+    }
 }
 
 /// The curated topology library. One entry today — extensible, per DESIGN.md
@@ -297,96 +308,123 @@ pub struct FuzzPedalSpec {
     stage2_r_bottom: f64,
 }
 
-/// Pull a `choice` answer out of a batched [`DecisionClient::ask_many`]
-/// result by key, erroring loud (never guessing) if it's missing or came
-/// back as the wrong answer kind — which would mean this module's own
-/// question-building code is broken, not that the caller did anything wrong.
-fn expect_choice(answers: &mut HashMap<String, Answer>, key: &str) -> Result<String, SpecError> {
-    match answers.remove(key) {
-        Some(Answer::Choice(a)) => Ok(a.choice),
-        _ => Err(SpecError::Decision(DecisionError::MalformedAnswer(
-            key.to_string(),
-        ))),
+/// Pull a `choice` answer out of `outcome` by key, recording it to `trace`
+/// and erroring loud (never guessing) if it's missing or came back as the
+/// wrong answer kind — which would mean this module's own question-building
+/// code is broken, not that the caller did anything wrong.
+fn expect_choice(
+    outcome: &ooda::Outcome,
+    trace: &mut Trace,
+    key: &str,
+) -> Result<String, SpecError> {
+    match outcome.recorded_answer(key, trace)? {
+        Answer::Choice { choice, .. } => Ok(choice.clone()),
+        _ => Err(SpecError::Decision(ooda::Error::WrongAnswerKind {
+            question: key.to_string(),
+            expected: "choice",
+        })),
     }
 }
 
 /// Pull a `noul` answer by key — see [`expect_choice`].
-fn expect_noul(answers: &mut HashMap<String, Answer>, key: &str) -> Result<f64, SpecError> {
-    match answers.remove(key) {
-        Some(Answer::Noul(v)) => Ok(v),
-        _ => Err(SpecError::Decision(DecisionError::MalformedAnswer(
-            key.to_string(),
-        ))),
+fn expect_noul(outcome: &ooda::Outcome, trace: &mut Trace, key: &str) -> Result<f64, SpecError> {
+    match outcome.recorded_answer(key, trace)? {
+        Answer::Noul { noul } => Ok(*noul),
+        _ => Err(SpecError::Decision(ooda::Error::WrongAnswerKind {
+            question: key.to_string(),
+            expected: "noul",
+        })),
     }
 }
 
-/// Pull a `score` answer's score value by key — see [`expect_choice`].
-fn expect_score(answers: &mut HashMap<String, Answer>, key: &str) -> Result<f64, SpecError> {
-    match answers.remove(key) {
-        Some(Answer::Score(a)) => Ok(a.score),
-        _ => Err(SpecError::Decision(DecisionError::MalformedAnswer(
-            key.to_string(),
-        ))),
+/// Pull a `score` answer's numeric value by key — see [`expect_choice`].
+fn expect_score(outcome: &ooda::Outcome, trace: &mut Trace, key: &str) -> Result<f64, SpecError> {
+    let answer = outcome.recorded_answer(key, trace)?;
+    match answer {
+        Answer::Score { .. } => answer.score_as_f64().ok_or_else(|| {
+            SpecError::Decision(ooda::Error::WrongAnswerKind {
+                question: key.to_string(),
+                expected: "score",
+            })
+        }),
+        _ => Err(SpecError::Decision(ooda::Error::WrongAnswerKind {
+            question: key.to_string(),
+            expected: "score",
+        })),
     }
 }
 
 /// Ask every typed decision for a fuzz-pedal spec and derive its component
 /// values. `brief` is the free-text design brief (e.g. "vintage silicon fuzz,
-/// 9V, true bypass") — carried as `state` context for every question, never
+/// 9V, true bypass") — carried as the observation for every question, never
 /// parsed for control flow itself (the *decisions*, not the brief text,
-/// determine the circuit).
+/// determine the circuit). Every resolved answer is appended to `trace`.
 pub fn generate_fuzz_pedal_spec(
-    client: &mut DecisionClient,
+    client: &impl Client,
+    trace: &mut Trace,
     brief: &str,
 ) -> Result<FuzzPedalSpec, SpecError> {
     // All five decisions go in one batched call (legion-of-bom-x74e) instead
     // of five round trips -- none of them depends on another's answer yet
     // (the curated topology set is one entry, so nothing branches off it),
     // so batching is a pure latency win with nothing to design around.
-    let mut answers = client.ask_many(
-        brief,
-        vec![
-            // Curated set has one entry today; the choice call still runs
-            // (and produces a real trace/confidence entry) so a second
-            // topology is a new catalog entry, not a new code path, once one
-            // exists.
-            NamedQuestion::choice(
-                "topology",
+    let request = Request::new(brief)
+        // Curated set has one entry today; the choice call still runs (and
+        // produces a real trace/confidence entry) so a second topology is a
+        // new catalog entry, not a new code path, once one exists.
+        .with(
+            "topology",
+            Question::choice(
                 "Pick the circuit topology for this fuzz pedal from the curated set.",
-                Topology::CURATED,
+                Topology::CURATED.iter().copied().collect::<Criteria>(),
             ),
-            NamedQuestion::choice(
-                "bias_voice",
+        )
+        .with(
+            "bias_voice",
+            Question::choice(
                 "Pick how stage 2's collector bias sits off center, which sets the \
                  clipping-asymmetry character.",
-                BiasVoice::CHOICES,
+                BiasVoice::CHOICES.iter().copied().collect::<Criteria>(),
             ),
-            NamedQuestion::score(
-                "gain_character",
+        )
+        .with(
+            "gain_character",
+            Question::score(
                 "Rate how much gain/instability this fuzz should make available at \
                  full clockwise on the Fuzz control.",
-                GainCharacter::LEVELS,
+                GainCharacter::LEVELS
+                    .iter()
+                    .map(|level| (*level, *level))
+                    .collect::<Criteria>(),
             ),
-            NamedQuestion::noul(
-                "tone_stack",
+        )
+        .with(
+            "tone_stack",
+            Question::noul_with_context(
                 "Should this design include a simple fixed treble-cut tone network \
                  ahead of the volume control?",
                 "yes, include a simple tone network",
                 "no, direct output to volume",
             ),
-            NamedQuestion::choice(
-                "enclosure_size",
+        )
+        .with(
+            "enclosure_size",
+            Question::choice(
                 "Pick the enclosure size class for this pedal.",
-                EnclosureSize::CHOICES,
+                EnclosureSize::CHOICES.iter().copied().collect::<Criteria>(),
             ),
-        ],
-    )?;
+        );
+    let outcome = client.decide(&request)?;
 
+    // Recorded in the same order the request declared them, matching every
+    // trace this pipeline has produced against the live endpoint so far.
+    expect_choice(&outcome, trace, "topology")?;
     let topology = Topology::Silicon2TransistorFuzz;
-    let voice = BiasVoice::from_key(&expect_choice(&mut answers, "bias_voice")?);
-    let character = GainCharacter::from_score(expect_score(&mut answers, "gain_character")?);
-    let tone_stack = expect_noul(&mut answers, "tone_stack")? >= 0.5;
-    let enclosure_size = EnclosureSize::from_key(&expect_choice(&mut answers, "enclosure_size")?);
+    let voice = BiasVoice::from_key(&expect_choice(&outcome, trace, "bias_voice")?);
+    let character = GainCharacter::from_score(expect_score(&outcome, trace, "gain_character")?);
+    let tone_stack = expect_noul(&outcome, trace, "tone_stack")? >= 0.5;
+    let enclosure_size =
+        EnclosureSize::from_key(&expect_choice(&outcome, trace, "enclosure_size")?);
 
     let (stage1_rc, stage1_r_top, stage1_r_bottom) = bias_network(
         VCC_V,
@@ -418,16 +456,19 @@ pub fn generate_fuzz_pedal_spec(
 /// actual "spec" artifact `lob spec` writes. No schematic, no code: what was
 /// decided, at what confidence, and what it implies, so a human can read it
 /// (or route it to `lob schematic`) without opening the JSON.
-pub fn render_spec_text(brief: &str, spec: &FuzzPedalSpec, trace: &[DecisionRecord]) -> String {
+pub fn render_spec_text(brief: &str, spec: &FuzzPedalSpec, trace: &[ooda::Record]) -> String {
     let mut out = String::new();
     out.push_str("FUZZ PEDAL SPEC\n");
     out.push_str("===============\n\n");
     out.push_str(&format!("Brief: {brief}\n\n"));
-    out.push_str("Decisions (System One / Jev-compatible, ai.fpl.dev/v1/systemone):\n");
+    out.push_str("Decisions (System One / Jev/Laya-compatible, via ooda):\n");
     for record in trace {
         out.push_str(&format!(
             "  - {:<16} [{}] {} (confidence {:.2})\n",
-            record.key, record.kind, record.chosen, record.confidence
+            record.key,
+            kind_str(record.kind),
+            record.chosen,
+            record.confidence
         ));
     }
     out.push_str("\nResolved design:\n");
@@ -681,9 +722,32 @@ if __name__ == "__main__":
 mod tests {
     use super::*;
 
-    /// A stub the decision client can't reach in `cargo test` — exercised
-    /// through the real `DecisionClient` type but never actually calling out,
-    /// by testing the pure functions this module is built from directly.
+    /// `generate_fuzz_pedal_spec` end to end against `ooda::ScriptedClient`
+    /// — no network, no credentials, but every line goes through the real
+    /// `Request`/`Question`/`Answer` wire types instead of a hand-rolled
+    /// shortcut around them.
+    #[test]
+    fn generate_fuzz_pedal_spec_runs_offline_against_a_scripted_client() {
+        let client = ooda::ScriptedClient::new([r#"{
+            "answers": {
+                "topology": {"type":"choice","choice":"silicon_2t_fuzz","confidence":0.99,"probabilities":{"silicon_2t_fuzz":0.99}},
+                "bias_voice": {"type":"choice","choice":"symmetric","confidence":0.8,"probabilities":{"symmetric":0.8}},
+                "gain_character": {"type":"score","score":2.0,"confidence":0.75},
+                "tone_stack": {"type":"boolean","probability":0.9},
+                "enclosure_size": {"type":"choice","choice":"1590B","confidence":0.85,"probabilities":{"1590B":0.85}}
+            }
+        }"#
+        .to_string()]);
+        let mut trace = Trace::new();
+        let spec =
+            generate_fuzz_pedal_spec(&client, &mut trace, "vintage silicon fuzz, 9V").unwrap();
+        assert_eq!(spec.voice, BiasVoice::Symmetric);
+        assert_eq!(spec.character, GainCharacter::Aggressive);
+        assert!(spec.tone_stack);
+        assert_eq!(spec.enclosure_size, EnclosureSize::Size1590B);
+        assert_eq!(trace.records().len(), 5);
+    }
+
     #[test]
     fn e12_rounds_to_nearest_preferred_value() {
         assert_eq!(round_e12(9000.0), 8200.0);
@@ -788,9 +852,9 @@ mod tests {
             stage2_r_top: 150000.0,
             stage2_r_bottom: 22000.0,
         };
-        let trace = vec![DecisionRecord {
+        let trace = vec![ooda::Record {
             key: "topology".into(),
-            kind: "choice".into(),
+            kind: ooda::Kind::Choice,
             chosen: "silicon_2t_fuzz".into(),
             confidence: 0.97,
             timestamp_unix: 0,

@@ -16,7 +16,6 @@ pub mod board;
 pub mod bom;
 pub mod bom_repair;
 pub mod carrier;
-pub mod decision;
 pub mod decouple;
 pub mod drc;
 pub mod dsp_import;
@@ -92,9 +91,6 @@ pub use bom_repair::{
 };
 pub use carrier::{
     firmware_pinmap_json, AudioChannel, CarrierBuilder, CarrierError, CarrierPlatform,
-};
-pub use decision::{
-    Answer, ChoiceAnswer, DecisionClient, DecisionError, DecisionRecord, NamedQuestion, ScoreAnswer,
 };
 pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};

@@ -23,11 +23,11 @@ use legion_of_bom_core::{
     render_board_png, render_skidl, render_spec_text, rules, run_drc, run_layout_loop, simulate_ac,
     simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
     ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, DecisionClient, EurorackPlacer, Finding, FuzzPedalSpec, GuideOptions, HpSearch,
-    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
-    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    CircuitSource, EurorackPlacer, Finding, FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient,
+    KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat,
+    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate,
+    ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig,
+    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -658,16 +658,23 @@ fn run(circuit: PathBuf) -> Result<()> {
 /// spec -- raw text (`<out>.txt`) plus machine-readable JSON (`<out>.json`) --
 /// with NO schematic. Today's curated set has one family ("fuzz-pedal"); an
 /// unknown family fails loud rather than guessing at one.
-fn spec_cmd(family: String, brief: String, out: PathBuf, trace: Option<PathBuf>) -> Result<()> {
+fn spec_cmd(
+    family: String,
+    brief: String,
+    out: PathBuf,
+    trace_path: Option<PathBuf>,
+) -> Result<()> {
     if family != "fuzz-pedal" {
         anyhow::bail!("unknown circuit family '{family}' (curated set today: fuzz-pedal)");
     }
 
-    let mut client = DecisionClient::from_env()
-        .with_context(|| "SYSTEMONE_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint")?;
+    let client = ooda::HttpClient::from_env().with_context(|| {
+        "OODA_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint"
+    })?;
+    let mut trace = ooda::Trace::new();
 
-    let spec =
-        generate_fuzz_pedal_spec(&mut client, &brief).with_context(|| "spec generation failed")?;
+    let spec = generate_fuzz_pedal_spec(&client, &mut trace, &brief)
+        .with_context(|| "spec generation failed")?;
 
     let json_path = with_extension_appended(&out, "json");
     let text_path = with_extension_appended(&out, "txt");
@@ -675,23 +682,26 @@ fn spec_cmd(family: String, brief: String, out: PathBuf, trace: Option<PathBuf>)
     let json = serde_json::to_string_pretty(&spec).with_context(|| "serializing spec")?;
     std::fs::write(&json_path, json).with_context(|| format!("writing {}", json_path.display()))?;
 
-    let text = render_spec_text(&brief, &spec, &client.trace);
+    let text = render_spec_text(&brief, &spec, trace.records());
     std::fs::write(&text_path, text).with_context(|| format!("writing {}", text_path.display()))?;
 
     println!("lob spec {family}: {}", text_path.display());
     println!("  spec (machine-readable): {}", json_path.display());
     println!("  enclosure size class: {}", spec.enclosure_size.key());
-    println!("  decisions made: {}", client.trace.len());
-    for record in &client.trace {
+    println!("  decisions made: {}", trace.records().len());
+    for record in trace.records() {
         println!(
             "    {:<16} {:<8} {} (confidence {:.2})",
-            record.key, record.kind, record.chosen, record.confidence
+            record.key,
+            format!("{:?}", record.kind).to_lowercase(),
+            record.chosen,
+            record.confidence
         );
     }
 
-    if let Some(trace_path) = trace {
-        let json = serde_json::to_string_pretty(&client.trace)
-            .with_context(|| "serializing decision trace")?;
+    if let Some(trace_path) = trace_path {
+        let json =
+            serde_json::to_string_pretty(&trace).with_context(|| "serializing decision trace")?;
         std::fs::write(&trace_path, json)
             .with_context(|| format!("writing {}", trace_path.display()))?;
         println!("wrote decision trace: {}", trace_path.display());
