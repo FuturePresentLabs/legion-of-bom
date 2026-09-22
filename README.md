@@ -64,6 +64,14 @@ The Phase 0 pipeline stages (SKiDL runner, netlist parser, ngspice, BOM) shell o
 to external tools — SKiDL/Python, ngspice, and KiCad — which are being pinned in
 the Phase 0 tooling task before the runner lands.
 
+## Vendored assets
+
+`assets/` carries real, sourced third-party panel-component footprints and
+3D meshes (Eurorack-style jacks, pots, LEDs, switches) for hardware KiCad's
+own stock libraries don't cover well. See [`assets/CREDITS.md`](assets/CREDITS.md)
+for exact provenance, licenses (Unlicense, CC-BY 4.0 — both redistribution-
+clean), and where to re-fetch them.
+
 ## Issue tracking
 
 This project tracks work in **[beads](https://github.com/gastownhall/beads)** (`bd`),
