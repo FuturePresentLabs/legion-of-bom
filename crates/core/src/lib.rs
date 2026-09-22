@@ -39,6 +39,7 @@ pub mod model;
 pub mod module_port;
 pub mod mouser;
 pub mod netlist;
+pub mod oscillator;
 pub mod package;
 pub mod panel;
 pub mod panel_edit;
@@ -143,6 +144,10 @@ pub use module_port::{
 };
 pub use mouser::{MouserClient, MouserError, PartPrice, PriceBreak};
 pub use netlist::{parse_netlist_file, parse_netlist_str};
+pub use oscillator::{
+    generate_pierce_oscillator, load_cap_pf, render_pierce_oscillator_skidl, CrystalOption,
+    PierceOscillator, CRYSTAL_CATALOG, STRAY_CAPACITANCE_PF,
+};
 pub use package::{body_mm as package_body_mm, short_name as package_short_name};
 pub use panel::{
     default_panel_orders_dir, derive_panel, derive_panel_for, footprint_shape, min_panel_hp,
