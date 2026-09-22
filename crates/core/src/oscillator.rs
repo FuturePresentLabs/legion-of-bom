@@ -37,8 +37,11 @@ use ooda::{Client, Question, Request, Trace};
 use crate::spec::SpecError;
 
 /// One real, sourced crystal: a real, currently-available part number, its
-/// real datasheet load-capacitance spec, and the frequency it's cut for.
-/// Not a "typical" CL guessed from the frequency alone — CL varies by
+/// real datasheet load-capacitance spec, the frequency it's cut for, and a
+/// real KiCad footprint matching its real package — confirmed against the
+/// installed library directly (both candidates checked for a 2-pad body,
+/// matching `Device:Crystal`'s 2 pins), not assumed from the package name
+/// alone. Not a "typical" CL guessed from the frequency alone — CL varies by
 /// manufacturer and part, not frequency, so each entry is its own verified
 /// fact, not derived from a pattern.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +54,11 @@ pub struct CrystalOption {
     pub mpn: &'static str,
     /// Real datasheet load capacitance, pF.
     pub cl_pf: f64,
+    /// Real KiCad footprint reference, confirmed 2-pad against the
+    /// installed `Crystal.pretty` library, matching this part's real
+    /// package (an SMD 3.2x1.5mm body for the watch crystal, the standard
+    /// HC-49/US through-hole can for the MHz-range parts).
+    pub footprint: &'static str,
 }
 
 /// Real crystals, ECS Inc., each individually verified against its own real
@@ -65,30 +73,35 @@ pub const CRYSTAL_CATALOG: &[CrystalOption] = &[
         hz: 32_768.0,
         mpn: "ECS-.327-12.5-34R-TR",
         cl_pf: 12.5,
+        footprint: "Crystal:Crystal_SMD_3215-2Pin_3.2x1.5mm",
     },
     CrystalOption {
         key: "8mhz",
         hz: 8_000_000.0,
         mpn: "ECS-80-20-4X",
         cl_pf: 20.0,
+        footprint: "Crystal:Crystal_HC49-U_Vertical",
     },
     CrystalOption {
         key: "16mhz",
         hz: 16_000_000.0,
         mpn: "ECS-160-20-4X",
         cl_pf: 20.0,
+        footprint: "Crystal:Crystal_HC49-U_Vertical",
     },
     CrystalOption {
         key: "20mhz",
         hz: 20_000_000.0,
         mpn: "ECS-200-20-4X",
         cl_pf: 20.0,
+        footprint: "Crystal:Crystal_HC49-U_Vertical",
     },
     CrystalOption {
         key: "25mhz",
         hz: 25_000_000.0,
         mpn: "ECS-250-20-4X-F-DN",
         cl_pf: 20.0,
+        footprint: "Crystal:Crystal_HC49-U_Vertical",
     },
 ];
 
@@ -213,7 +226,9 @@ circuit deliberately stops at the resonator (crystal + two load caps) --
 matches ST AN2867's own real reference design, which never draws the
 inverter either.
 
-Crystal: {mpn} -- real, sourced datasheet load capacitance CL={cl_pf:.1}pF.
+Crystal: {mpn} -- real, sourced datasheet load capacitance CL={cl_pf:.1}pF,
+real footprint {footprint} (confirmed 2-pad against the installed KiCad
+library, matching this part's real package).
 Frequency: {freq_label}.
 Load caps: computed as C1=C2=2*(CL-Cstray), Cstray={stray:.1}pF (Cerda,
 RF Design, July 2004) -- rounded to the nearest real E12 value ({cap_pf:.1}pF
@@ -241,7 +256,7 @@ def build():
     osc_in = Net("OSC_IN")
     osc_out = Net("OSC_OUT")
 
-    xtal = Part("Device", "Crystal", ref="Y1")
+    xtal = Part("Device", "Crystal", footprint="{footprint}", ref="Y1")
     xtal.fields["MPN"] = "{mpn}"
 
     c1 = Part("Device", "C", value="{cap_label}", footprint=C_FOOTPRINT, ref="C1")
@@ -271,6 +286,7 @@ if __name__ == "__main__":
 "#,
         mpn = osc.crystal.mpn,
         cl_pf = osc.crystal.cl_pf,
+        footprint = osc.crystal.footprint,
         freq_label = freq_label,
         stray = STRAY_CAPACITANCE_PF,
         cap_pf = osc.load_cap_pf,
@@ -319,6 +335,11 @@ mod tests {
                 c.key
             );
             assert!(!c.mpn.is_empty(), "{}: missing MPN", c.key);
+            assert!(
+                c.footprint.starts_with("Crystal:"),
+                "{}: footprint should resolve against the real Crystal.pretty library",
+                c.key
+            );
         }
     }
 
@@ -342,7 +363,9 @@ mod tests {
             load_cap_pf: load_cap_pf(CRYSTAL_CATALOG[2].cl_pf),
         };
         let py = render_pierce_oscillator_skidl(&osc);
-        assert!(py.contains("Part(\"Device\", \"Crystal\", ref=\"Y1\")"));
+        assert!(py.contains(
+            "Part(\"Device\", \"Crystal\", footprint=\"Crystal:Crystal_HC49-U_Vertical\", ref=\"Y1\")"
+        ));
         assert!(py.contains("ECS-160-20-4X"));
         assert!(py.contains(r#"osc_in += xtal[1], c1[1]"#));
         assert!(py.contains(r#"osc_out += xtal[2], c2[1]"#));

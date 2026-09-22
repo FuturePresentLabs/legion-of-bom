@@ -4,7 +4,9 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = std::env::args().skip(1);
-    let brief = a.next().unwrap_or_else(|| "a real-time clock reference, low power".to_string());
+    let brief = a
+        .next()
+        .unwrap_or_else(|| "a real-time clock reference, low power".to_string());
     let out = a.next().unwrap_or_else(|| "oscillator.py".to_string());
 
     let client = ooda::HttpClient::from_env()
