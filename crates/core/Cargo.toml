@@ -20,3 +20,5 @@ ooda.workspace = true
 mlua.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+gltf.workspace = true
+gltf-json.workspace = true

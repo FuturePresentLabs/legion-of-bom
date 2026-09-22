@@ -45,3 +45,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
     "runtime-tokio",
 ] }
+# Reading vendored component meshes (crates/core/src/gltf.rs) — the same
+# crate family `pedalkernel-pro`'s autolayout already uses for the identical
+# assets/meshes/jolin/glb/*.glb library. `gltf` imports; `gltf-json` (its own
+# write-side companion, not a separate dependency to justify) builds the
+# combined output document's schema.
+gltf = "1"
+gltf-json = { version = "1", features = ["names"] }

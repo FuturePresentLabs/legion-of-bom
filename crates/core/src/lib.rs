@@ -27,6 +27,7 @@ pub mod fab;
 pub mod fetch;
 pub mod gerber;
 pub mod git;
+pub mod gltf;
 pub mod guide;
 pub mod hardware;
 pub mod images;
@@ -119,6 +120,7 @@ pub use fab::{
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use gerber::{layers_to_svg, read_layers, Layer as GerberLayer, LayerKind};
 pub use git::{stage as git_stage, staged_paths, GitError};
+pub use gltf::{export_board_glb, GltfError, MeshMaterial};
 pub use guide::{
     build_guide, build_guide_with, guide_from_parts, guide_from_parts_with, guide_to_html,
     guide_to_pdf, BoardPng, BuildGuide, BuildStep, GuideOptions, KitType, PartNote, PlacedPart,
