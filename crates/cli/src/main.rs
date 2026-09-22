@@ -1384,6 +1384,8 @@ struct Layout {
     conflicts: Vec<String>,
     /// Mechanical clearance problems (DESIGN 6.7). Empty on the one-shot path.
     collisions: Vec<String>,
+    /// Parts with no footprint at all — off-board hardware, absent from the board.
+    not_placed: Vec<String>,
 }
 
 /// Generate a board the way every command **must**: the iterative layout loop when
@@ -1422,6 +1424,7 @@ fn build_layout(
                 board: report.board,
                 conflicts: report.unresolved,
                 collisions: report.collisions,
+                not_placed: report.not_placed,
             })
         }
         _ => {
@@ -1430,6 +1433,7 @@ fn build_layout(
                 board: art.pcb,
                 conflicts: art.route.conflicts,
                 collisions: art.collisions,
+                not_placed: art.not_placed,
             })
         }
     }
@@ -1547,6 +1551,7 @@ fn board_cmd(
         board,
         conflicts,
         collisions,
+        not_placed,
     } = build_layout(&model, options, &panel, &cfg)?;
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
@@ -1571,6 +1576,12 @@ fn board_cmd(
         for c in &collisions {
             eprintln!("      - {c}");
         }
+    }
+    if !not_placed.is_empty() {
+        println!(
+            "  not placed (no footprint — off-board hardware, see BOM for MPN): {}",
+            not_placed.join(", ")
+        );
     }
     println!("  validate: lob drc {}", path.display());
     println!("  export:   kicad-cli pcb export gerbers --check-zones (fills the pour) | export pos (CPL)");

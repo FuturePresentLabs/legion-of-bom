@@ -1548,6 +1548,15 @@ pub struct BoardArtifacts {
     /// stacked sub-board that is taller than the sub-board's standoff. Surfaced,
     /// not auto-fixed. Empty when nothing collides.
     pub collisions: Vec<String>,
+    /// Parts with no footprint assigned, and so absent from this board
+    /// entirely — not placed, no footprint emitted, nets touching them just
+    /// don't route there. A part with no footprint has no geometry to place;
+    /// refusing the whole board over one off-board connector (a real jack or
+    /// footswitch wired to the panel by loose leads, not soldered to the
+    /// PCB) would make a real, buildable circuit un-buildable. Surfaced here
+    /// (same as `collisions`) rather than silently dropped, so a genuinely
+    /// forgotten footprint still gets noticed.
+    pub not_placed: Vec<String>,
 }
 
 /// Load every part's footprint and measure its placement facts (keep-out extent,
@@ -1737,14 +1746,20 @@ pub fn generate_board_artifacts(
     // For sub-boards: refdes → (pad number → its function names), so a net can be
     // wired to a pad by function (`AUDIO_OUT_L`) as well as by number (25z.3).
     let mut pin_labels: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    // Parts with no footprint at all — genuinely off-board hardware (a panel
+    // jack or footswitch wired by loose leads, not a PCB part), not
+    // necessarily an oversight. Skipped from this board entirely rather than
+    // refusing the whole thing; surfaced in `not_placed` instead.
+    let mut not_placed: Vec<String> = Vec::new();
     for part in circuit.parts() {
         let refdes = part.refdes.0.as_str();
-        let lib_part = part
-            .footprint
-            .as_deref()
-            .ok_or_else(|| BoardError::NoFootprint {
-                refdes: refdes.to_string(),
-            })?;
+        let lib_part = match part.footprint.as_deref() {
+            Some(fp) => fp,
+            None => {
+                not_placed.push(refdes.to_string());
+                continue;
+            }
+        };
         if let Some((crate::subboard::SUBBOARD_LIB, name)) = lib_part.split_once(':') {
             if let Some(spec) = crate::subboard::from_name(name) {
                 let map: HashMap<String, Vec<String>> = spec
@@ -2166,6 +2181,7 @@ pub fn generate_board_artifacts(
         placements,
         route,
         collisions,
+        not_placed,
     })
 }
 
@@ -4640,15 +4656,32 @@ mod tests {
     }
 
     #[test]
-    fn missing_footprint_errors() {
-        // A single part with no footprint → NoFootprint (before any lib access).
+    fn missing_footprint_is_skipped_not_placed_not_a_hard_error() {
+        // A part with no footprint at all is real, off-board hardware (a
+        // panel jack or footswitch wired by loose leads) at least as often
+        // as it's an oversight -- refusing the whole board over one
+        // un-placeable part would make a real, buildable circuit
+        // un-buildable. It's surfaced in `not_placed`, not silently dropped
+        // and not a hard error.
         let c = Circuit {
             name: "x".into(),
             parts: vec![Part::new("U1", "TL072")],
             nets: vec![],
         };
-        let err = generate_board(&c, &BoardOptions::new(std::env::temp_dir())).unwrap_err();
-        assert!(matches!(err, BoardError::NoFootprint { refdes } if refdes == "U1"));
+        let art = generate_board_artifacts(&c, &BoardOptions::new(std::env::temp_dir())).unwrap();
+        assert_eq!(art.not_placed, vec!["U1".to_string()]);
+        // The placer may still give U1 a placeholder position (the existing,
+        // separate "no facts measured" fallback every Placer already has) --
+        // that's fine, it's not asserted against here. What matters for
+        // board correctness is `loaded` (not exposed on BoardArtifacts, but
+        // covered by the DXF/board-emission tests elsewhere): a part with no
+        // footprint gets no footprint block emitted, regardless of whether
+        // its phantom position shows up in placement-only bookkeeping like
+        // HPWL scoring.
+        assert!(
+            !art.pcb.contains("\"U1\""),
+            "U1 has no footprint -- nothing should be emitted for it in the board file"
+        );
     }
 
     #[test]

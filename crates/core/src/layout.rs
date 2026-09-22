@@ -254,6 +254,9 @@ pub struct LayoutReport {
     /// Mechanical clearance problems: parts under a stacked sub-board taller than
     /// its standoff (DESIGN 6.7). Surfaced, not auto-fixed.
     pub collisions: Vec<String>,
+    /// Parts with no footprint at all — off-board hardware, absent from
+    /// every attempt this loop ran (see [`crate::board::BoardArtifacts::not_placed`]).
+    pub not_placed: Vec<String>,
     /// Final-gate DRC report, when `kicad_cli` was provided.
     pub drc: Option<DrcReport>,
     /// Human-facing observations (info/warning/error), incl. unresolved criticals.
@@ -284,6 +287,7 @@ pub fn run_layout_loop(
         metrics: PlacementMetrics,
         unresolved: Vec<String>,
         collisions: Vec<String>,
+        not_placed: Vec<String>,
         drc: Option<DrcReport>,
     }
 
@@ -361,6 +365,7 @@ pub fn run_layout_loop(
                 metrics,
                 unresolved: art.route.conflicts.clone(),
                 collisions: art.collisions.clone(),
+                not_placed: art.not_placed,
                 drc,
             });
         }
@@ -411,6 +416,7 @@ pub fn run_layout_loop(
         metrics,
         unresolved,
         collisions,
+        not_placed,
         mut drc,
     } = best.expect("loop runs at least once");
 
@@ -449,6 +455,12 @@ pub fn run_layout_loop(
     for c in &collisions {
         findings.push(Finding::warning(format!("mechanical clearance: {c}")));
     }
+    if !not_placed.is_empty() {
+        findings.push(Finding::info(format!(
+            "not placed (no footprint — off-board hardware): {}",
+            not_placed.join(", ")
+        )));
+    }
     // What the winning layout had to break to fit, and by how much. Reported at
     // the severity of the tier it broke: a physical rule means the board cannot
     // be built, an electrical one means it will work worse than intended. This
@@ -484,6 +496,7 @@ pub fn run_layout_loop(
         metrics,
         unresolved,
         collisions,
+        not_placed,
         drc,
         findings,
     })
