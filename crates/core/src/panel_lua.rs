@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::panel::{Cutout, CutoutRole};
+use crate::tools::find_upward;
 
 /// A control kind's real, verified hole/envelope size — the data half of
 /// the boundary. Mirrors [`crate::pedal_panel::PedalCutouts`]'s table; a
@@ -273,21 +274,6 @@ pub fn panel_script_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
     let global = base.join("legion-of-bom").join("panels");
     global.is_dir().then_some(global)
-}
-
-/// Walks up from the working directory looking for `relative` — e.g. this
-/// checkout's own `assets/panels` when run from anywhere inside it.
-fn find_upward(relative: &str) -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(relative);
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 #[cfg(test)]

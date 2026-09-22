@@ -204,7 +204,7 @@ pub struct MpnCandidate {
 
 /// The distributor clients available for a suggestion run. Mouser needs a key
 /// (absent → skipped); LCSC/EasyEDA is keyless. Build with [`SourcingClients::from_env`].
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct SourcingClients {
     pub mouser: Option<MouserClient>,
     /// Whether to consult the keyless LCSC/EasyEDA catalog (default on).

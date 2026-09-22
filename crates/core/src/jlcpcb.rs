@@ -7,21 +7,19 @@
 //! pins). So this source contributes the authoritative datasheet + ratings +
 //! MPN↔LCSC mapping.
 //!
-//! Auth (reverse-engineered, verified live): each request is signed
-//! `HMAC-SHA256(secret, "METHOD\n{path}\n{timestamp}\n{nonce}\n{body}\n")`,
-//! base64-encoded, sent as `Authorization: JOP appid=…,accesskey=…,timestamp=…,
-//! nonce=…,signature=…`.
+//! The request/response mechanics — the HMAC-SHA256 request signing, the
+//! JSON shape, how a response maps onto [`JlcpcbComponent`] — live in
+//! `assets/distributors/jlcpcb.lua`, loaded via [`crate::distributor_lua`]:
+//! swapping in a different open-API distributor means editing that script,
+//! not this file. The signature itself (real crypto) and the network call
+//! stay host-side; the script only decides what to sign and where to send it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 
-use base64::Engine;
-use hmac::{Hmac, Mac};
-use serde_json::Value;
-use sha2::Sha256;
+use crate::distributor_lua::{load_named_script, DistributorScript, DistributorScriptError};
 
-const BASE_URL: &str = "https://open.jlcpcb.com";
-const DETAIL_PATH: &str = "/overseas/openapi/component/getComponentDetailByCode";
+const SCRIPT_NAME: &str = "jlcpcb.lua";
+const REQUIRED_FNS: &[&str] = &["component_by_code"];
 
 /// Errors from JLCPCB lookups.
 #[derive(Debug, thiserror::Error)]
@@ -30,14 +28,12 @@ pub enum JlcpcbError {
         "JLCPCB_APP_ID / JLCPCB_ACCESS_KEY / JLCPCB_SECRET_KEY not all set (put them in .env)"
     )]
     MissingKeys,
-    #[error("JLCPCB API error ({code}): {message}")]
-    Api { code: i64, message: String },
-    #[error("JLCPCB request failed: {0}")]
-    Http(String),
+    #[error("JLCPCB: {0}")]
+    Script(#[from] DistributorScriptError),
 }
 
 /// A component as returned by JLCPCB.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JlcpcbComponent {
     /// LCSC component code (`C1002`).
     pub component_code: String,
@@ -54,12 +50,20 @@ pub struct JlcpcbComponent {
     pub parameters: Vec<(String, String)>,
 }
 
+#[derive(Serialize)]
+struct ComponentRequest<'a> {
+    app_id: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    code: &'a str,
+}
+
 /// A signed JLCPCB open-API client.
-#[derive(Debug, Clone)]
 pub struct JlcpcbClient {
     app_id: String,
     access_key: String,
     secret_key: String,
+    script: DistributorScript,
 }
 
 impl JlcpcbClient {
@@ -67,12 +71,14 @@ impl JlcpcbClient {
         app_id: impl Into<String>,
         access_key: impl Into<String>,
         secret_key: impl Into<String>,
-    ) -> Self {
-        JlcpcbClient {
+    ) -> Result<Self, JlcpcbError> {
+        let script = load_named_script(SCRIPT_NAME, REQUIRED_FNS)?;
+        Ok(JlcpcbClient {
             app_id: app_id.into(),
             access_key: access_key.into(),
             secret_key: secret_key.into(),
-        }
+            script,
+        })
     }
 
     /// Build from `JLCPCB_APP_ID` / `JLCPCB_ACCESS_KEY` / `JLCPCB_SECRET_KEY`.
@@ -83,137 +89,81 @@ impl JlcpcbClient {
             get("JLCPCB_ACCESS_KEY"),
             get("JLCPCB_SECRET_KEY"),
         ) {
-            (Some(a), Some(k), Some(s)) => Ok(JlcpcbClient::new(a, k, s)),
+            (Some(a), Some(k), Some(s)) => JlcpcbClient::new(a, k, s),
             _ => Err(JlcpcbError::MissingKeys),
         }
     }
 
     /// Look up a component by LCSC code (`C1002`).
     pub fn component_by_code(&self, code: &str) -> Result<Option<JlcpcbComponent>, JlcpcbError> {
-        let body = serde_json::json!({ "componentCodes": [code] }).to_string();
-        let value = self.post(DETAIL_PATH, &body)?;
-        Ok(parse_detail(&value))
+        Ok(self.script.call(
+            "component_by_code",
+            &ComponentRequest {
+                app_id: &self.app_id,
+                access_key: &self.access_key,
+                secret_key: &self.secret_key,
+                code,
+            },
+        )?)
     }
-
-    /// Sign and POST a request, returning the parsed JSON (after checking `code`).
-    fn post(&self, path: &str, body: &str) -> Result<Value, JlcpcbError> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            .to_string();
-        let nonce = nonce();
-        let signature = self.sign("POST", path, &timestamp, &nonce, body);
-        let auth = format!(
-            r#"JOP appid="{}",accesskey="{}",timestamp="{timestamp}",nonce="{nonce}",signature="{signature}""#,
-            self.app_id, self.access_key
-        );
-
-        let response = ureq::post(&format!("{BASE_URL}{path}"))
-            .set("Content-Type", "application/json")
-            .set("Authorization", &auth)
-            .send_string(body)
-            .map_err(|e| JlcpcbError::Http(e.to_string()))?;
-        let value: Value = response
-            .into_json()
-            .map_err(|e| JlcpcbError::Http(e.to_string()))?;
-
-        let code = value.get("code").and_then(Value::as_i64).unwrap_or(0);
-        if code != 200 {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(JlcpcbError::Api { code, message });
-        }
-        Ok(value)
-    }
-
-    /// `base64(HMAC-SHA256(secret, "METHOD\n{path}\n{ts}\n{nonce}\n{body}\n"))`.
-    fn sign(&self, method: &str, path: &str, timestamp: &str, nonce: &str, body: &str) -> String {
-        let string_to_sign = format!("{method}\n{path}\n{timestamp}\n{nonce}\n{body}\n");
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret_key.as_bytes())
-            .expect("HMAC accepts any key length");
-        mac.update(string_to_sign.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-    }
-}
-
-/// A per-process-unique 32-hex-char nonce (time-nanos + counter — the server only
-/// needs uniqueness within its timestamp window, not cryptographic randomness).
-fn nonce() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:016x}{counter:016x}")
-}
-
-fn parse_detail(value: &Value) -> Option<JlcpcbComponent> {
-    let list = value.get("data").and_then(Value::as_array)?;
-    let c = list.first()?;
-    let string = |key: &str| {
-        c.get(key)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    // Prefer the LCSC datasheet link, fall back to JLCPCB's file link.
-    let datasheet_url = string("dataManualUrl").or_else(|| string("datasheetUrl"));
-    let parameters = c
-        .get("parameters")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    Some((
-                        p.get("parameterName").and_then(Value::as_str)?.to_string(),
-                        p.get("parameterValue").and_then(Value::as_str)?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Some(JlcpcbComponent {
-        component_code: string("componentCode").unwrap_or_default(),
-        component_model: string("componentModel").unwrap_or_default(),
-        package: string("componentSpecification"),
-        description: string("description"),
-        datasheet_url,
-        library_type: string("libraryType"),
-        stock: c.get("stockCount").and_then(Value::as_u64),
-        parameters,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    const REQUIRED_FNS_FOR_TEST: &[&str] = &[
+        "component_by_code",
+        "sign_for_test",
+        "parse_component_response",
+    ];
+
+    /// The real shipped script — these tests exercise its actual signing and
+    /// parsing logic (no live API keys / network needed: both are pure
+    /// functions given fixed inputs).
+    fn script() -> DistributorScript {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/distributors/jlcpcb.lua");
+        DistributorScript::load(&path, REQUIRED_FNS_FOR_TEST).expect("load jlcpcb.lua")
+    }
+
+    #[derive(Serialize)]
+    struct SignReq<'a> {
+        secret_key: &'a str,
+        method: &'a str,
+        path: &'a str,
+        timestamp: &'a str,
+        nonce: &'a str,
+        body: &'a str,
+    }
 
     #[test]
     fn signing_is_deterministic_and_matches_spec() {
-        let client = JlcpcbClient::new("app", "ak", "topsecret");
         // Known HMAC-SHA256 of the exact string, base64. Recomputed here to lock
         // the string-to-sign format (METHOD\npath\nts\nnonce\nbody\n).
-        let sig = client.sign("POST", "/x", "1700000000", "abc", "{}");
+        let sig: String = script()
+            .call(
+                "sign_for_test",
+                &SignReq {
+                    secret_key: "topsecret",
+                    method: "POST",
+                    path: "/x",
+                    timestamp: "1700000000",
+                    nonce: "abc",
+                    body: "{}",
+                },
+            )
+            .unwrap();
         let expected = {
+            use base64::Engine;
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
             let mut mac = Hmac::<Sha256>::new_from_slice(b"topsecret").unwrap();
             mac.update(b"POST\n/x\n1700000000\nabc\n{}\n");
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
         };
         assert_eq!(sig, expected);
-    }
-
-    #[test]
-    fn nonces_are_unique() {
-        let a = nonce();
-        let b = nonce();
-        assert_ne!(a, b);
-        assert_eq!(a.len(), 32);
     }
 
     const FIXTURE: &str = r#"{
@@ -236,8 +186,7 @@ mod tests {
 
     #[test]
     fn parses_detail_response() {
-        let value: Value = serde_json::from_str(FIXTURE).unwrap();
-        let c = parse_detail(&value).unwrap();
+        let c: JlcpcbComponent = script().call("parse_component_response", &FIXTURE).unwrap();
         assert_eq!(c.component_code, "C1002");
         assert_eq!(c.component_model, "GZ1608D601TF");
         assert_eq!(c.package.as_deref(), Some("0603"));
@@ -248,5 +197,12 @@ mod tests {
         assert_eq!(c.stock, Some(1072580));
         assert_eq!(c.parameters.len(), 2);
         assert_eq!(c.parameters[0], ("Number of Circuits".into(), "1".into()));
+    }
+
+    #[test]
+    fn parses_absent_component_as_none() {
+        let empty = r#"{"code":200,"data":[]}"#;
+        let c: Option<JlcpcbComponent> = script().call("parse_component_response", &empty).unwrap();
+        assert_eq!(c, None);
     }
 }

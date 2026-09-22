@@ -17,6 +17,7 @@ pub mod bom;
 pub mod bom_repair;
 pub mod carrier;
 pub mod decouple;
+pub mod distributor_lua;
 pub mod drc;
 pub mod dsp_import;
 pub mod eagle;
@@ -97,6 +98,9 @@ pub use carrier::{
     firmware_pinmap_json, AudioChannel, CarrierBuilder, CarrierError, CarrierPlatform,
 };
 pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
+pub use distributor_lua::{
+    distributor_script_dir, load_named_script, DistributorScript, DistributorScriptError,
+};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use dsp_import::{
     DspCore, DspImportManifest, DspImportProblem, DspModule, DspPackage, TargetRef,

@@ -138,6 +138,24 @@ pub fn find_on_path(command: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
+/// Walks up from the working directory looking for `relative` — e.g. a
+/// checkout's own `assets/panels` when run from anywhere inside it. Shared by
+/// every "look for a local scripts dir before falling back to the global
+/// one" resolver ([`crate::panel_lua::panel_script_dir`],
+/// [`crate::distributor_lua::distributor_script_dir`]).
+pub fn find_upward(relative: &str) -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(relative);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
