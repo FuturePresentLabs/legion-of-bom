@@ -20,14 +20,15 @@ use legion_of_bom_core::{
     guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
     min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
     panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
-    render_board_png, render_skidl, render_spec_text, rules, run_drc, run_layout_loop, simulate_ac,
-    simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
-    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, EurorackPlacer, Finding, FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient,
-    KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat,
-    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate,
-    ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig,
-    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    render_board_png, render_skidl, render_spec_text, rules, run_drc, run_layout_loop,
+    schematic_to_svg, simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns,
+    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
+    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EurorackPlacer, Finding,
+    FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo,
+    Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord, PartResolution,
+    PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality, Repair,
+    ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients,
+    StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -116,6 +117,19 @@ enum Command {
         /// Brand logo SVG to render on the back silk (bottom-centre).
         #[arg(long)]
         logo: Option<PathBuf>,
+    },
+    /// Render a readable schematic diagram (symbols + routed nets) from a
+    /// circuit — SVG for viewing/iterating, PDF for a shareable final export.
+    /// At least one of --svg/--pdf is required.
+    Diagram {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Write the diagram as SVG here.
+        #[arg(long)]
+        svg: Option<PathBuf>,
+        /// Write the diagram as PDF here (one page, sized to the diagram).
+        #[arg(long)]
+        pdf: Option<PathBuf>,
     },
     /// Run DRC on a .kicad_pcb and report violations (the layout loop's check step).
     Drc {
@@ -499,6 +513,7 @@ fn main() -> ExitCode {
             iterations,
             logo,
         } => board_cmd(circuit, out, panel, mode, iterations, logo),
+        Command::Diagram { circuit, svg, pdf } => diagram_cmd(circuit, svg, pdf),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab {
             circuit,
@@ -1418,6 +1433,40 @@ fn board_cmd(
     }
     println!("  validate: lob drc {}", path.display());
     println!("  export:   kicad-cli pcb export gerbers --check-zones (fills the pour) | export pos (CPL)");
+    Ok(())
+}
+
+/// Handle `lob diagram <circuit> [--svg <path>] [--pdf <path>]` — a readable
+/// schematic diagram (symbols + routed nets), straight from the circuit model,
+/// no board/layout step involved. SVG is the fast, iterate-on-it format; PDF
+/// is a one-shot render of that same diagram for sharing.
+fn diagram_cmd(circuit: PathBuf, svg_out: Option<PathBuf>, pdf_out: Option<PathBuf>) -> Result<()> {
+    if svg_out.is_none() && pdf_out.is_none() {
+        anyhow::bail!("nothing to write -- pass --svg <path>, --pdf <path>, or both");
+    }
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+
+    let svg = schematic_to_svg(&model);
+    if let Some(path) = &svg_out {
+        std::fs::write(path, &svg).with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    if let Some(path) = &pdf_out {
+        let pdf = svg_to_pdf_bytes(&svg).with_context(|| "rendering schematic PDF")?;
+        std::fs::write(path, &pdf).with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
     Ok(())
 }
 

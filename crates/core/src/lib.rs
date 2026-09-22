@@ -63,6 +63,7 @@ pub mod spice;
 pub mod stage;
 pub mod subboard;
 pub mod summing;
+pub mod svg2pdf;
 pub mod symbols;
 pub mod theme;
 pub mod thonk;
@@ -190,6 +191,7 @@ pub use spice::{
     TranAnalysis, TranDrive, TranPoint, TranResult,
 };
 pub use stage::{Finding, PipelineReport, Severity, Stage, StageError, StageOutcome};
+pub use svg2pdf::{svg_to_pdf_bytes, Svg2PdfError};
 pub use thonk::{product_image_url as thonk_image_url, search as thonk_search, ThonkProduct};
 pub use tools::{find_on_path, kicad_cli_path, phase0_tools, Tool, ToolStatus};
 pub use units::parse_eng_value;
