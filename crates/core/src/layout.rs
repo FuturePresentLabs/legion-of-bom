@@ -323,6 +323,9 @@ pub fn run_layout_loop(
 
         let art = generate_board_artifacts(circuit, &options)?;
         let metrics = measure_against(circuit, &art.placements, &art.route, &rules);
+        // Snapshot before `metrics` potentially moves into `Attempt` below —
+        // repair_nudges needs this attempt's violations after that point.
+        let violations_this_attempt = metrics.violations.clone();
         let mut sc = score(&metrics, &weights);
 
         // Optional per-iteration DRC (opt-in; slow). Errors add a large penalty.
@@ -396,7 +399,7 @@ pub fn run_layout_loop(
         // Repair: perturb the free parts so the next attempt explores a different
         // arrangement the router may find easier (DESIGN §6.5 step 4). Deterministic
         // shake — no RNG — so each attempt is a clean, reproducible git diff.
-        nudges = repair_nudges(&free, i + 1);
+        nudges = repair_nudges(&free, i + 1, &art.placements, &violations_this_attempt);
     }
 
     let Attempt {
@@ -511,12 +514,50 @@ fn relax_key(broken: [f64; 3], unrouted: usize, preference: f64) -> (f64, f64, f
     (broken[0], broken[1], broken[2], unrouted as f64, preference)
 }
 
-fn repair_nudges(free: &[String], attempt: usize) -> HashMap<String, (f64, f64)> {
+/// A part a rule violation names (`Violation.repair`, already computed by
+/// `rules::assess` — see e.g. `Rule::Proximity`'s "move the cap to its IC"
+/// hint) steps partway toward that real, targeted destination instead of
+/// guessing. Every other free part still gets the golden-angle exploration
+/// nudge — the loop's purpose is broader than fixing violations (DESIGN
+/// §6.5 step 4: finding a better *arrangement*, wirelength included, even
+/// where nothing is strictly broken), so an un-implicated part keeps
+/// exploring rather than sitting still.
+///
+/// The guided step is a fixed fraction ([`REPAIR_STEP`]) of the hinted
+/// distance, not the whole way — a hint is computed against *one* current
+/// violation, and the board moves when other parts move too, so jumping
+/// straight to it risks overshooting into a new violation next attempt.
+/// Magnitude for the unguided golden-angle parts still grows with the
+/// attempt number, exactly as before.
+fn repair_nudges(
+    free: &[String],
+    attempt: usize,
+    placements: &HashMap<String, Placement>,
+    violations: &[crate::rules::Violation],
+) -> HashMap<String, (f64, f64)> {
     const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653; // radians
+    /// Fraction of a repair hint's distance to actually move each attempt.
+    const REPAIR_STEP: f64 = 0.6;
     let mag = 2.0 + 1.5 * attempt as f64;
+
+    // Last violation naming a part wins if several do — one guided step per
+    // part per attempt, same as everything else in this loop.
+    let mut targeted: HashMap<&str, (f64, f64)> = HashMap::new();
+    for v in violations {
+        if let Some(r) = &v.repair {
+            targeted.insert(r.refdes.as_str(), r.toward_mm);
+        }
+    }
+
     free.iter()
         .enumerate()
         .map(|(k, r)| {
+            if let (Some(&(tx, ty)), Some(p)) = (targeted.get(r.as_str()), placements.get(r)) {
+                return (
+                    r.clone(),
+                    ((tx - p.x_mm) * REPAIR_STEP, (ty - p.y_mm) * REPAIR_STEP),
+                );
+            }
             let ang = GOLDEN_ANGLE * (k + attempt) as f64;
             (r.clone(), (mag * ang.cos(), mag * ang.sin()))
         })
@@ -962,10 +1003,62 @@ mod tests {
     #[test]
     fn repair_nudges_are_deterministic_and_grow() {
         let free = vec!["C1".to_string(), "R1".to_string()];
-        assert_eq!(repair_nudges(&free, 1), repair_nudges(&free, 1));
-        let mag1 = mag(&repair_nudges(&free, 1)["C1"]);
-        let mag3 = mag(&repair_nudges(&free, 3)["C1"]);
+        let placements = HashMap::new();
+        let violations = Vec::new();
+        assert_eq!(
+            repair_nudges(&free, 1, &placements, &violations),
+            repair_nudges(&free, 1, &placements, &violations)
+        );
+        let mag1 = mag(&repair_nudges(&free, 1, &placements, &violations)["C1"]);
+        let mag3 = mag(&repair_nudges(&free, 3, &placements, &violations)["C1"]);
         assert!(mag3 > mag1, "later attempts perturb further");
+    }
+
+    #[test]
+    fn repair_nudges_steps_a_named_part_toward_its_real_hint_not_a_blind_spiral() {
+        // C1 sits at (0,0); a violation says it should head to (10,0) — same
+        // shape as Rule::Proximity's real "move the cap to its IC" repair.
+        // R1 has no violation naming it at all, so it must still get the
+        // ordinary golden-angle exploration nudge, unaffected.
+        let free = vec!["C1".to_string(), "R1".to_string()];
+        let mut placements = HashMap::new();
+        placements.insert(
+            "C1".to_string(),
+            Placement {
+                x_mm: 0.0,
+                y_mm: 0.0,
+                rotation_deg: 0.0,
+                back: false,
+            },
+        );
+        let violations = vec![crate::rules::Violation {
+            tier: crate::rules::Tier::Electrical,
+            by_mm: 3.0,
+            what: "C1 too far from its IC".into(),
+            repair: Some(crate::rules::Repair {
+                refdes: "C1".to_string(),
+                toward_mm: (10.0, 0.0),
+            }),
+        }];
+
+        let guided = repair_nudges(&free, 1, &placements, &violations);
+        // 0.6 (REPAIR_STEP) of the 10mm gap toward the hint, straight along X.
+        assert!(
+            (guided["C1"].0 - 6.0).abs() < 1e-9,
+            "got {:?}",
+            guided["C1"]
+        );
+        assert!(
+            (guided["C1"].1 - 0.0).abs() < 1e-9,
+            "got {:?}",
+            guided["C1"]
+        );
+
+        // R1 (unmentioned by any violation, and absent from placements too)
+        // matches the plain golden-angle nudge exactly, as if there were no
+        // violations at all.
+        let unguided = repair_nudges(&free, 1, &HashMap::new(), &Vec::new());
+        assert_eq!(guided["R1"], unguided["R1"]);
     }
 
     fn mag((x, y): &(f64, f64)) -> f64 {
