@@ -150,8 +150,19 @@ fn build_subckt_model(
         .filter_map(|tok| tok.split_once('='))
         .collect();
 
-    // Order the part's pins by the subckt's declared terminal order.
-    let terminals = subckt_terminals(&include, &subckt)?;
+    // Order the part's pins by the subckt's declared terminal order. The
+    // bundled catalog resolves against its embedded text directly — see
+    // subckt_terminals_in_text's docs for why a bare "lob_builtin.lib" can't
+    // reliably resolve as a file path here.
+    let terminals = if sim_library == BUILTIN_LIB_NAME {
+        subckt_terminals_in_text(BUILTIN_LIB_TEXT, &subckt).ok_or_else(|| {
+            StageError::Other(format!(
+                "{label}: subckt '{subckt}' not found in {BUILTIN_LIB_NAME}"
+            ))
+        })?
+    } else {
+        subckt_terminals(&include, &subckt)?
+    };
     let mut pin_order = Vec::with_capacity(terminals.len());
     for terminal in &terminals {
         let pin = pin_to_terminal
@@ -282,6 +293,25 @@ fn expand_symbol_dir(sim_library: &str, symbol_dir: &Path) -> PathBuf {
 fn subckt_terminals(sp_path: &Path, name: &str) -> Result<Vec<String>, StageError> {
     let text = std::fs::read_to_string(sp_path)
         .map_err(|e| StageError::Other(format!("reading {}: {e}", sp_path.display())))?;
+    subckt_terminals_in_text(&text, name).ok_or_else(|| {
+        StageError::Other(format!(
+            "subckt '{name}' not found in {}",
+            sp_path.display()
+        ))
+    })
+}
+
+/// The parsing [`subckt_terminals`] does, over an already-loaded `.subckt`
+/// library text rather than a file path — the seam that lets a `Sim.Library`
+/// of exactly [`BUILTIN_LIB_NAME`] resolve against the embedded
+/// [`BUILTIN_LIB_TEXT`] directly. A bare relative filename like
+/// `"lob_builtin.lib"` has no directory to be relative *to* here (unlike
+/// `${KICAD_SYMBOL_DIR}`-prefixed paths, which do) — `subckt_terminals`
+/// reading it from disk would depend on the caller's current directory
+/// happening to match wherever `write_builtin_lib` last wrote it, which
+/// isn't guaranteed. Going through the embedded text instead needs no path
+/// resolution at all.
+fn subckt_terminals_in_text(text: &str, name: &str) -> Option<Vec<String>> {
     for line in text.lines() {
         let line = line.trim();
         if !line.to_ascii_lowercase().starts_with(".subckt ") {
@@ -293,16 +323,13 @@ fn subckt_terminals(sp_path: &Path, name: &str) -> Result<Vec<String>, StageErro
             continue;
         }
         // Terminals run until a `params:` keyword or a `key=value` param.
-        let terminals = toks
-            .take_while(|t| !t.eq_ignore_ascii_case("params:") && !t.contains('='))
-            .map(str::to_string)
-            .collect();
-        return Ok(terminals);
+        return Some(
+            toks.take_while(|t| !t.eq_ignore_ascii_case("params:") && !t.contains('='))
+                .map(str::to_string)
+                .collect(),
+        );
     }
-    Err(StageError::Other(format!(
-        "subckt '{name}' not found in {}",
-        sp_path.display()
-    )))
+    None
 }
 
 /// Filename of the bundled behavioural model library, written next to the SPICE
@@ -875,6 +902,40 @@ mod tests {
         assert_eq!(subckt("U1"), Some("LM13700"));
         assert_eq!(subckt("U2"), Some("TL072"));
         assert!(!models.contains_key("R1"), "a resistor carries no model");
+    }
+
+    #[test]
+    fn explicit_sim_fields_naming_the_builtin_lib_need_no_real_file() {
+        // legion-of-bom-utn.2 regression: a part that names the bundled
+        // catalog directly via Sim.Library (not the name-sniffed
+        // builtin_model() path above) must resolve against BUILTIN_LIB_TEXT,
+        // not a file read that only works if the caller's current directory
+        // happens to match wherever write_builtin_lib last wrote it.
+        let mut part = crate::model::Part::new("Q1", "MMBT3904");
+        part.sim = Some(crate::model::SimModel {
+            device: "SUBCKT".into(),
+            name: "NPN_GENERIC".into(),
+            library: Some(BUILTIN_LIB_NAME.into()),
+            pins: Some("B=b E=e C=c".into()),
+        });
+        let c = crate::model::Circuit {
+            name: "fuzz".into(),
+            parts: vec![part],
+            nets: vec![],
+        };
+        // A symbol_dir that doesn't exist proves this path touches no disk.
+        let models = resolve_models(&c, Path::new("/definitely/does/not/exist")).unwrap();
+        match models.get("Q1") {
+            Some(SpiceModel::Subckt {
+                subckt, pin_order, ..
+            }) => {
+                assert_eq!(subckt, "NPN_GENERIC");
+                // NPN_GENERIC's own terminal order is "c b e" (lob_builtin.lib);
+                // pin_order is the part's pin ids in THAT order, i.e. C, B, E.
+                assert_eq!(pin_order, &["C", "B", "E"]);
+            }
+            other => panic!("expected a resolved NPN_GENERIC subckt, got {other:?}"),
+        }
     }
 
     #[test]

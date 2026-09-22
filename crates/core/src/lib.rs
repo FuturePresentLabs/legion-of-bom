@@ -16,6 +16,7 @@ pub mod board;
 pub mod bom;
 pub mod bom_repair;
 pub mod carrier;
+pub mod decision;
 pub mod decouple;
 pub mod drc;
 pub mod dsp_import;
@@ -44,6 +45,7 @@ pub mod panel;
 pub mod panel_edit;
 pub mod parts;
 pub mod pdf;
+pub mod pedal_panel;
 pub mod photo;
 pub mod placement;
 pub mod placement_edit;
@@ -57,6 +59,7 @@ mod sexpr;
 pub mod skidl;
 pub mod source;
 pub mod sourcing;
+pub mod spec;
 pub mod spice;
 pub mod stage;
 pub mod subboard;
@@ -89,6 +92,9 @@ pub use bom_repair::{
 };
 pub use carrier::{
     firmware_pinmap_json, AudioChannel, CarrierBuilder, CarrierError, CarrierPlatform,
+};
+pub use decision::{
+    Answer, ChoiceAnswer, DecisionClient, DecisionError, DecisionRecord, NamedQuestion, ScoreAnswer,
 };
 pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
@@ -151,6 +157,7 @@ pub use parts::{
     default_parts_dir, HousePart, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
 };
+pub use pedal_panel::{fuzz_pedal_panel_file, PedalCutouts, PedalPanel};
 pub use photo::{photo_keyword, photo_source, thonk_keyword};
 pub use placement::{
     Column as PlacementColumn, Grid as PlacementGrid, PlacementError, PlacementFile, Point,
@@ -177,6 +184,10 @@ pub use source::CircuitSource;
 pub use sourcing::{
     build_query, part_kind, suggest_by_keyword, suggest_mpns, MpnCandidate, PartKind,
     SourcingClients,
+};
+pub use spec::{
+    generate_fuzz_pedal_spec, render_skidl, render_spec_text, EnclosureSize, FuzzPedalSpec,
+    SpecError, Topology,
 };
 pub use spice::{
     signal_channels, simulate_ac, simulate_tran, simulate_tran_drive, AcPoint, AcResult, SimConfig,

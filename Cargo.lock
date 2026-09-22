@@ -665,6 +665,7 @@ dependencies = [
  "dotenvy",
  "legion-of-bom-core",
  "legion-of-bom-web",
+ "serde_json",
  "toml",
  "tracing",
  "tracing-subscriber",

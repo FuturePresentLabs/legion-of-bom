@@ -84,3 +84,15 @@ RdbB dbB vm 1T
 Rvp vp vm 1T
 .model DLM D(Is=1e-14)
 .ends
+* --- Generic small-signal NPN (e.g. 2N3904/MMBT3904-class). ------------------
+* Behavioural in the same sense as the rest of this file: a real SPICE bipolar
+* junction transistor (Gummel-Poon via ngspice's native Q device + NPN model),
+* wrapped in a subckt so it fits the Sim.Device=SUBCKT resolution path
+* (crate::symbols) without a dedicated primitive-device code path. Parameters
+* are generic small-signal defaults (Bf~200, typical Cjc/Cje) -- enough to
+* validate bias point + gain-stage behaviour, not a vendor macro-model, and
+* NOT tied to any specific real part's datasheet. legion-of-bom-utn.2.
+.subckt NPN_GENERIC c b e
+Q1 c b e QNPN_GENERIC
+.model QNPN_GENERIC NPN(Is=1e-14 Bf=200 Vaf=100 Ikf=0.1 Cjc=5p Cje=8p)
+.ends

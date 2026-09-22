@@ -421,6 +421,16 @@ pub trait PanelSpec {
     fn format(&self) -> PanelFormat {
         PanelFormat::Eurorack3U
     }
+    /// The cutout catalogue this panel's hardware resolves against, for
+    /// rendering (DXF/SVG/KiCad panel PCB) to turn a cutout's `footprint`
+    /// name into real hole geometry. Defaults to Eurorack's [`BuiltinCutouts`]
+    /// (3.5mm jacks, 9mm pot bushings); a non-Eurorack format overrides this
+    /// with its own hardware conventions — the exact "library-backed
+    /// `CutoutSource` swaps in with no change to panel/derivation code" seam
+    /// this trait's own docs describe.
+    fn cutout_source(&self) -> &dyn CutoutSource {
+        &BuiltinCutouts
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +720,24 @@ pub struct CutoutFile {
     pub role: Option<String>,
 }
 
+/// Parse a Guitar Pedal fuzz-panel format token (`"pedal-1590b"` /
+/// `"pedal-1590bb"` / `"pedal-125b"`) into its enclosure size. `None` for
+/// anything else, so [`PanelFile::to_spec`] falls through to
+/// [`PanelFormat::parse`] for every existing (Eurorack) format string.
+fn pedal_fuzz_enclosure_size(format: &str) -> Option<crate::spec::EnclosureSize> {
+    match format
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .as_str()
+    {
+        "pedal-1590b" => Some(crate::spec::EnclosureSize::Size1590B),
+        "pedal-1590bb" => Some(crate::spec::EnclosureSize::Size1590BB),
+        "pedal-125b" => Some(crate::spec::EnclosureSize::Size125B),
+        _ => None,
+    }
+}
+
 impl PanelFile {
     /// Parse from TOML bytes.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
@@ -720,6 +748,36 @@ impl PanelFile {
     ///
     /// Returns `Err` if the format is unknown or required fields are missing.
     pub fn to_spec(&self) -> Result<Box<dyn PanelSpec>, String> {
+        // Guitar Pedal formats are checked first: they're not PanelFormat
+        // variants (that enum is Eurorack height-class semantics, HP/tile,
+        // which don't apply here), so they'd never match PanelFormat::parse.
+        // legion-of-bom-utn.3's one concrete case: the fuzz-pedal spec's
+        // RV1 (Fuzz)/RV2 (Volume) pots, laid out by PedalPanel::fuzz_pedal.
+        // A TOML-driven, arbitrary-pedal-circuit layout (mirroring how
+        // Eurorack cutouts come from this file's own `cutouts` list) is a
+        // reasonable next generalization once a second pedal circuit exists
+        // to prove the shape against — not guessed at here.
+        if let Some(size) = pedal_fuzz_enclosure_size(&self.format) {
+            // Cutouts come from this file's own `cutouts` list, same as
+            // Eurorack below — `pedal_panel::fuzz_pedal_panel_file` is what
+            // generates that list in the first place (mirroring how a
+            // Eurorack panel is hand-authored or auto-derived TOML, not
+            // reconstructed from the format string every time).
+            let mut panel =
+                crate::pedal_panel::PedalPanel::empty(size).with_thickness(self.thickness_mm);
+            for c in &self.cutouts {
+                panel = panel.with_cutout_spec(Cutout {
+                    x_mm: c.x_mm,
+                    y_mm: c.y_mm,
+                    rotation_deg: c.rotation_deg,
+                    footprint: c.footprint.clone(),
+                    refdes: c.refdes.clone(),
+                    label: c.label.clone(),
+                    role: c.role.as_deref().and_then(CutoutRole::parse),
+                });
+            }
+            return Ok(Box::new(panel));
+        }
         match PanelFormat::parse(&self.format) {
             Some(format) => {
                 let hp = self
@@ -1461,7 +1519,11 @@ pub fn write_dxf<W: std::fmt::Write>(w: &mut W, panel: &dyn PanelSpec) -> std::f
 
     // Cutouts.
     for cutout in panel.cutouts() {
-        match footprint_shape(&cutout.footprint) {
+        match panel
+            .cutout_source()
+            .cutout(None, &cutout.footprint)
+            .map(|s| s.shape)
+        {
             Some(CutoutShape::Circle { diameter_mm }) => {
                 write_circle(w, cutout.x_mm, cutout.y_mm, diameter_mm / 2.0)?;
             }
@@ -1552,7 +1614,11 @@ pub fn panel_to_svg(
     // Control cutouts + their labels.
     for c in panel.cutouts() {
         let (cx, cy) = (c.x_mm, sy(c.y_mm));
-        match footprint_shape(&c.footprint) {
+        match panel
+            .cutout_source()
+            .cutout(None, &c.footprint)
+            .map(|s| s.shape)
+        {
             Some(CutoutShape::Circle { diameter_mm }) => {
                 s.push_str(&svg_hole_circle(cx, cy, diameter_mm / 2.0));
             }
@@ -1666,7 +1732,11 @@ pub fn panel_to_svg(
             .cutouts()
             .iter()
             .map(|c| {
-                let r = match footprint_shape(&c.footprint) {
+                let r = match panel
+                    .cutout_source()
+                    .cutout(None, &c.footprint)
+                    .map(|s| s.shape)
+                {
                     Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
                     Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
                     None => 1.5,
@@ -1803,7 +1873,11 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
     for (i, c) in panel.cutouts().iter().enumerate() {
         let (cx, cy) = (fx(c.x_mm), fy(c.y_mm));
         let seed = format!("panel.cut.{i}");
-        match footprint_shape(&c.footprint) {
+        match panel
+            .cutout_source()
+            .cutout(None, &c.footprint)
+            .map(|s| s.shape)
+        {
             Some(CutoutShape::Circle { diameter_mm }) => {
                 s.push_str(&edge_circle(cx, cy, diameter_mm / 2.0, &seed))
             }
@@ -1913,7 +1987,11 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
             .cutouts()
             .iter()
             .map(|c| {
-                let r = match footprint_shape(&c.footprint) {
+                let r = match panel
+                    .cutout_source()
+                    .cutout(None, &c.footprint)
+                    .map(|s| s.shape)
+                {
                     Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
                     Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
                     None => 1.5,
@@ -3013,6 +3091,44 @@ footprint = "Alpha9mm"
         let toml = r#"format = "pedal""#;
         let file = PanelFile::from_toml(toml).unwrap();
         assert!(file.to_spec().is_err());
+    }
+
+    #[test]
+    fn panel_file_resolves_a_guitar_pedal_fuzz_panel() {
+        // Cutouts round-trip through the file itself, same as Eurorack --
+        // fuzz_pedal_panel_file generates them once, to_spec() reads them
+        // back from the TOML rather than reconstructing them from the format
+        // string.
+        let generated = crate::pedal_panel::fuzz_pedal_panel_file(
+            crate::spec::EnclosureSize::Size1590B,
+            ("RV1", "RV2"),
+            1.6,
+        );
+        let toml = generated.to_toml().unwrap();
+        let file = PanelFile::from_toml(&toml).unwrap();
+        assert_eq!(file.format, "pedal-1590b");
+        let panel = file.to_spec().unwrap();
+        assert_eq!(panel.width_mm(), 60.0);
+        assert_eq!(panel.height_mm(), 112.0);
+        assert!(panel
+            .cutouts()
+            .iter()
+            .any(|c| c.refdes.as_deref() == Some("RV1")));
+        assert!(panel
+            .cutouts()
+            .iter()
+            .any(|c| c.refdes.as_deref() == Some("RV2")));
+    }
+
+    #[test]
+    fn panel_file_without_explicit_cutouts_is_an_empty_pedal_panel() {
+        // Confirms to_spec() no longer hardcodes RV1/RV2 -- an author who
+        // writes just the format token gets a cutout-free panel, same as an
+        // Eurorack PanelFile with no [[cutouts]] blocks would.
+        let toml = r#"format = "pedal-1590b""#;
+        let file = PanelFile::from_toml(toml).unwrap();
+        let panel = file.to_spec().unwrap();
+        assert!(panel.cutouts().is_empty());
     }
 
     #[test]

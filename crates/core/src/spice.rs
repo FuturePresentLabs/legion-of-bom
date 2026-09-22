@@ -671,6 +671,14 @@ pub fn simulate_tran(
     let data_path = work_dir.join(format!("{name}_tran.dat"));
     let deck_path = work_dir.join(format!("{name}_tran.cir"));
 
+    // Before resolving models: a part whose Sim.Library names the bundled
+    // catalog by its bare filename (crate::symbols::BUILTIN_LIB_NAME) needs
+    // that file to already exist here, because model resolution reads it to
+    // discover the subckt's terminal order (crate::symbols::subckt_terminals)
+    // -- unlike the auto-detected builtin_model() path (op-amp/LM13700),
+    // which hardcodes pin order and never reads the file until ngspice runs.
+    crate::symbols::write_builtin_lib(&work_dir)?;
+
     let models = match crate::skidl::kicad_symbol_dir() {
         Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
         None => HashMap::new(),
@@ -678,7 +686,6 @@ pub fn simulate_tran(
 
     let deck = generate_tran_deck(circuit, config, tran, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
-    crate::symbols::write_builtin_lib(&work_dir)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")
@@ -819,6 +826,10 @@ pub fn simulate_tran_drive(
     let data_path = work_dir.join(format!("{name}_scope.dat"));
     let deck_path = work_dir.join(format!("{name}_scope.cir"));
 
+    // See simulate_tran: must happen before resolve_models, which reads this
+    // file for any part whose Sim.Library names it directly.
+    crate::symbols::write_builtin_lib(&work_dir)?;
+
     let models = match crate::skidl::kicad_symbol_dir() {
         Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
         None => HashMap::new(),
@@ -826,7 +837,6 @@ pub fn simulate_tran_drive(
 
     let deck = generate_tran_deck_drive(circuit, config, drive, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
-    crate::symbols::write_builtin_lib(&work_dir)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")
@@ -874,6 +884,10 @@ pub fn simulate_ac(
     let data_path = work_dir.join(format!("{name}_ac.dat"));
     let deck_path = work_dir.join(format!("{name}.cir"));
 
+    // See simulate_tran: must happen before resolve_models, which reads this
+    // file for any part whose Sim.Library names it directly.
+    crate::symbols::write_builtin_lib(&work_dir)?;
+
     // Resolve each modelled component's SPICE model from its symbol (the parts
     // library will be this source later). Without a symbol dir, only primitives
     // (R/C/L) can be simulated.
@@ -884,7 +898,6 @@ pub fn simulate_ac(
 
     let deck = generate_ac_deck(circuit, config, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
-    crate::symbols::write_builtin_lib(&work_dir)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")
