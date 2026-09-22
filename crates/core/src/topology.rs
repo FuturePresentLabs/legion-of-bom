@@ -424,16 +424,23 @@ fact. `lob parts gate` will (correctly) block real board/BOM generation on
 this MPN until a human confirms it against the datasheet, same as any other
 unverified part (DESIGN.md 3.5/4.3).
 
-J1/J2/SW1/SW2/SW3 carry no footprint yet. SW1/SW2/SW3 are one physical
-3PDT part represented as three schematic symbols (see above), and how that
-maps to a single PCB footprint placement (vs. three) is a real board-layout
-question this run doesn't answer. J1/J2's real stock KiCad footprint
-candidates (e.g. Neutrik NRJ4HH/NRJ4HF) carry 7 pads (mounting + switch
-contacts) against this symbol's 2 pins -- a real mismatch, not something to
-paper over with a footprint string that happens to sound right. `lob board`
-isn't expected to place this circuit correctly until these are resolved;
-`lob run`'s ERC/SPICE checks above don't need a footprint at all, so
-they're unaffected.
+J1/J2/SW1/SW2/SW3 carry real MPNs (Switchcraft 11; Alpha SF17020F-0302-21R-L,
+solder-lug) but no PCB footprint, on purpose, not as a gap: both parts are
+genuinely panel-mount/solder-lug hardware wired to this board via loose
+leads in real hand-wired pedal builds, the same real precedent
+GuitarML/GuitarPedalPCBs (MIT) and the true-bypass wiring convention this
+circuit already follows both use -- there is no PCB pin pattern to draw a
+footprint for, because the real parts never solder to a board. (J1/J2's
+real stock KiCad footprint candidates, e.g. Neutrik NRJ4HH/NRJ4HF, carry 7
+pads -- mounting + switch contacts -- against this symbol's 2 pins; a real
+mismatch confirming they're not board parts, not something to paper over
+with a footprint string that happens to sound right.) SW1/SW2/SW3 additionally
+represent one physical 3PDT part as three schematic symbols -- real
+precedent favors one combined symbol + one 9-pad footprint instead, flagged
+as open follow-up, not resolved here. `lob board` skips a part with no
+footprint (can't place what has no geometry, warns rather than refusing the
+whole board) rather than refusing to build; `lob run`'s ERC/SPICE checks
+don't need a footprint at all, so they're unaffected either way.
 
 Panel layout is NOT modelled here -- this file is the audio signal path plus
 its true-bypass switching, checked by lob run (ERC + ngspice); panel/
@@ -451,6 +458,17 @@ R_FOOTPRINT = "Resistor_SMD:R_0805_2012Metric"
 C_FOOTPRINT = "Capacitor_SMD:C_0805_2012Metric"
 Q_FOOTPRINT = "Package_TO_SOT_SMD:SOT-23"
 Q_MPN = "MMBT3904"  # NPN silicon, SOT-23 -- footprint lead order unverified, see docstring
+# Switchcraft 11 -- "1/4in Mono 2 Conductor Jack w/Nut & Washer, Open Circuit".
+# Datasheet-confirmed 2-pin (T/S), exact match for AudioJack2 -- and confirmed
+# panel-mount/solder-lug, no PCB pin pattern, so it stays footprint-less on
+# purpose (see build()); the MPN is real even though the part never solders
+# to this board. https://www.switchcraft.com/1-4-mono-2-conductor-jack-w-nut-and-washer-open-circuit/11/
+J_MPN = "11"
+# Taiwan Alpha SF17020F-0302-21R-L, solder-lug 3PDT footswitch -- Tayda A-4191.
+# Datasheet-confirmed 9-terminal, 3x3 grid; solder-lug variant matches this
+# circuit's loose-lead true-bypass wiring (see build()), same off-board
+# treatment as the jacks above, for the same real reason.
+SW_MPN = "SF17020F-0302-21R-L"
 
 
 def _npn(ref):
@@ -479,6 +497,8 @@ def build():
     # than silently carrying a footprint string that doesn't resolve.
     j_in = Part("Connector_Audio", "AudioJack2", ref="J1")
     j_out = Part("Connector_Audio", "AudioJack2", ref="J2")
+    j_in.fields["MPN"] = J_MPN
+    j_out.fields["MPN"] = J_MPN
     gnd += j_in["S"], j_out["S"]
 
     # -- True-bypass 3PDT footswitch: three SPDT poles (B=common, A=engaged,
@@ -498,6 +518,9 @@ def build():
     sw_in = Part("Switch", "SW_SPDT", ref="SW1")
     sw_out = Part("Switch", "SW_SPDT", ref="SW2")
     sw_led = Part("Switch", "SW_SPDT", ref="SW3")
+    sw_in.fields["MPN"] = SW_MPN
+    sw_out.fields["MPN"] = SW_MPN
+    sw_led.fields["MPN"] = SW_MPN
 
     bypass_link = Net("BYPASS_LINK")
     jack_in = Net("JACK_IN")
