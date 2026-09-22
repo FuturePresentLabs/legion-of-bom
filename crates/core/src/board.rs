@@ -12,7 +12,7 @@
 //! Output is deterministic (UUIDs derived from content) so each layout attempt is
 //! a clean git diff, per 6.5.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -601,7 +601,9 @@ impl Placer for EurorackPlacer {
 /// says little about *where* a part wants to be) barely pulls; `critical()` nets
 /// pull [`CRITICAL_PULL`]× harder. Placement order is greedy from the anchored
 /// frontier: the still-unplaced part most strongly tied to what's already down
-/// goes next.
+/// goes next, ties (and the fallback spread for a part with nothing placed
+/// yet to pull it) broken by [`signal_flow_depth`] when the circuit has a
+/// recognizable input net — real signal-flow order, not refdes text.
 #[derive(Debug, Clone)]
 pub struct SeededPlacer {
     pub width_mm: f64,
@@ -705,6 +707,77 @@ pub fn decoupling_pairs(circuit: &dyn CircuitSource) -> Vec<(String, String)> {
         bonuses.push((r.to_string(), ic.to_string()));
     }
     bonuses
+}
+
+/// Hop distance from the circuit's recognized signal input, over net-shared
+/// part adjacency — how many nets downstream a part sits from `IN`. `None`
+/// when [`crate::spice::SimConfig::infer`]'s heuristic can't find a real
+/// input net in this circuit (most Eurorack modules don't use `IN`-shaped
+/// net names), so callers fall back to whatever they'd otherwise do — this
+/// is an enhancement to a known, common convention, not a guess imposed on
+/// every circuit.
+///
+/// This is what "DAG-aware" placement ordering means here: not a guess at
+/// which part matters more, but a real BFS over the netlist's own
+/// connectivity, starting from the one net [`SimConfig::infer`] already
+/// treats as ground truth for "where does the signal come in" (the same
+/// net driven for AC/transient simulation).
+fn signal_flow_depth(circuit: &dyn CircuitSource) -> Option<HashMap<String, usize>> {
+    let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    let input_net = crate::spice::SimConfig::infer(circuit).input_net;
+    if !net_names.contains(input_net.as_str()) {
+        return None;
+    }
+
+    fn refs_of(pins: &[crate::model::PinRef]) -> Vec<&str> {
+        let mut r: Vec<&str> = pins.iter().map(|p| p.refdes.0.as_str()).collect();
+        r.sort_unstable();
+        r.dedup();
+        r
+    }
+
+    // Unweighted part<->part adjacency: any two parts sharing a net are
+    // neighbours, same net-derived edges the placer's own centroid pull
+    // uses, just without the pull weighting (BFS only needs "connected").
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for net in circuit.nets() {
+        let refs = refs_of(&net.pins);
+        for &a in &refs {
+            for &b in &refs {
+                if a != b {
+                    adj.entry(a).or_default().push(b);
+                }
+            }
+        }
+    }
+
+    let start: Vec<&str> = circuit
+        .nets()
+        .iter()
+        .find(|n| n.name == input_net)
+        .map(|n| refs_of(&n.pins))
+        .unwrap_or_default();
+    if start.is_empty() {
+        return None;
+    }
+
+    let mut depth: HashMap<String, usize> = HashMap::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    for &s in &start {
+        if depth.insert(s.to_string(), 0).is_none() {
+            queue.push_back(s);
+        }
+    }
+    while let Some(r) = queue.pop_front() {
+        let d = depth[r];
+        for &nb in adj.get(r).map(Vec::as_slice).unwrap_or_default() {
+            if !depth.contains_key(nb) {
+                depth.insert(nb.to_string(), d + 1);
+                queue.push_back(nb);
+            }
+        }
+    }
+    Some(depth)
 }
 
 impl SeededPlacer {
@@ -866,7 +939,11 @@ impl Placer for SeededPlacer {
         }
 
         // Free parts, in a deterministic base order (also the even-spread fallback
-        // order for parts with no placed neighbour yet).
+        // order for parts with no placed neighbour yet, and the greedy tie-break
+        // below). Alphabetical by default; DAG-ordered by real signal-flow depth
+        // when the circuit has a recognizable input net (`signal_flow_depth`) —
+        // so a part with no already-placed neighbour yet still lands somewhere
+        // signal-sensible instead of wherever its refdes happens to sort.
         let mut free: Vec<String> = circuit
             .parts()
             .iter()
@@ -875,6 +952,9 @@ impl Placer for SeededPlacer {
             .filter(|r| !power_headers.contains(r))
             .collect();
         free.sort();
+        if let Some(depth) = signal_flow_depth(circuit) {
+            free.sort_by_key(|r| (depth.get(r).copied().unwrap_or(usize::MAX), r.clone()));
+        }
         let free_index: HashMap<String, usize> = free
             .iter()
             .enumerate()
@@ -3105,6 +3185,78 @@ pub(crate) fn det_uuid(seed: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{Circuit, Net, Part, PinRef};
+
+    /// A 2-part signal chain deliberately named so alphabetical refdes order
+    /// (A1, Z1) *disagrees* with real signal-flow order (Z1 is one hop from
+    /// `IN`, A1 is two) — proves [`signal_flow_depth`] changes something
+    /// real, not just "doesn't crash."
+    fn dag_chain() -> Circuit {
+        Circuit {
+            name: "dag_chain".into(),
+            parts: vec![
+                Part::new("Z1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+                Part::new("A1", "159n").with_footprint("Capacitor_SMD:C_0805_2012Metric"),
+            ],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("Z1", "1")]),
+                Net::new("MID", vec![PinRef::new("Z1", "2"), PinRef::new("A1", "1")]),
+                Net::new("OUT", vec![PinRef::new("A1", "2")]),
+            ],
+        }
+    }
+
+    /// No net shaped like a recognizable signal input at all (not even the
+    /// `SimConfig::infer` default) — the case `signal_flow_depth` must bow
+    /// out of rather than pretend to answer.
+    fn no_recognizable_input() -> Circuit {
+        Circuit {
+            name: "no_input".into(),
+            parts: vec![
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+                Part::new("R2", "1k").with_footprint("Resistor_SMD:R_0805_2012Metric"),
+            ],
+            nets: vec![
+                Net::new("A", vec![PinRef::new("R1", "1")]),
+                Net::new("B", vec![PinRef::new("R1", "2"), PinRef::new("R2", "1")]),
+                Net::new("GND", vec![PinRef::new("R2", "2")]),
+            ],
+        }
+    }
+
+    #[test]
+    fn signal_flow_depth_follows_real_connectivity_not_refdes_text() {
+        let depth = signal_flow_depth(&dag_chain()).expect("IN net is present");
+        assert_eq!(depth.get("Z1"), Some(&0), "Z1 touches IN directly");
+        assert_eq!(depth.get("A1"), Some(&1), "A1 is one hop further, via MID");
+    }
+
+    #[test]
+    fn signal_flow_depth_is_none_without_a_recognizable_input_net() {
+        assert!(signal_flow_depth(&no_recognizable_input()).is_none());
+    }
+
+    #[test]
+    fn seeded_placer_places_the_lowest_signal_depth_part_first() {
+        // Neither part is anchored, so the first one placed uses the raw
+        // "no neighbour placed yet" fallback spread -- index 0 of 2, upper
+        // portion of the board. Under plain alphabetical order that slot
+        // would go to A1; DAG order gives it to Z1 (the real depth-0 part)
+        // instead. Only asserting on the first-placed part's own position
+        // (not a Z1-vs-A1 comparison) -- A1 is placed second and gets pulled
+        // toward Z1's actual spot via net adjacency, so its own position
+        // depends on `nearest_clear_spot`'s search order, not just index.
+        let circuit = dag_chain();
+        let placer = SeededPlacer::new(50.0, 50.0, (0.0, 0.0), HashMap::new());
+        let placements = placer.place(&circuit, &HashMap::new());
+        let z1 = placements.get("Z1").expect("Z1 placed");
+        let board_mid_y = EDGE_MARGIN_MM + (50.0 - 2.0 * EDGE_MARGIN_MM) / 2.0;
+        assert!(
+            z1.y_mm < board_mid_y,
+            "Z1 (signal depth 0, placed first, empty board) should land in the upper half: y={} mid={}",
+            z1.y_mm,
+            board_mid_y
+        );
+    }
 
     fn rc() -> Circuit {
         Circuit {
