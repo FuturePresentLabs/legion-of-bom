@@ -39,7 +39,10 @@ function layout(spec)
         { x_mm = w / 2, y_mm = power_y, footprint = "DC_Jack_5.5x2.1mm", label = "9V" },
         { x_mm = pot_x[1], y_mm = pot_y, footprint = "Potentiometer_16mm", refdes = spec.pot_refdes[1], label = "FUZZ", role = "knob" },
         { x_mm = pot_x[2], y_mm = pot_y, footprint = "Potentiometer_16mm", refdes = spec.pot_refdes[2], label = "VOLUME", role = "knob" },
-        { x_mm = w / 2, y_mm = led_y, footprint = "LED_5mm" },
+        -- D1 is a real board part (LED_THT:LED_D5.0mm, unlike the loose-wired
+        -- jacks/footswitch), so it's anchored like the pots -- the board
+        -- places its real pad at the panel hole it shines through.
+        { x_mm = w / 2, y_mm = led_y, footprint = "LED_5mm", refdes = "D1" },
         { x_mm = w / 2, y_mm = footswitch_y, footprint = "Footswitch_3PDT", role = "switch" },
     }
 end

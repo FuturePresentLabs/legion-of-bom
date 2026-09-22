@@ -251,7 +251,12 @@ impl PedalPanel {
                 y_mm: led_y,
                 rotation_deg: 0.0,
                 footprint: "LED_5mm".to_string(),
-                refdes: None,
+                // D1 is a real board part (LED_THT:LED_D5.0mm, unlike the
+                // loose-wired jacks/footswitch) -- anchored so the board
+                // places its actual pad at the panel hole it shines
+                // through, and so this panel matches what auto-derivation
+                // expects for any control with a real footprint.
+                refdes: Some("D1".to_string()),
                 label: None,
                 role: None,
             },
@@ -583,7 +588,7 @@ mod tests {
             .iter()
             .filter_map(|c| c.refdes.as_deref())
             .collect();
-        assert_eq!(anchored, vec!["RV1", "RV2"]);
+        assert_eq!(anchored, vec!["RV1", "RV2", "D1"]);
 
         // No overlaps, same threshold as the Rust layout's own check.
         let cutouts = panel.cutouts();
@@ -596,14 +601,17 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_pedal_panel_anchors_the_named_pots_and_leaves_hardware_unanchored() {
+    fn fuzz_pedal_panel_anchors_real_board_parts_and_leaves_loose_wired_hardware_unanchored() {
+        // Pots and the LED have real footprints and are board parts -- anchored.
+        // Jacks/power/footswitch are genuinely off-board (loose-wired), so they
+        // stay unanchored -- panel geometry only, no board part placed there.
         let panel = PedalPanel::fuzz_pedal(EnclosureSize::Size1590B, ("RV1", "RV2"));
         let anchored: Vec<&str> = panel
             .cutouts()
             .iter()
             .filter_map(|c| c.refdes.as_deref())
             .collect();
-        assert_eq!(anchored, vec!["RV1", "RV2"]);
+        assert_eq!(anchored, vec!["RV1", "RV2", "D1"]);
         assert!(panel.mounting_holes().is_empty());
     }
 

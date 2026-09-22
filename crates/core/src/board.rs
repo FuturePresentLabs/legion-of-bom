@@ -1562,7 +1562,11 @@ pub struct BoardArtifacts {
 /// Load every part's footprint and measure its placement facts (keep-out extent,
 /// origin offset, through-hole pads, side) — the same measurement
 /// [`generate_board_artifacts`] does in its first pass, exposed so sizing tools
-/// (e.g. [`minimum_hp`]) can reason about a board without generating it.
+/// (e.g. [`minimum_hp`]) can reason about a board without generating it. A part
+/// with no footprint at all (genuinely off-board hardware — see
+/// [`BoardArtifacts::not_placed`]) is skipped, same as that first pass, rather
+/// than failing every caller of this shared measurement — sizing tools have no
+/// more use for a part's geometry than the placer does when there is none.
 pub fn build_facts(
     circuit: &dyn CircuitSource,
     footprint_dir: &Path,
@@ -1570,12 +1574,10 @@ pub fn build_facts(
     let mut facts = HashMap::new();
     for part in circuit.parts() {
         let refdes = part.refdes.0.as_str();
-        let lib_part = part
-            .footprint
-            .as_deref()
-            .ok_or_else(|| BoardError::NoFootprint {
-                refdes: refdes.to_string(),
-            })?;
+        let lib_part = match part.footprint.as_deref() {
+            Some(fp) => fp,
+            None => continue,
+        };
         let fp = load_footprint(footprint_dir, lib_part)?;
         let pads = footprint_pads(&fp);
         let courtyard = courtyard_extent(&fp);
