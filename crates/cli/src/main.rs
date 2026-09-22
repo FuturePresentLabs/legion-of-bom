@@ -16,17 +16,18 @@ use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
-    generate_board_artifacts, generate_bom, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom,
-    jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
-    package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
-    part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, rules, run_drc,
-    run_layout_loop, simulate_ac, simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc,
-    value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
-    BuiltinCutouts, CircuitSource, EurorackPlacer, Finding, GuideOptions, HpSearch, JlcpcbClient,
-    KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat,
-    PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate,
-    ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig,
-    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    fuzz_pedal_panel_file, generate_board_artifacts, generate_bom, generate_fuzz_pedal_spec, guide,
+    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
+    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
+    render_board_png, render_skidl, render_spec_text, rules, run_drc, run_layout_loop, simulate_ac,
+    simulate_tran, suggest_by_keyword, suggest_mpns, validate_erc, value_key, zip_dir,
+    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
+    CircuitSource, DecisionClient, EurorackPlacer, Finding, FuzzPedalSpec, GuideOptions, HpSearch,
+    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
+    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -185,6 +186,45 @@ enum Command {
     Panel {
         #[command(subcommand)]
         action: PanelCmd,
+    },
+    /// Concept -> spec: ask every typed decision for a design brief and write
+    /// a spec -- raw text plus a machine-readable JSON, no schematic
+    /// (legion-of-bom-utn). Needs SYSTEMONE_API_KEY (and optionally
+    /// SYSTEMONE_BASE_URL for a local dev endpoint) in .env. Follow with
+    /// `lob schematic` to render the circuit from the written spec.
+    Spec {
+        /// Circuit family from the curated library (today: "fuzz-pedal").
+        family: String,
+        /// Free-text design brief, carried as decision context (not parsed for
+        /// control flow -- the decisions, not the brief, choose the circuit).
+        #[arg(long)]
+        brief: String,
+        /// Base output path (no extension): writes "<out>.json" (machine-
+        /// readable, input to `lob schematic`) and "<out>.txt" (human-readable).
+        #[arg(long)]
+        out: PathBuf,
+        /// Also write the full decision trace (JSON: key/type/chosen/confidence)
+        /// here, for eval scoring (e.g. PCBBench).
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+    /// Spec -> design: render a SKiDL schematic from a spec file written by
+    /// `lob spec`. A pure function of the spec -- no decision calls, no
+    /// network -- so the schematic traces back to exactly what System One
+    /// decided, replayably.
+    Schematic {
+        /// Spec JSON path (from `lob spec ... --out <base>`, i.e. "<base>.json").
+        spec: PathBuf,
+        /// Write the rendered SKiDL circuit here.
+        #[arg(long)]
+        out: PathBuf,
+        /// Also write a Guitar Pedal panel TOML sized to the spec's enclosure
+        /// class, with the Fuzz/Volume pots anchored to the circuit's RV1/RV2
+        /// refdes -- a pure function of the spec, same as the schematic
+        /// itself, so `lob board --panel <this file>` has real cutouts to
+        /// check the circuit against without a further design decision.
+        #[arg(long)]
+        panel: Option<PathBuf>,
     },
 }
 
@@ -478,6 +518,13 @@ fn main() -> ExitCode {
         } => guide_cmd(circuit, out, panel, kit, mode),
         Command::Import { action } => import_cmd(action),
         Command::Panel { action } => panel_cmd(action),
+        Command::Spec {
+            family,
+            brief,
+            out,
+            trace,
+        } => spec_cmd(family, brief, out, trace),
+        Command::Schematic { spec, out, panel } => schematic_cmd(spec, out, panel),
     };
 
     match result {
@@ -605,6 +652,104 @@ fn run(circuit: PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("pipeline reported stage failures")
     }
+}
+
+/// Concept -> spec: ask every typed decision for `family` once, and write the
+/// spec -- raw text (`<out>.txt`) plus machine-readable JSON (`<out>.json`) --
+/// with NO schematic. Today's curated set has one family ("fuzz-pedal"); an
+/// unknown family fails loud rather than guessing at one.
+fn spec_cmd(family: String, brief: String, out: PathBuf, trace: Option<PathBuf>) -> Result<()> {
+    if family != "fuzz-pedal" {
+        anyhow::bail!("unknown circuit family '{family}' (curated set today: fuzz-pedal)");
+    }
+
+    let mut client = DecisionClient::from_env()
+        .with_context(|| "SYSTEMONE_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint")?;
+
+    let spec =
+        generate_fuzz_pedal_spec(&mut client, &brief).with_context(|| "spec generation failed")?;
+
+    let json_path = with_extension_appended(&out, "json");
+    let text_path = with_extension_appended(&out, "txt");
+
+    let json = serde_json::to_string_pretty(&spec).with_context(|| "serializing spec")?;
+    std::fs::write(&json_path, json).with_context(|| format!("writing {}", json_path.display()))?;
+
+    let text = render_spec_text(&brief, &spec, &client.trace);
+    std::fs::write(&text_path, text).with_context(|| format!("writing {}", text_path.display()))?;
+
+    println!("lob spec {family}: {}", text_path.display());
+    println!("  spec (machine-readable): {}", json_path.display());
+    println!("  enclosure size class: {}", spec.enclosure_size.key());
+    println!("  decisions made: {}", client.trace.len());
+    for record in &client.trace {
+        println!(
+            "    {:<16} {:<8} {} (confidence {:.2})",
+            record.key, record.kind, record.chosen, record.confidence
+        );
+    }
+
+    if let Some(trace_path) = trace {
+        let json = serde_json::to_string_pretty(&client.trace)
+            .with_context(|| "serializing decision trace")?;
+        std::fs::write(&trace_path, json)
+            .with_context(|| format!("writing {}", trace_path.display()))?;
+        println!("wrote decision trace: {}", trace_path.display());
+    }
+
+    println!(
+        "\nNext: `lob schematic {} --out <circuit>.py` to render the circuit \
+         from exactly these decisions (no further System One calls).",
+        json_path.display()
+    );
+    Ok(())
+}
+
+/// Spec -> design: read a spec JSON and render its SKiDL schematic. A pure
+/// function of the spec file's contents -- makes no decision calls, so
+/// running it twice on the same spec always produces the same circuit.
+fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Result<()> {
+    let json = std::fs::read_to_string(&spec_path)
+        .with_context(|| format!("reading spec {}", spec_path.display()))?;
+    let spec: FuzzPedalSpec = serde_json::from_str(&json)
+        .with_context(|| format!("parsing spec {}", spec_path.display()))?;
+
+    let py = render_skidl(&spec);
+    std::fs::write(&out, &py).with_context(|| format!("writing {}", out.display()))?;
+
+    println!("lob schematic {}: {}", spec_path.display(), out.display());
+
+    if let Some(panel_path) = panel {
+        let panel_file = fuzz_pedal_panel_file(spec.enclosure_size, ("RV1", "RV2"), 1.6);
+        let toml = panel_file
+            .to_toml()
+            .with_context(|| "serializing panel spec")?;
+        std::fs::write(&panel_path, toml)
+            .with_context(|| format!("writing {}", panel_path.display()))?;
+        println!(
+            "  panel ({}): {}",
+            spec.enclosure_size.key(),
+            panel_path.display()
+        );
+    }
+
+    println!(
+        "\nNext: `lob run {out}` to validate + simulate; `lob parts gate {out}` \
+         before real board/BOM generation (the transistor MPN is not \
+         verified_by_human yet -- see the generated file's docstring).",
+        out = out.display()
+    );
+    Ok(())
+}
+
+/// Append `.ext` after whatever extension (if any) `path` already has, so
+/// `--out fuzz_v1` produces `fuzz_v1.json`/`fuzz_v1.txt` and `--out a.b`
+/// produces `a.b.json`/`a.b.txt` -- never silently drops what the caller wrote.
+fn with_extension_appended(path: &std::path::Path, ext: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
 }
 
 /// Dwell (s) each step of the crosstalk stimulus is held. Long enough for a slew
