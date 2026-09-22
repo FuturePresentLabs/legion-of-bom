@@ -39,3 +39,9 @@ toml_edit = "0.22"
 # sandboxed stdlib, a narrow required-function contract, serde-table
 # marshaling at the boundary. Same version/feature set for consistency.
 mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
+# The parts library's storage (crates/core/src/parts.rs). Runtime `query`/
+# `execute`, not the `query!` macro family, so building needs no live DB.
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+] }

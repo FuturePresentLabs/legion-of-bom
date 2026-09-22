@@ -71,7 +71,7 @@ enum Command {
     },
     /// Check that the external toolchain (ngspice, kicad-cli, SKiDL) is available.
     Doctor,
-    /// Inspect and edit the global, Dolt-backed parts library.
+    /// Inspect and edit the global, SQLite-backed parts library.
     Parts {
         #[command(subcommand)]
         action: PartsCmd,
@@ -339,8 +339,8 @@ enum PartsCmd {
         /// Only this kind (resistor, capacitor, jack, pot, ic, ...).
         #[arg(long)]
         kind: Option<String>,
-        /// Write CSV instead of a table — the reviewable export to commit, since
-        /// the Dolt store itself is local (the same split as `.beads`).
+        /// Write CSV instead of a table — a reviewable, diffable export, since
+        /// the SQLite file itself isn't (the same split as `.beads`).
         #[arg(long)]
         csv: bool,
     },
@@ -2547,7 +2547,7 @@ fn guide_cmd(
     println!("  kit: {:?} (assembly copy + framing)", guide.kit);
 
     // Per-part assembly notes from the parts library (best-effort; keyed by MPN
-    // via resolve_circuit). Skips silently when the library (dolt) is unavailable.
+    // via resolve_circuit). Skips silently when the library is unavailable.
     if let Ok(lib) = PartsLibrary::open(default_parts_dir()) {
         if let Ok(resolutions) = lib.resolve_circuit(&model) {
             let notes: std::collections::BTreeMap<String, Vec<String>> = resolutions
@@ -2708,7 +2708,7 @@ fn bom_cmd(
     if visual {
         // Hydrate line photos from the parts library first (curated/scripted
         // per-MPN images — the durable source for boutique parts). Best-effort:
-        // skip silently if the library (dolt) isn't available.
+        // skip silently if the library isn't available.
         if let Ok(lib) = PartsLibrary::open(default_parts_dir()) {
             for line in &mut bom.lines {
                 if line.image_url.is_some() {
@@ -2817,12 +2817,12 @@ fn eagle_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// Handle `lob parts …` against the global parts library.
 fn parts_cmd(action: PartsCmd) -> Result<()> {
     // `suggest` is about parts NOT yet in the library (generic, no MPN), so it
-    // doesn't need Dolt — handle it before opening the library.
+    // doesn't need the library open yet — handle it before opening it.
     if let PartsCmd::Suggest { circuit, limit } = action {
         return suggest_cmd(circuit, limit);
     }
-    let lib = PartsLibrary::open(default_parts_dir())
-        .with_context(|| "opening the parts library (is `dolt` installed?)")?;
+    let lib =
+        PartsLibrary::open(default_parts_dir()).with_context(|| "opening the parts library")?;
     match action {
         PartsCmd::Learn { packages, bom } => {
             // A BOM states what was bought, keyed by refdes — the half an Eagle
@@ -3074,7 +3074,6 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             part.manufacturer = manufacturer.or(part.manufacturer);
             part.datasheet_url = datasheet.or(part.datasheet_url);
             lib.upsert_part(&part)?;
-            lib.commit(&format!("parts: add/update {mpn}"))?;
             println!("saved {mpn}");
         }
         PartsCmd::Verify { mpn, by } => {
@@ -3082,7 +3081,6 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                 anyhow::bail!("no such part: {mpn}");
             }
             lib.mark_verified(&mpn, &by)?;
-            lib.commit(&format!("parts: verify {mpn}"))?;
             println!("verified {mpn} (by {by})");
         }
         PartsCmd::SetImage { mpn, source } => {
@@ -3096,12 +3094,10 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                 source.clone()
             };
             lib.set_image_url(&mpn, Some(&stored))?;
-            lib.commit(&format!("parts: set image {mpn}"))?;
             println!("set image for {mpn}: {stored}");
         }
         PartsCmd::SetAssembly { mpn, notes } => {
             lib.set_assembly_steps(&mpn, &notes)?;
-            lib.commit(&format!("parts: set assembly {mpn}"))?;
             if notes.is_empty() {
                 println!("cleared assembly notes for {mpn}");
             } else {
@@ -3114,7 +3110,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         PartsCmd::Resolve { circuit } => {
             print_resolutions(&resolve_circuit_file(&lib, circuit)?);
         }
-        // Handled before the library is opened (it needs no Dolt).
+        // Handled before the library is opened (it doesn't need one).
         PartsCmd::Suggest { .. } => unreachable!("suggest is dispatched before lib open"),
         PartsCmd::Gate { circuit } => {
             let resolutions = resolve_circuit_file(&lib, circuit)?;
@@ -3162,7 +3158,6 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             let part = merge_fetched(lib.get_part(&fetched.mpn)?, fetched);
             let mpn = part.mpn.clone();
             lib.upsert_part(&part)?;
-            lib.commit(&format!("parts: fetch {mpn} from {source}"))?;
             println!("fetched {mpn} from {source}:");
             print_part(&part);
             println!("\n(unverified — run `lob parts verify {mpn}` after confirming)");

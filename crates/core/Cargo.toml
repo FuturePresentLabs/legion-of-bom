@@ -18,3 +18,5 @@ sha2.workspace = true
 base64.workspace = true
 ooda.workspace = true
 mlua.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

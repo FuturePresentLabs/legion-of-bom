@@ -1,4 +1,4 @@
-//! The global, Dolt-backed parts library — verified part definitions keyed by
+//! The global, SQLite-backed parts library — verified part definitions keyed by
 //! MPN. DESIGN.md 2.6, 3.5; MCP.md 1.2.
 //!
 //! This answers "is this part definition trustworthy" (pinout, ratings, and —
@@ -6,58 +6,69 @@
 //! (that's BOM's job, layered on top). It is *global* and cross-project on
 //! purpose: once a part is verified it stays verified for every future project.
 //!
-//! Storage is a Dolt repository, version-controlled like git (each write can be
-//! committed, diffed, reverted). We drive the `dolt` CLI directly (shelling out,
-//! the same pattern as the SKiDL/ngspice/KiCad stages) rather than running a SQL
-//! server — simplest correct thing for a local-first tool; a `dolt sql-server` +
-//! prepared statements is the upgrade path if throughput ever demands it.
+//! Storage is a single SQLite file via `sqlx` — no version history (a write
+//! simply overwrites what was there), no server process, nothing to install.
+//! The public API stays synchronous (every other stage in this crate is): each
+//! call runs its query against a small dedicated tokio runtime and blocks on
+//! the result, so callers never see `async`/`.await`.
+//!
+//! [`PartsError::DoltNotFound`] and [`PartsError::Dolt`] are unused here — they
+//! remain because [`crate::panel::PanelOrders`] still shells out to Dolt and
+//! shares this error type. That store is a separate, deliberately unmigrated
+//! concern.
 
 use std::path::PathBuf;
-use std::process::Command;
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::{Row, SqlitePool};
 
 use crate::source::CircuitSource;
-use crate::tools::find_on_path;
 
 /// The parts-library schema. `mpn` is the natural key across all three tables
-/// (MCP.md 1.2 uses a surrogate `id`; the MPN is the real identity and keeps the
-/// shell-out layer simple — no id juggling).
+/// (MCP.md 1.2 uses a surrogate `id`; the MPN is the real identity and keeps
+/// queries simple — no id juggling).
 const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS parts (\
-  mpn VARCHAR(64) PRIMARY KEY,\
-  manufacturer VARCHAR(128),\
-  datasheet_url TEXT,\
-  fetched_at DATETIME,\
-  verified_by_human BOOLEAN NOT NULL DEFAULT FALSE,\
-  verified_at DATETIME,\
-  verified_by VARCHAR(64),\
-  image_url TEXT);\
-CREATE TABLE IF NOT EXISTS part_pins (\
-  mpn VARCHAR(64) NOT NULL,\
-  pin_number VARCHAR(8) NOT NULL,\
-  pin_name VARCHAR(64),\
-  cited_page INT,\
-  PRIMARY KEY (mpn, pin_number));\
-CREATE TABLE IF NOT EXISTS part_ratings (\
-  mpn VARCHAR(64) NOT NULL,\
-  rating_name VARCHAR(64) NOT NULL,\
-  value TEXT,\
-  unit VARCHAR(16),\
-  cited_page INT,\
-  PRIMARY KEY (mpn, rating_name));\
-CREATE TABLE IF NOT EXISTS part_assembly_steps (\
-  mpn VARCHAR(64) NOT NULL,\
-  step_order INT NOT NULL,\
-  text TEXT,\
-  PRIMARY KEY (mpn, step_order));\
-CREATE TABLE IF NOT EXISTS house_parts (\
-  kind VARCHAR(32) NOT NULL,\
-  value VARCHAR(64) NOT NULL,\
-  package VARCHAR(64) NOT NULL,\
-  mpn VARCHAR(64) NOT NULL,\
-  uses INT NOT NULL DEFAULT 1,\
-  seen_on TEXT,\
-  photo TEXT,\
-  PRIMARY KEY (kind, value, package));";
+CREATE TABLE IF NOT EXISTS parts (
+  mpn TEXT PRIMARY KEY,
+  manufacturer TEXT,
+  datasheet_url TEXT,
+  fetched_at TEXT,
+  verified_by_human INTEGER NOT NULL DEFAULT 0,
+  verified_at TEXT,
+  verified_by TEXT,
+  image_url TEXT
+);
+CREATE TABLE IF NOT EXISTS part_pins (
+  mpn TEXT NOT NULL,
+  pin_number TEXT NOT NULL,
+  pin_name TEXT,
+  cited_page INTEGER,
+  PRIMARY KEY (mpn, pin_number)
+);
+CREATE TABLE IF NOT EXISTS part_ratings (
+  mpn TEXT NOT NULL,
+  rating_name TEXT NOT NULL,
+  value TEXT,
+  unit TEXT,
+  cited_page INTEGER,
+  PRIMARY KEY (mpn, rating_name)
+);
+CREATE TABLE IF NOT EXISTS part_assembly_steps (
+  mpn TEXT NOT NULL,
+  step_order INTEGER NOT NULL,
+  text TEXT,
+  PRIMARY KEY (mpn, step_order)
+);
+CREATE TABLE IF NOT EXISTS house_parts (
+  kind TEXT NOT NULL,
+  value TEXT NOT NULL,
+  package TEXT NOT NULL,
+  mpn TEXT NOT NULL,
+  uses INTEGER NOT NULL DEFAULT 1,
+  seen_on TEXT,
+  photo TEXT,
+  PRIMARY KEY (kind, value, package)
+);";
 
 /// A part we actually build with: what we reach for given a kind, a value and a
 /// package, learned from boards that were really manufactured.
@@ -139,8 +150,11 @@ impl PartRecord {
 /// Errors from parts-library operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PartsError {
+    /// Unused by [`PartsLibrary`] itself — kept for [`crate::panel::PanelOrders`],
+    /// which still shells out to Dolt and shares this error type.
     #[error("`dolt` executable not found on PATH")]
     DoltNotFound,
+    /// Unused by [`PartsLibrary`] itself — see [`PartsError::DoltNotFound`].
     #[error("dolt {context} failed (exit {code}): {stderr}")]
     Dolt {
         context: String,
@@ -149,50 +163,51 @@ pub enum PartsError {
     },
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// Unused by [`PartsLibrary`] itself — see [`PartsError::DoltNotFound`].
     #[error("parsing dolt JSON output: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite error: {0}")]
+    Sqlx(#[from] sqlx::Error),
 }
 
-/// A handle to the Dolt-backed parts library at a given directory.
-#[derive(Debug, Clone)]
+/// A handle to the SQLite-backed parts library at a given directory.
 pub struct PartsLibrary {
-    root: PathBuf,
-    dolt: PathBuf,
+    pool: SqlitePool,
+    // A dedicated single-thread runtime so this otherwise-synchronous API can
+    // drive `sqlx`'s async queries without forcing async on every caller
+    // (`board`/`bom`/the CLI are all plain synchronous code).
+    rt: tokio::runtime::Runtime,
 }
 
 impl PartsLibrary {
     /// Open (initialising if needed) the parts library at `root`, ensuring the
     /// schema exists.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PartsError> {
-        let dolt = find_on_path("dolt").ok_or(PartsError::DoltNotFound)?;
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        let lib = PartsLibrary { root, dolt };
-        if !lib.root.join(".dolt").is_dir() {
-            lib.dolt(&["init"], "init")?;
-        }
-        lib.sql(SCHEMA)?;
-        lib.ensure_image_column()?;
-        lib.ensure_house_photo_column()?;
-        Ok(lib)
+        let db_path = root.join("parts.sqlite");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let pool = rt.block_on(async {
+            let opts = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await?;
+            sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+            Ok::<_, sqlx::Error>(pool)
+        })?;
+
+        Ok(PartsLibrary { pool, rt })
     }
 
-    /// Migrate a pre-existing library that predates the `image_url` column. New
-    /// DBs get it from `SCHEMA`; older ones are missing it, so add it when a probe
-    /// select fails. Version-safe (no reliance on `ADD COLUMN IF NOT EXISTS`).
-    fn ensure_image_column(&self) -> Result<(), PartsError> {
-        if self.query("SELECT image_url FROM parts LIMIT 1").is_err() {
-            self.sql("ALTER TABLE parts ADD COLUMN image_url TEXT")?;
-        }
-        Ok(())
-    }
-
-    /// Same migration for `house_parts.photo`, added after the table shipped.
-    fn ensure_house_photo_column(&self) -> Result<(), PartsError> {
-        if self.query("SELECT photo FROM house_parts LIMIT 1").is_err() {
-            self.sql("ALTER TABLE house_parts ADD COLUMN photo TEXT")?;
-        }
-        Ok(())
+    /// Run an async query against `self.pool` synchronously.
+    fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
+        self.rt.block_on(fut)
     }
 
     /// Attach our own photo of a part we build with.
@@ -206,221 +221,228 @@ impl PartsLibrary {
         package: &str,
         photo: &str,
     ) -> Result<bool, PartsError> {
-        let where_key = format!(
-            "kind = {} AND value = {} AND package = {}",
-            sql_str(kind),
-            sql_str(value),
-            sql_str(package)
-        );
-        if self
-            .query(&format!(
-                "SELECT mpn FROM house_parts WHERE {where_key} LIMIT 1"
-            ))?
-            .is_empty()
-        {
-            return Ok(false);
-        }
-        self.sql(&format!(
-            "UPDATE house_parts SET photo = {} WHERE {where_key}",
-            sql_str(photo)
-        ))?;
-        Ok(true)
+        self.block(async {
+            let result = sqlx::query(
+                "UPDATE house_parts SET photo = ? WHERE kind = ? AND value = ? AND package = ?",
+            )
+            .bind(photo)
+            .bind(kind)
+            .bind(value)
+            .bind(package)
+            .execute(&self.pool)
+            .await?;
+            Ok(result.rows_affected() > 0)
+        })
     }
 
     /// Insert or fully replace a part (and its pins/ratings) atomically.
     pub fn upsert_part(&self, part: &PartRecord) -> Result<(), PartsError> {
-        let mpn = sql_str(&part.mpn);
-        let mut stmts = vec![
-            "START TRANSACTION;".to_string(),
-            format!("DELETE FROM parts WHERE mpn={mpn};"),
-            format!("DELETE FROM part_pins WHERE mpn={mpn};"),
-            format!("DELETE FROM part_ratings WHERE mpn={mpn};"),
-            format!("DELETE FROM part_assembly_steps WHERE mpn={mpn};"),
-            format!(
+        self.block(async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM parts WHERE mpn = ?")
+                .bind(&part.mpn)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM part_pins WHERE mpn = ?")
+                .bind(&part.mpn)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM part_ratings WHERE mpn = ?")
+                .bind(&part.mpn)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM part_assembly_steps WHERE mpn = ?")
+                .bind(&part.mpn)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
                 "INSERT INTO parts (mpn, manufacturer, datasheet_url, verified_by_human, verified_by, image_url) \
-                 VALUES ({mpn}, {}, {}, {}, {}, {});",
-                sql_opt(part.manufacturer.as_deref()),
-                sql_opt(part.datasheet_url.as_deref()),
-                sql_bool(part.verified_by_human),
-                sql_opt(part.verified_by.as_deref()),
-                sql_opt(part.image_url.as_deref()),
-            ),
-        ];
-        for pin in &part.pins {
-            stmts.push(format!(
-                "INSERT INTO part_pins (mpn, pin_number, pin_name, cited_page) VALUES ({mpn}, {}, {}, {});",
-                sql_str(&pin.pin_number),
-                sql_str(&pin.pin_name),
-                sql_int(pin.cited_page),
-            ));
-        }
-        for rating in &part.ratings {
-            stmts.push(format!(
-                "INSERT INTO part_ratings (mpn, rating_name, value, unit, cited_page) VALUES ({mpn}, {}, {}, {}, {});",
-                sql_str(&rating.name),
-                sql_str(&rating.value),
-                sql_opt(rating.unit.as_deref()),
-                sql_int(rating.cited_page),
-            ));
-        }
-        for (i, step) in part.assembly_steps.iter().enumerate() {
-            stmts.push(format!(
-                "INSERT INTO part_assembly_steps (mpn, step_order, text) VALUES ({mpn}, {}, {});",
-                i as i64,
-                sql_str(step),
-            ));
-        }
-        stmts.push("COMMIT;".to_string());
-        self.sql(&stmts.join("\n"))
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&part.mpn)
+            .bind(&part.manufacturer)
+            .bind(&part.datasheet_url)
+            .bind(part.verified_by_human)
+            .bind(&part.verified_by)
+            .bind(&part.image_url)
+            .execute(&mut *tx)
+            .await?;
+            for pin in &part.pins {
+                sqlx::query(
+                    "INSERT INTO part_pins (mpn, pin_number, pin_name, cited_page) VALUES (?, ?, ?, ?)",
+                )
+                .bind(&part.mpn)
+                .bind(&pin.pin_number)
+                .bind(&pin.pin_name)
+                .bind(pin.cited_page)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for rating in &part.ratings {
+                sqlx::query(
+                    "INSERT INTO part_ratings (mpn, rating_name, value, unit, cited_page) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(&part.mpn)
+                .bind(&rating.name)
+                .bind(&rating.value)
+                .bind(&rating.unit)
+                .bind(rating.cited_page)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for (i, step) in part.assembly_steps.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO part_assembly_steps (mpn, step_order, text) VALUES (?, ?, ?)",
+                )
+                .bind(&part.mpn)
+                .bind(i as i64)
+                .bind(step)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     /// Fetch a part by MPN, with its pins and ratings, or `None` if absent.
     pub fn get_part(&self, mpn: &str) -> Result<Option<PartRecord>, PartsError> {
-        let key = sql_str(mpn);
-        let rows = self.query(&format!(
-            "SELECT mpn, manufacturer, datasheet_url, verified_by_human, verified_by, image_url FROM parts WHERE mpn={key}"
-        ))?;
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
+        self.block(async {
+            let row = sqlx::query(
+                "SELECT mpn, manufacturer, datasheet_url, verified_by_human, verified_by, image_url \
+                 FROM parts WHERE mpn = ?",
+            )
+            .bind(mpn)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
 
-        let pins = self
-            .query(&format!(
-                "SELECT pin_number, pin_name, cited_page FROM part_pins WHERE mpn={key} ORDER BY pin_number"
-            ))?
+            let pins = sqlx::query(
+                "SELECT pin_number, pin_name, cited_page FROM part_pins WHERE mpn = ? ORDER BY pin_number",
+            )
+            .bind(mpn)
+            .fetch_all(&self.pool)
+            .await?
             .into_iter()
             .map(|r| PinRecord {
-                pin_number: str_field(&r, "pin_number").unwrap_or_default(),
-                pin_name: str_field(&r, "pin_name").unwrap_or_default(),
-                cited_page: int_field(&r, "cited_page"),
+                pin_number: r.get("pin_number"),
+                pin_name: r.get::<Option<String>, _>("pin_name").unwrap_or_default(),
+                cited_page: r.get("cited_page"),
             })
             .collect();
 
-        let ratings = self
-            .query(&format!(
-                "SELECT rating_name, value, unit, cited_page FROM part_ratings WHERE mpn={key} ORDER BY rating_name"
-            ))?
+            let ratings = sqlx::query(
+                "SELECT rating_name, value, unit, cited_page FROM part_ratings WHERE mpn = ? ORDER BY rating_name",
+            )
+            .bind(mpn)
+            .fetch_all(&self.pool)
+            .await?
             .into_iter()
             .map(|r| RatingRecord {
-                name: str_field(&r, "rating_name").unwrap_or_default(),
-                value: str_field(&r, "value").unwrap_or_default(),
-                unit: str_field(&r, "unit"),
-                cited_page: int_field(&r, "cited_page"),
+                name: r.get("rating_name"),
+                value: r.get::<Option<String>, _>("value").unwrap_or_default(),
+                unit: r.get("unit"),
+                cited_page: r.get("cited_page"),
             })
             .collect();
 
-        let assembly_steps = self
-            .query(&format!(
-                "SELECT text FROM part_assembly_steps WHERE mpn={key} ORDER BY step_order"
-            ))?
+            let assembly_steps = sqlx::query(
+                "SELECT text FROM part_assembly_steps WHERE mpn = ? ORDER BY step_order",
+            )
+            .bind(mpn)
+            .fetch_all(&self.pool)
+            .await?
             .into_iter()
-            .filter_map(|r| str_field(&r, "text"))
+            .filter_map(|r| r.get::<Option<String>, _>("text"))
             .collect();
 
-        Ok(Some(PartRecord {
-            mpn: str_field(&row, "mpn").unwrap_or_else(|| mpn.to_string()),
-            manufacturer: str_field(&row, "manufacturer"),
-            datasheet_url: str_field(&row, "datasheet_url"),
-            verified_by_human: bool_field(&row, "verified_by_human"),
-            verified_by: str_field(&row, "verified_by"),
-            image_url: str_field(&row, "image_url"),
-            assembly_steps,
-            pins,
-            ratings,
-        }))
+            Ok(Some(PartRecord {
+                mpn: row.get("mpn"),
+                manufacturer: row.get("manufacturer"),
+                datasheet_url: row.get("datasheet_url"),
+                verified_by_human: row.get("verified_by_human"),
+                verified_by: row.get("verified_by"),
+                image_url: row.get("image_url"),
+                assembly_steps,
+                pins,
+                ratings,
+            }))
+        })
     }
 
     /// All MPNs in the library, sorted.
     pub fn list_mpns(&self) -> Result<Vec<String>, PartsError> {
-        Ok(self
-            .query("SELECT mpn FROM parts ORDER BY mpn")?
-            .into_iter()
-            .filter_map(|r| str_field(&r, "mpn"))
-            .collect())
+        self.block(async {
+            Ok(sqlx::query("SELECT mpn FROM parts ORDER BY mpn")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|r| r.get("mpn"))
+                .collect())
+        })
     }
 
     /// Set (or clear, with `None`) a part's product-photo URL. Creates a minimal
     /// stub row if the MPN isn't in the library yet — a boutique part we only have
     /// a photo for is still worth caching, and doesn't touch its verified status.
     pub fn set_image_url(&self, mpn: &str, image_url: Option<&str>) -> Result<(), PartsError> {
-        self.sql(&format!(
-            "INSERT INTO parts (mpn, image_url) VALUES ({}, {}) \
-             ON DUPLICATE KEY UPDATE image_url={};",
-            sql_str(mpn),
-            sql_opt(image_url),
-            sql_opt(image_url),
-        ))
+        self.block(async {
+            sqlx::query(
+                "INSERT INTO parts (mpn, image_url) VALUES (?, ?) \
+                 ON CONFLICT(mpn) DO UPDATE SET image_url = excluded.image_url",
+            )
+            .bind(mpn)
+            .bind(image_url)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
     }
 
     /// Replace a part's ordered assembly notes (empty clears them). Creates a
     /// minimal stub row if the MPN is new — a boutique part we only know a build
     /// tip for is still worth recording — without touching its verified status.
     pub fn set_assembly_steps(&self, mpn: &str, steps: &[String]) -> Result<(), PartsError> {
-        let key = sql_str(mpn);
-        let mut stmts = vec![
-            "START TRANSACTION;".to_string(),
-            format!("INSERT IGNORE INTO parts (mpn) VALUES ({key});"),
-            format!("DELETE FROM part_assembly_steps WHERE mpn={key};"),
-        ];
-        for (i, step) in steps.iter().enumerate() {
-            stmts.push(format!(
-                "INSERT INTO part_assembly_steps (mpn, step_order, text) VALUES ({key}, {}, {});",
-                i as i64,
-                sql_str(step),
-            ));
-        }
-        stmts.push("COMMIT;".to_string());
-        self.sql(&stmts.join("\n"))
+        self.block(async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("INSERT OR IGNORE INTO parts (mpn) VALUES (?)")
+                .bind(mpn)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM part_assembly_steps WHERE mpn = ?")
+                .bind(mpn)
+                .execute(&mut *tx)
+                .await?;
+            for (i, step) in steps.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO part_assembly_steps (mpn, step_order, text) VALUES (?, ?, ?)",
+                )
+                .bind(mpn)
+                .bind(i as i64)
+                .bind(step)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     /// Mark a part human-verified (the gate other stages check).
     pub fn mark_verified(&self, mpn: &str, by: &str) -> Result<(), PartsError> {
-        self.sql(&format!(
-            "UPDATE parts SET verified_by_human=TRUE, verified_by={}, verified_at=NOW() WHERE mpn={};",
-            sql_str(by),
-            sql_str(mpn)
-        ))
-    }
-
-    /// Commit the current state to Dolt history (no-op if nothing changed).
-    pub fn commit(&self, message: &str) -> Result<(), PartsError> {
-        self.dolt(&["add", "-A"], "add")?;
-        let output = Command::new(&self.dolt)
-            .current_dir(&self.root)
-            .args(["commit", "-m", message])
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-        // A commit with no staged changes is not an error for our purposes.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("nothing to commit") || stderr.contains("no changes") {
+        self.block(async {
+            sqlx::query(
+                "UPDATE parts SET verified_by_human = 1, verified_by = ?, verified_at = CURRENT_TIMESTAMP \
+                 WHERE mpn = ?",
+            )
+            .bind(by)
+            .bind(mpn)
+            .execute(&self.pool)
+            .await?;
             Ok(())
-        } else {
-            Err(PartsError::Dolt {
-                context: "commit".into(),
-                code: output.status.code().unwrap_or(-1),
-                stderr: stderr.trim().to_string(),
-            })
-        }
-    }
-
-    // ---- dolt plumbing -------------------------------------------------
-
-    fn dolt(&self, args: &[&str], context: &str) -> Result<String, PartsError> {
-        let output = Command::new(&self.dolt)
-            .current_dir(&self.root)
-            .args(args)
-            .output()?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(PartsError::Dolt {
-                context: context.to_string(),
-                code: output.status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            })
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -444,21 +466,24 @@ impl PartsLibrary {
         mpn: &str,
         seen_on: &str,
     ) -> Result<(), PartsError> {
-        // Dolt speaks MySQL, so an upsert that also bumps a counter and appends
-        // provenance is one statement.
-        self.sql(&format!(
-            "INSERT INTO house_parts (kind, value, package, mpn, uses, seen_on) \
-             VALUES ({}, {}, {}, {}, 1, {}) \
-             ON DUPLICATE KEY UPDATE uses = uses + 1, \
-             seen_on = IF(INSTR(seen_on, {}) > 0, seen_on, CONCAT(seen_on, ', ', {}))",
-            sql_str(kind),
-            sql_str(value),
-            sql_str(package),
-            sql_str(mpn),
-            sql_str(seen_on),
-            sql_str(seen_on),
-            sql_str(seen_on),
-        ))
+        self.block(async {
+            sqlx::query(
+                "INSERT INTO house_parts (kind, value, package, mpn, uses, seen_on) VALUES (?, ?, ?, ?, 1, ?) \
+                 ON CONFLICT(kind, value, package) DO UPDATE SET \
+                   uses = uses + 1, \
+                   seen_on = CASE WHEN instr(seen_on, ?) > 0 THEN seen_on ELSE seen_on || ', ' || ? END",
+            )
+            .bind(kind)
+            .bind(value)
+            .bind(package)
+            .bind(mpn)
+            .bind(seen_on)
+            .bind(seen_on)
+            .bind(seen_on)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
     }
 
     /// The part we use for a kind/value/package, most-used first.
@@ -479,92 +504,85 @@ impl PartsLibrary {
         if value_is_identity && value.is_empty() {
             return Ok(None);
         }
-        let mut steps = vec![(Some(value), Some(package)), (Some(value), None)];
+        let value = (!value.is_empty()).then_some(value);
+        let package = (!package.is_empty()).then_some(package);
+
+        let mut steps = vec![(value, package), (value, None)];
         if !value_is_identity {
-            steps.push((None, Some(package)));
+            steps.push((None, package));
             steps.push((None, None));
         }
 
-        for (v, p) in steps {
-            let mut wheres = vec![format!("kind = {}", sql_str(kind))];
-            if let Some(v) = v.filter(|v| !v.is_empty()) {
-                wheres.push(format!("value = {}", sql_str(v)));
-            }
-            if let Some(p) = p.filter(|p| !p.is_empty()) {
-                wheres.push(format!("package = {}", sql_str(p)));
-            }
-            let rows = self.query(&format!(
-                "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
-                 WHERE {} ORDER BY uses DESC LIMIT 1",
-                wheres.join(" AND ")
-            ))?;
-            if let Some(r) = rows.first() {
-                let get = |k: &str| {
-                    r.get(k)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string()
+        self.block(async {
+            for (v, p) in steps {
+                let row = match (v, p) {
+                    (Some(v), Some(p)) => sqlx::query(
+                        "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
+                         WHERE kind = ? AND value = ? AND package = ? ORDER BY uses DESC LIMIT 1",
+                    )
+                    .bind(kind)
+                    .bind(v)
+                    .bind(p)
+                    .fetch_optional(&self.pool)
+                    .await?,
+                    (Some(v), None) => sqlx::query(
+                        "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
+                         WHERE kind = ? AND value = ? ORDER BY uses DESC LIMIT 1",
+                    )
+                    .bind(kind)
+                    .bind(v)
+                    .fetch_optional(&self.pool)
+                    .await?,
+                    (None, Some(p)) => sqlx::query(
+                        "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
+                         WHERE kind = ? AND package = ? ORDER BY uses DESC LIMIT 1",
+                    )
+                    .bind(kind)
+                    .bind(p)
+                    .fetch_optional(&self.pool)
+                    .await?,
+                    (None, None) => sqlx::query(
+                        "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
+                         WHERE kind = ? ORDER BY uses DESC LIMIT 1",
+                    )
+                    .bind(kind)
+                    .fetch_optional(&self.pool)
+                    .await?,
                 };
-                return Ok(Some(HousePart {
-                    kind: get("kind"),
-                    value: get("value"),
-                    package: get("package"),
-                    mpn: get("mpn"),
-                    uses: r.get("uses").and_then(|v| v.as_i64()).unwrap_or(1),
-                    seen_on: get("seen_on"),
-                    photo: r.get("photo").and_then(|v| v.as_str()).map(String::from),
-                    exact: v.is_some() && p.is_some(),
-                }));
+                if let Some(r) = row {
+                    return Ok(Some(house_part_from_row(&r, v.is_some() && p.is_some())));
+                }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })
     }
 
     /// Every house part, most-used first.
     pub fn house_parts(&self) -> Result<Vec<HousePart>, PartsError> {
-        let rows = self.query(
-            "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
-             ORDER BY uses DESC, kind, value",
-        )?;
-        Ok(rows
+        self.block(async {
+            Ok(sqlx::query(
+                "SELECT kind, value, package, mpn, uses, seen_on, photo FROM house_parts \
+                 ORDER BY uses DESC, kind, value",
+            )
+            .fetch_all(&self.pool)
+            .await?
             .iter()
-            .map(|r| {
-                let get = |k: &str| {
-                    r.get(k)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string()
-                };
-                HousePart {
-                    kind: get("kind"),
-                    value: get("value"),
-                    package: get("package"),
-                    mpn: get("mpn"),
-                    uses: r.get("uses").and_then(|v| v.as_i64()).unwrap_or(1),
-                    seen_on: get("seen_on"),
-                    photo: r.get("photo").and_then(|v| v.as_str()).map(String::from),
-                    exact: true,
-                }
-            })
+            .map(|r| house_part_from_row(r, true))
             .collect())
+        })
     }
+}
 
-    fn sql(&self, sql: &str) -> Result<(), PartsError> {
-        self.dolt(&["sql", "-q", sql], "sql").map(|_| ())
-    }
-
-    /// Run a query and return its rows as JSON objects.
-    fn query(&self, sql: &str) -> Result<Vec<serde_json::Value>, PartsError> {
-        let stdout = self.dolt(&["sql", "-q", sql, "-r", "json"], "query")?;
-        if stdout.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let value: serde_json::Value = serde_json::from_str(&stdout)?;
-        Ok(value
-            .get("rows")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default())
+fn house_part_from_row(row: &SqliteRow, exact: bool) -> HousePart {
+    HousePart {
+        kind: row.get("kind"),
+        value: row.get("value"),
+        package: row.get("package"),
+        mpn: row.get("mpn"),
+        uses: row.get("uses"),
+        seen_on: row.get::<Option<String>, _>("seen_on").unwrap_or_default(),
+        photo: row.get("photo"),
+        exact,
     }
 }
 
@@ -693,64 +711,13 @@ fn enclosing_circuits_repo() -> Option<PathBuf> {
     }
 }
 
-// ---- SQL literal helpers (careful escaping for the shell-out layer) ----
-
-/// A SQL string literal: wrap in single quotes, double any internal quote.
-fn sql_str(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-fn sql_opt(s: Option<&str>) -> String {
-    s.map(sql_str).unwrap_or_else(|| "NULL".to_string())
-}
-
-fn sql_int(n: Option<i64>) -> String {
-    n.map(|n| n.to_string())
-        .unwrap_or_else(|| "NULL".to_string())
-}
-
-fn sql_bool(b: bool) -> String {
-    if b { "TRUE" } else { "FALSE" }.to_string()
-}
-
-// ---- JSON field extraction (Dolt renders NULL as absent/null, bool as 0/1) ----
-
-fn str_field(row: &serde_json::Value, key: &str) -> Option<String> {
-    row.get(key).and_then(|v| v.as_str()).map(str::to_string)
-}
-
-fn int_field(row: &serde_json::Value, key: &str) -> Option<i64> {
-    row.get(key).and_then(serde_json::Value::as_i64)
-}
-
-fn bool_field(row: &serde_json::Value, key: &str) -> bool {
-    match row.get(key) {
-        Some(v) => v
-            .as_bool()
-            .unwrap_or_else(|| v.as_i64().is_some_and(|n| n != 0)),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Full round-trip against a real (temp-dir) SQLite-backed library.
     #[test]
-    fn sql_escaping() {
-        assert_eq!(sql_str("LM13700"), "'LM13700'");
-        assert_eq!(sql_str("a'b"), "'a''b'"); // apostrophe doubled
-        assert_eq!(sql_opt(None), "NULL");
-        assert_eq!(sql_int(Some(3)), "3");
-        assert_eq!(sql_int(None), "NULL");
-    }
-
-    /// Full round-trip against a real Dolt repo. Skipped if `dolt` is absent.
-    #[test]
-    fn roundtrip_when_dolt_available() {
-        if find_on_path("dolt").is_none() {
-            return; // no dolt in this environment — integration test skipped
-        }
+    fn roundtrip() {
         let root = std::env::temp_dir().join(format!("lob-parts-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let lib = PartsLibrary::open(&root).expect("open");
@@ -824,14 +791,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Resolve a circuit's parts by MPN against the library. Skipped if no dolt.
+    /// Resolve a circuit's parts by MPN against the library.
     #[test]
-    fn resolve_circuit_by_mpn_when_dolt_available() {
+    fn resolve_circuit_by_mpn() {
         use crate::model::{Circuit, Part};
 
-        if find_on_path("dolt").is_none() {
-            return;
-        }
         let root = std::env::temp_dir().join(format!("lob-resolve-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let lib = PartsLibrary::open(&root).expect("open");
@@ -858,6 +822,61 @@ mod tests {
         assert_eq!(status("U2"), ResolutionStatus::Unverified);
         assert_eq!(status("U3"), ResolutionStatus::Unknown);
         assert_eq!(status("R1"), ResolutionStatus::NoMpn);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `house_part`'s value/package fallback ladder, and `learn_house_part`'s
+    /// use-counting + provenance de-dup.
+    #[test]
+    fn house_parts_fallback_and_learning() {
+        let root = std::env::temp_dir().join(format!("lob-house-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = PartsLibrary::open(&root).expect("open");
+
+        // A passive: value is identity, so an empty value never matches.
+        assert!(lib
+            .house_part("resistor", "", "0603")
+            .expect("query")
+            .is_none());
+
+        lib.learn_house_part("resistor", "10k", "0603", "RC0603FR-0710KL", "board-a")
+            .expect("learn");
+        lib.learn_house_part("resistor", "10k", "0603", "RC0603FR-0710KL", "board-b")
+            .expect("learn again bumps uses");
+        lib.learn_house_part("resistor", "10k", "0603", "RC0603FR-0710KL", "board-a")
+            .expect("learn same board again is a no-op on provenance");
+
+        let hit = lib
+            .house_part("resistor", "10k", "0603")
+            .expect("query")
+            .expect("present");
+        assert_eq!(hit.mpn, "RC0603FR-0710KL");
+        assert_eq!(hit.uses, 3);
+        assert_eq!(hit.seen_on, "board-a, board-b");
+        assert!(hit.exact);
+
+        // A non-passive (jack) falls back to kind-only when value/package don't
+        // narrow it — "a jack is a jack" if we only buy one kind.
+        lib.learn_house_part("jack", "1/4in", "THT", "PJ398SM", "board-a")
+            .expect("learn jack");
+        let jack = lib
+            .house_part("jack", "", "")
+            .expect("query")
+            .expect("kind-only fallback");
+        assert_eq!(jack.mpn, "PJ398SM");
+        assert!(!jack.exact);
+
+        assert!(lib
+            .set_house_photo("jack", "1/4in", "THT", "file:///photos/jack.jpg")
+            .expect("set photo"));
+        assert!(!lib
+            .set_house_photo("jack", "nope", "THT", "file:///photos/jack.jpg")
+            .expect("set photo on unknown key returns false"));
+
+        let all = lib.house_parts().expect("list all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].mpn, "RC0603FR-0710KL"); // most-used first
 
         let _ = std::fs::remove_dir_all(&root);
     }

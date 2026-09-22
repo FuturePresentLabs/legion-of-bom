@@ -55,8 +55,8 @@ pub const GENERATED: &[IgnoreRule] = &[
         patterns: &["*.kicad_prl", "*-backups/", "fp-info-cache"],
     },
     IgnoreRule {
-        why: "Parts library: the Dolt store is local, the CSV export is the record",
-        patterns: &[".lob/parts/.dolt/"],
+        why: "Parts library: SQLite's own transient journal/WAL files, not the db itself",
+        patterns: &["*.sqlite-journal", "*.sqlite-wal", "*.sqlite-shm"],
     },
     IgnoreRule {
         why: "Local Python venv for SKiDL",
@@ -182,7 +182,7 @@ mod tests {
             "slew_limiter.net",
             "rc_lowpass-drc.rpt",
             "slew_core.dat",
-            ".lob/parts/.dolt/config.json",
+            ".lob/parts/parts.sqlite-wal",
         ] {
             assert!(is_generated(gen), "{gen} is generated");
         }
@@ -191,7 +191,7 @@ mod tests {
             "slew_limiter.py",
             "slew_limiter_panel.toml",
             "slew-limiter-circuit.md",
-            ".lob/parts/house_parts.csv",
+            ".lob/parts/parts.sqlite",
             "supersynthesis/2opfm/2OPFM_REV5_JLCBOM.csv",
             "brand/puget-logo.svg",
         ] {
