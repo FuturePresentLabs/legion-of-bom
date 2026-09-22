@@ -23,12 +23,32 @@ const SHEET_BG: &str = "#fbfbf7";
 /// Sheet geometry (px). The diagram is emitted at these units and scaled by the
 /// viewer's `viewBox`.
 mod sheet {
-    pub const COL_W: f64 = 200.0;
-    /// A row has to hold, top to bottom: the rail stub and its label reaching up,
-    /// the symbol body, the ground stub and its label reaching down, and then the
-    /// refdes/value caption under all of it — about 30 + 74 + 33 + 26 px. Skimp and
-    /// a cap's caption lands on the next part's supply rail.
-    pub const ROW_H: f64 = 175.0;
+    /// Fixed clearance between one column's real content and the next
+    /// column's — the wire-trunk + net-label channel. Kept as a flat
+    /// constant deliberately: it is the "small fixed clearance" term next to
+    /// two *computed* half-extents (see [`super::Placed::content_size`]), not
+    /// a stand-in for either column's own size the way the old `COL_W` was.
+    pub const COL_CHANNEL: f64 = 92.0;
+    /// Extra width budgeted for a column when its part's refdes/value caption
+    /// prints *beside* the body rather than below it (every pin runs
+    /// vertically — a resistor, a cap). Sized for a short refdes plus an
+    /// 11-char ellipsized value at their real font sizes, so tightening a
+    /// column to its symbol's real width doesn't relocate the label
+    /// collision transmog hit onto this caption instead.
+    pub const CAPTION_SIDE_W: f64 = 80.0;
+    /// Fixed vertical budget *above* a part's body for its rail stub and
+    /// label. Not derived from the body's own height — a label needs this
+    /// room regardless of how small the symbol above it is.
+    pub const ROW_TOP_BUDGET: f64 = 32.0;
+    /// Fixed vertical budget *below* a part's body: the ground stub + its
+    /// label, then the refdes/value caption under all of it — about 33 + 26
+    /// px, plus a few px of slack. Same reasoning as [`ROW_TOP_BUDGET`]: this
+    /// is label space, budgeted separately from body-to-body clearance so it
+    /// is never the thing that gets squeezed when a row's body is short.
+    pub const ROW_BOTTOM_BUDGET: f64 = 64.0;
+    /// Floor under a column's/row's real content size, so a degenerate
+    /// near-zero symbol still gets breathing room for its stubs and leads.
+    pub const MIN_CONTENT: f64 = 16.0;
     pub const BOX_W: f64 = 108.0;
     pub const BOX_H: f64 = 46.0;
     /// Clear space between the sheet frame and the drawing, so net labels and rail
@@ -93,20 +113,61 @@ struct Placed {
     rot90: bool,
     /// Mirror the symbol, so its pins face the side its wires actually come from.
     flip: bool,
+    /// This part's resolved top-left corner in sheet px, computed once by
+    /// [`layout`] from every column's/row's *real* content — see
+    /// [`Placed::content_size`]. Not a `col`/`row` × fixed-pitch formula: a
+    /// resistor no longer gets the same berth as a switch.
+    sheet_x: f64,
+    sheet_y: f64,
+    /// The column's own resolved content width (the widest part placed in it),
+    /// shared by every part in the column. Kept alongside each part rather
+    /// than recomputed from `placed` at each use site, so the wire-trunk
+    /// channel (which must clear the whole column, not just the one part a
+    /// net happens to leave from) can't drift out of sync with the spacing
+    /// [`layout`] actually used.
+    col_w: f64,
 }
 
 impl Placed {
     fn x(&self) -> f64 {
-        sheet::MARGIN + self.col as f64 * sheet::COL_W
+        self.sheet_x
     }
     fn y(&self) -> f64 {
-        sheet::MARGIN + self.row as f64 * sheet::ROW_H
+        self.sheet_y
     }
     fn cx(&self) -> f64 {
-        self.x() + sheet::BOX_W / 2.0
+        self.x() + self.content_size().0 / 2.0
     }
     fn cy(&self) -> f64 {
-        self.y() + sheet::BOX_H / 2.0
+        self.y() + self.content_size().1 / 2.0
+    }
+
+    /// This part's own real drawn footprint: the KiCad symbol's oriented,
+    /// scaled bounding box when one resolved, else the fallback box's fixed
+    /// size. Everything a column's/row's spacing is sized from — a resistor
+    /// scaled down to a few px no longer sits in the middle of the same slot
+    /// a switch or a jack needs.
+    fn content_size(&self) -> (f64, f64) {
+        match self.oriented_bounds() {
+            Some((x0, y0, x1, y1)) => {
+                let scale = self.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
+                (((x1 - x0) * scale).max(1.0), ((y1 - y0) * scale).max(1.0))
+            }
+            None => (sheet::BOX_W, sheet::BOX_H),
+        }
+    }
+
+    /// True when any of this part's pins run sideways (left/right) once its
+    /// orientation is applied — a jack's contacts, a header's two rows. Those
+    /// pins occupy the sides, so the refdes/value caption is drawn below the
+    /// body instead of beside it, and the column needs no side-caption budget
+    /// for this part (see [`sheet::CAPTION_SIDE_W`]).
+    fn pins_sideways(&self) -> bool {
+        self.sym.as_ref().is_some_and(|g| {
+            g.pins
+                .iter()
+                .any(|q| self.orient_dir(q.outward()).0.abs() > 0.5)
+        })
     }
 
     /// Apply this part's orientation to a symbol-space point or vector: mirror
@@ -439,24 +500,73 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     let mut out = Vec::new();
     let mut cols: Vec<usize> = by_col.keys().copied().collect();
     cols.sort_unstable();
+    // Each column's left edge follows the previous column's *real* content,
+    // not a fixed pitch: `col_left += col_w + COL_CHANNEL`, where `col_w` is
+    // that column's own widest part. A column of resistors no longer costs
+    // the same width as a column holding a switch.
+    let mut col_left = sheet::MARGIN;
     for (ci, c) in cols.iter().enumerate() {
         let mut parts = by_col.remove(c).unwrap_or_default();
         parts.sort_by(|a, b| a.0.cmp(b.0));
-        for (ri, (refdes, value, sym, box_pins, pin_names, (rot90, flip))) in
-            parts.into_iter().enumerate()
-        {
-            out.push(Placed {
-                refdes: refdes.to_string(),
-                value: value.to_string(),
-                col: ci,
-                row: ri,
-                sym,
-                box_pins,
-                pin_names,
-                rot90,
-                flip,
-            });
+
+        let mut column: Vec<Placed> = parts
+            .into_iter()
+            .enumerate()
+            .map(
+                |(ri, (refdes, value, sym, box_pins, pin_names, (rot90, flip)))| Placed {
+                    refdes: refdes.to_string(),
+                    value: value.to_string(),
+                    col: ci,
+                    row: ri,
+                    sym,
+                    box_pins,
+                    pin_names,
+                    rot90,
+                    flip,
+                    sheet_x: 0.0,
+                    sheet_y: 0.0,
+                    col_w: 0.0,
+                },
+            )
+            .collect();
+
+        // `content_size`/`pins_sideways` need only `sym`/`rot90`/`flip`, not a
+        // resolved position, so every part's real footprint can be measured
+        // before any position in this column is finalised.
+        let footprint_w = |p: &Placed| {
+            let (w, _) = p.content_size();
+            if p.sym.is_some() && !p.pins_sideways() {
+                // The caption prints beside the body for this part; budget
+                // for it here so shrinking the column to its symbol's real
+                // width doesn't push that caption into the next column's
+                // territory — the label-collision trap transmog's naive fix
+                // fell into.
+                w + sheet::CAPTION_SIDE_W
+            } else {
+                w
+            }
+        };
+        let col_w = column
+            .iter()
+            .map(footprint_w)
+            .fold(0.0_f64, f64::max)
+            .max(sheet::MIN_CONTENT);
+
+        let mut row_top = sheet::MARGIN;
+        for p in &mut column {
+            let (_, h) = p.content_size();
+            p.sheet_x = col_left;
+            p.sheet_y = row_top;
+            p.col_w = col_w;
+            // The label budgets above/below are fixed regardless of the
+            // body's real height — shrinking them along with a short body is
+            // exactly the mistake that put a stage name on top of the next
+            // part's rail in transmog's first attempt.
+            row_top += sheet::ROW_TOP_BUDGET + h.max(sheet::MIN_CONTENT) + sheet::ROW_BOTTOM_BUDGET;
         }
+
+        out.extend(column);
+        col_left += col_w + sheet::COL_CHANNEL;
     }
     out
 }
@@ -466,12 +576,25 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
     let placed = layout(circuit);
     let pos: HashMap<&str, &Placed> = placed.iter().map(|p| (p.refdes.as_str(), p)).collect();
 
-    let cols = placed.iter().map(|p| p.col).max().unwrap_or(0) + 1;
-    let rows = placed.iter().map(|p| p.row).max().unwrap_or(0) + 1;
-    let w = (2.0 * sheet::MARGIN + cols as f64 * sheet::COL_W + sheet::GUTTER)
+    // Sheet extent from what is actually drawn, not `cols * COL_W` /
+    // `rows * ROW_H`: every part's real content now determines its own
+    // column's width and row's height (see `layout`), so the sheet itself
+    // must be sized from where that content actually ends up, not a fixed
+    // per-column/per-row pitch multiplied out.
+    let content_right = placed
+        .iter()
+        .map(|p| p.x() + p.content_size().0)
+        .fold(0.0_f64, f64::max);
+    let w = (content_right + sheet::COL_CHANNEL + sheet::GUTTER + sheet::MARGIN)
         .max(sheet::TITLE_W + 2.0 * sheet::FRAME + 40.0);
-    // Room under the drawing for the frame and the title block.
-    let h = 2.0 * sheet::MARGIN + rows as f64 * sheet::ROW_H + sheet::TITLE_H + sheet::FRAME;
+    let content_bottom = placed
+        .iter()
+        .map(|p| p.y() + p.content_size().1)
+        .fold(0.0_f64, f64::max);
+    // Room under the drawing for the ground stub + caption, the frame and the
+    // title block.
+    let h =
+        content_bottom + sheet::ROW_BOTTOM_BUDGET + sheet::MARGIN + sheet::TITLE_H + sheet::FRAME;
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -504,9 +627,10 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
             // trunk, so the wire continues the pin instead of striking it
             // side-on. Parts with no resolved symbol just break out sideways.
             let (at, (dx, dy)) = p.pin_anchor(&pin.pin).unwrap_or_else(|| {
-                // No symbol (a multi-unit part keeps its box): leave from the box
-                // edge, not its middle, so the wire still starts on the outline.
-                ((p.x() + sheet::BOX_W, p.cy()), (1.0, 0.0))
+                // Pin lookup failed (a net names a pin the resolved symbol/box
+                // doesn't have): leave from this part's own real right edge,
+                // not its middle, so the wire still starts on the outline.
+                ((p.x() + p.content_size().0, p.cy()), (1.0, 0.0))
             });
             let breakout = (at.0 + dx * sheet::PIN_STUB, at.1 + dy * sheet::PIN_STUB);
             pts.push((p, at, breakout));
@@ -534,11 +658,15 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
 
     for (idx, (name, pts)) in routed.iter().enumerate() {
         let (lane, lanes) = lane_of[idx];
-        // Spread trunks evenly across the channel between this column's boxes and
-        // the next, so parallel nets stay visually distinct.
-        let channel = sheet::COL_W - sheet::BOX_W;
+        // Spread trunks evenly across the channel between this column's real
+        // content and the next, so parallel nets stay visually distinct. Uses
+        // the *column's* resolved width (`col_w`, shared by every part in
+        // it), not this one part's own — the channel has to clear whichever
+        // part in the column is widest, not just the one a given net leaves
+        // from.
+        let channel = sheet::COL_CHANNEL;
         let trunk =
-            pts[0].0.x() + sheet::BOX_W + channel * (lane as f64 + 1.0) / (lanes as f64 + 1.0);
+            pts[0].0.x() + pts[0].0.col_w + channel * (lane as f64 + 1.0) / (lanes as f64 + 1.0);
         let (y0, y1) = pts
             .iter()
             .fold((f64::MAX, f64::MIN), |(lo, hi), (_, _, b)| {
@@ -686,26 +814,13 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         // labels are, so the caption goes below instead.
         // Judge on the pins as *drawn* — a resistor turned into the signal path now
         // has horizontal pins, so it needs the below-caption too.
-        let sideways = p.sym.as_ref().is_some_and(|g| {
-            g.pins
-                .iter()
-                .any(|q| p.orient_dir(q.outward()).0.abs() > 0.5)
-        });
+        let sideways = p.pins_sideways();
         let (label_x, label_y, value_y, anchor) = match p.sym.as_ref() {
             Some(_) if !sideways => {
-                // Oriented bounds: after a quarter turn the symbol's right edge is
-                // not where the raw symbol's was.
-                let half = p
-                    .oriented_bounds()
-                    .map(|(x0, _, x1, _)| (x1 - x0) / 2.0)
-                    .unwrap_or(0.0);
-                let scale = p.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
-                (
-                    p.cx() + half * scale + 7.0,
-                    p.cy() - 2.0,
-                    p.cy() + 11.0,
-                    "start",
-                )
+                // Oriented, scaled half-width: after a quarter turn the symbol's
+                // right edge is not where the raw symbol's was.
+                let half = p.content_size().0 / 2.0;
+                (p.cx() + half + 7.0, p.cy() - 2.0, p.cy() + 11.0, "start")
             }
             Some(_) => {
                 let below = lowest
@@ -1103,6 +1218,9 @@ mod tests {
             pin_names: HashMap::new(),
             rot90: false,
             flip: false,
+            sheet_x: 0.0,
+            sheet_y: 0.0,
+            col_w: sheet::BOX_W,
         };
         let out = symbol_svg(&p, &g, "#000");
         assert!(out.contains(">-<"), "named pin is labelled: {out}");
@@ -1120,8 +1238,8 @@ mod tests {
         );
     }
 
-    /// legion-of-bom regression: switch symbols were rendering as blank
-    /// rectangles. A KiCad symbol's shape declaration order is not guaranteed
+    /// legion-of-bom-<schematic switch symbols render as blank rectangles>
+    /// regression: a KiCad symbol's shape declaration order is not guaranteed
     /// to put its body (a `background`-filled shape) before its
     /// distinguishing detail graphics. `Switch:SW_SPDT` declares its lever,
     /// pivot dot and throw-contact circles (all `fill none`) in `SW_SPDT_0_1`
@@ -1165,6 +1283,9 @@ mod tests {
             pin_names: HashMap::new(),
             rot90: false,
             flip: false,
+            sheet_x: 0.0,
+            sheet_y: 0.0,
+            col_w: sheet::BOX_W,
         };
         let out = symbol_svg(&p, &g, "#000");
         // The body's *fill* is emitted in pass 1 (before any stroke), so it
