@@ -41,17 +41,49 @@ struct Band {
 }
 
 const VC1_BANDS: &[Band] = &[
-    Band { key: "0.1_0.3v", description: "about 0.1-0.3V off ground", mid: 0.2 },
-    Band { key: "0.4_0.6v", description: "about 0.4-0.6V off ground", mid: 0.5 },
-    Band { key: "0.8_1.2v", description: "about 0.8-1.2V off ground", mid: 1.0 },
-    Band { key: "2_3v", description: "about 2-3V off ground", mid: 2.5 },
+    Band {
+        key: "0.1_0.3v",
+        description: "about 0.1-0.3V off ground",
+        mid: 0.2,
+    },
+    Band {
+        key: "0.4_0.6v",
+        description: "about 0.4-0.6V off ground",
+        mid: 0.5,
+    },
+    Band {
+        key: "0.8_1.2v",
+        description: "about 0.8-1.2V off ground",
+        mid: 1.0,
+    },
+    Band {
+        key: "2_3v",
+        description: "about 2-3V off ground",
+        mid: 2.5,
+    },
 ];
 
 const IC1_BANDS: &[Band] = &[
-    Band { key: "10_50ua", description: "about 10-50 microamps", mid: 30e-6 },
-    Band { key: "50_150ua", description: "about 50-150 microamps", mid: 100e-6 },
-    Band { key: "150_350ua", description: "about 150-350 microamps", mid: 250e-6 },
-    Band { key: "350ua_1ma", description: "about 350 microamps to 1 milliamp", mid: 650e-6 },
+    Band {
+        key: "10_50ua",
+        description: "about 10-50 microamps",
+        mid: 30e-6,
+    },
+    Band {
+        key: "50_150ua",
+        description: "about 50-150 microamps",
+        mid: 100e-6,
+    },
+    Band {
+        key: "150_350ua",
+        description: "about 150-350 microamps",
+        mid: 250e-6,
+    },
+    Band {
+        key: "350ua_1ma",
+        description: "about 350 microamps to 1 milliamp",
+        mid: 650e-6,
+    },
 ];
 
 fn find_mid<'a>(bands: &'a [Band], key: &str) -> Option<&'a Band> {

@@ -42,6 +42,7 @@ pub mod netlist;
 pub mod package;
 pub mod panel;
 pub mod panel_edit;
+pub mod panel_lua;
 pub mod parts;
 pub mod pdf;
 pub mod pedal_panel;
@@ -151,6 +152,9 @@ pub use panel::{
     PanelOrders, PanelSpec,
 };
 pub use panel_edit::{apply_panel_edit_str, edit_panel, PanelEdit, PanelEditError};
+pub use panel_lua::{
+    panel_script_dir, HardwareCatalog, HardwareSpec, LayoutSpec, PanelScript, PanelScriptError,
+};
 pub use parts::{
     default_parts_dir, HousePart, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,

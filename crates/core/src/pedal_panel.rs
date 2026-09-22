@@ -8,13 +8,17 @@
 //! (Eurorack's [`crate::panel::BuiltinCutouts`] assumes 3.5mm jacks and 9mm
 //! pot bushings — wrong for 1/4" jacks and 16mm pedal pots).
 //!
-//! **Front panel only.** This models the enclosure's front face — the same
-//! single-face model `EurorackPanel` uses for a module's front panel. A real
-//! stompbox's DC jack is commonly mounted on the top or side edge rather than
-//! the front face; representing that needs a multi-face enclosure model this
-//! doesn't attempt yet, so the DC jack is intentionally left off this panel
-//! rather than forced into a front-face position that would misrepresent the
-//! real build. Flagged here, not silently dropped.
+//! **Single flattened face, not a true multi-face enclosure model.** Like
+//! `EurorackPanel`, this exposes one 2D layout — it does not model which of
+//! a die-cast box's distinct physical faces (front/top/sides) each control
+//! actually mounts to. That's the same simplification real DIY drilling
+//! templates use (e.g. a 1590B template drawn as one flattened footprint
+//! with side-edge jacks and a top-edge power jack, not a 3D unfolding), so
+//! `fuzz_pedal`'s layout follows that same convention: audio jacks at the
+//! left/right edges, power at the top edge, matching the real classic
+//! Fuzz-Face-style stompbox layout (cross-checked against a real vendor
+//! drilling template this session) rather than a made-up arrangement. A
+//! genuine multi-face model, if ever needed, is future work.
 //!
 //! **First-pass hole sizes**, same status as `BuiltinCutouts`'s table
 //! (DESIGN.md §7.7 already names the enclosure set this reads): common
@@ -42,6 +46,13 @@ const FOOTSWITCH_ENVELOPE: (f64, f64) = (20.0, 20.0);
 /// Bare 5mm LED, no bezel.
 const LED_HOLE_MM: f64 = 5.0;
 const LED_ENVELOPE: (f64, f64) = (6.0, 6.0);
+/// Standard 5.5mm/2.1mm panel-mount DC barrel jack (e.g. Kobiconn/CUI
+/// PJ-30x-style): cross-referenced mounting-hole specs cluster at
+/// 0.313in/~7.95mm (non-locking) up to ~13mm (locking variants) — first-pass
+/// like the other hole sizes in this file, not measured against one specific
+/// vendor's drawing.
+const DC_JACK_HOLE_MM: f64 = 8.0;
+const DC_JACK_ENVELOPE: (f64, f64) = (16.0, 16.0);
 
 /// Minimum clearance between adjacent control envelopes (larger than
 /// Eurorack's 2mm — pedal hardware runs bigger).
@@ -82,6 +93,14 @@ impl CutoutSource for PedalCutouts {
             .any(|k| name.contains(k))
         {
             circle(ControlKind::Pot, POT_HOLE_MM, POT_ENVELOPE)
+        } else if ["dc_jack", "dcjack", "power_jack", "barrel", "pj-", "pj_"]
+            .iter()
+            .any(|k| name.contains(k))
+        {
+            // Checked before the generic "jack" match below -- "dc_jack"
+            // contains "jack" as a substring, so a DC barrel connector would
+            // otherwise silently resolve to a 1/4in audio jack's hole size.
+            circle(ControlKind::Jack, DC_JACK_HOLE_MM, DC_JACK_ENVELOPE)
         } else if ["jack", "phone_jack", "6.35mm", "ts_jack"]
             .iter()
             .any(|k| name.contains(k))
@@ -121,7 +140,7 @@ fn face_mm(size: EnclosureSize) -> (f64, f64) {
 /// `count` envelopes of width `envelope_w`, each `GAP_MM` apart, centered in
 /// `available_w` at height `y_mm` — the x-centers, left to right. Generalizes
 /// across enclosure widths instead of hand-picking coordinates per size class.
-fn centered_row(available_w: f64, count: usize, envelope_w: f64) -> Vec<f64> {
+pub(crate) fn centered_row(available_w: f64, count: usize, envelope_w: f64) -> Vec<f64> {
     let n = count as f64;
     let total = n * envelope_w + (n - 1.0).max(0.0) * GAP_MM;
     let start = (available_w - total) / 2.0;
@@ -153,9 +172,12 @@ impl PedalPanel {
     }
 
     /// A pedal panel of the given enclosure size, laid out for the standard
-    /// controls a fuzz-family circuit needs: 2 jacks (top), 2 pots (middle),
-    /// an LED and footswitch (bottom). Every position is computed from the
-    /// enclosure's own width/height, not hand-picked per size class.
+    /// controls a fuzz-family circuit needs: audio jacks on the left/right
+    /// edges, DC power at the top edge, 2 pots in the middle, an LED and
+    /// footswitch at the bottom — the real classic-stompbox convention (see
+    /// this module's doc comment), not an arbitrary arrangement. Every
+    /// position is computed from the enclosure's own width/height, not
+    /// hand-picked per size class.
     ///
     /// `refdes` names the board parts to anchor at the pot positions (e.g.
     /// `("RV1", "RV2")` for a fuzz-pedal spec's Fuzz/Volume pots) — `None`
@@ -166,17 +188,21 @@ impl PedalPanel {
         let (w, h) = face_mm(size);
         let thickness_mm = 1.6; // typical die-cast aluminum lid thickness
 
-        let jack_y = h - EDGE_MM - JACK_ENVELOPE.1 / 2.0;
         let pot_y = h * 0.55;
         let footswitch_y = EDGE_MM + FOOTSWITCH_ENVELOPE.1 / 2.0 + 4.0;
         let led_y = footswitch_y + FOOTSWITCH_ENVELOPE.1 / 2.0 + GAP_MM + LED_ENVELOPE.1 / 2.0;
+        // Side jacks sit between the LED/footswitch cluster and the pot row
+        // — clear of both, not sharing either one's height.
+        let jack_y = led_y + (pot_y - led_y) * 0.5;
+        let jack_x_left = EDGE_MM + JACK_ENVELOPE.0 / 2.0;
+        let jack_x_right = w - EDGE_MM - JACK_ENVELOPE.0 / 2.0;
+        let power_y = h - EDGE_MM - DC_JACK_ENVELOPE.1 / 2.0;
 
-        let jack_x = centered_row(w, 2, JACK_ENVELOPE.0);
         let pot_x = centered_row(w, 2, POT_ENVELOPE.0);
 
         let cutouts = vec![
             Cutout {
-                x_mm: jack_x[0],
+                x_mm: jack_x_right,
                 y_mm: jack_y,
                 rotation_deg: 0.0,
                 footprint: "Jack_6.35mm_TS".to_string(),
@@ -185,13 +211,22 @@ impl PedalPanel {
                 role: Some(CutoutRole::Io),
             },
             Cutout {
-                x_mm: jack_x[1],
+                x_mm: jack_x_left,
                 y_mm: jack_y,
                 rotation_deg: 0.0,
                 footprint: "Jack_6.35mm_TS".to_string(),
                 refdes: None,
                 label: Some("OUT".to_string()),
                 role: Some(CutoutRole::Io),
+            },
+            Cutout {
+                x_mm: w / 2.0,
+                y_mm: power_y,
+                rotation_deg: 0.0,
+                footprint: "DC_Jack_5.5x2.1mm".to_string(),
+                refdes: None,
+                label: Some("9V".to_string()),
+                role: None,
             },
             Cutout {
                 x_mm: pot_x[0],
@@ -236,6 +271,58 @@ impl PedalPanel {
             thickness_mm,
             cutouts,
         }
+    }
+
+    /// A pedal panel whose control arrangement comes from a Lua layout
+    /// script ([`crate::panel_lua`]) instead of a hardcoded Rust function
+    /// like [`Self::fuzz_pedal`]. The verified hardware catalog (hole and
+    /// envelope sizes) is still Rust-sourced — the script only decides
+    /// positions, never hole sizes — so a script can rearrange controls
+    /// freely without ever being able to get a real part's mounting hole
+    /// wrong.
+    pub fn from_script(
+        size: EnclosureSize,
+        pot_refdes: (&str, &str),
+        script_path: &std::path::Path,
+    ) -> Result<Self, crate::panel_lua::PanelScriptError> {
+        let (w, h) = face_mm(size);
+        let hardware = crate::panel_lua::HardwareCatalog {
+            jack: crate::panel_lua::HardwareSpec {
+                diameter_mm: JACK_HOLE_MM,
+                envelope_mm: JACK_ENVELOPE,
+            },
+            dc_jack: crate::panel_lua::HardwareSpec {
+                diameter_mm: DC_JACK_HOLE_MM,
+                envelope_mm: DC_JACK_ENVELOPE,
+            },
+            pot: crate::panel_lua::HardwareSpec {
+                diameter_mm: POT_HOLE_MM,
+                envelope_mm: POT_ENVELOPE,
+            },
+            footswitch: crate::panel_lua::HardwareSpec {
+                diameter_mm: FOOTSWITCH_HOLE_MM,
+                envelope_mm: FOOTSWITCH_ENVELOPE,
+            },
+            led: crate::panel_lua::HardwareSpec {
+                diameter_mm: LED_HOLE_MM,
+                envelope_mm: LED_ENVELOPE,
+            },
+        };
+        let spec = crate::panel_lua::LayoutSpec {
+            width_mm: w,
+            height_mm: h,
+            edge_mm: EDGE_MM,
+            gap_mm: GAP_MM,
+            pot_refdes: (pot_refdes.0.to_string(), pot_refdes.1.to_string()),
+            hardware,
+        };
+        let script = crate::panel_lua::PanelScript::load(script_path)?;
+        let cutouts = script.layout(&spec)?;
+        Ok(PedalPanel {
+            size,
+            thickness_mm: 1.6,
+            cutouts,
+        })
     }
 
     /// Override the default thickness (mm).
@@ -326,6 +413,7 @@ pub fn fuzz_pedal_panel_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn pedal_cutouts_matches_pedal_hardware_not_eurorack_sizes() {
@@ -389,6 +477,120 @@ mod tests {
                         b.footprint
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_pedal_panel_puts_audio_jacks_on_the_sides_and_power_on_top() {
+        // Locks in the real classic-stompbox convention (module doc comment)
+        // -- IN on the right edge, OUT on the left edge, DC power at the top
+        // edge, distinct from the 1/4in audio jacks -- so a future edit that
+        // silently reverts to "both jacks on top" or drops power fails loud.
+        let panel = PedalPanel::fuzz_pedal(EnclosureSize::Size1590B, ("RV1", "RV2"));
+        let (w, h) = (panel.width_mm(), panel.height_mm());
+
+        let in_jack = panel
+            .cutouts()
+            .iter()
+            .find(|c| c.label.as_deref() == Some("IN"))
+            .expect("IN jack cutout");
+        let out_jack = panel
+            .cutouts()
+            .iter()
+            .find(|c| c.label.as_deref() == Some("OUT"))
+            .expect("OUT jack cutout");
+        assert!(
+            in_jack.x_mm > w / 2.0,
+            "IN jack should be on the right edge, got x={}",
+            in_jack.x_mm
+        );
+        assert!(
+            out_jack.x_mm < w / 2.0,
+            "OUT jack should be on the left edge, got x={}",
+            out_jack.x_mm
+        );
+        assert_eq!(in_jack.y_mm, out_jack.y_mm, "both side jacks at one height");
+
+        let power = panel
+            .cutouts()
+            .iter()
+            .find(|c| c.footprint == "DC_Jack_5.5x2.1mm")
+            .expect("DC power jack cutout");
+        assert!(
+            power.y_mm > h * 0.8,
+            "power jack should be near the top edge, got y={} of h={h}",
+            power.y_mm
+        );
+        assert_eq!(power.x_mm, w / 2.0, "power jack centered on top edge");
+
+        let power_cutout_spec = PedalCutouts
+            .cutout(None, &power.footprint)
+            .expect("DC jack footprint should resolve via PedalCutouts");
+        assert_eq!(
+            power_cutout_spec.shape,
+            CutoutShape::Circle {
+                diameter_mm: DC_JACK_HOLE_MM
+            },
+            "a DC barrel jack must not silently resolve to the 1/4in audio jack hole size"
+        );
+    }
+
+    #[test]
+    fn lua_fuzz_pedal_script_matches_the_hardcoded_rust_convention() {
+        // Parity check: assets/panels/fuzz_pedal.lua is meant to reproduce
+        // fuzz_pedal()'s exact real-convention properties, not just
+        // "produce some cutouts" -- same assertions as
+        // fuzz_pedal_panel_puts_audio_jacks_on_the_sides_and_power_on_top,
+        // run against the Lua-driven build instead of the Rust one.
+        let script_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/panels/fuzz_pedal.lua");
+        let panel = PedalPanel::from_script(EnclosureSize::Size1590B, ("RV1", "RV2"), &script_path)
+            .expect("fuzz_pedal.lua should load and run");
+        let (w, h) = (panel.width_mm(), panel.height_mm());
+
+        let in_jack = panel
+            .cutouts()
+            .iter()
+            .find(|c| c.label.as_deref() == Some("IN"))
+            .expect("IN jack cutout");
+        let out_jack = panel
+            .cutouts()
+            .iter()
+            .find(|c| c.label.as_deref() == Some("OUT"))
+            .expect("OUT jack cutout");
+        assert!(
+            in_jack.x_mm > w / 2.0,
+            "IN jack should be on the right edge"
+        );
+        assert!(
+            out_jack.x_mm < w / 2.0,
+            "OUT jack should be on the left edge"
+        );
+
+        let power = panel
+            .cutouts()
+            .iter()
+            .find(|c| c.footprint == "DC_Jack_5.5x2.1mm")
+            .expect("DC power jack cutout");
+        assert!(
+            power.y_mm > h * 0.8,
+            "power jack should be near the top edge"
+        );
+
+        let anchored: Vec<&str> = panel
+            .cutouts()
+            .iter()
+            .filter_map(|c| c.refdes.as_deref())
+            .collect();
+        assert_eq!(anchored, vec!["RV1", "RV2"]);
+
+        // No overlaps, same threshold as the Rust layout's own check.
+        let cutouts = panel.cutouts();
+        for (i, a) in cutouts.iter().enumerate() {
+            for b in &cutouts[i + 1..] {
+                let dist = ((a.x_mm - b.x_mm).powi(2) + (a.y_mm - b.y_mm).powi(2)).sqrt();
+                assert!(dist > 15.0, "Lua layout: cutouts too close: {a:?} vs {b:?}");
             }
         }
     }
