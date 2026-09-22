@@ -681,46 +681,84 @@ fn run(circuit: PathBuf) -> Result<()> {
     // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep. Infer
     // the I/O and supply nets from the circuit (SIG_IN/SIG_OUT, +12V/-12V) rather
     // than assuming IN/OUT/±15 V (tus.9).
+    //
+    // Not every circuit has an audio-style signal path to sweep — a Pierce
+    // oscillator's resonator network (crate::oscillator) has no IN/OUT at
+    // all, only OSC_IN/OSC_OUT net labels with no consuming circuit. That's
+    // not a broken circuit, it's a genuinely different shape (verified
+    // analytically, not by SPICE — see that module's docs), and used to
+    // hard-fail the *entire* pipeline here the same way a missing footprint
+    // used to hard-fail the entire board (see the `not_placed` fix) — fixed
+    // the same way: skip what doesn't apply, don't refuse what does.
     let sim_config = SimConfig::infer(&model);
-    let ac = simulate_ac(&model, &sim_config, &work_dir)
-        .with_context(|| "simulate stage failed (try `lob doctor`)")?;
-    report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
-        "AC sweep: {} points, passband {:.2} dB",
-        ac.points.len(),
-        ac.passband_gain_db().unwrap_or(0.0)
-    ))));
+    let net_names: std::collections::HashSet<&str> =
+        model.nets().iter().map(|n| n.name.as_str()).collect();
+    let has_signal_path = net_names.contains(sim_config.input_net.as_str())
+        && net_names.contains(sim_config.output_net.as_str());
 
-    // Stage: transient — a step response, which shows time-domain behaviour (a
-    // slew limiter's peak slew rate) that an AC sweep can't (tus.10). Soft: a
-    // circuit whose step response won't converge is surfaced, not fatal.
-    match simulate_tran(&model, &sim_config, &TranAnalysis::default(), &work_dir) {
-        Ok(t) => {
-            let slew = t.max_slew_v_per_s().map_or_else(
-                || "n/a".to_string(),
-                |s| format!("{:.0} V/s ({:.2} V/ms)", s, s / 1e3),
-            );
-            report.push(
+    let ac_result = if has_signal_path {
+        let ac = simulate_ac(&model, &sim_config, &work_dir)
+            .with_context(|| "simulate stage failed (try `lob doctor`)")?;
+        report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
+            "AC sweep: {} points, passband {:.2} dB",
+            ac.points.len(),
+            ac.passband_gain_db().unwrap_or(0.0)
+        ))));
+
+        // Stage: transient — a step response, which shows time-domain behaviour (a
+        // slew limiter's peak slew rate) that an AC sweep can't (tus.10). Soft: a
+        // circuit whose step response won't converge is surfaced, not fatal.
+        match simulate_tran(&model, &sim_config, &TranAnalysis::default(), &work_dir) {
+            Ok(t) => {
+                let slew = t.max_slew_v_per_s().map_or_else(
+                    || "n/a".to_string(),
+                    |s| format!("{:.0} V/s ({:.2} V/ms)", s, s / 1e3),
+                );
+                report.push(
+                    StageOutcome::passed("transient")
+                        .with(Finding::info(format!("step response: peak slew {slew}"))),
+                );
+            }
+            Err(e) => report.push(
                 StageOutcome::passed("transient")
-                    .with(Finding::info(format!("step response: peak slew {slew}"))),
-            );
+                    .with(Finding::warning(format!("step response did not run: {e}"))),
+            ),
         }
-        Err(e) => report.push(
-            StageOutcome::passed("transient")
-                .with(Finding::warning(format!("step response did not run: {e}"))),
-        ),
-    }
 
-    // Stage: crosstalk — a multi-channel circuit has a question a single-channel
-    // one does not: do the channels stay independent? Drive channel 1 with a step
-    // sequence, hold every other channel's input at 0, and probe both outputs
-    // (tus.13 / 9wh). Self-selecting: skipped entirely on a single-channel board.
-    if let Some(outcome) = crosstalk_stage(&model, &sim_config, &work_dir) {
-        report.push(outcome);
-    }
+        // Stage: crosstalk — a multi-channel circuit has a question a single-channel
+        // one does not: do the channels stay independent? Drive channel 1 with a step
+        // sequence, hold every other channel's input at 0, and probe both outputs
+        // (tus.13 / 9wh). Self-selecting: skipped entirely on a single-channel board.
+        if let Some(outcome) = crosstalk_stage(&model, &sim_config, &work_dir) {
+            report.push(outcome);
+        }
+
+        Some(ac)
+    } else {
+        report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
+            "no recognizable signal-path net ('{}'/'{}' not present — have: {}) — \
+             this circuit has no audio-style I/O; AC/transient/crosstalk analysis \
+             doesn't apply, see the circuit's own docs for how it's verified instead",
+            sim_config.input_net,
+            sim_config.output_net,
+            {
+                let mut names: Vec<&str> = net_names.iter().copied().collect();
+                names.sort_unstable();
+                names.join(", ")
+            }
+        ))));
+        None
+    };
 
     // Stage: verify — assert the simulated response against the textbook value
-    // for this topology (RC cutoff, op-amp gain, …).
-    report.push(analytic_check(&model, &ac, 0.02));
+    // for this topology (RC cutoff, op-amp gain, …). Only meaningful when
+    // there was an AC sweep to check.
+    match &ac_result {
+        Some(ac) => report.push(analytic_check(&model, ac, 0.02)),
+        None => report.push(StageOutcome::passed("verify").with(Finding::info(
+            "skipped — no AC sweep to check (see simulate stage)",
+        ))),
+    }
 
     // Stage: bom — group parts into a BOM, write CSV, summarize.
     let bom = generate_bom(&model);
