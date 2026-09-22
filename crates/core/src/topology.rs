@@ -424,12 +424,16 @@ fact. `lob parts gate` will (correctly) block real board/BOM generation on
 this MPN until a human confirms it against the datasheet, same as any other
 unverified part (DESIGN.md 3.5/4.3).
 
-SW1/SW2/SW3 carry no footprint yet -- they're one physical 3PDT part
-represented as three schematic symbols (see above), and how that maps to a
-single PCB footprint placement (vs. three) is a real board-layout question
-this run doesn't answer. `lob board` isn't expected to place this circuit
-correctly until that's resolved; `lob run`'s ERC/SPICE checks above don't
-need a footprint at all, so they're unaffected.
+J1/J2/SW1/SW2/SW3 carry no footprint yet. SW1/SW2/SW3 are one physical
+3PDT part represented as three schematic symbols (see above), and how that
+maps to a single PCB footprint placement (vs. three) is a real board-layout
+question this run doesn't answer. J1/J2's real stock KiCad footprint
+candidates (e.g. Neutrik NRJ4HH/NRJ4HF) carry 7 pads (mounting + switch
+contacts) against this symbol's 2 pins -- a real mismatch, not something to
+paper over with a footprint string that happens to sound right. `lob board`
+isn't expected to place this circuit correctly until these are resolved;
+`lob run`'s ERC/SPICE checks above don't need a footprint at all, so
+they're unaffected.
 
 Panel layout is NOT modelled here -- this file is the audio signal path plus
 its true-bypass switching, checked by lob run (ERC + ngspice); panel/
@@ -466,8 +470,15 @@ def build():
     vcc = Net("+9V")
 
     # -- I/O jacks (mono TS: T=tip/signal, S=sleeve/ground). --
-    j_in = Part("Connector_Audio", "AudioJack2", footprint="Jack_6.35mm_TS", ref="J1")
-    j_out = Part("Connector_Audio", "AudioJack2", footprint="Jack_6.35mm_TS", ref="J2")
+    # No real footprint assigned yet -- "Jack_6.35mm_TS" (the pedal_panel.rs
+    # cutout-matching token) isn't an actual KiCad footprint, and the real
+    # stock 6.35mm Neutrik jacks (e.g. NRJ4HH/NRJ4HF) carry 7 pads (mounting
+    # + switch contacts) against this symbol's 2 pins -- a real mismatch,
+    # not a guess to paper over. Left unresolved on purpose; `lob run`'s BOM
+    # stage already surfaces this honestly ("no footprint: J1, J2") rather
+    # than silently carrying a footprint string that doesn't resolve.
+    j_in = Part("Connector_Audio", "AudioJack2", ref="J1")
+    j_out = Part("Connector_Audio", "AudioJack2", ref="J2")
     gnd += j_in["S"], j_out["S"]
 
     # -- True-bypass 3PDT footswitch: three SPDT poles (B=common, A=engaged,
@@ -505,7 +516,7 @@ def build():
     # -- Bypass-indicator LED: lit only in the engaged position. Generic
     # diode SPICE mapping (crate::spice needs one for any non-R/C/L part),
     # not a specific real LED's datasheet -- see lob_builtin.lib.
-    led = Part("Device", "LED", footprint="LED_5mm", ref="D1")
+    led = Part("Device", "LED", footprint="LED_THT:LED_D5.0mm", ref="D1")
     led.fields["Sim.Device"] = "SUBCKT"
     led.fields["Sim.Name"] = "LED_GENERIC"
     led.fields["Sim.Library"] = "lob_builtin.lib"
