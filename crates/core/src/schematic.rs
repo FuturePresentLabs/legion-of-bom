@@ -849,6 +849,20 @@ fn frame_and_title_svg(
 
 /// Draw a resolved KiCad symbol: its body primitives plus a lead for every pin,
 /// mapped from symbol space (mm, Y up) into sheet px.
+///
+/// Fill and stroke are drawn as two separate passes over `g.shapes` — every
+/// shape's fill first, then every shape's stroke on top — rather than one
+/// fill+stroke element per shape in file order. A KiCad symbol's declaration
+/// order does not reliably put its body (`fill background`) first: `SW_SPDT`
+/// declares its lever, pivot dot and throw-contact circles (all `fill none`)
+/// in `SW_SPDT_0_1` *before* its body rectangle in `SW_SPDT_1_1`, the opposite
+/// of `AudioJack2`, whose body rectangle happens to precede its distinguishing
+/// polylines. Drawing shapes as single combined elements in that order let the
+/// later-declared filled body paint over — and completely hide — the
+/// earlier-declared unfilled detail shapes, rendering every SW_SPDT as a bare
+/// rectangle. Splitting fill from stroke guarantees a solid fill always sits
+/// behind every stroke, whatever order the symbol declared its shapes in —
+/// the same fill-then-stroke convention real schematic renderers use.
 fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
     let mut s = String::new();
     // KiCad fill modes: `outline` is solid in the line colour, `background` is the
@@ -859,7 +873,9 @@ fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
         SymFill::None => "none",
     };
     let pt = |x: f64, y: f64| p.sym_px(x, y);
+    let scale = p.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
 
+    // Pass 1: fills only, `fill=none` shapes contribute nothing here.
     for shape in &g.shapes {
         match shape {
             SymShape::Rect {
@@ -868,12 +884,12 @@ fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
                 x1,
                 y1,
                 fill,
-            } => {
+            } if *fill != SymFill::None => {
                 let (ax, ay) = pt(*x0, *y0);
                 let (bx, by) = pt(*x1, *y1);
                 s.push_str(&format!(
                     "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
-                     fill=\"{}\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                     fill=\"{}\"/>",
                     ax.min(bx),
                     ay.min(by),
                     (bx - ax).abs(),
@@ -881,7 +897,9 @@ fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
                     paint(*fill),
                 ));
             }
-            SymShape::Poly { pts, fill } => {
+            SymShape::Poly { pts, fill } if *fill != SymFill::None => {
+                // A polyline's fill closes the point list implicitly (SVG
+                // always fills as if closed), so this needs no `polygon`.
                 let d: Vec<String> = pts
                     .iter()
                     .map(|&(x, y)| {
@@ -890,19 +908,59 @@ fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
                     })
                     .collect();
                 s.push_str(&format!(
-                    "<polyline points=\"{}\" fill=\"{}\" stroke=\"{ink}\" \
-                     stroke-width=\"1.4\" stroke-linejoin=\"round\"/>",
+                    "<polyline points=\"{}\" fill=\"{}\"/>",
                     d.join(" "),
                     paint(*fill)
                 ));
             }
-            SymShape::Circle { cx, cy, r, fill } => {
+            SymShape::Circle { cx, cy, r, fill } if *fill != SymFill::None => {
                 let (px, py) = pt(*cx, *cy);
-                let rr = r * p.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
+                let rr = r * scale;
                 s.push_str(&format!(
-                    "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"{rr:.1}\" fill=\"{}\" \
-                     stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"{rr:.1}\" fill=\"{}\"/>",
                     paint(*fill)
+                ));
+            }
+            // `fill == None`, or an arc (which carries no fill at all).
+            _ => {}
+        }
+    }
+
+    // Pass 2: strokes only, every shape, in original declaration order.
+    for shape in &g.shapes {
+        match shape {
+            SymShape::Rect { x0, y0, x1, y1, .. } => {
+                let (ax, ay) = pt(*x0, *y0);
+                let (bx, by) = pt(*x1, *y1);
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                     fill=\"none\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    ax.min(bx),
+                    ay.min(by),
+                    (bx - ax).abs(),
+                    (by - ay).abs(),
+                ));
+            }
+            SymShape::Poly { pts, .. } => {
+                let d: Vec<String> = pts
+                    .iter()
+                    .map(|&(x, y)| {
+                        let (px, py) = pt(x, y);
+                        format!("{px:.1},{py:.1}")
+                    })
+                    .collect();
+                s.push_str(&format!(
+                    "<polyline points=\"{}\" fill=\"none\" stroke=\"{ink}\" \
+                     stroke-width=\"1.4\" stroke-linejoin=\"round\"/>",
+                    d.join(" "),
+                ));
+            }
+            SymShape::Circle { cx, cy, r, .. } => {
+                let (px, py) = pt(*cx, *cy);
+                let rr = r * scale;
+                s.push_str(&format!(
+                    "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"{rr:.1}\" fill=\"none\" \
+                     stroke=\"{ink}\" stroke-width=\"1.4\"/>",
                 ));
             }
             SymShape::Arc { start, mid, end } => {
@@ -1059,6 +1117,73 @@ mod tests {
         assert!(
             !hidden.contains("<text"),
             "a symbol that hides names gets none: {hidden}"
+        );
+    }
+
+    /// legion-of-bom regression: switch symbols were rendering as blank
+    /// rectangles. A KiCad symbol's shape declaration order is not guaranteed
+    /// to put its body (a `background`-filled shape) before its
+    /// distinguishing detail graphics. `Switch:SW_SPDT` declares its lever,
+    /// pivot dot and throw-contact circles (all `fill none`) in `SW_SPDT_0_1`
+    /// *before* its body rectangle in `SW_SPDT_1_1` — the opposite of
+    /// `Connector_Audio:AudioJack2`, whose body rectangle happens to precede
+    /// its distinguishing polylines. Drawing one fill+stroke element per shape
+    /// in file order let the later-declared filled body paint over the
+    /// earlier-declared unfilled detail shapes and erase them outright, so
+    /// every switch rendered as a bare rectangle with no lever or pivot dot.
+    #[test]
+    fn a_background_fill_body_never_hides_shapes_declared_before_it() {
+        use crate::symbols::{SymFill, SymShape, SymbolGraphics};
+        let g = SymbolGraphics {
+            shapes: vec![
+                // Detail declared FIRST, like SW_SPDT's lever polyline.
+                SymShape::Poly {
+                    pts: vec![(-1.0, 0.0), (1.0, 1.0)],
+                    fill: SymFill::None,
+                },
+                // Body declared SECOND, like SW_SPDT_1_1's rectangle.
+                SymShape::Rect {
+                    x0: -2.0,
+                    y0: -2.0,
+                    x1: 2.0,
+                    y1: 2.0,
+                    fill: SymFill::Background,
+                },
+            ],
+            pins: Vec::new(),
+            units: 1,
+            pin_names: HashMap::new(),
+            hide_pin_names: false,
+        };
+        let p = Placed {
+            refdes: "SW1".into(),
+            value: "SW_SPDT".into(),
+            col: 0,
+            row: 0,
+            sym: Some(g.clone()),
+            box_pins: Vec::new(),
+            pin_names: HashMap::new(),
+            rot90: false,
+            flip: false,
+        };
+        let out = symbol_svg(&p, &g, "#000");
+        // The body's *fill* is emitted in pass 1 (before any stroke), so it
+        // must appear earlier in the document than the detail shape's
+        // *stroke*, which is emitted in pass 2 — otherwise the fill would
+        // paint over the stroke and hide it, the exact bug this regresses.
+        let body_fill = out.find("<rect").expect("body fill emitted");
+        let detail_stroke = out.find("<polyline").expect("detail stroke emitted");
+        assert!(
+            body_fill < detail_stroke,
+            "the body's fill must be painted before the detail shape's \
+             stroke, or it hides it: {out}"
+        );
+        // And the detail shape must still actually be visible: its stroke
+        // must not be `none`.
+        let stroke_snippet = &out[detail_stroke..];
+        assert!(
+            stroke_snippet.contains("stroke=\"#000\""),
+            "the detail polyline must be stroked: {out}"
         );
     }
 
