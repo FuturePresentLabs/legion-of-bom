@@ -22,14 +22,14 @@ use legion_of_bom_core::{
     package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
     part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, render_chain_skidl,
     render_skidl, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg, simulate_ac,
-    simulate_tran, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key,
-    zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy,
-    BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, Finding, FuzzChain,
-    FuzzConstraints, FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
-    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
-    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
-    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis,
+    simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes,
+    validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng,
+    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, Finding,
+    FuzzChain, FuzzConstraints, FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient, KitType,
+    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
+    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis, TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -131,6 +131,37 @@ enum Command {
         /// Write the diagram as PDF here (one page, sized to the diagram).
         #[arg(long)]
         pdf: Option<PathBuf>,
+    },
+    /// Drive a sine sweep into a circuit's recognized input net and measure
+    /// gain compression / flat-topping — "does this circuit actually clip
+    /// like a fuzz" as a measured SPICE claim, not a schematic read. Exits
+    /// non-zero only if the measurement itself couldn't run (SKiDL/netlist
+    /// failure, or no recognizable input net) — a low/uninteresting
+    /// flat-top is still exit 0, since "it doesn't clip at this drive
+    /// level" is a valid, successfully-measured answer. Threshold
+    /// pass/fail against a task's rubric is the caller's job (see
+    /// PCBBench's `Check::SpiceClips`), not this command's.
+    ScopeProbe {
+        /// Path to the circuit definition (e.g. a SKiDL script).
+        circuit: PathBuf,
+        /// Override which net to drive (default: SimConfig::infer's guess).
+        #[arg(long)]
+        input_net_hint: Option<String>,
+        /// Sweep drive frequency (Hz).
+        #[arg(long, default_value_t = 200.0)]
+        freq_hz: f64,
+        /// Smallest drive amplitude, peak volts.
+        #[arg(long, default_value_t = 0.005)]
+        min_amplitude: f64,
+        /// Largest drive amplitude, peak volts.
+        #[arg(long, default_value_t = 1.0)]
+        max_amplitude: f64,
+        /// Sweep points between min and max amplitude (log-spaced).
+        #[arg(long, default_value_t = 8)]
+        steps: usize,
+        /// Write the measurement report here as JSON.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Run DRC on a .kicad_pcb and report violations (the layout loop's check step).
     Drc {
@@ -541,6 +572,23 @@ fn main() -> ExitCode {
             logo,
         } => board_cmd(circuit, out, panel, mode, iterations, logo),
         Command::Diagram { circuit, svg, pdf } => diagram_cmd(circuit, svg, pdf),
+        Command::ScopeProbe {
+            circuit,
+            input_net_hint,
+            freq_hz,
+            min_amplitude,
+            max_amplitude,
+            steps,
+            out,
+        } => scope_probe_cmd(
+            circuit,
+            input_net_hint,
+            freq_hz,
+            min_amplitude,
+            max_amplitude,
+            steps,
+            out,
+        ),
         Command::Drc { board } => drc_cmd(board),
         Command::Fab {
             circuit,
@@ -1619,6 +1667,188 @@ fn diagram_cmd(circuit: PathBuf, svg_out: Option<PathBuf>, pdf_out: Option<PathB
         std::fs::write(path, &pdf).with_context(|| format!("writing {}", path.display()))?;
         println!("wrote {}", path.display());
     }
+    Ok(())
+}
+
+/// `count` breakpoints of a `amplitude`-peak sine at `freq_hz`, sampled
+/// `points_per_cycle` times per cycle over `cycles` — dense enough that
+/// ngspice's PWL source reads as sinusoidal rather than faceted.
+fn sine_pwl(freq_hz: f64, amplitude: f64, cycles: u32, points_per_cycle: u32) -> Vec<(f64, f64)> {
+    let period = 1.0 / freq_hz;
+    let n = cycles * points_per_cycle;
+    (0..=n)
+        .map(|i| {
+            let t = period * f64::from(i) / f64::from(points_per_cycle);
+            let v = amplitude * (2.0 * std::f64::consts::PI * freq_hz * t).sin();
+            (t, v)
+        })
+        .collect()
+}
+
+/// Peak-to-peak of the last cycle only, so a settling transient at turn-on
+/// isn't counted as part of the steady-state signal.
+fn steady_state_pp(points: &[legion_of_bom_core::TranPoint], period_s: f64, stop_s: f64) -> f64 {
+    let window_start = (stop_s - period_s).max(0.0);
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in points.iter().filter(|p| p.t_s >= window_start) {
+        lo = lo.min(p.v);
+        hi = hi.max(p.v);
+    }
+    hi - lo
+}
+
+/// Fraction of steady-state samples whose slope is under `flat_frac` of this
+/// waveform's own peak slope — scale-invariant (unlike comparing raw
+/// sample-to-sample deltas against peak-to-peak, which conflates "the
+/// timestep is fine" with "the signal is flat"). A clean sine's derivative
+/// is near-zero only for an instant at each peak; a clipped waveform's
+/// derivative is pinned near zero for a real chunk of each half-cycle.
+fn flat_top_fraction(
+    points: &[legion_of_bom_core::TranPoint],
+    period_s: f64,
+    stop_s: f64,
+    flat_frac: f64,
+) -> f64 {
+    let window_start = (stop_s - period_s).max(0.0);
+    let window: Vec<_> = points.iter().filter(|p| p.t_s >= window_start).collect();
+    if window.len() < 3 {
+        return 0.0;
+    }
+    let slopes: Vec<f64> = window
+        .windows(2)
+        .filter_map(|w| {
+            let dt = w[1].t_s - w[0].t_s;
+            (dt > 0.0).then(|| (w[1].v - w[0].v) / dt)
+        })
+        .collect();
+    let peak_slope = slopes.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+    if peak_slope <= 0.0 {
+        return 1.0;
+    }
+    let threshold = peak_slope * flat_frac;
+    let flat = slopes.iter().filter(|s| s.abs() < threshold).count();
+    flat as f64 / slopes.len() as f64
+}
+
+/// Handle `lob scope-probe` — drive a sine sweep into a circuit's recognized
+/// input net and measure gain compression / flat-topping. Built for
+/// PCBBench's `Check::SpiceClips` (see legion-of-bom's own
+/// `crates/core/examples/scope_probe.rs`, this is that mechanism promoted to
+/// a real subcommand with a machine-readable report instead of a println).
+fn scope_probe_cmd(
+    circuit: PathBuf,
+    input_net_hint: Option<String>,
+    freq_hz: f64,
+    min_amplitude: f64,
+    max_amplitude: f64,
+    steps: usize,
+    out: PathBuf,
+) -> Result<()> {
+    if steps < 2 {
+        anyhow::bail!("--steps must be at least 2 (need a min and a max point)");
+    }
+    if min_amplitude <= 0.0 || max_amplitude <= min_amplitude {
+        anyhow::bail!("need 0 < --min-amplitude < --max-amplitude");
+    }
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+
+    let mut config = SimConfig::infer(&model);
+    if let Some(hint) = &input_net_hint {
+        config.input_net = hint.clone();
+    }
+
+    let cycles = 4;
+    let points_per_cycle = 80;
+    let period = 1.0 / freq_hz;
+
+    // Log-spaced amplitudes: clipping onset is a decades-wide phenomenon
+    // (mV to V), a linear sweep would waste most of its points above onset.
+    let log_min = min_amplitude.ln();
+    let log_max = max_amplitude.ln();
+    let amplitudes: Vec<f64> = (0..steps)
+        .map(|i| (log_min + (log_max - log_min) * i as f64 / (steps - 1) as f64).exp())
+        .collect();
+
+    let mut points_json = Vec::new();
+    let mut small_gain = None;
+    let mut large: Option<(f64, f64)> = None; // (gain, flat_top) at the largest amplitude
+    for &amp in &amplitudes {
+        let pwl = sine_pwl(freq_hz, amp, cycles, points_per_cycle);
+        let stop_s = pwl
+            .last()
+            .map(|(t, _)| *t)
+            .unwrap_or(cycles as f64 * period);
+        let drive = TranDrive {
+            step_s: period / 1000.0,
+            stop_s,
+            pwl,
+            cv: Vec::new(),
+            probe_net: None,
+        };
+        // Fails loud (non-zero exit) on a genuine measurement failure -- a
+        // missing input net, a SPICE deck ngspice can't run -- exactly what
+        // "crashed / no recognizable input net = nonzero exit" means: this
+        // command only ever reports a clean 0 for a measurement that
+        // actually ran, never for one it gave up partway through.
+        let result = simulate_tran_drive(&model, &config, &drive, &work_dir)
+            .with_context(|| format!("scope-probe at {amp}V peak"))?;
+        let in_pp = 2.0 * amp;
+        let out_pp = steady_state_pp(&result.points, period, stop_s);
+        let gain = out_pp / in_pp;
+        let flat_top = flat_top_fraction(&result.points, period, stop_s, 0.1);
+        if small_gain.is_none() {
+            small_gain = Some(gain);
+        }
+        large = Some((gain, flat_top));
+        points_json.push(serde_json::json!({
+            "amplitude_v": amp,
+            "gain": gain,
+            "gain_db": 20.0 * gain.log10(),
+            "flat_top": flat_top,
+        }));
+    }
+
+    let (gain_at_max, flat_top_at_max) = large.expect("steps >= 2, loop ran");
+    let gain_at_min = small_gain.expect("steps >= 2, loop ran");
+    let compression_db = 20.0 * (gain_at_max / gain_at_min).log10();
+
+    let report = serde_json::json!({
+        "circuit": stem,
+        "input_net": config.input_net,
+        "output_net": config.output_net,
+        "freq_hz": freq_hz,
+        "flat_top_at_max": flat_top_at_max,
+        "gain_at_max": gain_at_max,
+        "gain_at_min": gain_at_min,
+        "compression_db": compression_db,
+        "points": points_json,
+    });
+    let json = serde_json::to_string_pretty(&report).with_context(|| "serializing report")?;
+    std::fs::write(&out, &json).with_context(|| format!("writing {}", out.display()))?;
+
+    println!(
+        "scope-probe: {} ({} -> {}, {:.0}Hz): flat-top {:.1}% at {:.3}V peak, {:.2}dB compression vs {:.3}V peak",
+        stem,
+        config.input_net,
+        config.output_net,
+        freq_hz,
+        flat_top_at_max * 100.0,
+        max_amplitude,
+        compression_db,
+        min_amplitude,
+    );
+    println!("wrote {}", out.display());
     Ok(())
 }
 
