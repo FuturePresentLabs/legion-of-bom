@@ -15,21 +15,22 @@ use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
-    eurorack_trial_build, export_cpl, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
-    fuzz_pedal_panel_file, generate_board_artifacts, generate_bom, generate_fuzz_chain,
-    generate_fuzz_pedal_spec, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom,
-    jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
-    package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
-    part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, render_chain_skidl,
-    render_skidl, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg, simulate_ac,
-    simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes,
-    validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions, BoardPng,
-    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, Finding,
-    FuzzChain, FuzzConstraints, FuzzPedalSpec, GuideOptions, HpSearch, JlcpcbClient, KitType,
-    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
-    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis, TranDrive,
+    eurorack_trial_build, export_board_glb, export_cpl, export_gerbers, fetch_from_jlcpcb,
+    fetch_from_kicad, fuzz_pedal_panel_file, generate_board_artifacts, generate_bom,
+    generate_fuzz_chain, generate_fuzz_pedal_spec, guide, guide_to_html, guide_to_pdf,
+    jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp,
+    minimum_routable_hp, package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb,
+    parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png,
+    render_chain_skidl, render_skidl, render_spec_text, rules, run_drc, run_layout_loop,
+    schematic_to_svg, simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword,
+    suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus,
+    BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize,
+    EurorackPlacer, Finding, FuzzChain, FuzzConstraints, FuzzPedalSpec, GuideOptions, HpSearch,
+    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
+    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -118,6 +119,11 @@ enum Command {
         /// Brand logo SVG to render on the back silk (bottom-centre).
         #[arg(long)]
         logo: Option<PathBuf>,
+        /// Also write a combined, named, colored 3D scene (.glb) of the
+        /// placed board — for an external model viewer, never a rendered
+        /// image. See `legion_of_bom_core::export_board_glb`.
+        #[arg(long)]
+        model: Option<PathBuf>,
     },
     /// Render a readable schematic diagram (symbols + routed nets) from a
     /// circuit — SVG for viewing/iterating, PDF for a shareable final export.
@@ -570,7 +576,8 @@ fn main() -> ExitCode {
             mode,
             iterations,
             logo,
-        } => board_cmd(circuit, out, panel, mode, iterations, logo),
+            model: model_glb,
+        } => board_cmd(circuit, out, panel, mode, iterations, logo, model_glb),
         Command::Diagram { circuit, svg, pdf } => diagram_cmd(circuit, svg, pdf),
         Command::ScopeProbe {
             circuit,
@@ -1597,6 +1604,7 @@ fn board_cmd(
     mode: String,
     iterations: usize,
     logo: Option<PathBuf>,
+    model_glb: Option<PathBuf>,
 ) -> Result<()> {
     let circuit = circuit
         .canonicalize()
@@ -1645,6 +1653,20 @@ fn board_cmd(
     let vias = board.matches("(via").count();
     println!("wrote {}", path.display());
     println!("  placed + routed: {tracks} tracks, {vias} vias, outline + GND pour");
+    if let Some(model_path) = model_glb {
+        let parts = guide::parse_board(&board).map_err(|e| anyhow::anyhow!(e))?;
+        let outline = guide::board_outline(&board)
+            .ok_or_else(|| anyhow::anyhow!("board has no Edge.Cuts outline"))?;
+        let glb = export_board_glb(stem, &parts, outline).context("exporting 3D model")?;
+        std::fs::write(&model_path, &glb)
+            .with_context(|| format!("writing {}", model_path.display()))?;
+        println!(
+            "  wrote {} ({} part(s), {} bytes) — named/colored, for a model viewer, not a render",
+            model_path.display(),
+            parts.len(),
+            glb.len()
+        );
+    }
     if !conflicts.is_empty() {
         eprintln!(
             "  ⚠ {} connection(s) left unrouted (for manual/iterative routing):",
