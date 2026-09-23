@@ -2189,6 +2189,17 @@ pub fn generate_board_artifacts(
         if route_opts.bounds.is_none() {
             route_opts.bounds = outline;
         }
+        // The ground net is poured on both layers (above) whenever there is an
+        // outline, so it is routed as a plane: each SMD ground pad gets its own
+        // via onto the pour instead of a track to every other ground pad.
+        if outline.is_some() && route_opts.plane_net.is_none() {
+            route_opts.plane_net = options.ground_net.as_ref().and_then(|gnd| {
+                net_names
+                    .iter()
+                    .find(|n| n.eq_ignore_ascii_case(gnd))
+                    .map(|n| net_index[n.as_str()])
+            });
+        }
         route = router.route(&nets, &route_opts);
         for track in &route.tracks {
             board.push(track_sexpr(track));

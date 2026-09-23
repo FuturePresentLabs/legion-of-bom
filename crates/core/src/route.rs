@@ -136,6 +136,12 @@ pub struct RouteOptions {
     /// Routable rectangle `(min_x, min_y, max_x, max_y)`; defaults to the pads'
     /// bounding box (plus a margin) when `None`.
     pub bounds: Option<(f64, f64, f64, f64)>,
+    /// The net poured as a plane on both layers (ground), if any. Its pads are
+    /// not joined to each other: each single-layer pad gets a short stub to a
+    /// via onto the other layer's pour, and the zone fill makes every other
+    /// connection — so a board's fifty ground pads cost fifty tiny searches,
+    /// not a spanning tree across the whole board (legion-of-bom-y17.12).
+    pub plane_net: Option<usize>,
     pub front: String,
     pub back: String,
 }
@@ -164,6 +170,7 @@ impl Default for RouteOptions {
             // crossing over. Crossover vs a via is ~via_cost/penalty ≈ 20 cells.
             back_penalty_mm: 0.1,
             bounds: None,
+            plane_net: None,
             front: "F.Cu".into(),
             back: "B.Cu".into(),
         }
@@ -292,6 +299,11 @@ const DENOM: i64 = 1000;
 /// — room to detour round an obstacle between them. A quarter of the
 /// connection's own span is added when that is more.
 const SEARCH_MARGIN_CELLS: usize = 50;
+
+/// How far (mm) a plane-net pad looks for a spot to drop its via — far enough
+/// to escape a fine-pitch row, near enough that a pad with no legal spot is
+/// reported instead of being routed across the board to one.
+const PLANE_REACH_MM: f64 = 5.0;
 
 impl Router for GridRouter {
     /// Route all nets with **rip-up-and-reroute**: route in an order; any net that
@@ -477,6 +489,13 @@ struct Surface {
     /// [`via_halo`](Self::via_halo) answered for every cell up front, against
     /// the pads-only grid — see [`ViaTable`].
     via_table: ViaTable,
+    /// The net poured as a plane ([`RouteOptions::plane_net`]).
+    plane_net: Option<usize>,
+    /// Cells (`c + r * cols`) a plane via may not drop on: the plane net's own
+    /// pad copper, grown by a via radius.
+    plane_no_via: HashSet<usize>,
+    /// How far (cells) a plane pad searches for its via.
+    plane_reach: usize,
     /// Per routable net: each pad's cell and the layers it connects.
     pad_cells: Vec<Vec<((usize, usize), PadLayer)>>,
     /// Routable pads whose own centre cell lies inside another net's pad
@@ -539,6 +558,13 @@ fn keepout_disc(d_mm: f64, res: f64) -> Vec<(isize, isize)> {
 /// How the maze search decides whether a via may drop at a cell.
 #[derive(Clone, Copy)]
 enum ViaCheck<'a> {
+    /// Look the answer up, and additionally refuse the listed cells (global
+    /// `c + r * cols` indices) — the plane net's own pad copper, so a plane
+    /// via never lands in an SMD pad and wicks its solder away.
+    TableExcept(&'a ViaTable, &'a HashSet<usize>),
+    /// Scan the live grid, and refuse the listed cells, for a grid that is
+    /// still changing ([`GridRouter`]).
+    LiveExcept(isize, &'a HashSet<usize>),
     /// Scan the live grid (it changes as [`GridRouter`] commits copper).
     Live(isize),
     /// Look the answer up — for a grid that never changes during the search.
@@ -762,6 +788,21 @@ fn paint_surface(
     }
 
     let via_table = ViaTable::new(&grid, via_halo);
+    let mut plane_no_via = HashSet::new();
+    if let Some(plane) = opts.plane_net {
+        let grow = opts.via_size_mm / 2.0;
+        for pad in nets.iter().filter(|n| n.net_idx == plane).flat_map(|n| &n.pads) {
+            let lo = |v: f64, o: f64| (((v - o) / res).floor() as isize).max(0) as usize;
+            let hi = |v: f64, o: f64, n: usize| (((v - o) / res).ceil() as usize).min(n - 1);
+            let (x0, x1) = (pad.x_mm - pad.w_mm / 2.0 - grow, pad.x_mm + pad.w_mm / 2.0 + grow);
+            let (y0, y1) = (pad.y_mm - pad.h_mm / 2.0 - grow, pad.y_mm + pad.h_mm / 2.0 + grow);
+            for r in lo(y0, miny)..=hi(y1, miny, rows) {
+                for c in lo(x0, minx)..=hi(x1, minx, cols) {
+                    plane_no_via.insert(c + r * cols);
+                }
+            }
+        }
+    }
     Surface {
         grid,
         cols,
@@ -770,6 +811,9 @@ fn paint_surface(
         minx,
         miny,
         via_table,
+        plane_net: opts.plane_net,
+        plane_no_via,
+        plane_reach: (PLANE_REACH_MM / res).ceil() as usize,
         track_disc,
         track_halo,
         via_disc,
@@ -814,6 +858,8 @@ fn route_pass(
     let mm_of = move |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
     let pad_cells = surface.pad_cells.clone();
     let (track_disc, via_disc) = (surface.track_disc.clone(), surface.via_disc.clone());
+    let (plane_net, plane_reach) = (surface.plane_net, surface.plane_reach);
+    let plane_no_via = std::mem::take(&mut surface.plane_no_via);
     let grid = &mut surface.grid;
 
     // Route each net in the given order, growing a tree from pad 0.
@@ -830,6 +876,41 @@ fn route_pass(
             via: (opts.via_cost_mm * 1000.0) as i64,
             back: (opts.back_penalty_mm * 1000.0) as i64,
         };
+
+        // A plane net: each single-layer pad's own stub and via onto the pour,
+        // exactly as PathfinderRouter does it (see `route_net_soft`).
+        if plane_net == Some(net.net_idx) {
+            for (k, &((c, r), layer)) in pad_cells[ni].iter().enumerate() {
+                let start = match layer {
+                    PadLayer::Front => (c, r, FRONT),
+                    PadLayer::Back => (c, r, BACK),
+                    PadLayer::Both => continue,
+                };
+                let vias = ViaCheck::LiveExcept(via_halo, &plane_no_via);
+                match grid.route_to_plane(net.net_idx, start, plane_reach, costs, vias, learned, 0)
+                {
+                    Some(path) => {
+                        emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
+                        for &(c, r, l) in &path {
+                            grid.commit(c, r, l, net.net_idx, &track_disc);
+                        }
+                        if let Some(&(vc, vr, _)) = path.last() {
+                            grid.commit_via(vc, vr, net.net_idx, &via_disc);
+                        }
+                    }
+                    None => {
+                        out.conflicts.push(format!(
+                            "net {} ({}): could not route to pad {}.{}",
+                            net.net_idx, net.name, net.pads[k].refdes, net.pads[k].pad
+                        ));
+                        if !failed.contains(&ni) {
+                            failed.push(ni);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
 
         // Connected component: cells already part of this net's routed tree.
         // A through-hole pad seeds both layers (it bridges them).
@@ -1081,8 +1162,33 @@ impl Grid {
             (r1 + margin).min(self.rows - 1),
         );
         let whole = (0, 0, self.cols - 1, self.rows - 1);
-        let search = |w| self.search(net, sources, targets, costs, vias, cong, p_fac, w);
+        let search = |w| self.search(net, sources, targets, false, costs, vias, cong, p_fac, w);
         search(window).or_else(|| (window != whole).then(|| search(whole)).flatten())
+    }
+
+    /// The cheapest short path from a single-layer pad cell to a via onto the
+    /// other layer — how a plane net's pad reaches its pour. Searched within
+    /// `reach` cells of the pad; a pad with no legal via that close is reported
+    /// rather than dragged across the board.
+    #[allow(clippy::too_many_arguments)]
+    fn route_to_plane(
+        &self,
+        net: usize,
+        pad: (usize, usize, usize),
+        reach: usize,
+        costs: Costs,
+        vias: ViaCheck<'_>,
+        cong: &Congestion,
+        p_fac: i64,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        let (c, r, _) = pad;
+        let window = (
+            c.saturating_sub(reach),
+            r.saturating_sub(reach),
+            (c + reach).min(self.cols - 1),
+            (r + reach).min(self.rows - 1),
+        );
+        self.search(net, &[pad], &[], true, costs, vias, cong, p_fac, window)
     }
 
     /// [`route_one_soft`](Self::route_one_soft) confined to the inclusive cell
@@ -1093,6 +1199,9 @@ impl Grid {
         net: usize,
         sources: &[(usize, usize, usize)],
         targets: &[(usize, usize, usize)],
+        // Instead of `targets`, stop at the first cell on the other layer from
+        // the sources — a via onto a plane.
+        to_plane: bool,
         costs: Costs,
         vias: ViaCheck<'_>,
         cong: &Congestion,
@@ -1150,7 +1259,7 @@ impl Grid {
             if g > dist[i] {
                 continue;
             }
-            if tgt.contains(&i) {
+            if tgt.contains(&i) || (to_plane && cell(i).2 != sources[0].2) {
                 let mut path = Vec::new();
                 let mut cur = i;
                 while cur != usize::MAX {
@@ -1209,6 +1318,13 @@ impl Grid {
             let via_ok = match vias {
                 ViaCheck::Live(via_halo) => self.via_area_clear(c, r, net, via_halo),
                 ViaCheck::Table(t) => t.allows(c, r, net),
+                ViaCheck::TableExcept(t, refused) => {
+                    !refused.contains(&(c + r * self.cols)) && t.allows(c, r, net)
+                }
+                ViaCheck::LiveExcept(via_halo, refused) => {
+                    !refused.contains(&(c + r * self.cols))
+                        && self.via_area_clear(c, r, net, via_halo)
+                }
             };
             if via_ok {
                 relax(
@@ -1635,6 +1751,24 @@ fn route_net_soft(
     p_fac: i64,
 ) -> NetRoute {
     let mut rt = NetRoute::default();
+    // A plane net's pads are joined by the pour, not by each other: each
+    // single-layer pad needs only its own stub and via onto the other layer.
+    // A through-hole pad is already on both.
+    if s.plane_net == Some(net.net_idx) {
+        for (k, &((c, r), layer)) in s.pad_cells[ni].iter().enumerate() {
+            let start = match layer {
+                PadLayer::Front => (c, r, FRONT),
+                PadLayer::Back => (c, r, BACK),
+                PadLayer::Both => continue,
+            };
+            let vias = ViaCheck::TableExcept(&s.via_table, &s.plane_no_via);
+            match s.grid.route_to_plane(net.net_idx, start, s.plane_reach, s.costs, vias, cong, p_fac) {
+                Some(path) => rt.paths.push(path),
+                None => rt.unreached.push(k),
+            }
+        }
+        return rt;
+    }
     let mut connected: Vec<(usize, usize, usize)> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     let mut join = |c: usize, r: usize, l: usize, conn: &mut Vec<(usize, usize, usize)>| {
@@ -2859,6 +2993,61 @@ mod tests {
     /// board can route: at 0.25mm track / 0.2mm clearance there is 0.025mm of
     /// slack either side of each pin's axis, so this is a test of whether the
     /// grid measures clearance honestly, not of routing cleverness.
+    #[test]
+    fn a_plane_net_drops_each_pad_to_a_via_instead_of_joining_them() {
+        // Two SMD ground pads 10mm apart, and a signal passing between them.
+        let smd = |r: &str, x: f64, y: f64| PadPoint {
+            w_mm: 0.8,
+            h_mm: 0.9,
+            ..pad(r, "2", x, y)
+        };
+        let nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "GND".into(),
+                pads: vec![smd("C1", 5.0, 5.0), smd("C2", 15.0, 5.0)],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG".into(),
+                pads: vec![pad("A", "1", 10.0, 1.5), pad("B", "1", 10.0, 8.5)],
+            },
+        ];
+        for router in [
+            &PathfinderRouter::default() as &dyn Router,
+            &GridRouter as &dyn Router,
+        ] {
+            let opts = RouteOptions {
+                bounds: Some((0.0, 0.0, 20.0, 10.0)),
+                plane_net: Some(1),
+                ..RouteOptions::default()
+            };
+            let out = router.route(&nets, &opts);
+            assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+            let gnd_vias: Vec<&Via> = out.vias.iter().filter(|v| v.net_idx == 1).collect();
+            assert_eq!(gnd_vias.len(), 2, "one via per ground pad: {:?}", out.vias);
+            let gnd_copper: f64 = out
+                .tracks
+                .iter()
+                .filter(|t| t.net_idx == 1)
+                .map(|t| (t.end.0 - t.start.0).hypot(t.end.1 - t.start.1))
+                .sum();
+            assert!(
+                gnd_copper < 4.0,
+                "ground is stubs to vias, not a track across the board ({gnd_copper:.1}mm)"
+            );
+            for v in gnd_vias {
+                for p in &nets[0].pads {
+                    let inside = (v.at.0 - p.x_mm).abs() < p.w_mm / 2.0 + v.size_mm / 2.0
+                        && (v.at.1 - p.y_mm).abs() < p.h_mm / 2.0 + v.size_mm / 2.0;
+                    assert!(!inside, "a via in pad {}.{} would wick its solder", p.refdes, p.pad);
+                }
+            }
+            let bad = clearance_violations(&nets, &out, opts.clearance_mm);
+            assert!(bad.is_empty(), "{bad:#?}");
+        }
+    }
+
     #[test]
     fn pathfinder_escapes_a_half_millimetre_pitch_qfp_drc_clean() {
         let (nets, opts) = lqfp_fanout_board();
