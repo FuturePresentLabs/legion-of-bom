@@ -1,0 +1,435 @@
+{
+  "mpn": "ES8388",
+  "manufacturer": "Everest Semiconductor",
+  "lcsc": "C365736",
+  "summary": "Low-power stereo 24-bit audio codec (ADC + DAC), I2S slave, configured over I2C; two stereo line inputs, line out and a headphone output, 1.8-3.3 V",
+  "symbol": {
+    "kicad": "Audio:ES8388"
+  },
+  "footprint": "Package_DFN_QFN:QFN-28-1EP_4x4mm_P0.45mm_EP2.6x2.6mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/b5b69a0d4875954a40e8f8a3f42483af.pdf",
+    "sha256": "db9300f79df430d022b754b29eb1b6b17ca08e3b91d3ba833606dadc65898258"
+  },
+  "provides": [
+    "i2s-dac",
+    "i2s-adc",
+    "headphone-out"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "i2s",
+      "role": "slave",
+      "signals": {
+        "mclk": "pin:MCLK",
+        "bck": "pin:SCLK",
+        "lrck": "pin:LRCK",
+        "din": "pin:DSDIN",
+        "dout": "pin:ASDOUT"
+      },
+      "cite": {
+        "page": 7,
+        "quote": "In slave mode, LRCK and SCLK are supplied externally."
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "slave",
+      "signals": {
+        "scl": "pin:CCLK",
+        "sda": "pin:CDATA"
+      },
+      "cite": {
+        "page": 9,
+        "quote": "In 2-wire mode, pin CE, CCLK and CDATA function as AD0, SCL and"
+      }
+    },
+    {
+      "kind": "audio-line-in",
+      "role": "sink",
+      "signals": {
+        "l": "node:in_l",
+        "r": "node:in_r"
+      },
+      "cite": {
+        "reading": "1uF series on each line input",
+        "page": 7
+      }
+    },
+    {
+      "kind": "audio-line-out",
+      "role": "source",
+      "signals": {
+        "l": "node:out_l",
+        "r": "node:out_r"
+      },
+      "cite": {
+        "reading": "1uF series on LOUT1/ROUT1 used as line output",
+        "page": 7
+      }
+    },
+    {
+      "kind": "headphone-out",
+      "role": "source",
+      "signals": {
+        "l": "node:hp_l",
+        "r": "node:hp_r"
+      },
+      "cite": {
+        "reading": "47uF series on LOUT2/ROUT2 used as headphone output",
+        "page": 7
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:DVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "1.8V to 3.3V operation"
+      }
+    },
+    {
+      "between": [
+        "pin:DVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:DVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:PVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "1.8V to 3.3V operation"
+      }
+    },
+    {
+      "between": [
+        "pin:PVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:PVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "1.8V to 3.3V operation"
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:HPVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "1.8V to 3.3V operation"
+      }
+    },
+    {
+      "between": [
+        "pin:HPVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:HPVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on each supply pin group in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:DGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Digital ground (return path for both DVDD and PVDD)"
+      }
+    },
+    {
+      "between": [
+        "pin:AGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "AGND and HPGND to ground in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:HPGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "AGND and HPGND to ground in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:EPAD",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "exposed pad to ground (GND THERMAL) in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:CE",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 10,
+        "quote": "The chip address must be 001000x, where x equals AD0."
+      }
+    },
+    {
+      "between": [
+        "pin:VMID",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 6,
+        "quote": "20       VMID            O         Decoupling capacitor"
+      }
+    },
+    {
+      "between": [
+        "pin:VMID",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on VMID, ADCVREF and VREF",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:ADCVREF",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 6,
+        "quote": "19       ADCVREF         O         Decoupling capacitor"
+      }
+    },
+    {
+      "between": [
+        "pin:ADCVREF",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on VMID, ADCVREF and VREF",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VREF",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 6,
+        "quote": "10       VREF            O         Decoupling capacitor"
+      }
+    },
+    {
+      "between": [
+        "pin:VREF",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10uF + 0.1uF on VMID, ADCVREF and VREF",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "node:in_l",
+        "pin:LIN1"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "1uF series on each line input",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "node:in_r",
+        "pin:RIN1"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "1uF series on each line input",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:LOUT1",
+        "node:out_l"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "1uF series on LOUT1/ROUT1 used as line output",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:ROUT1",
+        "node:out_r"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "1uF series on LOUT1/ROUT1 used as line output",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:LOUT2",
+        "node:hp_l"
+      ],
+      "part": "CP",
+      "value": "47uF",
+      "footprint": "Capacitor_Tantalum_SMD:CP_EIA-3528-21_Kemet-B",
+      "cite": {
+        "reading": "47uF series on LOUT2/ROUT2 used as headphone output",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:ROUT2",
+        "node:hp_r"
+      ],
+      "part": "CP",
+      "value": "47uF",
+      "footprint": "Capacitor_Tantalum_SMD:CP_EIA-3528-21_Kemet-B",
+      "cite": {
+        "reading": "47uF series on LOUT2/ROUT2 used as headphone output",
+        "page": 7
+      }
+    }
+  ]
+}

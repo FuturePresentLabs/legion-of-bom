@@ -1,0 +1,79 @@
+{
+  "mpn": "AMS1117-3.3",
+  "manufacturer": "Advanced Monolithic Systems",
+  "lcsc": "C6186",
+  "summary": "Fixed 3.3 V linear regulator, up to 1 A, from a 5 V rail (SOT-223)",
+  "symbol": {
+    "kicad": "Regulator_Linear:AMS1117-3.3"
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/e6935943fc6b1bbf350a1a0f3e90dc4a.pdf",
+    "sha256": "189a2651878a87d590b768eaa9b44217a3fdf460352ce6ecaff127221282a3f0"
+  },
+  "provides": [
+    "rail:+3V3"
+  ],
+  "sim_excluded": true,
+  "support": [
+    {
+      "between": [
+        "pin:VI",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "5V to 3.3V Linear Regulator"
+      }
+    },
+    {
+      "between": [
+        "pin:VO",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 2,
+        "quote": "AMS1117-3.3 VIN = 4.8V 3.251 3.300 3.349 V"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "5V to 3.3V Linear Regulator"
+      }
+    },
+    {
+      "between": [
+        "pin:VO",
+        "net:GND"
+      ],
+      "part": "CP",
+      "value": "22uF",
+      "footprint": "Capacitor_Tantalum_SMD:CP_EIA-3528-21_Kemet-B",
+      "cite": {
+        "page": 4,
+        "quote": "The addition of 22µF solid tantalum on the output will ensure"
+      }
+    },
+    {
+      "between": [
+        "pin:VI",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "10µF on the input in the application figure",
+        "page": 4
+      }
+    }
+  ]
+}

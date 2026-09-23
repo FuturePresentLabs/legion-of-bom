@@ -1,0 +1,351 @@
+{
+  "mpn": "PCM1808PWR",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C55513",
+  "summary": "Stereo 24-bit 96 kHz audio ADC, I2S slave, configured by pins only (no control bus); needs a 5 V analog supply and an external system clock (MCLK)",
+  "symbol": {
+    "pins": [
+      {
+        "number": "1",
+        "name": "VREF",
+        "io": "passive",
+        "cite": {
+          "page": 5,
+          "quote": "VREF 1 14 VINR"
+        }
+      },
+      {
+        "number": "2",
+        "name": "AGND",
+        "io": "power",
+        "cite": {
+          "page": 5,
+          "quote": "AGND 2 – Analog GND"
+        }
+      },
+      {
+        "number": "3",
+        "name": "VCC",
+        "io": "power",
+        "cite": {
+          "page": 5,
+          "quote": "VCC 3 – Analog power supply, 5-V"
+        }
+      },
+      {
+        "number": "4",
+        "name": "VDD",
+        "io": "power",
+        "cite": {
+          "page": 5,
+          "quote": "VDD 4 – Digital power supply, 3.3-V"
+        }
+      },
+      {
+        "number": "5",
+        "name": "DGND",
+        "io": "power",
+        "cite": {
+          "page": 5,
+          "quote": "DGND 5 – Digital GND"
+        }
+      },
+      {
+        "number": "6",
+        "name": "SCKI",
+        "io": "I",
+        "cite": {
+          "page": 5,
+          "quote": "SCKI 6 I System clock input"
+        }
+      },
+      {
+        "number": "7",
+        "name": "LRCK",
+        "io": "I/O",
+        "cite": {
+          "page": 5,
+          "quote": "LRCK 7 I/O Audio data latch enable input/output"
+        }
+      },
+      {
+        "number": "8",
+        "name": "BCK",
+        "io": "I/O",
+        "cite": {
+          "page": 5,
+          "quote": "BCK 8 I/O Audio data bit clock input/output"
+        }
+      },
+      {
+        "number": "9",
+        "name": "DOUT",
+        "io": "O",
+        "cite": {
+          "page": 5,
+          "quote": "DOUT 9 O Audio data digital output"
+        }
+      },
+      {
+        "number": "10",
+        "name": "MD0",
+        "io": "I",
+        "cite": {
+          "page": 5,
+          "quote": "MD0 10 I Audio interface mode select 0"
+        }
+      },
+      {
+        "number": "11",
+        "name": "MD1",
+        "io": "I",
+        "cite": {
+          "page": 5,
+          "quote": "MD1 11 I Audio interface mode select 1"
+        }
+      },
+      {
+        "number": "12",
+        "name": "FMT",
+        "io": "I",
+        "cite": {
+          "page": 5,
+          "quote": "FMT 12 I Audio interface format select"
+        }
+      },
+      {
+        "number": "13",
+        "name": "VINL",
+        "io": "I",
+        "cite": {
+          "page": 5,
+          "quote": "VINL 13 I Analog input, L-channel"
+        }
+      },
+      {
+        "number": "14",
+        "name": "VINR",
+        "io": "I",
+        "cite": {
+          "page": 5,
+          "quote": "VINR 14 I Analog input, R-channel"
+        }
+      }
+    ]
+  },
+  "footprint": "Package_SO:TSSOP-14_4.4x5mm_P0.65mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/123fc00b1e2e42d784540e014c38fb88.pdf",
+    "sha256": "a36e2bcd3b168e3efe4c3fc8dd3d0799e2f9fc84f99aca1fd24b82a9d2cf13db"
+  },
+  "provides": [
+    "i2s-adc"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "i2s",
+      "role": "slave",
+      "signals": {
+        "mclk": "pin:SCKI",
+        "bck": "pin:BCK",
+        "lrck": "pin:LRCK",
+        "dout": "pin:DOUT"
+      },
+      "cite": {
+        "page": 11,
+        "quote": "at 256 fS, 384 fS, or 512 fS in slave mode."
+      }
+    },
+    {
+      "kind": "audio-line-in",
+      "role": "sink",
+      "signals": {
+        "l": "node:in_l",
+        "r": "node:in_r"
+      },
+      "cite": {
+        "page": 19,
+        "quote": "C1, C2: A 1-µF electrolytic capacitor gives 2.7 Hz"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VCC",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 2,
+        "quote": "Analog supply voltage, VCC"
+      }
+    },
+    {
+      "between": [
+        "pin:VCC",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 19,
+        "quote": "C3, C4: Bypass capacitors, 0.1-µF ceramic and 10-µF electrolytic"
+      }
+    },
+    {
+      "between": [
+        "pin:VCC",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 19,
+        "quote": "C3, C4: Bypass capacitors, 0.1-µF ceramic and 10-µF electrolytic"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 5,
+        "quote": "VDD 4 – Digital power supply, 3.3-V"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 19,
+        "quote": "C3, C4: Bypass capacitors, 0.1-µF ceramic and 10-µF electrolytic"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 19,
+        "quote": "C3, C4: Bypass capacitors, 0.1-µF ceramic and 10-µF electrolytic"
+      }
+    },
+    {
+      "between": [
+        "pin:VREF",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 19,
+        "quote": "C5: 0.1-µF ceramic and 10-µF electrolytic capacitors are recommended."
+      }
+    },
+    {
+      "between": [
+        "pin:VREF",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 19,
+        "quote": "C5: 0.1-µF ceramic and 10-µF electrolytic capacitors are recommended."
+      }
+    },
+    {
+      "between": [
+        "pin:AGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 19,
+        "quote": "should be connected directly to each other under the PCM1808 package"
+      }
+    },
+    {
+      "between": [
+        "pin:DGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 19,
+        "quote": "should be connected directly to each other under the PCM1808 package"
+      }
+    },
+    {
+      "between": [
+        "pin:MD0",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 14,
+        "quote": "Low             Low        Slave mode (256 fS, 384 fS, 512 fS autodetection)"
+      }
+    },
+    {
+      "between": [
+        "pin:MD1",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 14,
+        "quote": "Low             Low        Slave mode (256 fS, 384 fS, 512 fS autodetection)"
+      }
+    },
+    {
+      "between": [
+        "pin:FMT",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 14,
+        "quote": "0              Low        I2S, 24-bit"
+      }
+    },
+    {
+      "between": [
+        "node:in_l",
+        "pin:VINL"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 19,
+        "quote": "C1, C2: A 1-µF electrolytic capacitor gives 2.7 Hz"
+      }
+    },
+    {
+      "between": [
+        "node:in_r",
+        "pin:VINR"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 19,
+        "quote": "C1, C2: A 1-µF electrolytic capacitor gives 2.7 Hz"
+      }
+    }
+  ]
+}

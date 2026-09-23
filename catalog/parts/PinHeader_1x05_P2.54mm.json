@@ -1,0 +1,45 @@
+{
+  "mpn": "PinHeader_1x05_P2.54mm",
+  "manufacturer": "generic",
+  "summary": "5-pad SWD landing (SWDIO, SWCLK, NRST, 3V3, GND) for a pogo-pin programming jig; footprint only",
+  "symbol": {
+    "kicad": "Connector_Generic:Conn_01x05"
+  },
+  "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x05_P2.54mm_Vertical",
+  "provides": [
+    "connector"
+  ],
+  "interfaces": [
+    {
+      "kind": "swd",
+      "role": "debugger",
+      "signals": {
+        "swdio": "pin:Pin_1",
+        "swclk": "pin:Pin_2",
+        "nrst": "pin:Pin_3"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:Pin_4",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "house practice: MCU boards flashed in-house through pogo pins on SWD pads"
+      }
+    },
+    {
+      "between": [
+        "pin:Pin_5",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "pin header ground pin"
+      }
+    }
+  ]
+}

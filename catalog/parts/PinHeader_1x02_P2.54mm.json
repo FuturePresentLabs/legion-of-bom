@@ -1,0 +1,40 @@
+{
+  "mpn": "PinHeader_1x02_P2.54mm",
+  "manufacturer": "generic",
+  "summary": "2-pin 2.54 mm header: a mono audio port or a power input",
+  "symbol": {
+    "kicad": "Connector_Generic:Conn_01x02"
+  },
+  "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical",
+  "provides": [
+    "connector"
+  ],
+  "interfaces": [
+    {
+      "kind": "mono-audio",
+      "role": "port",
+      "signals": {
+        "sig": "pin:Pin_1"
+      }
+    },
+    {
+      "kind": "power-in",
+      "role": "port",
+      "signals": {
+        "v": "pin:Pin_1"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:Pin_2",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "pin header ground pin"
+      }
+    }
+  ]
+}

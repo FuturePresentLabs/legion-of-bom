@@ -1,0 +1,46 @@
+{
+  "mpn": "PCM5102APWR",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C107671",
+  "summary": "Stereo 32-bit 384 kHz audio DAC, I2S slave, configured by pins only (no control bus); 2.1 Vrms line out from 3.3 V with an on-chip charge pump",
+  "symbol": {"kicad": "Audio:PCM5102A"},
+  "footprint": "Package_SO:TSSOP-20_4.4x6.5mm_P0.65mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/427cb50cd71d4fa092a8afe7bc909457.pdf",
+    "sha256": "82970ecf973a6c13a4c729c43889501d4b5b4258614a9941a5660d3c355b3c3b"
+  },
+  "provides": ["i2s-dac"],
+  "sim_excluded": true,
+  "interfaces": [
+    {"kind": "i2s", "role": "slave", "signals": {"bck": "pin:BCK", "lrck": "pin:LRCK", "din": "pin:DIN"},
+     "cite": {"page": 26, "quote": "3-wire I2S interface (BCK PLL)"}},
+    {"kind": "audio-line-out", "role": "source", "signals": {"l": "node:out_l", "r": "node:out_r"},
+     "cite": {"page": 8, "quote": "with 470-Ω output resistor and a 2.2-nF shunt capacitor"}}
+  ],
+  "support": [
+    {"between": ["pin:AVDD", "net:+3V3"], "part": "tie", "cite": {"page": 28, "quote": "Analog voltage supply; must be 3.3 V."}},
+    {"between": ["pin:AVDD", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 26, "quote": "BCK            AVDD           0.1mF       10mF"}},
+    {"between": ["pin:AVDD", "net:GND"], "part": "C", "value": "10uF", "footprint": "Capacitor_SMD:C_0805_2012Metric", "cite": {"page": 26, "quote": "BCK            AVDD           0.1mF       10mF"}},
+    {"between": ["pin:CPVDD", "net:+3V3"], "part": "tie", "cite": {"page": 6, "quote": "CPVDD           Charge pump supply voltage range"}},
+    {"between": ["pin:CPVDD", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 26, "quote": "CAPP           0.1mF       10mF"}},
+    {"between": ["pin:CPVDD", "net:GND"], "part": "C", "value": "10uF", "footprint": "Capacitor_SMD:C_0805_2012Metric", "cite": {"page": 26, "quote": "CAPP           0.1mF       10mF"}},
+    {"between": ["pin:DVDD", "net:+3V3"], "part": "tie", "cite": {"page": 6, "quote": "3.3 V DVDD                          3.1        3.3    3.46"}},
+    {"between": ["pin:DVDD", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 26, "quote": "10mF                        0.1mF"}},
+    {"between": ["pin:DVDD", "net:GND"], "part": "C", "value": "10uF", "footprint": "Capacitor_SMD:C_0805_2012Metric", "cite": {"page": 26, "quote": "10mF                        0.1mF"}},
+    {"between": ["pin:AGND", "net:GND"], "part": "tie", "cite": {"page": 6, "quote": "All grounds on board are tied together"}},
+    {"between": ["pin:DGND", "net:GND"], "part": "tie", "cite": {"page": 6, "quote": "All grounds on board are tied together"}},
+    {"between": ["pin:CPGND", "net:GND"], "part": "tie", "cite": {"page": 6, "quote": "All grounds on board are tied together"}},
+    {"between": ["pin:CAPP", "pin:CAPM"], "part": "C", "value": "2.2uF", "cite": {"page": 26, "quote": "CAPM   2.2mF   2.2mF"}},
+    {"between": ["pin:VNEG", "net:GND"], "part": "C", "value": "2.2uF", "cite": {"page": 26, "quote": "CAPM   2.2mF   2.2mF"}},
+    {"between": ["pin:LDOO", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 28, "quote": "Should be used with a 0.1-µF decoupling cap."}},
+    {"between": ["pin:FMT", "net:GND"], "part": "tie", "cite": {"page": 26, "quote": "Audio format selection: FMT pin tied low"}},
+    {"between": ["pin:FLT", "net:GND"], "part": "tie", "cite": {"page": 26, "quote": "Normal filter latency: FLT pin tied low"}},
+    {"between": ["pin:DEMP", "net:GND"], "part": "tie", "cite": {"page": 5, "quote": "De-emphasis control for 44.1-kHz sampling rate (1): Off (Low) / On (High)"}},
+    {"between": ["pin:XSMT", "net:+3V3"], "part": "tie", "cite": {"page": 16, "quote": "In systems where XSMT is not required, it can be directly connected to AVDD."}},
+    {"between": ["pin:SCK", "net:GND"], "part": "tie", "cite": {"page": 25, "quote": "ground level for 16 successive LRCK periods, then the internal PLL starts, automatically generating an internal"}},
+    {"between": ["pin:OUTL", "node:out_l"], "part": "R", "value": "470", "cite": {"page": 8, "quote": "with 470-Ω output resistor and a 2.2-nF shunt capacitor"}},
+    {"between": ["node:out_l", "net:GND"], "part": "C", "value": "2.2nF", "cite": {"page": 8, "quote": "with 470-Ω output resistor and a 2.2-nF shunt capacitor"}},
+    {"between": ["pin:OUTR", "node:out_r"], "part": "R", "value": "470", "cite": {"page": 8, "quote": "with 470-Ω output resistor and a 2.2-nF shunt capacitor"}},
+    {"between": ["node:out_r", "net:GND"], "part": "C", "value": "2.2nF", "cite": {"page": 8, "quote": "with 470-Ω output resistor and a 2.2-nF shunt capacitor"}}
+  ]
+}

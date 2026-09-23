@@ -1,0 +1,450 @@
+{
+  "mpn": "STM32H743VIT6",
+  "manufacturer": "STMicroelectronics",
+  "lcsc": "C114409",
+  "summary": "Arm Cortex-M7 MCU at 480 MHz, 2 MB flash, 1 MB RAM, LQFP-100; four SAI and three I2S audio interfaces, four I2C buses; needs an external crystal for audio-rate clocks",
+  "symbol": {
+    "kicad": "MCU_ST_STM32H7:STM32H743VITx"
+  },
+  "footprint": "Package_QFP:LQFP-100_14x14mm_P0.5mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/880ee2974c46763ce43da1468b8b0b74.pdf",
+    "sha256": "9c74d2015445f7c3c2c9076fc13a2665c8f6fecec7898d128dac836d6d39314b"
+  },
+  "provides": [
+    "mcu"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "SAI1",
+      "signals": {
+        "mclk": {
+          "alt": "SAI1_MCLK_A"
+        },
+        "bck": {
+          "alt": "SAI1_SCK_A"
+        },
+        "lrck": {
+          "alt": "SAI1_FS_A"
+        },
+        "dout": {
+          "alt": "SAI1_SD_A"
+        },
+        "din": {
+          "alt": "SAI1_SD_B"
+        }
+      },
+      "cite": {
+        "reading": "SAI block A as clock master driving the DAC data, block B synchronous to it receiving the ADC data (RM0433 SAI synchronous mode; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "SAI2",
+      "signals": {
+        "mclk": {
+          "alt": "SAI2_MCLK_A"
+        },
+        "bck": {
+          "alt": "SAI2_SCK_A"
+        },
+        "lrck": {
+          "alt": "SAI2_FS_A"
+        },
+        "dout": {
+          "alt": "SAI2_SD_A"
+        },
+        "din": {
+          "alt": "SAI2_SD_B"
+        }
+      },
+      "cite": {
+        "reading": "SAI block A as clock master driving the DAC data, block B synchronous to it receiving the ADC data (RM0433 SAI synchronous mode; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "SAI3",
+      "signals": {
+        "mclk": {
+          "alt": "SAI3_MCLK_A"
+        },
+        "bck": {
+          "alt": "SAI3_SCK_A"
+        },
+        "lrck": {
+          "alt": "SAI3_FS_A"
+        },
+        "dout": {
+          "alt": "SAI3_SD_A"
+        },
+        "din": {
+          "alt": "SAI3_SD_B"
+        }
+      },
+      "cite": {
+        "reading": "SAI block A as clock master driving the DAC data, block B synchronous to it receiving the ADC data (RM0433 SAI synchronous mode; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "SAI4",
+      "signals": {
+        "mclk": {
+          "alt": "SAI4_MCLK_A"
+        },
+        "bck": {
+          "alt": "SAI4_SCK_A"
+        },
+        "lrck": {
+          "alt": "SAI4_FS_A"
+        },
+        "dout": {
+          "alt": "SAI4_SD_A"
+        },
+        "din": {
+          "alt": "SAI4_SD_B"
+        }
+      },
+      "cite": {
+        "reading": "SAI block A as clock master driving the DAC data, block B synchronous to it receiving the ADC data (RM0433 SAI synchronous mode; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "I2S1",
+      "signals": {
+        "mclk": {
+          "alt": "I2S1_MCK"
+        },
+        "bck": {
+          "alt": "I2S1_CK"
+        },
+        "lrck": {
+          "alt": "I2S1_WS"
+        },
+        "dout": {
+          "alt": "I2S1_SDO"
+        },
+        "din": {
+          "alt": "I2S1_SDI"
+        }
+      },
+      "cite": {
+        "reading": "SPI/I2S peripheral in full-duplex I2S master mode (RM0433; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "I2S2",
+      "signals": {
+        "mclk": {
+          "alt": "I2S2_MCK"
+        },
+        "bck": {
+          "alt": "I2S2_CK"
+        },
+        "lrck": {
+          "alt": "I2S2_WS"
+        },
+        "dout": {
+          "alt": "I2S2_SDO"
+        },
+        "din": {
+          "alt": "I2S2_SDI"
+        }
+      },
+      "cite": {
+        "reading": "SPI/I2S peripheral in full-duplex I2S master mode (RM0433; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "I2S3",
+      "signals": {
+        "mclk": {
+          "alt": "I2S3_MCK"
+        },
+        "bck": {
+          "alt": "I2S3_CK"
+        },
+        "lrck": {
+          "alt": "I2S3_WS"
+        },
+        "dout": {
+          "alt": "I2S3_SDO"
+        },
+        "din": {
+          "alt": "I2S3_SDI"
+        }
+      },
+      "cite": {
+        "reading": "SPI/I2S peripheral in full-duplex I2S master mode (RM0433; not pinned)"
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C1",
+      "signals": {
+        "scl": {
+          "alt": "I2C1_SCL"
+        },
+        "sda": {
+          "alt": "I2C1_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C2",
+      "signals": {
+        "scl": {
+          "alt": "I2C2_SCL"
+        },
+        "sda": {
+          "alt": "I2C2_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C3",
+      "signals": {
+        "scl": {
+          "alt": "I2C3_SCL"
+        },
+        "sda": {
+          "alt": "I2C3_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C4",
+      "signals": {
+        "scl": {
+          "alt": "I2C4_SCL"
+        },
+        "sda": {
+          "alt": "I2C4_SDA"
+        }
+      }
+    },
+    {
+      "kind": "swd",
+      "role": "target",
+      "signals": {
+        "swdio": {
+          "alt": "DEBUG_JTMS-SWDIO"
+        },
+        "swclk": {
+          "alt": "DEBUG_JTCK-SWCLK"
+        },
+        "nrst": "pin:NRST"
+      }
+    },
+    {
+      "kind": "hse",
+      "role": "needs",
+      "signals": {
+        "in": "pin:PH0",
+        "out": "pin:PH1"
+      },
+      "cite": {
+        "page": 128,
+        "quote": "4 to 48 MHz crystal/ceramic"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 105,
+        "quote": "N(1) x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "page": 105,
+        "quote": "N(1) x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "net:+3V3",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 105,
+        "quote": "+ 1 x 4.7 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VSS",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 105,
+        "quote": "N(1) x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VCAP",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "2.2uF",
+      "each_pin": true,
+      "cite": {
+        "page": 105,
+        "quote": "2 x 2.2μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VREF+",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VREF+",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VREF+",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VSSA",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 105,
+        "quote": "100 nF + 1 x 1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VBAT",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 37,
+        "quote": "VBAT pin should be connected to VDD"
+      }
+    },
+    {
+      "between": [
+        "pin:NRST",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 146,
+        "quote": "Recommended NRST pin protection"
+      }
+    },
+    {
+      "between": [
+        "pin:BOOT0",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "BOOT0 held low through 10k so the part boots from flash (AN2606 / RM0433; not pinned)"
+      }
+    }
+  ]
+}

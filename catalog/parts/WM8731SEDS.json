@@ -1,0 +1,538 @@
+{
+  "mpn": "WM8731SEDS",
+  "manufacturer": "Cirrus Logic (Wolfson)",
+  "lcsc": "C41511",
+  "summary": "Stereo 24-bit audio codec (ADC + DAC), I2S slave, configured over I2C; line inputs, a microphone input with bias, and a headphone driver, from 3.3 V",
+  "symbol": {
+    "kicad": "Audio:WM8731SEDS"
+  },
+  "footprint": "Package_SO:SSOP-28_5.3x10.2mm_P0.65mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/d8923c62c1264cd78eaae0b5889c3563.pdf",
+    "sha256": "2862107246dc672cad4358a32c0b8b8e24954ba3eefad568971c44419f7ad8fa"
+  },
+  "provides": [
+    "i2s-dac",
+    "i2s-adc",
+    "mic-in"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "i2s",
+      "role": "slave",
+      "signals": {
+        "mclk": "pin:XTI/MCLK",
+        "bck": "pin:BCLK",
+        "lrck": "pin:DACLRC",
+        "din": "pin:DACDAT",
+        "dout": "pin:ADCDAT"
+      },
+      "cite": {
+        "page": 41,
+        "quote": "12.288MHz (256fs) or 18.432MHz (384fs) can be used."
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "slave",
+      "signals": {
+        "scl": "pin:SCLK",
+        "sda": "pin:SDIN"
+      },
+      "cite": {
+        "page": 46,
+        "quote": "0                                0011010"
+      }
+    },
+    {
+      "kind": "audio-line-in",
+      "role": "sink",
+      "signals": {
+        "l": "node:lin_l",
+        "r": "node:lin_r"
+      },
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "kind": "audio-line-out",
+      "role": "source",
+      "signals": {
+        "l": "node:lout_l",
+        "r": "node:lout_r"
+      },
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "kind": "audio-mic-in",
+      "role": "sink",
+      "signals": {
+        "mic": "node:mic"
+      },
+      "cite": {
+        "page": 24,
+        "quote": "Recommended component values are C1 = 220pF (npo ceramic), C2 = 1µF, R1 = 680 Ω, R2 = 47k."
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:DBVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Digital supply range (Buffer)             DBVDD                                       2.7                    3.6           V"
+      }
+    },
+    {
+      "between": [
+        "pin:DBVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:DBVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:DCVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Digital supply range (Core)               DCVDD                                      1.42                    3.6           V"
+      }
+    },
+    {
+      "between": [
+        "pin:DCVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:DCVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Analogue supply range                 AVDD, HPVDD                                     2.7                    3.6           V"
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:HPVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Analogue supply range                 AVDD, HPVDD                                     2.7                    3.6           V"
+      }
+    },
+    {
+      "between": [
+        "pin:HPVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:HPVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "Figure 57: 10µF + 0.1µF on each of DBVDD, DCVDD, AVDD and HPVDD",
+        "page": 60
+      }
+    },
+    {
+      "between": [
+        "pin:DGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Analogue and digital grounds must always be within 0.3V of each other."
+      }
+    },
+    {
+      "between": [
+        "pin:AGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Analogue and digital grounds must always be within 0.3V of each other."
+      }
+    },
+    {
+      "between": [
+        "pin:HPGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "Analogue and digital grounds must always be within 0.3V of each other."
+      }
+    },
+    {
+      "between": [
+        "pin:VMID",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 9,
+        "quote": "VMID decoupled with 10uF and 0.1uF capacitors"
+      }
+    },
+    {
+      "between": [
+        "pin:VMID",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 9,
+        "quote": "VMID decoupled with 10uF and 0.1uF capacitors"
+      }
+    },
+    {
+      "between": [
+        "pin:MODE",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 45,
+        "quote": "0                             2 wire"
+      }
+    },
+    {
+      "between": [
+        "pin:~{CSB}",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 46,
+        "quote": "0                                0011010"
+      }
+    },
+    {
+      "between": [
+        "pin:ADCLRC",
+        "pin:DACLRC"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "ADC and DAC share one LRCK: one frame clock for both directions on a single I2S link"
+      }
+    },
+    {
+      "between": [
+        "node:lin_l",
+        "node:lin_l_div"
+      ],
+      "part": "R",
+      "value": "5.6k",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_l_div",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "5.6k",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_l_div",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "220pF",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_l_div",
+        "pin:LLINEIN"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_r",
+        "node:lin_r_div"
+      ],
+      "part": "R",
+      "value": "5.6k",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_r_div",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "5.6k",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_r_div",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "220pF",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "node:lin_r_div",
+        "pin:RLINEIN"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 23,
+        "quote": "R1 = 5.6k, R2 = 5.6k, C1 = 220pF, C2 = 1"
+      }
+    },
+    {
+      "between": [
+        "pin:LOUT",
+        "node:lout_l_c"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "between": [
+        "node:lout_l_c",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "47k",
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "between": [
+        "node:lout_l_c",
+        "node:lout_l"
+      ],
+      "part": "R",
+      "value": "100",
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "between": [
+        "pin:ROUT",
+        "node:lout_r_c"
+      ],
+      "part": "C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "between": [
+        "node:lout_r_c",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "47k",
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "between": [
+        "node:lout_r_c",
+        "node:lout_r"
+      ],
+      "part": "R",
+      "value": "100",
+      "cite": {
+        "page": 29,
+        "quote": "Recommended values are C1 = 10"
+      }
+    },
+    {
+      "between": [
+        "pin:MICBIAS",
+        "node:mic"
+      ],
+      "part": "R",
+      "value": "680",
+      "cite": {
+        "page": 24,
+        "quote": "Recommended component values are C1 = 220pF (npo ceramic), C2 = 1µF, R1 = 680 Ω, R2 = 47k."
+      }
+    },
+    {
+      "between": [
+        "node:mic",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "47k",
+      "cite": {
+        "page": 24,
+        "quote": "Recommended component values are C1 = 220pF (npo ceramic), C2 = 1µF, R1 = 680 Ω, R2 = 47k."
+      }
+    },
+    {
+      "between": [
+        "node:mic",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "220pF",
+      "cite": {
+        "page": 24,
+        "quote": "Recommended component values are C1 = 220pF (npo ceramic), C2 = 1µF, R1 = 680 Ω, R2 = 47k."
+      }
+    },
+    {
+      "between": [
+        "node:mic",
+        "pin:MICIN"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "Figure 57 gain-dependent Rmic between C2 and MICIN omitted (0 Ω): mic gain set in the codec registers",
+        "page": 60
+      }
+    }
+  ]
+}

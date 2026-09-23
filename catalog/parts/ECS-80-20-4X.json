@@ -1,0 +1,37 @@
+{
+  "mpn": "ECS-80-20-4X",
+  "manufacturer": "ECS Inc.",
+  "summary": "8 MHz fundamental crystal, 20 pF load, HC-49/US",
+  "symbol": {
+    "kicad": "Device:Crystal"
+  },
+  "footprint": "Crystal:Crystal_HC49-U_Vertical",
+  "provides": [
+    "crystal"
+  ],
+  "sim_excluded": true,
+  "params": {
+    "freq_hz": {
+      "value": 8000000,
+      "cite": {
+        "reading": "8 MHz per the ECS-80-20-4X part number and distributor listing (no datasheet pinned)"
+      }
+    },
+    "cl_pf": {
+      "value": 20,
+      "cite": {
+        "reading": "20 pF load capacitance per the ECS-80-20-4X listing (no datasheet pinned)"
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "hse",
+      "role": "source",
+      "signals": {
+        "in": "pin:1",
+        "out": "pin:2"
+      }
+    }
+  ]
+}

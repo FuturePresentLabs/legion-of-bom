@@ -1,0 +1,34 @@
+{
+  "mpn": "PinHeader_1x03_P2.54mm",
+  "manufacturer": "generic",
+  "summary": "3-pin 2.54 mm header: a stereo audio port (L, R, ground)",
+  "symbol": {
+    "kicad": "Connector_Generic:Conn_01x03"
+  },
+  "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical",
+  "provides": [
+    "connector"
+  ],
+  "interfaces": [
+    {
+      "kind": "stereo-audio",
+      "role": "port",
+      "signals": {
+        "l": "pin:Pin_1",
+        "r": "pin:Pin_2"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:Pin_3",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "pin header ground pin"
+      }
+    }
+  ]
+}

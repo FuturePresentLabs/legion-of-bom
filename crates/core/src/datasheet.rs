@@ -113,26 +113,34 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// The pinned PDF on disk: from the cache when present and intact, else
 /// downloaded and checked against its hash before it is kept.
 pub fn fetch(ds: &Datasheet, cache_dir: &Path) -> Result<PathBuf, StageError> {
-    let path = cache_dir.join(format!("{}.pdf", ds.sha256));
+    fetch_pinned(ds.part, ds.url, ds.sha256, cache_dir)
+}
+
+/// [`fetch`] for a datasheet named by its parts rather than a [`Datasheet`].
+pub fn fetch_pinned(
+    part: &str,
+    url: &str,
+    sha256: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, StageError> {
+    let path = cache_dir.join(format!("{sha256}.pdf"));
     if let Ok(bytes) = std::fs::read(&path) {
-        if sha256_hex(&bytes) == ds.sha256 {
+        if sha256_hex(&bytes) == sha256 {
             return Ok(path);
         }
     }
-    let resp = ureq::get(ds.url)
+    let resp = ureq::get(url)
         .set("User-Agent", "Mozilla/5.0 (legion-of-bom datasheet fetch)")
         .call()
-        .map_err(|e| {
-            StageError::Other(format!("fetching {} datasheet {}: {e}", ds.part, ds.url))
-        })?;
+        .map_err(|e| StageError::Other(format!("fetching {part} datasheet {url}: {e}")))?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes)?;
     let got = sha256_hex(&bytes);
-    if got != ds.sha256 {
+    if got != sha256 {
         return Err(StageError::Other(format!(
             "{} datasheet at {} is not the pinned revision (sha256 {got}, pinned {}): \
              re-read the citations against the new one before re-pinning",
-            ds.part, ds.url, ds.sha256
+            part, url, sha256
         )));
     }
     std::fs::create_dir_all(cache_dir)?;
@@ -189,17 +197,22 @@ pub fn normalize(s: &str) -> String {
 /// Is `c`'s quote on its page of `pages`? An error names the citation, and —
 /// when the quote is elsewhere in the document — where it actually is.
 pub fn check(c: &Citation, pages: &[String]) -> Result<(), String> {
-    let want = normalize(c.quote);
+    check_quote(c.source.part, c.page, c.quote, pages)
+}
+
+/// [`check`] for a quote named by its parts rather than a [`Citation`].
+pub fn check_quote(part: &str, page: usize, quote: &str, pages: &[String]) -> Result<(), String> {
+    let want = normalize(quote);
     let on = |i: usize| pages.get(i).is_some_and(|p| normalize(p).contains(&want));
-    if c.page >= 1 && on(c.page - 1) {
+    if page >= 1 && on(page - 1) {
         return Ok(());
     }
     let elsewhere: Vec<usize> = (0..pages.len()).filter(|&i| on(i)).map(|i| i + 1).collect();
     Err(format!(
         "{} p.{}: {:?} is not on that page{}",
-        c.source.part,
-        c.page,
-        c.quote,
+        part,
+        page,
+        quote,
         if elsewhere.is_empty() {
             " or anywhere in the document".to_string()
         } else {
