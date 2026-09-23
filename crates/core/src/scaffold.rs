@@ -59,6 +59,10 @@ pub const GENERATED: &[IgnoreRule] = &[
         patterns: &["*.sqlite-journal", "*.sqlite-wal", "*.sqlite-shm"],
     },
     IgnoreRule {
+        why: "lob spec/spec-chain — durable local ooda decision-capture log, for fine-tuning, not the repo",
+        patterns: &[".ooda/"],
+    },
+    IgnoreRule {
         why: "Local Python venv for SKiDL",
         patterns: &[".venv/"],
     },
@@ -183,6 +187,7 @@ mod tests {
             "rc_lowpass-drc.rpt",
             "slew_core.dat",
             ".lob/parts/parts.sqlite-wal",
+            ".ooda/lob/decisions.jsonl",
         ] {
             assert!(is_generated(gen), "{gen} is generated");
         }

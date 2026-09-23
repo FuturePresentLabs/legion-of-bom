@@ -16,7 +16,10 @@ ureq.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 base64.workspace = true
-ooda.workspace = true
+# "capture" only makes ooda::Capture/CapturingClient available to use (the
+# dev probes under examples/ construct one); it's zero cost unless a caller
+# actually wraps a client with it.
+ooda = { workspace = true, features = ["capture"] }
 mlua.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

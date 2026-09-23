@@ -9,8 +9,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "a real-time clock reference, low power".to_string());
     let out = a.next().unwrap_or_else(|| "oscillator.py".to_string());
 
-    let client = ooda::HttpClient::from_env()
-        .map_err(|e| format!("{e} (need OODA_API_KEY -- see .env.example)"))?;
+    let client = ooda::CapturingClient::new(
+        ooda::HttpClient::from_env()
+            .map_err(|e| format!("{e} (need OODA_API_KEY -- see .env.example)"))?,
+        ooda::Capture::for_current_binary()?,
+    );
     let mut trace = ooda::Trace::new();
     let osc = legion_of_bom_core::generate_pierce_oscillator(&client, &mut trace, &brief)?;
 

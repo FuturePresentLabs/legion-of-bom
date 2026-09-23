@@ -810,9 +810,12 @@ fn spec_cmd(
         anyhow::bail!("unknown circuit family '{family}' (curated set today: fuzz-pedal)");
     }
 
-    let client = ooda::HttpClient::from_env().with_context(|| {
-        "OODA_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint"
-    })?;
+    let client = ooda::CapturingClient::new(
+        ooda::HttpClient::from_env().with_context(|| {
+            "OODA_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint"
+        })?,
+        ooda::Capture::for_current_binary().context("opening the decision capture log")?,
+    );
     let mut trace = ooda::Trace::new();
 
     let spec = generate_fuzz_pedal_spec(&client, &mut trace, &brief)
@@ -866,9 +869,12 @@ fn spec_chain_cmd(
     trace_path: Option<PathBuf>,
 ) -> Result<()> {
     let enclosure_size = parse_enclosure(&enclosure)?;
-    let client = ooda::HttpClient::from_env().with_context(|| {
-        "OODA_API_KEY not set (see .env.example) -- lob spec-chain needs a Jev/System One-compatible endpoint"
-    })?;
+    let client = ooda::CapturingClient::new(
+        ooda::HttpClient::from_env().with_context(|| {
+            "OODA_API_KEY not set (see .env.example) -- lob spec-chain needs a Jev/System One-compatible endpoint"
+        })?,
+        ooda::Capture::for_current_binary().context("opening the decision capture log")?,
+    );
     let mut trace = ooda::Trace::new();
 
     let constraints = FuzzConstraints {

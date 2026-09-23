@@ -138,8 +138,11 @@ const QUIZ: &[QuizItem] = &[
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ooda::HttpClient::from_env()
-        .map_err(|e| format!("{e} (need OODA_API_KEY — see .env.example)"))?;
+    let client = ooda::CapturingClient::new(
+        ooda::HttpClient::from_env()
+            .map_err(|e| format!("{e} (need OODA_API_KEY — see .env.example)"))?,
+        ooda::Capture::for_current_binary()?,
+    );
 
     let observation = serde_json::json!({
         "topic": "the classic Dallas Arbiter Fuzz Face guitar fuzz pedal — the original, unmodified 1966-67 two-knob (Fuzz, Volume) germanium PNP version",

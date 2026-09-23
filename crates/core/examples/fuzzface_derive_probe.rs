@@ -91,8 +91,11 @@ fn find_mid<'a>(bands: &'a [Band], key: &str) -> Option<&'a Band> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ooda::HttpClient::from_env()
-        .map_err(|e| format!("{e} (need OODA_API_KEY — see .env.example)"))?;
+    let client = ooda::CapturingClient::new(
+        ooda::HttpClient::from_env()
+            .map_err(|e| format!("{e} (need OODA_API_KEY — see .env.example)"))?,
+        ooda::Capture::for_current_binary()?,
+    );
 
     let observation = serde_json::json!({
         "topic": "Q1 (the first transistor) in a classic, correctly biased Dallas Arbiter Fuzz Face — PNP germanium, positive-ground, -9V supply. Q1's emitter is grounded directly, collector loaded by a single resistor to the -9V rail.",
