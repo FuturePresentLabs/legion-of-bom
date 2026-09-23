@@ -29,7 +29,9 @@ use std::path::Path;
 use ooda::{Client, Criteria, Question, Request, Trace};
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Catalog, CatalogPart, Endpoint, Interface, PartSymbol, Signal};
+use crate::catalog::{
+    Catalog, CatalogPart, Endpoint, Interface, PartSymbol, Scoped, Signal, Subcircuit,
+};
 use crate::oscillator::{fmt_pf, load_cap_pf, round_e12_pf};
 use crate::skidl_emit::{Circuit, EmitPart, PinRef, SymbolSrc};
 use crate::spec::{expect_choice, expect_noul, SpecError};
@@ -115,41 +117,69 @@ fn split(key: &str) -> Vec<String> {
     key.split('+').map(str::to_string).collect()
 }
 
-/// The smallest sets of parts (of one or two) that between them provide every
-/// role in `roles`: no set with a part it could drop. Sorted, stable.
-pub fn minimal_covers<'a>(
-    catalog: &'a Catalog,
-    roles: &BTreeSet<&str>,
-) -> Vec<Vec<&'a CatalogPart>> {
+/// What fills a role: one catalog part, or a subcircuit around several.
+#[derive(Debug, Clone, Copy)]
+pub enum Unit<'a> {
+    Part(&'a CatalogPart),
+    Sub(&'a Subcircuit),
+}
+
+impl<'a> Unit<'a> {
+    pub fn name(&self) -> &'a str {
+        match self {
+            Unit::Part(p) => &p.mpn,
+            Unit::Sub(s) => &s.name,
+        }
+    }
+    fn summary(&self) -> &'a str {
+        match self {
+            Unit::Part(p) => &p.summary,
+            Unit::Sub(s) => &s.summary,
+        }
+    }
+    fn provides(&self) -> &'a [String] {
+        match self {
+            Unit::Part(p) => &p.provides,
+            Unit::Sub(s) => &s.provides,
+        }
+    }
+}
+
+/// The smallest sets of parts and subcircuits (of one or two) that between
+/// them provide every role in `roles`: no set with a unit it could drop.
+/// Sorted, stable.
+pub fn minimal_covers<'a>(catalog: &'a Catalog, roles: &BTreeSet<&str>) -> Vec<Vec<Unit<'a>>> {
     if roles.is_empty() {
         return vec![Vec::new()];
     }
-    let useful: Vec<&CatalogPart> = catalog
+    let useful: Vec<Unit> = catalog
         .parts
         .iter()
-        .filter(|p| p.provides.iter().any(|r| roles.contains(r.as_str())))
+        .map(Unit::Part)
+        .chain(catalog.subcircuits.iter().map(Unit::Sub))
+        .filter(|u| u.provides().iter().any(|r| roles.contains(r.as_str())))
         .collect();
-    let covers = |set: &[&CatalogPart]| {
+    let covers = |set: &[Unit]| {
         roles
             .iter()
-            .all(|r| set.iter().any(|p| p.provides.iter().any(|x| x == r)))
+            .all(|r| set.iter().any(|u| u.provides().iter().any(|x| x == r)))
     };
-    let mut out: Vec<Vec<&CatalogPart>> = Vec::new();
+    let mut out: Vec<Vec<Unit>> = Vec::new();
     for (i, a) in useful.iter().enumerate() {
-        if covers(&[a]) {
-            out.push(vec![a]);
+        if covers(&[*a]) {
+            out.push(vec![*a]);
         }
         for b in &useful[i + 1..] {
             let pair = [*a, *b];
-            if covers(&pair) && !covers(&[a]) && !covers(&[b]) {
+            if covers(&pair) && !covers(&[*a]) && !covers(&[*b]) {
                 out.push(pair.to_vec());
             }
         }
     }
     for set in &mut out {
-        set.sort_by(|x, y| x.mpn.cmp(&y.mpn));
+        set.sort_by(|x, y| x.name().cmp(y.name()));
     }
-    out.sort_by_key(|s| s.iter().map(|p| p.mpn.clone()).collect::<Vec<_>>());
+    out.sort_by_key(|s| s.iter().map(|u| u.name().to_string()).collect::<Vec<_>>());
     out
 }
 
@@ -273,6 +303,11 @@ impl Pinout {
     }
 }
 
+/// The slot one of a subcircuit's slots is filled in.
+fn sub_slot(sub: &str, slot: &str) -> String {
+    format!("sub:{sub}:{slot}")
+}
+
 /// The slot a part's need of `kind` is filled in.
 fn need_slot(kind: &str, needer: &str) -> String {
     format!("needs:{kind}:{needer}")
@@ -354,12 +389,9 @@ pub fn design(
         .iter()
         .map(|set| {
             (
+                set.iter().map(|u| u.name()).collect::<Vec<_>>().join("+"),
                 set.iter()
-                    .map(|p| p.mpn.as_str())
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                set.iter()
-                    .map(|p| p.summary.as_str())
+                    .map(|u| u.summary())
                     .collect::<Vec<_>>()
                     .join(" + "),
             )
@@ -373,8 +405,30 @@ pub fn design(
         "Which parts should the board be built around?",
         options,
     )?;
-    parts.insert("function".into(), function);
-    let function_parts = chosen(&parts, "function");
+    parts.insert("function".into(), function.clone());
+
+    // A chosen subcircuit's slots, each filled from the parts that meet it;
+    // from here on its members stand in for it.
+    let mut function_parts: Vec<&CatalogPart> = Vec::new();
+    for name in &function.chosen {
+        let Some(sub) = catalog.subcircuit(name) else {
+            function_parts.extend(catalog.part(name));
+            continue;
+        };
+        for (slot_name, slot) in &sub.slots {
+            let key = sub_slot(&sub.name, slot_name);
+            let sel = pick(
+                client,
+                trace,
+                brief,
+                &key,
+                &format!("Which part should be the {slot_name} of {}?", sub.name),
+                catalog.candidates(slot).map(describe).collect(),
+            )?;
+            parts.insert(key.clone(), sel);
+            function_parts.extend(chosen(&parts, &key));
+        }
+    }
 
     // 2b. The MCU: a master for every bus the function parts are slaves on.
     let bus_kinds = buses(&function_parts);
@@ -430,6 +484,15 @@ pub fn design(
 
     // 2d. Rails every chosen part ties to, other than ground and the input.
     let mut rails: BTreeSet<String> = BTreeSet::new();
+    for sub in function.chosen.iter().filter_map(|n| catalog.subcircuit(n)) {
+        for e in sub.support.iter().flat_map(|s| &s.between) {
+            if let Ok(Scoped::Own(Endpoint::Net(n))) = Scoped::parse(e) {
+                if crate::model::is_supply_rail(&n) && n != SUPPLY_NET {
+                    rails.insert(n);
+                }
+            }
+        }
+    }
     for slot in parts.keys().cloned().collect::<Vec<_>>() {
         for p in chosen(&parts, &slot) {
             for e in p.support.iter().flat_map(|s| &s.between) {
@@ -661,6 +724,37 @@ fn free_gpio(pl: &Placed, taken: &mut Taken) -> Result<String, SynthError> {
     Ok(pin_key(&pl.reference, &pin))
 }
 
+/// A subcircuit on the board: its members are placed parts, `scope` says
+/// which fills each slot, and its own nodes are keyed under `reference`.
+struct PlacedSub<'a> {
+    reference: String,
+    sub: &'a Subcircuit,
+    scope: BTreeMap<String, String>,
+}
+
+impl PlacedSub<'_> {
+    /// An endpoint of the subcircuit as a connection key: a slot's pin is its
+    /// member's pin.
+    fn key(&self, e: &str) -> Result<String, SynthError> {
+        Ok(match Scoped::parse(e).map_err(SynthError::Invalid)? {
+            Scoped::SlotPin { slot, pin } => pin_key(&self.scope[&slot], &pin),
+            Scoped::Own(Endpoint::Net(n)) => format!("net:{n}"),
+            Scoped::Own(Endpoint::Node(n)) => format!("{}.node.{n}", self.reference),
+            Scoped::Own(Endpoint::Pin(_)) => unreachable!("Scoped::parse refuses a bare pin"),
+        })
+    }
+}
+
+/// The passive a support entry places (`tie` is not one).
+fn passive_kind(part: &str) -> &'static str {
+    match part {
+        "R" => "R",
+        "CP" => "CP",
+        "L" => "L",
+        _ => "C",
+    }
+}
+
 fn first_iface(pl: &Placed, kind: &str, role: &str) -> Option<Interface> {
     interfaces(pl.part, kind, role).next().cloned()
 }
@@ -685,6 +779,7 @@ pub fn circuit(
     let rank = |s: &str| match s {
         "mcu" => 0,
         "function" => 1,
+        s if s.starts_with("sub:") => 1,
         s if s.starts_with("needs:") => 2,
         s if s.starts_with("rail:") => 3,
         _ => 4,
@@ -693,6 +788,10 @@ pub fn circuit(
     slots.sort_by_key(|s| (rank(s), s.to_string()));
     for slot in slots {
         for mpn in &spec.parts[slot].chosen {
+            // A subcircuit is placed as its members, in their own slots.
+            if catalog.subcircuit(mpn).is_some() {
+                continue;
+            }
             let part = catalog.part(mpn).ok_or_else(|| {
                 SynthError::Invalid(format!("spec names {mpn}, which the catalog lacks"))
             })?;
@@ -721,6 +820,26 @@ pub fn circuit(
     let mcu = *in_slot("mcu")
         .first()
         .ok_or_else(|| SynthError::Unfilled("mcu".into()))?;
+    let mut subs: Vec<PlacedSub> = Vec::new();
+    for sub in spec.parts["function"]
+        .chosen
+        .iter()
+        .filter_map(|n| catalog.subcircuit(n))
+    {
+        let mut scope = BTreeMap::new();
+        for slot in sub.slots.keys() {
+            let key = sub_slot(&sub.name, slot);
+            let &m = in_slot(&key)
+                .first()
+                .ok_or_else(|| SynthError::Unfilled(key.clone()))?;
+            scope.insert(slot.clone(), placed[m].reference.clone());
+        }
+        subs.push(PlacedSub {
+            reference: format!("SC{}", subs.len() + 1),
+            sub,
+            scope,
+        });
+    }
 
     let mut nets = Nets::default();
     let mut passives: Vec<(&'static str, String, String, String, String)> = Vec::new();
@@ -871,24 +990,47 @@ pub fn circuit(
         let Some(&j) = in_slot(&format!("port:{}", f.key)).first() else {
             continue;
         };
-        let (src, iface) = in_slot("function")
-            .into_iter()
-            .find_map(|a| {
-                placed[a]
-                    .part
-                    .interfaces
-                    .iter()
-                    .find(|i| i.kind == f.interface)
-                    .map(|i| (a, i.clone()))
-            })
-            .ok_or_else(|| SynthError::Invalid(format!("no function part has {}", f.interface)))?;
+        // The feature's signals, as keys: a subcircuit's export first (it
+        // wraps its members' own), else a function part's interface.
+        let mut signals: Vec<(String, String)> = Vec::new();
+        let exported = subs.iter().find_map(|ps| {
+            ps.sub
+                .interfaces
+                .iter()
+                .find(|i| i.kind == f.interface)
+                .map(|i| (ps, i))
+        });
+        if let Some((ps, iface)) = exported {
+            for (sig, s) in &iface.signals {
+                let Signal::At(at) = s else {
+                    unreachable!("a subcircuit's alternates are refused on load")
+                };
+                signals.push((sig.clone(), ps.key(at)?));
+            }
+        } else {
+            let (src, iface) = in_slot("function")
+                .into_iter()
+                .find_map(|a| {
+                    placed[a]
+                        .part
+                        .interfaces
+                        .iter()
+                        .find(|i| i.kind == f.interface)
+                        .map(|i| (a, i.clone()))
+                })
+                .ok_or_else(|| {
+                    SynthError::Invalid(format!("no function part has {}", f.interface))
+                })?;
+            for (sig, at) in &iface.signals {
+                signals.push((sig.clone(), resolve(&placed[src], at, &mut taken)?));
+            }
+        }
         let port = first_iface(&placed[j], &f.port, "port")
             .ok_or_else(|| SynthError::Invalid(format!("connector has no {} port", f.port)))?;
         let port_sigs: Vec<&Signal> = port.signals.values().collect();
-        for (k, (sig, at)) in iface.signals.iter().enumerate() {
+        for (k, (sig, sk)) in signals.iter().enumerate() {
             let net = format!("net:{}_{}", f.net, sig.to_uppercase());
-            let sk = resolve(&placed[src], at, &mut taken)?;
-            nets.union(&net, &sk);
+            nets.union(&net, sk);
             let p = port_sigs.get(k).ok_or_else(|| {
                 SynthError::Invalid(format!("{} port too narrow for {}", f.port, f.key))
             })?;
@@ -925,12 +1067,7 @@ pub fn circuit(
             }
             let fp = s.footprint.clone().unwrap_or_default();
             let value = s.value.clone().unwrap_or_default();
-            let kind: &'static str = match s.part.as_str() {
-                "R" => "R",
-                "CP" => "CP",
-                "L" => "L",
-                _ => "C",
-            };
+            let kind = passive_kind(&s.part);
             let repeat = s.between.iter().find_map(|e| match Endpoint::parse(e) {
                 Ok(Endpoint::Pin(n)) if s.each_pin => Some(n),
                 _ => None,
@@ -962,6 +1099,29 @@ pub fn circuit(
                     endpoint_key(&pl.reference, b)?,
                 )),
             }
+        }
+    }
+    // Each subcircuit's own wiring: ties between its slots, passives around
+    // them.
+    for ps in &subs {
+        for s in &ps.sub.support {
+            let (a, b) = (ps.key(&s.between[0])?, ps.key(&s.between[1])?);
+            if s.part == "tie" {
+                nets.union(&a, &b);
+                for k in [&a, &b] {
+                    if let Some((r, n)) = k.split_once(".pin.") {
+                        name_used.insert((r.to_string(), n.to_string()));
+                    }
+                }
+                continue;
+            }
+            passives.push((
+                passive_kind(&s.part),
+                s.value.clone().unwrap_or_default(),
+                s.footprint.clone().unwrap_or_default(),
+                a,
+                b,
+            ));
         }
     }
     // Interface pins count as named too, so a repeated one joins its siblings.
@@ -1106,16 +1266,20 @@ pub fn circuit(
     Ok(c)
 }
 
-/// Every reading no person has confirmed yet, across the parts a spec uses.
+/// Every reading no person has confirmed yet, across the parts and
+/// subcircuits a spec uses.
 pub fn unconfirmed(spec: &DesignSpec, catalog: &Catalog) -> Vec<String> {
-    let mut out: Vec<String> = spec
-        .parts
-        .values()
-        .flat_map(|s| &s.chosen)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+    let names: BTreeSet<&String> = spec.parts.values().flat_map(|s| &s.chosen).collect();
+    let mut out: Vec<String> = names
+        .iter()
         .filter_map(|m| catalog.part(m))
         .flat_map(|p| p.unconfirmed())
+        .chain(
+            names
+                .iter()
+                .filter_map(|m| catalog.subcircuit(m))
+                .flat_map(|s| s.unconfirmed()),
+        )
         .collect();
     out.sort();
     out.dedup();
@@ -1207,12 +1371,7 @@ mod tests {
         let roles: BTreeSet<&str> = ["i2s-adc", "i2s-dac"].into();
         let covers: Vec<String> = minimal_covers(&cat, &roles)
             .iter()
-            .map(|s| {
-                s.iter()
-                    .map(|p| p.mpn.as_str())
-                    .collect::<Vec<_>>()
-                    .join("+")
-            })
+            .map(|s| s.iter().map(|u| u.name()).collect::<Vec<_>>().join("+"))
             .collect();
         assert!(
             covers.contains(&"PCM1808PWR+PCM5102APWR".to_string()),
@@ -1274,6 +1433,90 @@ mod tests {
             "a 32 MHz need refuses an 8 MHz crystal"
         );
         assert_eq!(need_slot("hse", "SX1262IMLTRT"), "needs:hse:SX1262IMLTRT");
+    }
+
+    /// A catalog with one subcircuit: a radio slot any_of the CC1101, whose
+    /// RF_P reaches the subcircuit's own antenna node through a capacitor.
+    fn catalog_with_radio_subcircuit() -> Catalog {
+        let mut cat = catalog();
+        cat.subcircuits.push(
+            serde_json::from_str(
+                r#"{"name": "test-radio", "summary": "a radio block",
+                    "provides": ["radio-subghz"],
+                    "slots": {"radio": {"provides": "radio-subghz", "any_of": ["CC1101RGPR"]}},
+                    "interfaces": [{"kind": "rf", "role": "source", "signals": {"rf": "node:ant"}}],
+                    "support": [{"between": ["radio.pin:RF_P", "node:ant"], "part": "C",
+                                 "value": "47pF", "cite": {"reading": "test"}}]}"#,
+            )
+            .unwrap(),
+        );
+        cat
+    }
+
+    fn radio_design(cat: &Catalog) -> DesignSpec {
+        let decider = Decider {
+            yes: &["subghz_radio"],
+            prefer: &[("function", "test-radio"), ("mcu", "STM32G0B1KEU6")],
+        };
+        design(&decider, &mut Trace::new(), "a 915 MHz node", cat, None).expect("designs")
+    }
+
+    #[test]
+    fn a_subcircuit_is_offered_for_its_role_and_its_slots_are_filled() {
+        let cat = catalog_with_radio_subcircuit();
+        let roles: BTreeSet<&str> = ["radio-subghz"].into();
+        let covers: Vec<&str> = minimal_covers(&cat, &roles)
+            .iter()
+            .flat_map(|s| s.iter().map(|u| u.name()))
+            .collect();
+        assert!(covers.contains(&"test-radio"), "{covers:?}");
+
+        let spec = radio_design(&cat);
+        assert_eq!(spec.parts["function"].chosen, ["test-radio"]);
+        let radio = &spec.parts["sub:test-radio:radio"];
+        assert_eq!(
+            (radio.chosen.as_slice(), radio.how.as_str()),
+            (["CC1101RGPR".to_string()].as_slice(), "derived"),
+            "one candidate: derived"
+        );
+        // Its member stands in for it: the radio's crystal need is filled.
+        assert!(spec.parts.contains_key("needs:hse:CC1101RGPR"), "{spec:#?}");
+        assert!(
+            unconfirmed(&spec, &cat)
+                .iter()
+                .any(|u| u == "test-radio: test"),
+            "the subcircuit's readings are the spec's too"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs KiCad symbols"]
+    fn a_subcircuit_wires_its_members_and_exports_its_own_node() {
+        let cat = catalog_with_radio_subcircuit();
+        let dir = crate::skidl::kicad_symbol_dir().expect("KiCad symbol library");
+        let c = circuit(&radio_design(&cat), &cat, dir.path()).unwrap();
+        let cap = c
+            .parts
+            .iter()
+            .find(|p| p.value == "47pF")
+            .expect("the subcircuit's capacitor is placed");
+        let rf = &c.nets["RF_RF"];
+        assert!(
+            rf.iter().any(|(r, _)| r.starts_with('J'))
+                && rf.iter().any(|(r, _)| *r == cap.reference),
+            "the connector meets the capacitor at the exported node: {rf:?}"
+        );
+        let radio_side = c
+            .nets
+            .values()
+            .find(|n| n.iter().any(|(r, _)| *r == cap.reference) && n != &rf)
+            .expect("the capacitor's other side");
+        assert!(
+            radio_side
+                .iter()
+                .any(|(_, p)| *p == PinRef::Name("RF_P".into())),
+            "{radio_side:?}"
+        );
     }
 
     #[test]

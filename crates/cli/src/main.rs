@@ -4212,6 +4212,19 @@ fn catalog_cmd(action: CatalogCmd) -> Result<()> {
             for p in &cat.parts {
                 println!("{:<28} {}", p.mpn, p.provides.join(", "));
             }
+            for s in &cat.subcircuits {
+                let slots: Vec<String> = s
+                    .slots
+                    .iter()
+                    .map(|(name, slot)| format!("{name}={}", slot.provides))
+                    .collect();
+                println!(
+                    "{:<28} {} (subcircuit: {})",
+                    s.name,
+                    s.provides.join(", "),
+                    slots.join(", ")
+                );
+            }
         }
         CatalogCmd::Check { dir } => {
             let dir = dir_or_default(dir);
@@ -4223,14 +4236,30 @@ fn catalog_cmd(action: CatalogCmd) -> Result<()> {
                 &cat,
                 &legion_of_bom_core::datasheet::default_cache_dir(),
             )?);
-            let unconfirmed: usize = cat.parts.iter().map(|p| p.unconfirmed().len()).sum();
+            let unconfirmed: usize = cat
+                .parts
+                .iter()
+                .map(|p| p.unconfirmed().len())
+                .sum::<usize>()
+                + cat
+                    .subcircuits
+                    .iter()
+                    .map(|s| s.unconfirmed().len())
+                    .sum::<usize>();
+            let quotes: usize = cat.parts.iter().map(|p| p.quotes().len()).sum::<usize>()
+                + cat
+                    .subcircuits
+                    .iter()
+                    .map(|s| s.quotes().len())
+                    .sum::<usize>();
             for p in &problems {
                 println!("  ✗ {p}");
             }
             println!(
-                "{} part(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
+                "{} part(s), {} subcircuit(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
                 cat.parts.len(),
-                cat.parts.iter().map(|p| p.quotes().len()).sum::<usize>(),
+                cat.subcircuits.len(),
+                quotes,
                 unconfirmed,
                 problems.len()
             );

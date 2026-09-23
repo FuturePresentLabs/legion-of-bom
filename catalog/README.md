@@ -90,6 +90,46 @@ interface that fits the needer. A needer narrows that with cited `params`:
 Without `xtal_load_internal`, synthesis adds the load caps computed from the
 crystal's own cited `cl_pf`.
 
+## Subcircuits
+
+A circuit around several parts — a radio with its RF switch and matching
+network, an op-amp stage — is a **subcircuit**: one file under
+`catalog/subcircuits/<name>.json`, beside `parts/`. It is a reference design
+over role **slots**, not a board, and it is held to the same rule: every fact is
+quoted from its pinned `source` (the reference design, app note or module
+schematic) or is a reading.
+
+```json
+{
+  "name": "sx1262-frontend-915",
+  "summary": "what a decider is told",
+  "source": {"url": "…", "sha256": "…"},
+  "provides": ["radio-subghz"],
+  "slots": {
+    "radio":  {"provides": "lora-transceiver", "any_of": ["SX1262IMLTRT"]},
+    "switch": {"provides": "rf-spdt"}
+  },
+  "interfaces": [{"kind": "rf", "role": "source", "signals": {"rf": "switch.pin:RFC"}}],
+  "support": [
+    {"between": ["radio.pin:DIO2", "switch.pin:CTRL"], "part": "tie", "cite": {…}},
+    {"between": ["radio.pin:RFO", "node:tx"], "part": "L", "value": "…", "cite": {…}}
+  ]
+}
+```
+
+- **Slots.** A slot is filled from the parts that `provides` its role, and
+  with `any_of` only those parts, for when the values are tuned to them (a
+  PA match). One candidate is derived; several are a typed decision
+  (`sub:<name>:<slot>` in the spec). Each member keeps its own support and
+  interfaces: its bus, control lines and crystal are wired as usual.
+- **Endpoints** are `slot.pin:NAME` (checked against the symbol of *every*
+  part that could fill the slot), or the subcircuit's own `node:` / `net:`.
+  It has no pins of its own, and no alternates or `each_pin`.
+- **Interfaces** are what it exports. A feature's port is wired to a chosen
+  subcircuit's export before any part's own interface.
+- A part that is not a working function on its own (a radio die with no
+  front end) should not `provide` the board-level role. The subcircuit does.
+
 ## Support entries
 
 Every tie, capacitor and resistor the part needs, between two endpoints —

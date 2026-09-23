@@ -179,10 +179,87 @@ impl Endpoint {
     }
 }
 
+/// A reusable circuit around role **slots** — a reference design, not a board
+/// (DESIGN.md 3.4). One JSON file per subcircuit under `catalog/subcircuits/`,
+/// named `<name>.json`.
+///
+/// Synthesis offers a subcircuit wherever a part providing the same role
+/// would go; each slot is then filled from the catalog parts that meet the
+/// slot's requirement. Its facts — the wiring between slots, the matching
+/// network — come from the reference design pinned as `source`, cited like a
+/// part's, and its endpoints may name a slot's pin: `radio.pin:RFO`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subcircuit {
+    pub name: String,
+    /// What a decider is told about it.
+    pub summary: String,
+    /// The reference design its quotes are on.
+    #[serde(default)]
+    pub source: Option<DatasheetRef>,
+    /// The roles it fills on a board.
+    pub provides: Vec<String>,
+    pub slots: BTreeMap<String, Slot>,
+    /// What it exposes to the board, each signal at a slot's pin
+    /// (`switch.pin:RFC`) or one of its own nodes (`node:ant`).
+    #[serde(default)]
+    pub interfaces: Vec<Interface>,
+    /// Ties between slots and the passives around them.
+    #[serde(default)]
+    pub support: Vec<Support>,
+}
+
+/// What the part filling a slot must be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Slot {
+    /// The role it must provide.
+    pub provides: String,
+    /// When the subcircuit's values hold only for certain parts (a matching
+    /// network tuned to one PA), exactly those; empty means any part with
+    /// the role.
+    #[serde(default)]
+    pub any_of: Vec<String>,
+}
+
+/// An endpoint inside a subcircuit: its own (`node:ant`, `net:GND`), or a
+/// slot's pin (`radio.pin:RFO`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Scoped {
+    Own(Endpoint),
+    SlotPin { slot: String, pin: String },
+}
+
+impl Scoped {
+    pub fn parse(s: &str) -> Result<Scoped, String> {
+        let (kind, name) = s
+            .split_once(':')
+            .ok_or_else(|| format!("endpoint {s:?} is not [slot.]pin:/net:/node:NAME"))?;
+        match kind.split_once('.') {
+            Some((slot, "pin")) if !slot.is_empty() && !name.is_empty() => Ok(Scoped::SlotPin {
+                slot: slot.into(),
+                pin: name.into(),
+            }),
+            Some(_) => Err(format!(
+                "endpoint {s:?}: only a slot's pin can be named (slot.pin:NAME)"
+            )),
+            None => match Endpoint::parse(s)? {
+                Endpoint::Pin(_) => Err(format!(
+                    "endpoint {s:?}: a subcircuit has no pins of its own; name the slot (slot.pin:NAME)"
+                )),
+                e => Ok(Scoped::Own(e)),
+            },
+        }
+    }
+}
+
 /// The loaded catalog.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
     pub parts: Vec<CatalogPart>,
+    /// Reusable circuits over the parts (`subcircuits/` beside the parts
+    /// directory).
+    pub subcircuits: Vec<Subcircuit>,
     /// The requirement vocabulary (`features.json` beside the parts
     /// directory): what a brief can ask for, and the role, interface and
     /// connector port that meet it.
@@ -235,28 +312,8 @@ impl Catalog {
     /// always loads the same way. A file whose name is not its part's `mpn`
     /// is rejected: the file name is how a reviewer finds the part.
     pub fn load(dir: &Path) -> Result<Catalog, CatalogError> {
-        let io = |source| CatalogError::Io {
-            path: dir.to_path_buf(),
-            source,
-        };
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(io)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .collect();
-        files.sort();
         let mut parts = Vec::new();
-        for path in files {
-            let text = std::fs::read_to_string(&path).map_err(|source| CatalogError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let part: CatalogPart =
-                serde_json::from_str(&text).map_err(|source| CatalogError::Parse {
-                    path: path.clone(),
-                    source,
-                })?;
+        for (path, part) in read_json_dir::<CatalogPart>(dir)? {
             let invalid = |message: String| CatalogError::Invalid {
                 path: path.clone(),
                 message,
@@ -269,6 +326,29 @@ impl Catalog {
                 return Err(invalid(problems.join("; ")));
             }
             parts.push(part);
+        }
+        let mut catalog = Catalog {
+            parts,
+            ..Catalog::default()
+        };
+        // Subcircuits sit beside the parts; a parts-only directory has none.
+        let sub_dir = dir.parent().map(|p| p.join("subcircuits"));
+        for (path, sub) in match sub_dir.filter(|d| d.is_dir()) {
+            Some(d) => read_json_dir::<Subcircuit>(&d)?,
+            None => Vec::new(),
+        } {
+            let mut problems = Vec::new();
+            if path.file_stem().and_then(|s| s.to_str()) != Some(sub.name.as_str()) {
+                problems.push(format!("file name must be {}.json", sub.name));
+            }
+            problems.extend(sub.shape_problems(&catalog));
+            if !problems.is_empty() {
+                return Err(CatalogError::Invalid {
+                    path,
+                    message: problems.join("; "),
+                });
+            }
+            catalog.subcircuits.push(sub);
         }
         // The vocabulary sits beside the parts; a parts-only directory has none.
         let features_path = dir.parent().map(|p| p.join("features.json"));
@@ -283,7 +363,8 @@ impl Catalog {
             }
             None => Vec::new(),
         };
-        Ok(Catalog { parts, features })
+        catalog.features = features;
+        Ok(catalog)
     }
 
     /// A hash of every part's content, in part order: what a design spec
@@ -296,6 +377,14 @@ impl Catalog {
             h.update(
                 serde_json::to_string(p)
                     .expect("a part serializes")
+                    .as_bytes(),
+            );
+            h.update([0]);
+        }
+        for s in &self.subcircuits {
+            h.update(
+                serde_json::to_string(s)
+                    .expect("a subcircuit serializes")
                     .as_bytes(),
             );
             h.update([0]);
@@ -321,6 +410,191 @@ impl Catalog {
             .iter()
             .filter(move |p| p.provides.iter().any(|r| r == role))
     }
+
+    pub fn subcircuit(&self, name: &str) -> Option<&Subcircuit> {
+        self.subcircuits.iter().find(|s| s.name == name)
+    }
+
+    /// Every part that can fill `slot`, in catalog order.
+    pub fn candidates<'a>(&'a self, slot: &'a Slot) -> impl Iterator<Item = &'a CatalogPart> + 'a {
+        self.providing(&slot.provides)
+            .filter(|p| slot.any_of.is_empty() || slot.any_of.contains(&p.mpn))
+    }
+}
+
+/// Every `*.json` in `dir`, parsed, sorted by file name so the same catalog
+/// always loads the same way.
+fn read_json_dir<T: serde::de::DeserializeOwned>(
+    dir: &Path,
+) -> Result<Vec<(PathBuf, T)>, CatalogError> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|source| CatalogError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).map_err(|source| CatalogError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let value = serde_json::from_str(&text).map_err(|source| CatalogError::Parse {
+                path: path.clone(),
+                source,
+            })?;
+            Ok((path, value))
+        })
+        .collect()
+}
+
+/// Problems with one support entry's kind and value, whatever owns it.
+fn support_problems(s: &Support) -> Vec<String> {
+    let mut out = Vec::new();
+    if !matches!(s.part.as_str(), "tie" | "C" | "CP" | "L" | "R") {
+        out.push(format!(
+            "support part {:?} is not tie, C, CP, L or R",
+            s.part
+        ));
+    }
+    if s.part != "tie" && s.value.is_none() {
+        out.push(format!("{} between {:?} has no value", s.part, s.between));
+    }
+    out
+}
+
+/// The quotes among `cites`, as `(page, quote)`.
+fn quotes_of<'a>(cites: impl IntoIterator<Item = &'a Cite>) -> Vec<(usize, &'a str)> {
+    cites
+        .into_iter()
+        .filter_map(|c| match c {
+            Cite::Quote { page, quote } => Some((*page, quote.as_str())),
+            Cite::Reading { .. } => None,
+        })
+        .collect()
+}
+
+/// The readings among `cites` no person has confirmed, labelled with `who`.
+fn unconfirmed_of<'a>(who: &str, cites: impl IntoIterator<Item = &'a Cite>) -> Vec<String> {
+    cites
+        .into_iter()
+        .filter_map(|c| match c {
+            Cite::Reading {
+                reading,
+                page,
+                confirmed_by: None,
+            } => Some(match page {
+                Some(p) => format!("{who} p.{p}: {reading}"),
+                None => format!("{who}: {reading}"),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+impl Subcircuit {
+    /// Every endpoint it names, with where it is named.
+    fn endpoints(&self) -> Vec<(String, &str)> {
+        let mut out: Vec<(String, &str)> = Vec::new();
+        for s in &self.support {
+            out.extend(
+                s.between
+                    .iter()
+                    .map(|e| ("support".to_string(), e.as_str())),
+            );
+        }
+        for i in &self.interfaces {
+            for (sig, s) in &i.signals {
+                match s {
+                    Signal::At(at) => out.push((format!("{} {sig}", i.kind), at.as_str())),
+                    // Caught in shape_problems: a subcircuit has no alternates.
+                    Signal::Alt { .. } => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Problems visible from the file and the parts it draws on: malformed or
+    /// unknown-slot endpoints, a slot no part can fill, a quote with no
+    /// source to be on.
+    fn shape_problems(&self, catalog: &Catalog) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in &self.support {
+            out.extend(support_problems(s));
+            if s.each_pin {
+                out.push(format!(
+                    "each_pin support {:?}: a subcircuit names each pin",
+                    s.between
+                ));
+            }
+        }
+        for i in &self.interfaces {
+            for (sig, s) in &i.signals {
+                if let Signal::Alt { alt } = s {
+                    out.push(format!(
+                        "{} {sig} wants alternate {alt}: a subcircuit wires named pins only",
+                        i.kind
+                    ));
+                }
+            }
+        }
+        for (context, e) in self.endpoints() {
+            match Scoped::parse(e) {
+                Ok(Scoped::SlotPin { slot, .. }) if !self.slots.contains_key(&slot) => {
+                    out.push(format!("{context} names slot {slot:?}, which it lacks"))
+                }
+                Ok(Scoped::Own(Endpoint::Net(_))) if context != "support" => {
+                    out.push(format!("{context} lands on a net, not the subcircuit"))
+                }
+                Ok(_) => {}
+                Err(m) => out.push(m),
+            }
+        }
+        for (name, slot) in &self.slots {
+            for mpn in &slot.any_of {
+                match catalog.part(mpn) {
+                    None => out.push(format!("slot {name} names {mpn}, which the catalog lacks")),
+                    Some(p) if !p.provides.contains(&slot.provides) => out.push(format!(
+                        "slot {name} names {mpn}, which does not provide {}",
+                        slot.provides
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if catalog.candidates(slot).next().is_none() {
+                out.push(format!(
+                    "slot {name}: no catalog part provides {}",
+                    slot.provides
+                ));
+            }
+        }
+        if self.source.is_none() && !self.quotes().is_empty() {
+            out.push("quotes a source but names none".into());
+        }
+        out
+    }
+
+    fn cites(&self) -> Vec<&Cite> {
+        let mut out: Vec<&Cite> = self.support.iter().map(|s| &s.cite).collect();
+        out.extend(self.interfaces.iter().filter_map(|i| i.cite.as_ref()));
+        out
+    }
+
+    /// Every quote from its reference design, as `(page, quote)`.
+    pub fn quotes(&self) -> Vec<(usize, &str)> {
+        quotes_of(self.cites())
+    }
+
+    /// Every reading no person has confirmed yet.
+    pub fn unconfirmed(&self) -> Vec<String> {
+        unconfirmed_of(&self.name, self.cites())
+    }
 }
 
 impl CatalogPart {
@@ -336,15 +610,7 @@ impl CatalogPart {
                     out.push(m);
                 }
             }
-            if !matches!(s.part.as_str(), "tie" | "C" | "CP" | "L" | "R") {
-                out.push(format!(
-                    "support part {:?} is not tie, C, CP, L or R",
-                    s.part
-                ));
-            }
-            if s.part != "tie" && s.value.is_none() {
-                out.push(format!("{} between {:?} has no value", s.part, s.between));
-            }
+            out.extend(support_problems(s));
             if s.each_pin && !s.between.iter().any(|e| e.starts_with("pin:")) {
                 out.push(format!(
                     "each_pin support {:?} has no pin: endpoint",
@@ -391,31 +657,12 @@ impl CatalogPart {
 
     /// Every datasheet quote the part rests on, as `(page, quote)`.
     pub fn quotes(&self) -> Vec<(usize, &str)> {
-        self.cites()
-            .into_iter()
-            .filter_map(|c| match c {
-                Cite::Quote { page, quote } => Some((*page, quote.as_str())),
-                Cite::Reading { .. } => None,
-            })
-            .collect()
+        quotes_of(self.cites())
     }
 
     /// Every reading no person has confirmed yet.
     pub fn unconfirmed(&self) -> Vec<String> {
-        self.cites()
-            .into_iter()
-            .filter_map(|c| match c {
-                Cite::Reading {
-                    reading,
-                    page,
-                    confirmed_by: None,
-                } => Some(match page {
-                    Some(p) => format!("{} p.{p}: {reading}", self.mpn),
-                    None => format!("{}: {reading}", self.mpn),
-                }),
-                _ => None,
-            })
-            .collect()
+        unconfirmed_of(&self.mpn, self.cites())
     }
 
     /// `(number, name)` for every pin, from the KiCad symbol or the inline
@@ -477,25 +724,49 @@ pub fn check_symbols(catalog: &Catalog, symbol_dir: &Path) -> Result<Vec<String>
             }
         }
     }
+    // A subcircuit's slot pins must exist on every part that could fill it.
+    for sub in &catalog.subcircuits {
+        for (context, e) in sub.endpoints() {
+            let Ok(Scoped::SlotPin { slot, pin }) = Scoped::parse(e) else {
+                continue;
+            };
+            for part in catalog.candidates(&sub.slots[&slot]) {
+                let (pins, _) = part.pins(symbol_dir)?;
+                if !pins.iter().any(|(_, name)| *name == pin) {
+                    problems.push(format!(
+                        "{}: {context} names {slot} pin {pin:?}, which {} lacks",
+                        sub.name, part.mpn
+                    ));
+                }
+            }
+        }
+    }
     Ok(problems)
 }
 
 /// Check every quote in the catalog against its part's pinned datasheet.
 /// One line per failure; empty means every quote is on its page.
 pub fn check_quotes(catalog: &Catalog, cache_dir: &Path) -> Result<Vec<String>, StageError> {
+    let parts = catalog
+        .parts
+        .iter()
+        .map(|p| (&p.mpn, &p.datasheet, p.quotes()));
+    let subs = catalog
+        .subcircuits
+        .iter()
+        .map(|s| (&s.name, &s.source, s.quotes()));
     let mut failures = Vec::new();
-    for part in &catalog.parts {
-        let quotes = part.quotes();
-        let Some(ds) = &part.datasheet else {
+    for (who, source, quotes) in parts.chain(subs) {
+        let Some(ds) = source else {
             continue;
         };
         if quotes.is_empty() {
             continue;
         }
-        let pdf = crate::datasheet::fetch_pinned(&part.mpn, &ds.url, &ds.sha256, cache_dir)?;
+        let pdf = crate::datasheet::fetch_pinned(who, &ds.url, &ds.sha256, cache_dir)?;
         let pages = crate::datasheet::pages(&pdf)?;
         for (page, quote) in quotes {
-            if let Err(e) = crate::datasheet::check_quote(&part.mpn, page, quote, &pages) {
+            if let Err(e) = crate::datasheet::check_quote(who, page, quote, &pages) {
                 failures.push(e);
             }
         }
@@ -604,6 +875,97 @@ mod tests {
         let cat = Catalog::load(&default_catalog_dir()).unwrap();
         let failures = check_quotes(&cat, &crate::datasheet::default_cache_dir()).unwrap();
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn a_subcircuit_endpoint_is_its_own_or_a_slots_pin() {
+        assert_eq!(
+            Scoped::parse("radio.pin:RFO"),
+            Ok(Scoped::SlotPin {
+                slot: "radio".into(),
+                pin: "RFO".into()
+            })
+        );
+        assert_eq!(
+            Scoped::parse("node:ant"),
+            Ok(Scoped::Own(Endpoint::Node("ant".into())))
+        );
+        for bad in ["pin:RFO", "radio.node:x", ".pin:RFO", "RFO"] {
+            assert!(Scoped::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Load a catalog of the shipped parts plus one subcircuit file.
+    fn load_with_subcircuit(name: &str, json: &str) -> Result<Catalog, CatalogError> {
+        let root = std::env::temp_dir().join(format!(
+            "lob-subcircuit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let parts = root.join("parts");
+        std::fs::create_dir_all(&parts).unwrap();
+        std::fs::create_dir_all(root.join("subcircuits")).unwrap();
+        for e in std::fs::read_dir(default_catalog_dir()).unwrap() {
+            let p = e.unwrap().path();
+            std::fs::copy(&p, parts.join(p.file_name().unwrap())).unwrap();
+        }
+        std::fs::write(root.join("subcircuits").join(format!("{name}.json")), json).unwrap();
+        let out = Catalog::load(&parts);
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    fn subcircuit_json(slot: &str, support_end: &str) -> String {
+        format!(
+            r#"{{"name": "s", "summary": "s", "provides": ["radio-subghz"],
+                "slots": {{"radio": {slot}}},
+                "support": [{{"between": ["{support_end}", "net:GND"], "part": "C",
+                             "value": "1pF", "cite": {{"reading": "r"}}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn a_subcircuit_is_checked_against_its_slots_and_the_catalog_on_load() {
+        let ok_slot = r#"{"provides": "radio-subghz", "any_of": ["CC1101RGPR"]}"#;
+        let cat = load_with_subcircuit("s", &subcircuit_json(ok_slot, "radio.pin:RF_P")).unwrap();
+        assert_eq!(cat.subcircuits.len(), 1);
+        assert_eq!(
+            cat.candidates(&cat.subcircuits[0].slots["radio"])
+                .map(|p| p.mpn.as_str())
+                .collect::<Vec<_>>(),
+            ["CC1101RGPR"]
+        );
+
+        let bad = [
+            (ok_slot, "switch.pin:RFC", "slot \"switch\""),
+            (ok_slot, "pin:RF_P", "name the slot"),
+            (
+                r#"{"provides": "radio-subghz", "any_of": ["NOPE"]}"#,
+                "radio.pin:RF_P",
+                "catalog lacks",
+            ),
+            (
+                r#"{"provides": "radio-subghz", "any_of": ["AMS1117-3.3"]}"#,
+                "radio.pin:RF_P",
+                "does not provide",
+            ),
+            (
+                r#"{"provides": "no-such-role"}"#,
+                "radio.pin:RF_P",
+                "no catalog part",
+            ),
+        ];
+        for (slot, end, want) in bad {
+            let err = load_with_subcircuit("s", &subcircuit_json(slot, end))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{want}: {err}");
+        }
+        let err = load_with_subcircuit("other", &subcircuit_json(ok_slot, "radio.pin:RF_P"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("s.json"), "{err}");
     }
 
     #[test]
