@@ -15,6 +15,22 @@
     "mcu"
   ],
   "sim_excluded": true,
+  "params": {
+    "xtal_min_hz": {
+      "value": 4000000,
+      "cite": {
+        "page": 1,
+        "quote": "4-to-26 MHz crystal oscillator"
+      }
+    },
+    "xtal_max_hz": {
+      "value": 26000000,
+      "cite": {
+        "page": 1,
+        "quote": "4-to-26 MHz crystal oscillator"
+      }
+    }
+  },
   "interfaces": [
     {
       "kind": "spi",

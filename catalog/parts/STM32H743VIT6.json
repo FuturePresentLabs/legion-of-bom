@@ -15,6 +15,22 @@
     "mcu"
   ],
   "sim_excluded": true,
+  "params": {
+    "xtal_min_hz": {
+      "value": 4000000,
+      "cite": {
+        "page": 128,
+        "quote": "The high-speed external (HSE) clock can be supplied with a 4 to 48 MHz crystal/ceramic"
+      }
+    },
+    "xtal_max_hz": {
+      "value": 48000000,
+      "cite": {
+        "page": 128,
+        "quote": "The high-speed external (HSE) clock can be supplied with a 4 to 48 MHz crystal/ceramic"
+      }
+    }
+  },
   "interfaces": [
     {
       "kind": "i2s",
