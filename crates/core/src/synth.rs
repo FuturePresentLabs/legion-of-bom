@@ -273,6 +273,24 @@ impl Pinout {
     }
 }
 
+/// The slot a part's need of `kind` is filled in.
+fn need_slot(kind: &str, needer: &str) -> String {
+    format!("needs:{kind}:{needer}")
+}
+
+/// Whether `source` can meet what `needer` states about its need: a needer
+/// with `xtal_freq_hz` takes only a crystal cut for that frequency.
+fn fits_need(needer: &CatalogPart, source: &CatalogPart) -> bool {
+    match (
+        needer.params.get("xtal_freq_hz"),
+        source.params.get("freq_hz"),
+    ) {
+        (Some(want), Some(have)) => (want.value - have.value).abs() < 1.0,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 /// Pin names a part's own support (and its fixed interfaces) already use: not
 /// free for a bus or a control line.
 fn support_pins(p: &CatalogPart) -> BTreeSet<String> {
@@ -380,32 +398,34 @@ pub fn design(
     parts.insert("mcu".into(), mcu_sel);
     let mcu = chosen(&parts, "mcu")[0];
 
-    // 2c. Whatever a chosen part needs from outside it (the MCU's crystal).
-    let needs: BTreeSet<String> = function_parts
-        .iter()
-        .copied()
-        .chain([mcu])
-        .flat_map(|p| &p.interfaces)
-        .filter(|i| i.role == "needs")
-        .map(|i| i.kind.clone())
-        .collect();
-    for kind in &needs {
-        let options = catalog
-            .parts
+    // 2c. Whatever each chosen part needs from outside it (the MCU's crystal,
+    // the radio's): one slot per needing part, and only sources that fit it.
+    let needers: Vec<&CatalogPart> = function_parts.iter().copied().chain([mcu]).collect();
+    for needer in needers {
+        for kind in needer
+            .interfaces
             .iter()
-            .filter(|p| interfaces(p, kind, "source").next().is_some())
-            .map(describe)
-            .collect();
-        let slot = format!("needs:{kind}");
-        let sel = pick(
-            client,
-            trace,
-            brief,
-            &slot,
-            &format!("Which part should supply {kind}?"),
-            options,
-        )?;
-        parts.insert(slot, sel);
+            .filter(|i| i.role == "needs")
+            .map(|i| i.kind.clone())
+        {
+            let options = catalog
+                .parts
+                .iter()
+                .filter(|p| interfaces(p, &kind, "source").next().is_some())
+                .filter(|p| fits_need(needer, p))
+                .map(describe)
+                .collect();
+            let slot = need_slot(&kind, &needer.mpn);
+            let sel = pick(
+                client,
+                trace,
+                brief,
+                &slot,
+                &format!("Which part should supply {kind}?"),
+                options,
+            )?;
+            parts.insert(slot, sel);
+        }
     }
 
     // 2d. Rails every chosen part ties to, other than ground and the input.
@@ -805,7 +825,7 @@ pub fn circuit(
             .cloned()
             .collect();
         for need in needs {
-            let Some(&src) = in_slot(&format!("needs:{}", need.kind)).first() else {
+            let Some(&src) = in_slot(&need_slot(&need.kind, &placed[n].part.mpn)).first() else {
                 continue;
             };
             let source = first_iface(&placed[src], &need.kind, "source").ok_or_else(|| {
@@ -814,13 +834,25 @@ pub fn circuit(
                     placed[src].part.mpn, need.kind
                 ))
             })?;
+            // A needer that trims its crystal load internally takes no caps.
+            let internal = placed[n]
+                .part
+                .params
+                .get("xtal_load_internal")
+                .is_some_and(|p| p.value != 0.0);
             let load = placed[src]
                 .part
                 .params
                 .get("cl_pf")
+                .filter(|_| !internal)
                 .map(|p| fmt_pf(round_e12_pf(load_cap_pf(p.value))));
             for (sig, at) in &need.signals {
-                let net = format!("net:{}_{}", need.kind.to_uppercase(), sig.to_uppercase());
+                let net = format!(
+                    "net:{}_{}_{}",
+                    placed[n].reference,
+                    need.kind.to_uppercase(),
+                    sig.to_uppercase()
+                );
                 let nk = resolve(&placed[n], at, &mut taken)?;
                 nets.union(&net, &nk);
                 if let Some(s) = source.signals.get(sig) {
@@ -846,7 +878,7 @@ pub fn circuit(
                     .part
                     .interfaces
                     .iter()
-                    .find(|i| i.kind == f.interface && i.role != "port")
+                    .find(|i| i.kind == f.interface)
                     .map(|i| (a, i.clone()))
             })
             .ok_or_else(|| SynthError::Invalid(format!("no function part has {}", f.interface)))?;
@@ -1204,7 +1236,7 @@ mod tests {
             "pin-strapped parts need no control bus"
         );
         assert!(
-            spec.parts.contains_key("needs:hse"),
+            spec.parts.contains_key("needs:hse:STM32H743VIT6"),
             "the MCU's crystal is a need, filled"
         );
     }
@@ -1215,6 +1247,33 @@ mod tests {
         spec.catalog = "0000000000000000".into();
         let err = circuit(&spec, &catalog(), Path::new("/nonexistent")).unwrap_err();
         assert!(matches!(err, SynthError::StaleCatalog { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_need_is_met_only_by_a_source_that_fits_it() {
+        let cat = catalog();
+        let mut radio = cat.part("STM32H743VIT6").unwrap().clone();
+        let xtal_8 = cat.part("ECS-80-20-4X").unwrap();
+        assert!(
+            fits_need(&radio, xtal_8),
+            "no stated frequency: any crystal fits"
+        );
+        radio.params.insert(
+            "xtal_freq_hz".into(),
+            crate::catalog::Param {
+                value: 32e6,
+                cite: crate::catalog::Cite::Reading {
+                    reading: "test".into(),
+                    page: None,
+                    confirmed_by: None,
+                },
+            },
+        );
+        assert!(
+            !fits_need(&radio, xtal_8),
+            "a 32 MHz need refuses an 8 MHz crystal"
+        );
+        assert_eq!(need_slot("hse", "SX1262IMLTRT"), "needs:hse:SX1262IMLTRT");
     }
 
     #[test]

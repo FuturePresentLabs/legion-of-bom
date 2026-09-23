@@ -912,12 +912,22 @@ fn spec_cmd(
     println!("  spec (machine-readable): {}", json_path.display());
     println!("  decisions made: {}", trace.records().len());
     for record in trace.records() {
+        // ooda records a yes/no answer's probability as its confidence; a
+        // confident NO (p = 0.09) is 0.91 sure, not 0.09.
+        let (answer, confidence) = match record.kind {
+            ooda::Kind::Noul => {
+                let p = record.confidence;
+                let yes = if p >= 0.5 { "yes" } else { "no" };
+                (format!("{yes} (p={p:.2})"), p.max(1.0 - p))
+            }
+            _ => (record.chosen.clone(), record.confidence),
+        };
         println!(
             "    {:<16} {:<8} {} (confidence {:.2})",
             record.key,
             format!("{:?}", record.kind).to_lowercase(),
-            record.chosen,
-            record.confidence
+            answer,
+            confidence
         );
     }
 

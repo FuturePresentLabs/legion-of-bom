@@ -76,6 +76,20 @@ receives. An MCU maps each signal to an **alternate function**
 | `stereo-audio`, `mono-audio` | `port` | `l`, `r` / `sig` |
 | `audio-line-in`, `audio-line-out`, `audio-mic-in`, `headphone-out` | `sink` / `source` | `l`, `r` / `mic` |
 
+## Needs
+
+An interface with role `needs` (an MCU's or a radio's crystal, `hse`) is
+filled per part: synthesis offers every part with a matching `source`
+interface that fits the needer. A needer narrows that with cited `params`:
+
+| param | meaning |
+|---|---|
+| `xtal_freq_hz` | only a crystal with this `freq_hz` fits (a radio's 32 MHz) |
+| `xtal_load_internal` | `1` when the chip trims its crystal load internally: no external load caps |
+
+Without `xtal_load_internal`, synthesis adds the load caps computed from the
+crystal's own cited `cl_pf`.
+
 ## Support entries
 
 Every tie, capacitor and resistor the part needs, between two endpoints —
