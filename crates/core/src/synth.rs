@@ -314,16 +314,25 @@ fn need_slot(kind: &str, needer: &str) -> String {
 }
 
 /// Whether `source` can meet what `needer` states about its need: a needer
-/// with `xtal_freq_hz` takes only a crystal cut for that frequency.
+/// with `xtal_freq_hz` takes only a crystal cut for that frequency, one with
+/// `xtal_min_hz` / `xtal_max_hz` only a crystal in that range. A stated
+/// constraint and a source with no cited `freq_hz` never fit.
 fn fits_need(needer: &CatalogPart, source: &CatalogPart) -> bool {
-    match (
-        needer.params.get("xtal_freq_hz"),
-        source.params.get("freq_hz"),
-    ) {
-        (Some(want), Some(have)) => (want.value - have.value).abs() < 1.0,
-        (Some(_), None) => false,
-        (None, _) => true,
+    let want = |k: &str| needer.params.get(k).map(|p| p.value);
+    let (exact, min, max) = (
+        want("xtal_freq_hz"),
+        want("xtal_min_hz"),
+        want("xtal_max_hz"),
+    );
+    if exact.is_none() && min.is_none() && max.is_none() {
+        return true;
     }
+    let Some(have) = source.params.get("freq_hz").map(|p| p.value) else {
+        return false;
+    };
+    exact.is_none_or(|f| (f - have).abs() < 1.0)
+        && min.is_none_or(|m| have >= m)
+        && max.is_none_or(|m| have <= m)
 }
 
 /// Pin names a part's own support (and its fixed interfaces) already use: not
@@ -1434,6 +1443,34 @@ mod tests {
             "a 32 MHz need refuses an 8 MHz crystal"
         );
         assert_eq!(need_slot("hse", "SX1262IMLTRT"), "needs:hse:SX1262IMLTRT");
+    }
+
+    #[test]
+    fn a_crystal_outside_the_needers_range_does_not_fit() {
+        let cat = catalog();
+        let param = |value| crate::catalog::Param {
+            value,
+            cite: crate::catalog::Cite::Reading {
+                reading: "test".into(),
+                page: None,
+                confirmed_by: None,
+            },
+        };
+        let mut mcu = cat.part("STM32F411CEU6").unwrap().clone();
+        mcu.params.insert("xtal_min_hz".into(), param(4e6));
+        mcu.params.insert("xtal_max_hz".into(), param(26e6));
+        let xtal = |mhz: f64| {
+            cat.parts
+                .iter()
+                .find(|p| {
+                    p.params
+                        .get("freq_hz")
+                        .is_some_and(|f| f.value == mhz * 1e6)
+                })
+                .unwrap_or_else(|| panic!("a {mhz} MHz crystal in the catalog"))
+        };
+        assert!(fits_need(&mcu, xtal(8.0)), "8 MHz is in 4-26 MHz");
+        assert!(!fits_need(&mcu, xtal(32.0)), "32 MHz is above 26 MHz");
     }
 
     /// A catalog with one subcircuit: a radio slot any_of the CC1101, whose

@@ -85,6 +85,7 @@ interface that fits the needer. A needer narrows that with cited `params`:
 | param | meaning |
 |---|---|
 | `xtal_freq_hz` | only a crystal with this `freq_hz` fits (a radio's 32 MHz) |
+| `xtal_min_hz`, `xtal_max_hz` | only a crystal in this range fits (an MCU's HSE, 4–26 MHz) |
 | `xtal_load_internal` | `1` when the chip trims its crystal load internally: no external load caps |
 
 Without `xtal_load_internal`, synthesis adds the load caps computed from the
