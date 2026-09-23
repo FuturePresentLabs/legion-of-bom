@@ -738,6 +738,7 @@ impl PlacedSub<'_> {
     fn key(&self, e: &str) -> Result<String, SynthError> {
         Ok(match Scoped::parse(e).map_err(SynthError::Invalid)? {
             Scoped::SlotPin { slot, pin } => pin_key(&self.scope[&slot], &pin),
+            Scoped::SlotNode { slot, node } => format!("{}.node.{node}", self.scope[&slot]),
             Scoped::Own(Endpoint::Net(n)) => format!("net:{n}"),
             Scoped::Own(Endpoint::Node(n)) => format!("{}.node.{n}", self.reference),
             Scoped::Own(Endpoint::Pin(_)) => unreachable!("Scoped::parse refuses a bare pin"),

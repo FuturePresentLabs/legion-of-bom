@@ -1,0 +1,241 @@
+{
+  "name": "sx1262-frontend-915",
+  "summary": "LoRa/(G)FSK radio for 902-928 MHz at up to +22 dBm: an SX1262 with Semtech's 915 MHz reference front end (PA feed, L/C match and harmonic filter, RX balun, a PE4259 SPDT RF switch driven by DIO2, antenna-side filter) ending in one 50 ohm antenna port. SPI slave plus BUSY, DIO1 IRQ and reset; 32 MHz crystal with internal load trim. Values from Semtech's reference BOM, which a person must confirm before fab",
+  "source": {
+    "url": "https://cdn-reichelt.de/documents/datenblatt/A200/SX1262REFERENCE.pdf",
+    "sha256": "1447fa948e5b191c3894c86d62d632e27c306092da2943c33373f20f7e0955d0"
+  },
+  "provides": [
+    "radio-subghz"
+  ],
+  "slots": {
+    "radio": {
+      "provides": "lora-transceiver",
+      "any_of": [
+        "SX1262IMLTRT"
+      ]
+    },
+    "switch": {
+      "provides": "rf-spdt",
+      "any_of": [
+        "PE4259-63"
+      ]
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "rf",
+      "role": "source",
+      "signals": {
+        "rf": "node:ant"
+      },
+      "cite": {
+        "reading": "node:ant is the 50 ohm antenna side of the harmonics/RX filter (C9, L5, C10), where the e499v01b schematic p.1 marks 'Antenna matching' as not included"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "radio.pin:VR_PA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "47nF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 21: \"C1 | GRM155R71C473KA01D | 0402 | 47nF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:VR_PA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "47pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 22: \"C2 | GJM1555C1H470JB01D | 0402 | 47pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:VR_PA",
+        "node:tx1"
+      ],
+      "part": "L",
+      "value": "47nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 42: \"L1 | LQW15AN47NJ00D | 0402 | 47nH\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:RFO",
+        "node:tx1"
+      ],
+      "part": "R",
+      "value": "0R",
+      "footprint": "Resistor_SMD:R_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 43: \"L2 | CRCW04020000Z0ED | 0402 | 0R\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "node:tx1",
+        "node:tx2"
+      ],
+      "part": "L",
+      "value": "2.5nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 44: \"L3 | LQW15AN2N5C00D | 0402 | 2.5nH\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "node:tx1",
+        "node:tx2"
+      ],
+      "part": "C",
+      "value": "3.0pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 23: \"C4 | GJM1555C1H3R0BB01D | 0402 | 3.0pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "node:tx2",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "5.6pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 24: \"C5 | GJM1555C1H5R6CB01D | 0402 | 5.6pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "node:tx2",
+        "node:tx3"
+      ],
+      "part": "C",
+      "value": "39pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 25: \"C6 | GJM1555C1H390JB01D | 0402 | 39pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "node:tx3",
+        "switch.pin:RF1"
+      ],
+      "part": "L",
+      "value": "4.7nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 45: \"L4 | LQW15AN4N7C00D | 0402 | 4.7nH\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "switch.pin:RF1",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1.8pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 26: \"C7 | GJM1555C1H1R8BB01D | 0402 | 1.8pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:RFI_N",
+        "switch.pin:RF2"
+      ],
+      "part": "C",
+      "value": "2.4pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 30: \"C11 | GJM1555C1H2R4BB01D | 0402 | 2.4pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:RFI_N",
+        "radio.pin:RFI_P"
+      ],
+      "part": "L",
+      "value": "15nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 47: \"L6 | LQW15AN15NH00D | 0402 | 15nH\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:RFI_P",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1.8pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 31: \"C12 | GJM1555C1H1R8BB01D | 0402 | 1.8pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "switch.node:rfc",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "3.3pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 28: \"C9 | GJM1555C1H3R3BB01D | 0402 | 3.3pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "switch.node:rfc",
+        "node:ant"
+      ],
+      "part": "L",
+      "value": "9.1nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 46: \"L5 | LQW15AN9N1H00D | 0402 | 9.1nH\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "node:ant",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "3.3pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "Semtech SX1262MB2CAS 915 MHz reference BOM (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, sha256 30516987c4cc112f04adc34cf3c1c1a8191044ccb07cb5183ac57cb0e85388f3) row 29: \"C10 | GJM1555C1H3R3BB01D | 0402 | 3.3pF\"; placement read off the e499v01b schematic p.1 (sha256 e247d1b87912b2e0df502c6f1868e910f58594e35c3d725a5fdf7af327abb0da). Tuned on the DC-DC reference board"
+      }
+    },
+    {
+      "between": [
+        "radio.pin:DIO2",
+        "switch.node:ctrl"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "DIO2 drives the switch CTRL (through R3/C15 on the switch part) on the e499v01b schematic p.1; DIO2 is high in TX (SX1261/2 datasheet p.80) and CTRL high routes RFC to RF1, the TX path"
+      }
+    }
+  ]
+}

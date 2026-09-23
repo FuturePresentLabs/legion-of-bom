@@ -222,12 +222,14 @@ pub struct Slot {
     pub any_of: Vec<String>,
 }
 
-/// An endpoint inside a subcircuit: its own (`node:ant`, `net:GND`), or a
-/// slot's pin (`radio.pin:RFO`).
+/// An endpoint inside a subcircuit: its own (`node:ant`, `net:GND`), a
+/// slot's pin (`radio.pin:RFO`), or a node its slot's part names in its own
+/// support (`switch.node:rfc`, past the switch's DC block).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scoped {
     Own(Endpoint),
     SlotPin { slot: String, pin: String },
+    SlotNode { slot: String, node: String },
 }
 
 impl Scoped {
@@ -240,8 +242,12 @@ impl Scoped {
                 slot: slot.into(),
                 pin: name.into(),
             }),
+            Some((slot, "node")) if !slot.is_empty() && !name.is_empty() => Ok(Scoped::SlotNode {
+                slot: slot.into(),
+                node: name.into(),
+            }),
             Some(_) => Err(format!(
-                "endpoint {s:?}: only a slot's pin can be named (slot.pin:NAME)"
+                "endpoint {s:?}: only a slot's pin or node can be named (slot.pin:NAME, slot.node:NAME)"
             )),
             None => match Endpoint::parse(s)? {
                 Endpoint::Pin(_) => Err(format!(
@@ -546,8 +552,32 @@ impl Subcircuit {
         }
         for (context, e) in self.endpoints() {
             match Scoped::parse(e) {
-                Ok(Scoped::SlotPin { slot, .. }) if !self.slots.contains_key(&slot) => {
+                Ok(Scoped::SlotPin { slot, .. } | Scoped::SlotNode { slot, .. })
+                    if !self.slots.contains_key(&slot) =>
+                {
                     out.push(format!("{context} names slot {slot:?}, which it lacks"))
+                }
+                // A slot's node must be one every candidate part names.
+                Ok(Scoped::SlotNode { slot, node }) => {
+                    let want = format!("node:{node}");
+                    for p in catalog.candidates(&self.slots[&slot]) {
+                        let in_support = p
+                            .support
+                            .iter()
+                            .flat_map(|s| &s.between)
+                            .any(|e| *e == want);
+                        let in_interface = p
+                            .interfaces
+                            .iter()
+                            .flat_map(|i| i.signals.values())
+                            .any(|s| matches!(s, Signal::At(at) if *at == want));
+                        if !in_support && !in_interface {
+                            out.push(format!(
+                                "{context} names {slot} node {node:?}, which {} lacks",
+                                p.mpn
+                            ));
+                        }
+                    }
                 }
                 Ok(Scoped::Own(Endpoint::Net(_))) if context != "support" => {
                     out.push(format!("{context} lands on a net, not the subcircuit"))
@@ -890,7 +920,14 @@ mod tests {
             Scoped::parse("node:ant"),
             Ok(Scoped::Own(Endpoint::Node("ant".into())))
         );
-        for bad in ["pin:RFO", "radio.node:x", ".pin:RFO", "RFO"] {
+        assert_eq!(
+            Scoped::parse("switch.node:rfc"),
+            Ok(Scoped::SlotNode {
+                slot: "switch".into(),
+                node: "rfc".into()
+            })
+        );
+        for bad in ["pin:RFO", "radio.net:x", ".pin:RFO", "RFO"] {
             assert!(Scoped::parse(bad).is_err(), "{bad}");
         }
     }

@@ -1,0 +1,183 @@
+{
+  "mpn": "PE4259-63",
+  "manufacturer": "pSemi",
+  "lcsc": "C470892",
+  "summary": "SPDT reflective UltraCMOS RF switch, 10-3000 MHz, typ. input P1dB +33.5 dBm at 2.3-3.3 V (ample for SX1262 +22 dBm), 1.8-3.3 V, SC-70-6. The switch in SX1262 datasheet Figure 14-2 and in Semtech's SX1262MB2CAS 915 MHz reference BOM (U2). Wired for single-pin control mode, as the Semtech reference does it: pin 6 is the switch supply (through R4 100R / C14 1nF from +3V3, where the reference feeds it from the host's ANT_SW line) and CTRL is driven through an R3 100R / C15 1nF filter from node:ctrl (the reference drives it from SX1262 DIO2). CTRL high = RFC to RF1 (TX in the reference), CTRL low = RFC to RF2 (RX). Every RF pin must be DC blocked: RFC's 39 pF block (reference C8) is here, so the common port is node:rfc; RF1/RF2 rely on the radio side's series caps (SX1262 reference C6 on the TX path, C11 on the RX path). LCSC listed stock was 0 at curation time; pin-compatible clones (TECH PUBLIC TPE4259-63 C47117600, Tokmas, XINLUDA) are stocked but are not this datasheet",
+  "symbol": {
+    "pins": [
+      {
+        "number": "1",
+        "name": "RF1",
+        "io": "passive",
+        "cite": {
+          "page": 3,
+          "quote": "1 RF1* RF port 1."
+        }
+      },
+      {
+        "number": "2",
+        "name": "GND",
+        "io": "power",
+        "cite": {
+          "page": 3,
+          "quote": "2 GND physically short and connected to ground"
+        }
+      },
+      {
+        "number": "3",
+        "name": "RF2",
+        "io": "passive",
+        "cite": {
+          "page": 3,
+          "quote": "3 RF21 RF port 2."
+        }
+      },
+      {
+        "number": "4",
+        "name": "CTRL",
+        "io": "I",
+        "cite": {
+          "page": 3,
+          "quote": "4 CTRL Switch control input, CMOS logic level."
+        }
+      },
+      {
+        "number": "5",
+        "name": "RFC",
+        "io": "passive",
+        "cite": {
+          "page": 3,
+          "quote": "5 RFC 1 RF common."
+        }
+      },
+      {
+        "number": "6",
+        "name": "VDD",
+        "io": "power",
+        "cite": {
+          "page": 3,
+          "quote": "Single-pin control mode. A nominal 3-volt"
+        }
+      }
+    ]
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-363_SC-70-6",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/0ab426dc96a0f17099b51f2f2d8ab07a.pdf",
+    "sha256": "e09b2c69b708a94679d76c63df5e362793e2772700ad4f4bf6c5e820f58164a2"
+  },
+  "provides": [
+    "rf-spdt"
+  ],
+  "sim_excluded": true,
+  "params": {
+    "freq_max_hz": {
+      "value": 3000000000,
+      "cite": {
+        "page": 2,
+        "quote": "Operation frequency 10 3000 MHz"
+      }
+    },
+    "vdd_max_v": {
+      "value": 3.3,
+      "cite": {
+        "page": 3,
+        "quote": "VDD Power supply voltage 1.8 3.0 3.3 V"
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "rf-spdt",
+      "role": "switch",
+      "signals": {
+        "common": "node:rfc",
+        "a": "pin:RF1",
+        "b": "pin:RF2",
+        "ctrl": "node:ctrl"
+      },
+      "cite": {
+        "page": 4,
+        "quote": "Single-pin control mode enables the switch to"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 3,
+        "quote": "2 GND physically short and connected to ground"
+      }
+    },
+    {
+      "between": [
+        "pin:RFC",
+        "node:rfc"
+      ],
+      "part": "C",
+      "value": "39pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "The DC block itself is required by p.3 (\"All RF pins must be DC blocked with an external series capacitor or held at 0 VDC.\"); the PE4259 datasheet gives no value. 39pF is C8 (GJM1555C1H390JB01D, C0G) on U2 RFC in Semtech's SX1262MB2CAS 915 MHz reference (SX1262MB2CAS_915MHz_e499v01b_BOM.xlsx, row \"C8 | GJM1555C1H390JB01D | 0402 | 39pF\"; topology on SX1262MB2xAS_e499v01b_sch_layout.pdf p.1). See catalog/staging-sx1262/frontend-sources.md",
+        "page": 3
+      }
+    },
+    {
+      "between": [
+        "net:+3V3",
+        "pin:VDD"
+      ],
+      "part": "R",
+      "value": "100R",
+      "footprint": "Resistor_SMD:R_0402_1005Metric",
+      "cite": {
+        "reading": "Single-pin control mode needs a ~3 V supply on pin 6 (p.4: \"requires a dedicated +3-volt power supply connection on pin 6 (VDD)\"). The 100R feed is R4 (CRCW0402100RFKED) from ANT_SW to U2 pin 6 in Semtech's SX1262MB2CAS reference (BOM row \"R4 | CRCW0402100RFKED | 0402 | 100R\"; schematic p.1 draws ANT_SW - R4 100R - pin 6 CTRL-bar). Here fed from +3V3 instead of a host GPIO; confirm",
+        "page": 4
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1nF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "C14 1nF (GRM155R72A102KA01D) from U2 pin 6 to GND in Semtech's SX1262MB2CAS reference (BOM row \"C14 | GRM155R72A102KA01D | 0402 | 1nF\"; value also printed on schematic p.1). The PE4259 datasheet states no bypass for single-pin mode",
+        "page": 3
+      }
+    },
+    {
+      "between": [
+        "node:ctrl",
+        "pin:CTRL"
+      ],
+      "part": "R",
+      "value": "100R",
+      "footprint": "Resistor_SMD:R_0402_1005Metric",
+      "cite": {
+        "reading": "R3 100R (CRCW0402100RFKED) in series from SX1262 DIO2 to U2 pin 4 CTRL in Semtech's SX1262MB2CAS reference (BOM row \"R3 | CRCW0402100RFKED | 0402 | 100R\"; schematic p.1). Not stated in the PE4259 datasheet",
+        "page": 3
+      }
+    },
+    {
+      "between": [
+        "pin:CTRL",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1nF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "reading": "C15 1nF (GRM155R72A102KA01D) from U2 pin 4 CTRL to GND in Semtech's SX1262MB2CAS reference (BOM row \"C15 | GRM155R72A102KA01D | 0402 | 1nF\"; value also printed on schematic p.1). Not stated in the PE4259 datasheet",
+        "page": 3
+      }
+    }
+  ]
+}

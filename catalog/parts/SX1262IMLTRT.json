@@ -2,7 +2,7 @@
   "mpn": "SX1262IMLTRT",
   "manufacturer": "Semtech",
   "lcsc": "C191341",
-  "summary": "LoRa/(G)FSK sub-GHz transceiver, 150-960 MHz, up to +22 dBm; SPI slave (mode 0, up to 16 MHz) plus BUSY, DIO1 IRQ and NRESET lines; 32 MHz crystal with internal trim caps (no load caps) or TCXO on XTA; 1.8-3.7 V. Entry wires the LDO regulation option (no DC-DC inductor). The RF front end (PA feed choke, TX match/LPF, RX balun, RF switch on DIO2) is NOT modelled here: its component values are only in Semtech's reference design, so node:rf is not fab-ready until that network is added",
+  "summary": "LoRa/(G)FSK sub-GHz transceiver, 150-960 MHz, up to +22 dBm; SPI slave (mode 0, up to 16 MHz) plus BUSY, DIO1 IRQ and NRESET lines; 32 MHz crystal with internal trim caps (no load caps) or TCXO on XTA; 1.8-3.7 V. Entry wires the LDO regulation option (no DC-DC inductor). The RF front end (PA feed, match and harmonic filter, RX balun, RF switch on DIO2) is not on this part: it lives in the subcircuit sx1262-frontend-915, so the bare die is not offered as a radio.",
   "symbol": {
     "kicad": "RF:SX1262IMLTRT"
   },
@@ -12,7 +12,7 @@
     "sha256": "a0fd29d13e779c1d49130d71442c91260448ab2c453ce9b9d9ff630184830606"
   },
   "provides": [
-    "radio-subghz"
+    "lora-transceiver"
   ],
   "sim_excluded": true,
   "params": {
@@ -83,17 +83,6 @@
       "cite": {
         "page": 23,
         "quote": "The SX1261/2 does not require the user to set external foot capacitors on the XTAL supplying the 32 MHz clock."
-      }
-    },
-    {
-      "kind": "rf",
-      "role": "port",
-      "signals": {
-        "rf": "node:rf"
-      },
-      "cite": {
-        "reading": "node:rf is the 50 ohm antenna side of the RF front end in Figure 14-2 (RFIO/SMA): RFO and RFI_P/RFI_N reach it through L1 (VR_PA feed), L2-L6/C3-C13 match and LPF, a PE4259 RF switch driven by DIO2, and C8-C10/L5. Figure 14-2 gives no values for any of these; confirm topology and values against Semtech's SX1262 reference design for the chosen band (SX1262MB2xAS / SX1262 reference design files on semtech.com), which the datasheet note on the same page defers to. Not expressible in this schema today (no inductor support part).",
-        "page": 100
       }
     }
   ],
