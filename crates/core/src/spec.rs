@@ -728,6 +728,28 @@ if __name__ == "__main__":
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// One decided fuzz-pedal answer set, as the wire carries it.
+    pub(crate) const SCRIPTED_ANSWERS: &str = r#"{
+            "answers": {
+                "topology": {"type":"choice","choice":"silicon_2t_fuzz","confidence":0.99,"probabilities":{"silicon_2t_fuzz":0.99}},
+                "bias_voice": {"type":"choice","choice":"symmetric","confidence":0.8,"probabilities":{"symmetric":0.8}},
+                "gain_character": {"type":"score","score":2.0,"confidence":0.75},
+                "tone_stack": {"type":"boolean","probability":0.9},
+                "enclosure_size": {"type":"choice","choice":"1590B","confidence":0.85,"probabilities":{"1590B":0.85}}
+            }
+        }"#;
+
+    /// A real [`FuzzPedalSpec`], decided offline from [`SCRIPTED_ANSWERS`].
+    pub(crate) fn fuzz_pedal_spec() -> FuzzPedalSpec {
+        let client = ooda::ScriptedClient::new([SCRIPTED_ANSWERS.to_string()]);
+        generate_fuzz_pedal_spec(&client, &mut Trace::new(), "vintage silicon fuzz, 9V").unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -737,16 +759,7 @@ mod tests {
     /// shortcut around them.
     #[test]
     fn generate_fuzz_pedal_spec_runs_offline_against_a_scripted_client() {
-        let client = ooda::ScriptedClient::new([r#"{
-            "answers": {
-                "topology": {"type":"choice","choice":"silicon_2t_fuzz","confidence":0.99,"probabilities":{"silicon_2t_fuzz":0.99}},
-                "bias_voice": {"type":"choice","choice":"symmetric","confidence":0.8,"probabilities":{"symmetric":0.8}},
-                "gain_character": {"type":"score","score":2.0,"confidence":0.75},
-                "tone_stack": {"type":"boolean","probability":0.9},
-                "enclosure_size": {"type":"choice","choice":"1590B","confidence":0.85,"probabilities":{"1590B":0.85}}
-            }
-        }"#
-        .to_string()]);
+        let client = ooda::ScriptedClient::new([tests_support::SCRIPTED_ANSWERS.to_string()]);
         let mut trace = Trace::new();
         let spec =
             generate_fuzz_pedal_spec(&client, &mut trace, "vintage silicon fuzz, 9V").unwrap();

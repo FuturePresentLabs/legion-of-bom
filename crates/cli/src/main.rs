@@ -11,26 +11,25 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use legion_of_bom_core::family;
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_board_glb, export_cpl, export_gerbers, fetch_from_jlcpcb,
-    fetch_from_kicad, fuzz_pedal_panel_file, generate_board_artifacts, generate_bom,
-    generate_fuzz_chain, generate_fuzz_pedal_spec, guide, guide_to_html, guide_to_pdf,
-    jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp,
-    minimum_routable_hp, package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb,
-    parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png,
-    render_chain_skidl, render_skidl, render_spec_text, rules, run_drc, run_layout_loop,
-    schematic_to_svg, simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword,
-    suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus,
-    BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize,
-    EurorackPlacer, Finding, FuzzChain, FuzzConstraints, FuzzPedalSpec, GuideOptions, HpSearch,
-    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
-    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
-    TranDrive,
+    fetch_from_kicad, generate_board_artifacts, generate_bom, generate_fuzz_chain, guide,
+    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
+    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
+    render_board_png, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg,
+    simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
+    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
+    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer,
+    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
+    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
+    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
+    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis, TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -806,8 +805,10 @@ fn spec_cmd(
     out: PathBuf,
     trace_path: Option<PathBuf>,
 ) -> Result<()> {
-    if family != "fuzz-pedal" {
-        anyhow::bail!("unknown circuit family '{family}' (curated set today: fuzz-pedal)");
+    // Fail on an unknown family before asking for credentials: the typo is
+    // the more useful error.
+    if !family::FAMILIES.contains(&family.as_str()) {
+        return Err(family::FamilyError::Unknown(family).into());
     }
 
     let client = ooda::CapturingClient::new(
@@ -818,7 +819,7 @@ fn spec_cmd(
     );
     let mut trace = ooda::Trace::new();
 
-    let spec = generate_fuzz_pedal_spec(&client, &mut trace, &brief)
+    let spec = family::generate(&family, &client, &mut trace, &brief)
         .with_context(|| "spec generation failed")?;
 
     let json_path = with_extension_appended(&out, "json");
@@ -827,12 +828,14 @@ fn spec_cmd(
     let json = serde_json::to_string_pretty(&spec).with_context(|| "serializing spec")?;
     std::fs::write(&json_path, json).with_context(|| format!("writing {}", json_path.display()))?;
 
-    let text = render_spec_text(&brief, &spec, trace.records());
+    let text = match &spec {
+        family::Spec::FuzzPedal(s) => render_spec_text(&brief, s, trace.records()),
+        other => anyhow::bail!("`lob spec` does not decide {} specs", other.family()),
+    };
     std::fs::write(&text_path, text).with_context(|| format!("writing {}", text_path.display()))?;
 
     println!("lob spec {family}: {}", text_path.display());
     println!("  spec (machine-readable): {}", json_path.display());
-    println!("  enclosure size class: {}", spec.enclosure_size.key());
     println!("  decisions made: {}", trace.records().len());
     for record in trace.records() {
         println!(
@@ -887,7 +890,8 @@ fn spec_chain_cmd(
     let json_path = with_extension_appended(&out, "json");
     let text_path = with_extension_appended(&out, "txt");
 
-    let json = serde_json::to_string_pretty(&chain).with_context(|| "serializing chain")?;
+    let json = serde_json::to_string_pretty(&family::Spec::FuzzChain(chain.clone()))
+        .with_context(|| "serializing chain")?;
     std::fs::write(&json_path, json).with_context(|| format!("writing {}", json_path.display()))?;
 
     let mut text = String::new();
@@ -961,41 +965,48 @@ fn parse_enclosure(key: &str) -> Result<EnclosureSize> {
 /// Spec -> design: read a spec JSON and render its SKiDL schematic. A pure
 /// function of the spec file's contents -- makes no decision calls, so
 /// running it twice on the same spec always produces the same circuit.
-/// Detects whether the file is a fixed two-stage [`FuzzPedalSpec`] or a
-/// DAG-assembled [`FuzzChain`] by peeking at its shape (a chain has a
-/// `stages` array; the fixed spec has a `topology` field) -- both write
-/// through the same command, since both are just "spec -> design" either way.
+/// Dispatches on the spec's `family` tag ([`family::Spec`]), so every curated
+/// family renders through this one command.
 fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Result<()> {
     let json = std::fs::read_to_string(&spec_path)
         .with_context(|| format!("reading spec {}", spec_path.display()))?;
     let value: serde_json::Value = serde_json::from_str(&json)
         .with_context(|| format!("parsing spec {}", spec_path.display()))?;
 
-    let (py, enclosure_size) = if value.get("stages").is_some() {
-        let chain: FuzzChain = serde_json::from_value(value)
-            .with_context(|| format!("parsing chain spec {}", spec_path.display()))?;
-        (render_chain_skidl(&chain), chain.enclosure_size)
-    } else {
-        let spec: FuzzPedalSpec = serde_json::from_value(value)
-            .with_context(|| format!("parsing spec {}", spec_path.display()))?;
-        (render_skidl(&spec), spec.enclosure_size)
-    };
-    std::fs::write(&out, &py).with_context(|| format!("writing {}", out.display()))?;
+    let spec = family::Spec::from_json(value)
+        .with_context(|| format!("parsing spec {}", spec_path.display()))?;
+    std::fs::write(&out, spec.render_skidl())
+        .with_context(|| format!("writing {}", out.display()))?;
 
-    println!("lob schematic {}: {}", spec_path.display(), out.display());
+    println!(
+        "lob schematic {} ({}): {}",
+        spec_path.display(),
+        spec.family(),
+        out.display()
+    );
 
+    // A family with no panel writes none: `lob board` then derives the
+    // outline from the parts, and a stale panel file from an earlier run
+    // must not be mistaken for this spec's.
     if let Some(panel_path) = panel {
-        let panel_file = fuzz_pedal_panel_file(enclosure_size, ("RV1", "RV2"), 1.6);
-        let toml = panel_file
-            .to_toml()
-            .with_context(|| "serializing panel spec")?;
-        std::fs::write(&panel_path, toml)
-            .with_context(|| format!("writing {}", panel_path.display()))?;
-        println!(
-            "  panel ({}): {}",
-            enclosure_size.key(),
-            panel_path.display()
-        );
+        match spec.panel() {
+            Some(panel_file) => {
+                let toml = panel_file
+                    .to_toml()
+                    .with_context(|| "serializing panel spec")?;
+                std::fs::write(&panel_path, toml)
+                    .with_context(|| format!("writing {}", panel_path.display()))?;
+                println!("  panel: {}", panel_path.display());
+            }
+            None => {
+                if panel_path.exists() {
+                    std::fs::remove_file(&panel_path).with_context(|| {
+                        format!("removing stale panel {}", panel_path.display())
+                    })?;
+                }
+                println!("  panel: none ({} boards have no panel)", spec.family());
+            }
+        }
     }
 
     println!(

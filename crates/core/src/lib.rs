@@ -24,6 +24,7 @@ pub mod eagle;
 pub mod easyeda;
 pub mod edit;
 pub mod fab;
+pub mod family;
 pub mod fetch;
 pub mod gerber;
 pub mod git;
