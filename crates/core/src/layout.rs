@@ -48,6 +48,16 @@ impl LayoutMode {
         }
     }
 
+    /// The name this mode parses from — so a command can report the mode it
+    /// actually used rather than echoing back the string it was given.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayoutMode::Analog => "analog",
+            LayoutMode::Digital => "digital",
+            LayoutMode::Mixed => "mixed",
+        }
+    }
+
     /// The cost weights this mode scores placements by.
     pub fn weights(self) -> CostWeights {
         match self {
@@ -97,7 +107,7 @@ pub struct CostWeights {
 
 /// What one placement+route attempt measured — all in-process, no KiCad. Lower is
 /// better on every field.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PlacementMetrics {
     /// Raw total half-perimeter wirelength across all multi-pin nets (reporting).
     pub hpwl_mm: f64,
@@ -112,6 +122,12 @@ pub struct PlacementMetrics {
     pub via_count: usize,
     /// Connections the router could not complete.
     pub unrouted: usize,
+    /// Cost of the design rules this placement broke ([`crate::rules`]), tiered
+    /// so a higher tier cannot be traded away for a lower one.
+    pub rule_penalty: f64,
+    /// What was broken, worst first — surfaced in the report rather than
+    /// silently priced in.
+    pub violations: Vec<crate::rules::Violation>,
 }
 
 /// Measure a placement+route attempt. `placements` are part centres (board
@@ -121,7 +137,20 @@ pub fn measure(
     placements: &HashMap<String, Placement>,
     route: &RouteOutput,
 ) -> PlacementMetrics {
+    measure_against(circuit, placements, route, &crate::rules::derive(circuit))
+}
+
+/// [`measure`], against a rule set derived once by the caller — the loop
+/// evaluates the same rules on every attempt and should not re-derive them.
+pub fn measure_against(
+    circuit: &dyn CircuitSource,
+    placements: &HashMap<String, Placement>,
+    route: &RouteOutput,
+    rules: &[crate::rules::Rule],
+) -> PlacementMetrics {
     let mut m = PlacementMetrics::default();
+    m.violations = crate::rules::evaluate(rules, placements);
+    m.rule_penalty = crate::rules::penalty(&m.violations);
     for net in circuit.nets() {
         // Distinct placed parts on this net, by centre.
         let mut seen: Vec<&str> = Vec::new();
@@ -165,12 +194,24 @@ pub fn measure(
 
 /// The mode-weighted cost of a placement — lower is better.
 pub fn score(m: &PlacementMetrics, w: &CostWeights) -> f64 {
-    w.wirelength * m.signal_hpwl_mm
+    // Rule violations come first and are priced decades above the preference
+    // terms. Without this the loop happily trades a decoupling cap across the
+    // board for a few millimetres of copper — which is exactly what shipped.
+    m.rule_penalty
+        + w.wirelength * m.signal_hpwl_mm
         + w.critical * m.critical_hpwl_mm
         + w.via * m.via_count as f64
         + w.routed_len * m.routed_len_mm
         + w.unrouted * m.unrouted as f64
 }
+
+/// Consecutive non-improving attempts before the loop calls it done.
+///
+/// The cost of raising this is a full place+route per extra attempt; the cost of
+/// lowering it to 1 is stopping one short of a candidate that would have helped,
+/// since the spreading trajectory a placer offers is not monotonic — on
+/// `daisy_panel_demo` the useful arrangement sits *after* a worse one.
+const PATIENCE: usize = 2;
 
 /// Loop configuration.
 #[derive(Debug, Clone)]
@@ -213,6 +254,9 @@ pub struct LayoutReport {
     /// Mechanical clearance problems: parts under a stacked sub-board taller than
     /// its standoff (DESIGN 6.7). Surfaced, not auto-fixed.
     pub collisions: Vec<String>,
+    /// Parts with no footprint at all — off-board hardware, absent from
+    /// every attempt this loop ran (see [`crate::board::BoardArtifacts::not_placed`]).
+    pub not_placed: Vec<String>,
     /// Final-gate DRC report, when `kicad_cli` was provided.
     pub drc: Option<DrcReport>,
     /// Human-facing observations (info/warning/error), incl. unresolved criticals.
@@ -231,15 +275,33 @@ pub fn run_layout_loop(
 ) -> Result<LayoutReport, BoardError> {
     // One placement attempt's result, so the loop can keep the best by score.
     struct Attempt {
+        /// Millimetres broken per tier, worst tier first — the relaxation key.
+        broken: [f64; 3],
+        /// Connections the router could not make. Ranks above every preference.
+        unrouted: usize,
+        /// Preference cost with the rule penalty removed, so the tiers above are
+        /// not counted twice.
+        preference: f64,
         score: f64,
         board: String,
         metrics: PlacementMetrics,
         unresolved: Vec<String>,
         collisions: Vec<String>,
+        not_placed: Vec<String>,
         drc: Option<DrcReport>,
     }
 
     let weights = cfg.mode.weights();
+    // Size-aware rules: how close a cap *can* get to its chip depends on how big
+    // both are, and a limit smaller than that floor can never be met.
+    let facts = crate::board::build_facts(circuit, &options.footprint_dir).ok();
+    let rules = crate::rules::derive_in(
+        circuit,
+        &crate::rules::Context {
+            facts: facts.as_ref(),
+            outline: options.fixed_outline,
+        },
+    );
     let iters = cfg.max_iters.max(1);
 
     // Free parts (everything not anchored), sorted — the repair perturbation set.
@@ -254,6 +316,8 @@ pub fn run_layout_loop(
     let mut best: Option<Attempt> = None;
     let mut nudges: HashMap<String, (f64, f64)> = HashMap::new();
     let mut ran = 0;
+    // Consecutive attempts that did not improve on the best so far.
+    let mut stale = 0usize;
 
     for i in 0..iters {
         ran += 1;
@@ -262,7 +326,10 @@ pub fn run_layout_loop(
         options.placer = Box::new(placer);
 
         let art = generate_board_artifacts(circuit, &options)?;
-        let metrics = measure(circuit, &art.placements, &art.route);
+        let metrics = measure_against(circuit, &art.placements, &art.route, &rules);
+        // Snapshot before `metrics` potentially moves into `Attempt` below —
+        // repair_nudges needs this attempt's violations after that point.
+        let violations_this_attempt = metrics.violations.clone();
         let mut sc = score(&metrics, &weights);
 
         // Optional per-iteration DRC (opt-in; slow). Errors add a large penalty.
@@ -276,20 +343,58 @@ pub fn run_layout_loop(
             }
         }
 
-        let improved = best.as_ref().is_none_or(|b| sc < b.score - 1e-6);
+        let (unrouted, penalty) = (metrics.unrouted, metrics.rule_penalty);
+        let broken = crate::rules::by_tier(&metrics.violations);
+        let preference = sc - penalty;
+        // Ordered relaxation: physical damage decides first, then electrical,
+        // then whether the board is even connected, and only when those tie does
+        // the preference cost break it. An attempt is never allowed to buy
+        // wirelength with a rule, or with a net.
+        let key = relax_key(broken, unrouted, preference);
+        let improved = best
+            .as_ref()
+            .is_none_or(|b| key < relax_key(b.broken, b.unrouted, b.preference));
+        stale = if improved { 0 } else { stale + 1 };
         if improved {
             best = Some(Attempt {
+                broken,
+                unrouted,
+                preference,
                 score: sc,
                 board: art.pcb,
                 metrics,
                 unresolved: art.route.conflicts.clone(),
                 collisions: art.collisions.clone(),
+                not_placed: art.not_placed,
                 drc,
             });
         }
 
-        // Nothing left unrouted → the seeded placement is already clean; stop.
-        if metrics.unrouted == 0 {
+        // Stop when attempts stop helping — not when one merely comes out clean.
+        //
+        // This used to exit the moment `unrouted == 0 && penalty <= 0.0`, on the
+        // reasoning that a clean board is a finished board. It is not: it is the
+        // *first* acceptable board, and the loop's whole purpose is to be a
+        // fine-tuning stage. Two ways that bit. Under analytical placement the
+        // first attempt is usually already clean, so fine-tuning never ran at
+        // all. And on `daisy_panel_demo` the first *routable* attempt was a badly
+        // spread one scoring 739.6, which the loop then returned while a 307.8
+        // was two candidates further down the list (`legion-of-bom-lso`).
+        //
+        // Clean is now the floor, not the finish line: keep going while attempts
+        // improve, and give up after [`PATIENCE`] consecutive ones that do not.
+        //
+        // Giving up early is only allowed once there is something worth keeping.
+        // Patience is a stop rule for *polishing*, and applying it to a board
+        // that is still broken is just quitting: on the real 5 HP slew limiter it
+        // ended the search after 3 attempts holding a board with a physical rule
+        // violation, where spending the full budget finds a clean one. While the
+        // best attempt so far still breaks a rule or leaves a net unrouted, the
+        // whole iteration budget is on the table.
+        let acceptable = best
+            .as_ref()
+            .is_some_and(|b| b.unrouted == 0 && b.broken.iter().all(|&mm| mm <= 0.0));
+        if acceptable && stale >= PATIENCE {
             break;
         }
         // Last iteration — no point planning another repair.
@@ -299,15 +404,19 @@ pub fn run_layout_loop(
         // Repair: perturb the free parts so the next attempt explores a different
         // arrangement the router may find easier (DESIGN §6.5 step 4). Deterministic
         // shake — no RNG — so each attempt is a clean, reproducible git diff.
-        nudges = repair_nudges(&free, i + 1);
+        nudges = repair_nudges(&free, i + 1, &art.placements, &violations_this_attempt);
     }
 
     let Attempt {
+        broken: _,
+        unrouted: _,
+        preference: _,
         score,
         board,
         metrics,
         unresolved,
         collisions,
+        not_placed,
         mut drc,
     } = best.expect("loop runs at least once");
 
@@ -346,6 +455,29 @@ pub fn run_layout_loop(
     for c in &collisions {
         findings.push(Finding::warning(format!("mechanical clearance: {c}")));
     }
+    if !not_placed.is_empty() {
+        findings.push(Finding::info(format!(
+            "not placed (no footprint — off-board hardware): {}",
+            not_placed.join(", ")
+        )));
+    }
+    // What the winning layout had to break to fit, and by how much. Reported at
+    // the severity of the tier it broke: a physical rule means the board cannot
+    // be built, an electrical one means it will work worse than intended. This
+    // used to be absorbed silently into the score, which is how a decoupling cap
+    // shipped 89mm from its chip without anything saying so.
+    if metrics.violations.is_empty() {
+        findings.push(Finding::info("all design rules met"));
+    } else {
+        for v in &metrics.violations {
+            let msg = format!("relaxed by {:.1}mm — {}", v.by_mm, v.what);
+            findings.push(match v.tier {
+                crate::rules::Tier::Physical => Finding::error(msg),
+                crate::rules::Tier::Electrical => Finding::warning(msg),
+                crate::rules::Tier::Preference => Finding::info(msg),
+            });
+        }
+    }
     if let Some(report) = &drc {
         if report.error_count() > 0 {
             findings.push(Finding::error(format!(
@@ -364,6 +496,7 @@ pub fn run_layout_loop(
         metrics,
         unresolved,
         collisions,
+        not_placed,
         drc,
         findings,
     })
@@ -372,12 +505,72 @@ pub fn run_layout_loop(
 /// Deterministic repair perturbation: nudge each free part by a golden-angle
 /// offset that varies with the attempt, so successive attempts explore different
 /// arrangements without any RNG. Magnitude grows with the attempt number.
-fn repair_nudges(free: &[String], attempt: usize) -> HashMap<String, (f64, f64)> {
+/// The ordering key for one attempt: millimetres broken per tier, worst tier
+/// first, then connections the router could not make, then the preference cost.
+/// Lower is better, compared lexicographically.
+///
+/// This is what "relax the lowest tier first" means mechanically. A lower tier
+/// is only ever traded once every higher tier ties, so no amount of wirelength
+/// can buy back an electrical rule and nothing can buy back a physical one —
+/// exactly, rather than the [`crate::rules::penalty`] weights' approximation.
+///
+/// `unrouted` sits above the preference cost for the same reason, and used not
+/// to. [`CostWeights::unrouted`] prices a missing connection at 50, which reads
+/// like a lot until an attempt is 327 mm of wirelength tighter — then two
+/// unconnected nets are a bargain, and the loop took that trade on
+/// `daisy_panel_demo` and returned the broken board (`legion-of-bom-7a7`). A net
+/// the router could not finish is not a preference: `lob fab` refuses the board,
+/// so it is not a board. The module docs already claimed "unrouted dominates so
+/// a routable board always beats a tighter-but-broken one" — this is what makes
+/// that true.
+fn relax_key(broken: [f64; 3], unrouted: usize, preference: f64) -> (f64, f64, f64, f64, f64) {
+    (broken[0], broken[1], broken[2], unrouted as f64, preference)
+}
+
+/// A part a rule violation names (`Violation.repair`, already computed by
+/// `rules::assess` — see e.g. `Rule::Proximity`'s "move the cap to its IC"
+/// hint) steps partway toward that real, targeted destination instead of
+/// guessing. Every other free part still gets the golden-angle exploration
+/// nudge — the loop's purpose is broader than fixing violations (DESIGN
+/// §6.5 step 4: finding a better *arrangement*, wirelength included, even
+/// where nothing is strictly broken), so an un-implicated part keeps
+/// exploring rather than sitting still.
+///
+/// The guided step is a fixed fraction ([`REPAIR_STEP`]) of the hinted
+/// distance, not the whole way — a hint is computed against *one* current
+/// violation, and the board moves when other parts move too, so jumping
+/// straight to it risks overshooting into a new violation next attempt.
+/// Magnitude for the unguided golden-angle parts still grows with the
+/// attempt number, exactly as before.
+fn repair_nudges(
+    free: &[String],
+    attempt: usize,
+    placements: &HashMap<String, Placement>,
+    violations: &[crate::rules::Violation],
+) -> HashMap<String, (f64, f64)> {
     const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653; // radians
+    /// Fraction of a repair hint's distance to actually move each attempt.
+    const REPAIR_STEP: f64 = 0.6;
     let mag = 2.0 + 1.5 * attempt as f64;
+
+    // Last violation naming a part wins if several do — one guided step per
+    // part per attempt, same as everything else in this loop.
+    let mut targeted: HashMap<&str, (f64, f64)> = HashMap::new();
+    for v in violations {
+        if let Some(r) = &v.repair {
+            targeted.insert(r.refdes.as_str(), r.toward_mm);
+        }
+    }
+
     free.iter()
         .enumerate()
         .map(|(k, r)| {
+            if let (Some(&(tx, ty)), Some(p)) = (targeted.get(r.as_str()), placements.get(r)) {
+                return (
+                    r.clone(),
+                    ((tx - p.x_mm) * REPAIR_STEP, (ty - p.y_mm) * REPAIR_STEP),
+                );
+            }
             let ang = GOLDEN_ANGLE * (k + attempt) as f64;
             (r.clone(), (mag * ang.cos(), mag * ang.sin()))
         })
@@ -392,9 +585,202 @@ fn drc_on(
     board: &str,
     kicad_cli: &std::path::Path,
 ) -> Result<DrcReport, BoardError> {
-    let path = std::env::temp_dir().join(format!("lob_layout_{}.kicad_pcb", circuit.name()));
+    // Unique per board *content*, not just per circuit: the HP search writes a
+    // different board for every candidate width, and a shared path means one
+    // trial can be read as another's.
+    let stamp: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(board.as_bytes())
+            .iter()
+            .take(6)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let path =
+        std::env::temp_dir().join(format!("lob_layout_{}_{stamp}.kicad_pcb", circuit.name()));
     std::fs::write(&path, board)?;
     run_drc(&path, kicad_cli).map_err(|e| BoardError::Other(e.to_string()))
+}
+
+/// Options + seeded template for a **trial build** of a Eurorack module at `hp`,
+/// set up exactly as a real build is at that width: panel derived from the
+/// circuit, its cutouts anchored, outline fixed to the panel, everything else
+/// left at [`BoardOptions::new`]'s defaults.
+///
+/// This lives here, rather than in each caller, because "exactly as" is the
+/// load-bearing part and a second copy is a second chance to drift from it. A
+/// sizing trial configured differently from the build measures a board nobody
+/// ships: `examples/board_preview` overrode the router and reported ~69 DRC
+/// errors against a shipped board's 5, misleading this work twice
+/// (`legion-of-bom-nz1`).
+///
+/// A caller with a *hand-authored* panel or placement should pass its own
+/// closure to [`minimum_routable_hp`] instead — this one derives the panel, which
+/// is only right when nobody has laid the module out by hand.
+pub fn eurorack_trial_build(
+    circuit: &dyn CircuitSource,
+    footprint_dir: &std::path::Path,
+    hp: u16,
+) -> Result<(BoardOptions, SeededPlacer), BoardError> {
+    use crate::panel::{BuiltinCutouts, EurorackPanel, PanelSpec};
+    let dims = EurorackPanel::new(hp);
+    let (w, h) = (dims.width_mm(), dims.height_mm());
+    let anchors: HashMap<String, (f64, f64)> =
+        crate::panel::derive_panel(circuit, hp, &BuiltinCutouts)
+            .cutouts
+            .iter()
+            .filter_map(|c| c.refdes.clone().map(|r| (r, (c.x_mm, h - c.y_mm))))
+            .collect();
+    // Centre on KiCad's A4 sheet, as the CLI does, rather than the (0,0) corner.
+    let origin = (((297.0 - w) / 2.0).max(10.0), ((210.0 - h) / 2.0).max(10.0));
+    let mut opts = BoardOptions::new(footprint_dir);
+    opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
+    opts.placer = Box::new(crate::board::EurorackPlacer {
+        width_mm: w,
+        height_mm: h,
+        origin_mm: origin,
+        anchors: anchors.clone(),
+    });
+    Ok((opts, SeededPlacer::new(w, h, origin, anchors)))
+}
+
+/// The panel widths a Eurorack module is actually sold in, from `floor` upward.
+///
+/// Even HP, plus 3 — that is the convention, and 5, 7 or 9 HP reads as a mistake
+/// to anyone buying a module. There is no technical reason a 7 HP panel cannot
+/// be cut; it just is not a width the format uses, so offering one as "the
+/// minimum buildable width" is offering something nobody wants.
+fn conventional_widths(floor: u16) -> impl Iterator<Item = u16> {
+    (floor..=u16::MAX).filter(|hp| *hp == 2 || *hp == 3 || hp % 2 == 0)
+}
+
+/// How far above the geometric floor to look for a width that actually builds.
+#[derive(Debug, Clone)]
+pub struct HpSearch {
+    /// Widths to trial, starting at the floor, before giving up. Each one costs a
+    /// full place → route → DRC, so this is deliberately small: if a board needs
+    /// four more HP than its parts occupy, the answer is a layout problem, not a
+    /// wider search.
+    pub max_widths: u16,
+}
+
+impl Default for HpSearch {
+    fn default() -> Self {
+        HpSearch { max_widths: 4 }
+    }
+}
+
+/// What one candidate width did when actually built.
+#[derive(Debug, Clone)]
+pub struct HpTrial {
+    pub hp: u16,
+    /// DRC errors at this width; `None` if the board could not be generated.
+    pub errors: Option<usize>,
+    /// Error counts per DRC rule, so a rejection says *what* was wrong.
+    pub kinds: Vec<(String, usize)>,
+}
+
+/// The narrowest width proven buildable, and the evidence for it.
+#[derive(Debug, Clone)]
+pub struct RoutableHp {
+    /// The narrowest width that routed DRC-clean. `None` means no width in range
+    /// did — which is a real answer, not a failure to compute one.
+    pub hp: Option<u16>,
+    /// The geometric floor the search started from: the width the parts *fit* in.
+    pub floor_hp: u16,
+    /// Each width tried, narrowest first.
+    pub tried: Vec<HpTrial>,
+    /// DRC never ran (no `kicad-cli`), so nothing here is proven.
+    pub unproven: bool,
+}
+
+/// The narrowest width the circuit actually **builds** in — placed, routed, and
+/// gated on real KiCad DRC — searching upward from a geometric floor.
+///
+/// [`minimum_hp`](crate::board::minimum_hp) answers a different and weaker
+/// question: does the parts' copper *fit* between the edges. That is a genuine
+/// lower bound and a fast one, but a board can fit and still be unbuildable
+/// because the router cannot complete every net in the space left over. Reporting
+/// the fit answer as the minimum width is what produced a 3 HP slew limiter with
+/// parts hanging off the edge (`legion-of-bom-t5t`).
+///
+/// `configure` supplies the options and placer template for a given width, and it
+/// must be **the same configuration the caller will really build with**. This is
+/// the whole point of the seam: the sizing harness in `examples/board_preview`
+/// spent two rounds of this work drawing DRC conclusions from a router the CLI
+/// never uses (`legion-of-bom-nz1`), and a trial that does not match the build
+/// proves nothing about the build.
+///
+/// Degrades gracefully: with no `kicad_cli` in `cfg`, routability cannot be
+/// checked at all, so this returns `unproven` rather than guessing.
+pub fn minimum_routable_hp<F>(
+    circuit: &dyn CircuitSource,
+    floor_hp: u16,
+    search: &HpSearch,
+    cfg: &LayoutLoop,
+    mut configure: F,
+) -> RoutableHp
+where
+    F: FnMut(u16) -> Result<(BoardOptions, SeededPlacer), BoardError>,
+{
+    let mut out = RoutableHp {
+        hp: None,
+        floor_hp,
+        tried: Vec::new(),
+        unproven: cfg.kicad_cli.is_none(),
+    };
+    if out.unproven {
+        return out;
+    }
+    for hp in conventional_widths(floor_hp).take(search.max_widths.max(1) as usize) {
+        let built = configure(hp)
+            .and_then(|(options, template)| run_layout_loop(circuit, options, template, cfg));
+        // A width that cannot even be generated is recorded and stepped past: the
+        // next one up may well work, and that is the question being asked.
+        let Ok(report) = built else {
+            out.tried.push(HpTrial {
+                hp,
+                errors: None,
+                kinds: Vec::new(),
+            });
+            continue;
+        };
+        // No DRC report despite a kicad-cli means the gate could not run. Treat it
+        // as unproven rather than silently accepting the width.
+        let Some(drc) = report.drc else {
+            out.tried.push(HpTrial {
+                hp,
+                errors: None,
+                kinds: Vec::new(),
+            });
+            continue;
+        };
+        let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
+        for v in drc
+            .violations
+            .iter()
+            .chain(&drc.unconnected_items)
+            .filter(|v| v.severity == "error")
+        {
+            *by_kind.entry(v.kind.as_str()).or_default() += 1;
+        }
+        let mut kinds: Vec<(String, usize)> = by_kind
+            .into_iter()
+            .map(|(k, n)| (k.to_string(), n))
+            .collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let errors = drc.error_count();
+        out.tried.push(HpTrial {
+            hp,
+            errors: Some(errors),
+            kinds,
+        });
+        if errors == 0 {
+            out.hp = Some(hp);
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -420,6 +806,47 @@ mod tests {
         fn nets(&self) -> &[Net] {
             &self.nets
         }
+    }
+
+    /// Without `kicad-cli` there is no way to check routability, so the search
+    /// must say it could not prove anything rather than hand back the floor as if
+    /// it had — quoting an unproven width as buildable is the original bug.
+    #[test]
+    fn with_no_kicad_cli_the_search_proves_nothing() {
+        let cfg = LayoutLoop {
+            kicad_cli: None,
+            ..LayoutLoop::default()
+        };
+        let mut called = 0;
+        let out = minimum_routable_hp(&toy(), 4, &HpSearch::default(), &cfg, |_| {
+            called += 1;
+            Err(BoardError::Other("should not be reached".into()))
+        });
+        assert!(out.unproven);
+        assert_eq!(out.hp, None);
+        assert_eq!(out.floor_hp, 4);
+        assert!(out.tried.is_empty());
+        assert_eq!(called, 0, "no width should be built when DRC cannot run");
+    }
+
+    /// A width that cannot even be configured is recorded and stepped past — the
+    /// next one up may well build, and that is the question being asked.
+    #[test]
+    fn a_width_that_cannot_be_built_is_recorded_and_the_search_continues() {
+        let cfg = LayoutLoop {
+            kicad_cli: Some(PathBuf::from("/nonexistent/kicad-cli")),
+            ..LayoutLoop::default()
+        };
+        let search = HpSearch { max_widths: 3 };
+        let out = minimum_routable_hp(&toy(), 6, &search, &cfg, |_| {
+            Err(BoardError::Other("no footprints".into()))
+        });
+        assert!(!out.unproven);
+        assert_eq!(out.hp, None, "nothing built, so nothing is proven");
+        let widths: Vec<u16> = out.tried.iter().map(|t| t.hp).collect();
+        // 7 HP is skipped: even HP plus 3 is what modules are sold in.
+        assert_eq!(widths, vec![6, 8, 10], "every conventional width was tried");
+        assert!(out.tried.iter().all(|t| t.errors.is_none()));
     }
 
     fn toy() -> Toy {
@@ -456,7 +883,7 @@ mod tests {
         // with one connection left open must score worse than fully routed.
         let broken = PlacementMetrics {
             unrouted: 1,
-            ..tight
+            ..tight.clone()
         };
         assert!(score(&broken, &w) > score(&tight, &w));
     }
@@ -509,11 +936,13 @@ mod tests {
         let mut facts = HashMap::new();
         let f = |w, h| PartFacts {
             extent: (w, h),
+            body_extent: (w, h),
             origin_offset: (0.0, 0.0),
             side: crate::model::Side::Front,
             height_mm: 2.0,
             standoff_mm: None,
             tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
         };
         facts.insert("C1".to_string(), f(5.0, 5.0));
         facts.insert("U1".to_string(), f(8.0, 8.0));
@@ -525,13 +954,124 @@ mod tests {
         assert!(dist < 20.0, "C1 should seed near U1, got {dist}mm");
     }
 
+    /// Ordered relaxation: break the cheapest thing that lets the board fit,
+    /// and never buy a higher tier with a lower one.
+    #[test]
+    fn a_lower_tier_is_only_traded_once_the_higher_ones_tie() {
+        // An attempt that breaks a physical rule loses to one that breaks a much
+        // larger electrical one, however good its wirelength.
+        let physical = relax_key([0.1, 0.0, 0.0], 0, 0.0);
+        let electrical = relax_key([0.0, 50.0, 0.0], 0, 9_999.0);
+        assert!(electrical < physical);
+
+        // Likewise electrical over preference…
+        let elec = relax_key([0.0, 0.1, 0.0], 0, 0.0);
+        let pref = relax_key([0.0, 0.0, 50.0], 0, 9_999.0);
+        assert!(pref < elec);
+
+        // …and only when every tier ties does wirelength decide.
+        let tidy = relax_key([0.0, 2.0, 0.0], 0, 100.0);
+        let untidy = relax_key([0.0, 2.0, 0.0], 0, 200.0);
+        assert!(tidy < untidy);
+    }
+
+    /// legion-of-bom-7a7: the loop returned a board with two unconnected nets
+    /// because it was 327mm of wirelength tighter than the routable one, which
+    /// at 50 per unrouted net was a trade the score was happy to make. A board
+    /// `lob fab` refuses is not a board, so no wirelength can buy a net.
+    #[test]
+    fn no_amount_of_wirelength_buys_an_unrouted_net() {
+        let broken_but_tight = relax_key([0.0, 0.0, 0.0], 2, 412.4);
+        let routed_but_loose = relax_key([0.0, 0.0, 0.0], 0, 739.6);
+        assert!(routed_but_loose < broken_but_tight);
+
+        // Fewer unrouted still wins, and among equally-routable attempts the
+        // preference cost decides as before.
+        assert!(relax_key([0.0; 3], 1, 9_999.0) < relax_key([0.0; 3], 2, 0.0));
+        assert!(relax_key([0.0; 3], 0, 100.0) < relax_key([0.0; 3], 0, 200.0));
+
+        // But a physical rule still outranks routability: a board that does not
+        // fit its own outline is not rescued by connecting every net.
+        assert!(relax_key([0.0; 3], 3, 0.0) < relax_key([0.5, 0.0, 0.0], 0, 0.0));
+    }
+
+    #[test]
+    fn violations_total_by_tier() {
+        use crate::rules::{by_tier, Tier, Violation};
+        let v = |tier, by_mm| Violation {
+            tier,
+            by_mm,
+            what: String::new(),
+            repair: None,
+        };
+        let got = by_tier(&[
+            v(Tier::Electrical, 1.5),
+            v(Tier::Electrical, 2.0),
+            v(Tier::Physical, 0.25),
+        ]);
+        assert_eq!(got, [0.25, 3.5, 0.0]);
+        assert_eq!(by_tier(&[]), [0.0; 3]);
+    }
+
     #[test]
     fn repair_nudges_are_deterministic_and_grow() {
         let free = vec!["C1".to_string(), "R1".to_string()];
-        assert_eq!(repair_nudges(&free, 1), repair_nudges(&free, 1));
-        let mag1 = mag(&repair_nudges(&free, 1)["C1"]);
-        let mag3 = mag(&repair_nudges(&free, 3)["C1"]);
+        let placements = HashMap::new();
+        let violations = Vec::new();
+        assert_eq!(
+            repair_nudges(&free, 1, &placements, &violations),
+            repair_nudges(&free, 1, &placements, &violations)
+        );
+        let mag1 = mag(&repair_nudges(&free, 1, &placements, &violations)["C1"]);
+        let mag3 = mag(&repair_nudges(&free, 3, &placements, &violations)["C1"]);
         assert!(mag3 > mag1, "later attempts perturb further");
+    }
+
+    #[test]
+    fn repair_nudges_steps_a_named_part_toward_its_real_hint_not_a_blind_spiral() {
+        // C1 sits at (0,0); a violation says it should head to (10,0) — same
+        // shape as Rule::Proximity's real "move the cap to its IC" repair.
+        // R1 has no violation naming it at all, so it must still get the
+        // ordinary golden-angle exploration nudge, unaffected.
+        let free = vec!["C1".to_string(), "R1".to_string()];
+        let mut placements = HashMap::new();
+        placements.insert(
+            "C1".to_string(),
+            Placement {
+                x_mm: 0.0,
+                y_mm: 0.0,
+                rotation_deg: 0.0,
+                back: false,
+            },
+        );
+        let violations = vec![crate::rules::Violation {
+            tier: crate::rules::Tier::Electrical,
+            by_mm: 3.0,
+            what: "C1 too far from its IC".into(),
+            repair: Some(crate::rules::Repair {
+                refdes: "C1".to_string(),
+                toward_mm: (10.0, 0.0),
+            }),
+        }];
+
+        let guided = repair_nudges(&free, 1, &placements, &violations);
+        // 0.6 (REPAIR_STEP) of the 10mm gap toward the hint, straight along X.
+        assert!(
+            (guided["C1"].0 - 6.0).abs() < 1e-9,
+            "got {:?}",
+            guided["C1"]
+        );
+        assert!(
+            (guided["C1"].1 - 0.0).abs() < 1e-9,
+            "got {:?}",
+            guided["C1"]
+        );
+
+        // R1 (unmentioned by any violation, and absent from placements too)
+        // matches the plain golden-angle nudge exactly, as if there were no
+        // violations at all.
+        let unguided = repair_nudges(&free, 1, &HashMap::new(), &Vec::new());
+        assert_eq!(guided["R1"], unguided["R1"]);
     }
 
     fn mag((x, y): &(f64, f64)) -> f64 {

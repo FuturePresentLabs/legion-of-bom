@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/web"]
 
 [workspace.package]
 version = "0.0.1"
@@ -11,6 +11,16 @@ authors = ["Future Present Labs"]
 
 [workspace.dependencies]
 legion-of-bom-core = { path = "crates/core" }
+legion-of-bom-web = { path = "crates/web" }
+# Shared typed-decision client (Jev/Laya-compatible "System One" APIs) —
+# lives in its own repo since it's consumed across the FPL ecosystem, not
+# just here. Path dependency for now: not yet published or pushed.
+ooda = { path = "../../rlcd/ooda/crates/ooda" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+rust-embed = "8"
 thiserror = "2"
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
@@ -24,3 +34,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+toml_edit = "0.22"
+# Bounded-host-API scripting, same pattern as speedy's src/lua_game.rs:
+# sandboxed stdlib, a narrow required-function contract, serde-table
+# marshaling at the boundary. Same version/feature set for consistency.
+mlua = { version = "0.10", features = ["lua54", "vendored", "serialize", "send"] }
+# The parts library's storage (crates/core/src/parts.rs). Runtime `query`/
+# `execute`, not the `query!` macro family, so building needs no live DB.
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+] }
+# Reading vendored component meshes (crates/core/src/gltf.rs) — the same
+# crate family `pedalkernel-pro`'s autolayout already uses for the identical
+# assets/meshes/jolin/glb/*.glb library. `gltf` imports; `gltf-json` (its own
+# write-side companion, not a separate dependency to justify) builds the
+# combined output document's schema.
+gltf = "1"
+gltf-json = { version = "1", features = ["names"] }

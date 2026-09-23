@@ -2,78 +2,130 @@
 
 *SKiDLs are better with friends.*
 
-**legion-of-bom** turns circuit-as-code into manufacturing-ready outputs and live
-inventory/reorder state — one pipeline instead of KiCad + spreadsheets + manual
-ordering scattered across tools. Starting with [Puget Audio](https://pugetaudio.com)
-Eurorack boards.
+**legion-of-bom** turns circuit-as-code into manufacturing-ready outputs — placed
+and routed boards, panels, Gerbers, a JLCPCB assembly package, build guides and a
+priced BOM — in one pipeline instead of KiCad + spreadsheets + manual ordering
+scattered across tools. It started with [Puget Audio](https://pugetaudio.com)
+Eurorack modules and now designs small digital boards too.
 
-Status: **early scaffold.** The pipeline is being proven on textbook circuits
-before any real product design runs through it. See [`DESIGN.md`](./DESIGN.md) for
-the full design and [beads](#issue-tracking) for the live task graph.
+Status: **in use.** The Puget Audio slew limiter builds from source to a
+DRC-clean fab package, and the first microcontroller family (an STM32H743 audio
+board) runs the design pipeline end to end. See [`DESIGN.md`](./DESIGN.md) for
+the full design and [marbles](#issue-tracking) for the live task graph.
 
-## The pipeline loop
+## The pipeline
 
-A circuit is defined as code (SKiDL today), then flows through composable stages:
+A circuit is defined as code (SKiDL), or decided from a design brief and then
+rendered to code, and flows through composable stages:
 
 ```
-SKiDL script → netlist → parse → validate (ERC) → simulate (ngspice) → verify → BOM
-                                                                          ↓
-                                          (later) layout · panels · gerbers · PCBA · inventory
+brief ─(lob spec)─► spec ─(lob schematic)─► SKiDL circuit
+                                              │
+        lob run:  netlist → parse → ERC → simulate (ngspice) → verify → BOM
+        lob board: place → legalize → route → .kicad_pcb → lob drc (kicad-cli)
+        lob fab / guide / build: Gerbers + drill + CPL + BOM, assembly guide, Visual BOM
 ```
 
-Phase 0's goal is to run that whole loop locally on a known-good RC low-pass filter
-and a non-inverting op-amp gain stage — checking the simulation against textbook
-values — so the loop is trustworthy before a real board depends on it.
+- **Typed decisions, curated families.** `lob spec <family> --brief "…"` asks a
+  small number of bounded questions (a choice, a probability, a rubric score —
+  never free text) of a System One–compatible endpoint through the shared
+  [`ooda`](https://github.com/FuturePresentLabs/ooda) client, and writes a spec. `lob schematic` renders
+  the circuit as a pure function of that spec. Families today: `fuzz-pedal`
+  (plus `lob spec-chain` for chained gain stages) and `stm32-codec` (an
+  STM32H743 with a PCM5102A + PCM1808, WM8731 or ES8388 codec).
+- **Cited, not remembered.** A family's pinouts come from the official KiCad
+  symbols, connected by pin name and checked against the symbol file (including
+  pin-mux alternates). Every component value carries a verbatim quote from a
+  page of a pinned datasheet — distributor copy, URL + SHA-256 — that is checked
+  mechanically with `pdftotext`. Values read off a figure, or not stated in any
+  pinned source, are recorded as readings; `lob schematic` lists every one no
+  person has confirmed yet.
+- **Layout for Eurorack and free boards.** A board with a panel is laid out
+  against it (the PCB also derives its own minimum-width panel); a board without
+  one gets a free rectangle sized to its parts. A negotiated-congestion router
+  escapes 0.5 mm-pitch QFP/QFN pins and measures clearance in exact geometry.
+- **Measured, not assumed.** Simulation checks textbook circuits against
+  analytic values, `lob scope-probe` measures clipping as a SPICE claim, and
+  [PCBBench](https://github.com/FuturePresentLabs/pcbbench) scores whole runs — brief to DRC — against a
+  task rubric.
 
 ## Architecture
 
-- **`legion-of-bom-core`** (`crates/core`) — the pipeline library. Circuit model,
-  the `CircuitSource` trait every stage reads through, `Stage` traits, and the
-  report types. Deliberately DSL-agnostic (DESIGN.md 2.3/3.3).
+- **`legion-of-bom-core`** (`crates/core`) — the pipeline library: circuit model
+  and the `CircuitSource` trait every stage reads through (DSL-agnostic, DESIGN.md
+  2.3/3.3), placement, routing, rules, panels, fab, guides, SPICE, the curated
+  families (`family.rs`) and datasheet citations (`datasheet.rs`).
 - **`lob`** (`crates/cli`) — the command-line interface, a thin wrapper over the
   core library.
-- **Parts library** — a global, Dolt-backed store of verified part definitions
-  (pinout, ratings, SPICE models) keyed by MPN; cross-project and version-
-  controlled. Requires [`dolt`](https://github.com/dolthub/dolt). Try
-  `lob parts add <MPN> --manufacturer …`, `lob parts show <MPN>`.
-- **MCP server** — next interface after the CLI, over the same core library.
-- **Web backend / UI** — deferred (axum + Slint/React later); nothing is web-only.
+- **`legion-of-bom-web`** (`crates/web`) — the local read-only dashboard
+  (`lob serve`) over the same core.
+- **Parts library** — a global SQLite store (via SQLx) of part definitions keyed
+  by MPN, with a `verified_by_human` gate on real board/BOM generation
+  (`lob parts …`). Distributor clients (Mouser, JLCPCB) are sandboxed Lua scripts,
+  not built-in Rust.
 
-## Quickstart (dev loop)
+## Setup
 
-Requires a Rust toolchain. Run the gates in this order — cheapest feedback first:
+Rust toolchain, plus the external tools the stages shell out to — each stage
+fails with a clear error, never a panic, when its tool is missing:
+
+- **KiCad 9** (`kicad-cli`, symbol + footprint libraries) — boards, DRC, fab
+- **Python + SKiDL** in a `.venv` (or `$VIRTUAL_ENV`) — circuit scripts
+- **ngspice** — simulation
+- **poppler** (`pdftotext`) — datasheet citation checks
+
+`lob doctor` reports what it found. API keys (`OODA_API_KEY` for `lob spec`,
+`MOUSER_API_KEY`, `JLCPCB_*`) go in `~/.lob/credentials` or a repo `.env` — see
+[`.env.example`](./.env.example).
+
+## Quickstart
 
 ```bash
-cargo check          # fast type/borrow check
+cargo run -p legion-of-bom-cli -- run examples/rc_lowpass.py        # simulate a textbook filter
+
+lob spec stm32-codec --brief "stereo line in/out, no I2C setup" --out design
+lob schematic design.json --out board.py                            # + unconfirmed readings
+lob run board.py && lob board board.py && lob drc out/board/board.kicad_pcb
+```
+
+## Dev loop
+
+Run the gates in this order — cheapest feedback first:
+
+```bash
+cargo check          # fast type/borrow check (run first, run often)
 cargo test           # unit tests
 cargo build          # produce the lob binary
 
-cargo fmt --check    # formatting (run often)
-cargo clippy --all-targets --all-features -- -D warnings   # lints (run often)
+cargo fmt --check    # formatting
+cargo clippy --all-targets --all-features -- -D warnings   # lints, warnings are errors
+
+# Checks that need the installed KiCad libraries and the pinned datasheets:
+cargo test -p legion-of-bom-core -- --ignored
 ```
 
-Run the CLI:
+## Vendored assets
 
-```bash
-cargo run -p legion-of-bom-cli -- run examples/rc_lowpass.py
-# or, after `cargo build`:
-./target/debug/lob run <circuit>
-```
-
-The Phase 0 pipeline stages (SKiDL runner, netlist parser, ngspice, BOM) shell out
-to external tools — SKiDL/Python, ngspice, and KiCad — which are being pinned in
-the Phase 0 tooling task before the runner lands.
+`assets/` carries real, sourced third-party panel-component footprints and
+3D meshes (Eurorack-style jacks, pots, LEDs, switches) for hardware KiCad's
+own stock libraries don't cover well. See [`assets/CREDITS.md`](assets/CREDITS.md)
+for exact provenance, licenses (Unlicense, CC-BY 4.0 — both redistribution-
+clean), and where to re-fetch them.
 
 ## Issue tracking
 
-This project tracks work in **[beads](https://github.com/gastownhall/beads)** (`bd`),
-not markdown TODOs. The roadmap (DESIGN.md §14) is modeled as epics per phase:
+Work is tracked in **[marbles](https://github.com/FuturePresentLabs/marbles)**
+(hosted, one writer per project), not markdown TODOs. Ids carried over unchanged
+from beads. The roadmap (DESIGN.md §14) is modeled as epics:
 
 ```bash
-bd ready              # what's available to work on now
-bd list --type=epic   # the phase roadmap
-bd show <id>          # details + dependencies
+marbles ready                 # what's available to work on now
+marbles list --json           # everything, machine-readable
+marbles show <id> --json      # details + dependencies
 ```
+
+Closed means merged: finished work moves to `review` with its PR and closes on
+merge.
 
 ## License
 

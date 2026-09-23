@@ -63,35 +63,196 @@ fn cache_path(cache_dir: &Path, url: &str) -> PathBuf {
     cache_dir.join(format!("{hash}.{ext}"))
 }
 
-/// Fetch an image by URL and return it as an embeddable `data:` URI, caching the
-/// bytes under `cache_dir`. A cached file is reused without any network call
-/// (offline-friendly). Returns `None` on any failure — callers degrade, never fail.
-pub fn fetch_data_uri(url: &str, cache_dir: &Path) -> Option<String> {
-    let mime = mime_from_url(url);
-    let path = cache_path(cache_dir, url);
-    // A cached file is trusted only if it still looks like an image (guards against
-    // a stale cache written before payload validation existed).
-    if let Ok(bytes) = std::fs::read(&path) {
-        if is_probably_image(&bytes) {
-            return Some(to_data_uri(&bytes, mime));
-        }
+/// A crop rectangle over a source image, as **fractions** of its width and
+/// height (`0.0..=1.0`).
+///
+/// Fractions rather than pixels so a crop survives the source being re-fetched
+/// at a different resolution, and so the same rectangle means the same thing
+/// whatever the shop serves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crop {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Crop {
+    /// Whether this rectangle is usable: inside the image, and not degenerate.
+    /// A bad crop is ignored rather than applied, because a photo must never be
+    /// able to break the BOM.
+    pub fn is_sane(&self) -> bool {
+        self.w > 0.001
+            && self.h > 0.001
+            && self.x >= 0.0
+            && self.y >= 0.0
+            && self.x + self.w <= 1.0001
+            && self.y + self.h <= 1.0001
     }
-    let bytes = download(url)?;
+}
+
+/// Where a source's crop is recorded: beside its cached image, keyed the same
+/// way. Cropping a Thonk photo once therefore applies in every project that
+/// references it — the same reasoning that makes the image cache shared.
+fn crop_path(cache_dir: &Path, source: &str) -> PathBuf {
+    cache_path(cache_dir, source).with_extension("crop")
+}
+
+/// The crop recorded for `source`, if any.
+pub fn read_crop(cache_dir: &Path, source: &str) -> Option<Crop> {
+    let text = std::fs::read_to_string(crop_path(cache_dir, source)).ok()?;
+    let n: Vec<f64> = text
+        .trim()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let [x, y, w, h] = n[..] else { return None };
+    let crop = Crop { x, y, w, h };
+    crop.is_sane().then_some(crop)
+}
+
+/// Record (or, with `None`, clear) the crop for `source`.
+pub fn write_crop(cache_dir: &Path, source: &str, crop: Option<Crop>) -> std::io::Result<()> {
+    let path = crop_path(cache_dir, source);
+    match crop.filter(Crop::is_sane) {
+        Some(c) => {
+            std::fs::create_dir_all(cache_dir)?;
+            std::fs::write(path, format!("{},{},{},{}", c.x, c.y, c.w, c.h))
+        }
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        },
+    }
+}
+
+/// The bytes for an image *source* — `file://` local path or http(s) URL —
+/// **uncropped**, fetching and caching a URL as needed.
+///
+/// This is what a crop editor needs: you cannot choose a rectangle over an image
+/// you are only shown the inside of.
+pub fn source_bytes(source: &str, cache_dir: &Path) -> Option<Vec<u8>> {
+    if let Some(bytes) = cached_source_bytes(source, cache_dir) {
+        return Some(bytes);
+    }
+    if source.starts_with("file://") {
+        return None; // a local file that is missing or not an image
+    }
+    let bytes = download(source)?;
+    let path = cache_path(cache_dir, source);
     let _ = std::fs::create_dir_all(cache_dir);
     let _ = std::fs::write(&path, &bytes);
+    Some(bytes)
+}
+
+/// The bytes already on disk for a source, **never** going to the network.
+///
+/// What an HTTP endpoint should serve: fetching whatever URL a request names
+/// would make the dashboard a proxy for arbitrary outbound GETs. Cropping only
+/// ever touches photos the BOM has already resolved and cached, so cache-only is
+/// no restriction in practice.
+pub fn cached_source_bytes(source: &str, cache_dir: &Path) -> Option<Vec<u8>> {
+    let path = match source.strip_prefix("file://") {
+        Some(local) => PathBuf::from(local),
+        None => cache_path(cache_dir, source),
+    };
+    // A cached file is trusted only if it still looks like an image (guards against
+    // a stale cache written before payload validation existed).
+    let bytes = std::fs::read(path).ok()?;
+    is_probably_image(&bytes).then_some(bytes)
+}
+
+/// The MIME to serve a source's bytes as, from its extension.
+pub fn source_mime(source: &str) -> &'static str {
+    mime_from_url(source.strip_prefix("file://").unwrap_or(source))
+}
+
+/// The bytes for a source with its recorded crop applied, and the MIME to serve
+/// them as. Falls back to the full image if the crop cannot be applied.
+pub fn cropped_bytes(source: &str, cache_dir: &Path) -> Option<(Vec<u8>, &'static str)> {
+    let bytes = source_bytes(source, cache_dir)?;
+    let mime = source_mime(source);
+    match read_crop(cache_dir, source) {
+        Some(crop) => Some((apply_crop(&bytes, crop).unwrap_or(bytes), mime)),
+        None => Some((bytes, mime)),
+    }
+}
+
+/// Crop `bytes` to `crop` with macOS `sips`, as [`crate::fab::png_to_jpeg`] does
+/// for format conversion. `None` when the tool is absent or the crop fails, and
+/// the caller keeps the full image — a missing cropper degrades the picture, it
+/// does not break the build.
+fn apply_crop(bytes: &[u8], crop: Crop) -> Option<Vec<u8>> {
+    use std::process::Command;
+    if !crop.is_sane() {
+        return None;
+    }
+    let dir = std::env::temp_dir();
+    let stamp: String = Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let src = dir.join(format!("lob-crop-{stamp}-in"));
+    let out = dir.join(format!("lob-crop-{stamp}-out"));
+    std::fs::write(&src, bytes).ok()?;
+
+    let dims = Command::new("sips")
+        .args(["-g", "pixelWidth", "-g", "pixelHeight"])
+        .arg(&src)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&dims.stdout);
+    let num = |key: &str| -> Option<f64> {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(key)?.trim().parse().ok())
+    };
+    let (w, h) = (num("pixelWidth:")?, num("pixelHeight:")?);
+
+    // sips takes the crop as height/width plus a top/left offset, in pixels.
+    let px = |v: f64| v.round().max(1.0) as i64;
+    let ok = Command::new("sips")
+        .args([
+            "-c",
+            &px(crop.h * h).to_string(),
+            &px(crop.w * w).to_string(),
+        ])
+        .arg("--cropOffset")
+        .args([
+            (crop.y * h).round().max(0.0).to_string(),
+            (crop.x * w).round().max(0.0).to_string(),
+        ])
+        .arg(&src)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let result = ok
+        .then(|| std::fs::read(&out).ok())
+        .flatten()
+        .filter(|b| is_probably_image(b));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    result
+}
+
+/// Fetch an image by URL and return it as an embeddable `data:` URI, caching the
+/// bytes under `cache_dir` and applying any crop recorded for it. A cached file
+/// is reused without any network call (offline-friendly). Returns `None` on any
+/// failure — callers degrade, never fail.
+pub fn fetch_data_uri(url: &str, cache_dir: &Path) -> Option<String> {
+    let (bytes, mime) = cropped_bytes(url, cache_dir)?;
     Some(to_data_uri(&bytes, mime))
 }
 
 /// Embed an image *source* — either a `file://` local path (a hand-attached
-/// photo) or an http(s) URL (a distributor/curated image) — as a `data:` URI.
-/// Local files are read + validated directly; URLs go through [`fetch_data_uri`]
-/// (fetch + cache). `None` on any failure, so callers degrade to a swatch/blank.
+/// photo) or an http(s) URL (a distributor/curated image) — as a `data:` URI,
+/// cropped to whatever rectangle was chosen for it. `None` on any failure, so
+/// callers degrade to a swatch/blank.
 pub fn embed_source(source: &str, cache_dir: &Path) -> Option<String> {
-    if let Some(path) = source.strip_prefix("file://") {
-        let bytes = std::fs::read(path).ok()?;
-        return is_probably_image(&bytes).then(|| to_data_uri(&bytes, mime_from_url(path)));
-    }
-    fetch_data_uri(source, cache_dir)
+    let (bytes, mime) = cropped_bytes(source, cache_dir)?;
+    Some(to_data_uri(&bytes, mime))
 }
 
 /// GET `url` into bytes, bounded by [`MAX_BYTES`]; `None` on any error or if the
@@ -190,6 +351,45 @@ mod tests {
         );
         // A missing file → None (degrade, don't panic).
         assert_eq!(embed_source("file:///no/such/file.jpg", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crop is recorded beside the cached image, survives a round trip, and
+    /// clears cleanly. Keyed by source, so cropping a Thonk photo once applies
+    /// everywhere that photo is used.
+    #[test]
+    fn a_crop_round_trips_and_clears() {
+        let dir = std::env::temp_dir().join(format!("lob-crop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = "https://example.invalid/bag-of-jacks.jpg";
+
+        assert_eq!(read_crop(&dir, url), None, "no crop to begin with");
+        let crop = Crop {
+            x: 0.25,
+            y: 0.1,
+            w: 0.5,
+            h: 0.5,
+        };
+        write_crop(&dir, url, Some(crop)).unwrap();
+        assert_eq!(read_crop(&dir, url), Some(crop));
+
+        // Clearing is idempotent — clearing a crop that is already gone is fine.
+        write_crop(&dir, url, None).unwrap();
+        assert_eq!(read_crop(&dir, url), None);
+        write_crop(&dir, url, None).unwrap();
+
+        // A rectangle that runs off the image is refused rather than stored: a
+        // bad crop must never be able to break a photo.
+        let off = Crop {
+            x: 0.8,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
+        assert!(!off.is_sane());
+        write_crop(&dir, url, Some(off)).unwrap();
+        assert_eq!(read_crop(&dir, url), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

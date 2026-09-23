@@ -1,0 +1,267 @@
+[package]
+name = "handpan"
+repo_path = "../handpan"
+source_branch = "claude/handpan-vsti-modular-x7xsj8"
+license = "proprietary"
+
+[[cores]]
+name = "handpan-core"
+crate_path = "crates/handpan-core"
+description = "Playable modal handpan/tongue-drum voice with scale quantization and internal generative mode."
+firmware_targets = [
+  { path = "firmware/src/bin/voice.rs", symbol = "HandpanInstrument" },
+  { path = "firmware/src/bin/brain.rs", symbol = "Sequencer" },
+]
+vcv_targets = [
+  { path = "vcv/src/Handpan.cpp" },
+  { path = "vcv/libvcv_handpan" },
+]
+
+[[cores]]
+name = "mallet-core"
+crate_path = "crates/mallet-core"
+description = "Mallet and bell modal voice family."
+
+[[cores]]
+name = "bowed-core"
+crate_path = "crates/bowed-core"
+description = "Bowed string physical-model voice family."
+
+[[cores]]
+name = "wind-core"
+crate_path = "crates/wind-core"
+description = "Wind instrument waveguide voice family."
+
+[[modules]]
+name = "handpan-voice"
+core = "handpan-core"
+preferred_carrier = "PatchSm"
+firmware_target = "firmware/src/bin/voice.rs"
+vcv_target = "vcv/src/Handpan.cpp"
+
+[modules.interface]
+name = "handpan-voice"
+role = "Voice"
+
+[[modules.interface.ports]]
+name = "V/OCT"
+direction = "Input"
+kind = "Cv"
+exposure = { panel = true, internal = false }
+range = { min = -5.0, max = 5.0, unit = "V" }
+
+[[modules.interface.ports]]
+name = "STRIKE"
+direction = "Input"
+kind = "Strike"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "STRIKE", required = false } }
+
+[[modules.interface.ports]]
+name = "VELOCITY"
+direction = "Input"
+kind = "Cv"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "VELOCITY", required = false } }
+range = { min = 0.0, max = 10.0, unit = "V" }
+
+[modules.interface.ports.conditioning]
+combine = "Sum"
+paths = [
+  { source = { PanelKnob = { default = 0.8 } }, transform = "Direct" },
+  { source = { CvInput = { normalled = "Ground" } }, transform = { Attenuverter = { max_abs_gain = 1.0 } } },
+]
+
+[[modules.interface.ports]]
+name = "CLOCK"
+direction = "Input"
+kind = "Clock"
+exposure = { panel = false, internal = true, expander = { bus = "HANDPAN", signal = "CLOCK", required = false } }
+
+[[modules.interface.ports]]
+name = "SCALE"
+direction = "Input"
+kind = "Control"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "SCALE", required = false } }
+range = { min = 0.0, max = 1.0, unit = "norm" }
+conditioning = { combine = "Direct", paths = [{ source = { PanelKnob = { default = 0.0 } }, transform = "Direct" }] }
+
+[[modules.interface.ports]]
+name = "AIR"
+direction = "Input"
+kind = "Control"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "AIR", required = false } }
+range = { min = 0.0, max = 1.0, unit = "norm" }
+conditioning = { combine = "Sum", paths = [{ source = { PanelKnob = { default = 0.16 } }, transform = "Direct" }, { source = { CvInput = { normalled = "Ground" } }, transform = { Attenuverter = { max_abs_gain = 1.0 } } }] }
+
+[[modules.interface.ports]]
+name = "LEFT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules.interface.ports]]
+name = "RIGHT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules]]
+name = "handpan-brain"
+core = "handpan-core"
+preferred_carrier = "PatchSm"
+firmware_target = "firmware/src/bin/brain.rs"
+
+[modules.interface]
+name = "handpan-brain"
+role = "Controller"
+
+[[modules.interface.ports]]
+name = "CLOCK"
+direction = "Input"
+kind = "Clock"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "CLOCK", required = false } }
+
+[[modules.interface.ports]]
+name = "GATE"
+direction = "Output"
+kind = "Gate"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "GATE", required = false } }
+
+[[modules.interface.ports]]
+name = "V/OCT"
+direction = "Output"
+kind = "Cv"
+exposure = { panel = true, internal = false, expander = { bus = "HANDPAN", signal = "V/OCT", required = false } }
+range = { min = -5.0, max = 5.0, unit = "V" }
+
+[[modules.interface.ports]]
+name = "FEEL"
+direction = "Output"
+kind = "Cv"
+exposure = { panel = false, internal = true, expander = { bus = "HANDPAN", signal = "FEEL", required = false } }
+range = { min = 0.0, max = 1.0, unit = "norm" }
+
+[[modules]]
+name = "mallet-voice"
+core = "mallet-core"
+preferred_carrier = "PatchSm"
+
+[modules.interface]
+name = "mallet-voice"
+role = "Voice"
+
+[[modules.interface.ports]]
+name = "V/OCT"
+direction = "Input"
+kind = "Cv"
+exposure = { panel = true, internal = false }
+range = { min = -5.0, max = 5.0, unit = "V" }
+
+[[modules.interface.ports]]
+name = "STRIKE"
+direction = "Input"
+kind = "Strike"
+exposure = { panel = true, internal = false, expander = { bus = "MALLET", signal = "STRIKE", required = false } }
+
+[[modules.interface.ports]]
+name = "DAMP"
+direction = "Input"
+kind = "Control"
+exposure = { panel = true, internal = false, expander = { bus = "MALLET", signal = "DAMP", required = false } }
+range = { min = 0.0, max = 1.0, unit = "norm" }
+conditioning = { combine = "Sum", paths = [{ source = { PanelKnob = { default = 0.0 } }, transform = "Direct" }, { source = { CvInput = { normalled = "Ground" } }, transform = { Attenuverter = { max_abs_gain = 1.0 } } }] }
+
+[[modules.interface.ports]]
+name = "LEFT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules.interface.ports]]
+name = "RIGHT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules]]
+name = "bowed-voice"
+core = "bowed-core"
+preferred_carrier = "PatchSm"
+
+[modules.interface]
+name = "bowed-voice"
+role = "Voice"
+
+[[modules.interface.ports]]
+name = "V/OCT"
+direction = "Input"
+kind = "Cv"
+exposure = { panel = true, internal = false }
+range = { min = -5.0, max = 5.0, unit = "V" }
+
+[[modules.interface.ports]]
+name = "GATE"
+direction = "Input"
+kind = "Gate"
+exposure = { panel = true, internal = false, expander = { bus = "BOWED", signal = "GATE", required = false } }
+
+[[modules.interface.ports]]
+name = "BOW_PRESSURE"
+direction = "Input"
+kind = "Control"
+exposure = { panel = true, internal = false, expander = { bus = "BOWED", signal = "PRESSURE", required = false } }
+range = { min = 0.0, max = 1.0, unit = "norm" }
+conditioning = { combine = "Sum", paths = [{ source = { PanelKnob = { default = 0.5 } }, transform = "Direct" }, { source = { CvInput = { normalled = "Ground" } }, transform = { Attenuverter = { max_abs_gain = 1.0 } } }] }
+
+[[modules.interface.ports]]
+name = "LEFT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules.interface.ports]]
+name = "RIGHT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules]]
+name = "wind-voice"
+core = "wind-core"
+preferred_carrier = "PatchSm"
+
+[modules.interface]
+name = "wind-voice"
+role = "Voice"
+
+[[modules.interface.ports]]
+name = "V/OCT"
+direction = "Input"
+kind = "Cv"
+exposure = { panel = true, internal = false }
+range = { min = -5.0, max = 5.0, unit = "V" }
+
+[[modules.interface.ports]]
+name = "GATE"
+direction = "Input"
+kind = "Gate"
+exposure = { panel = true, internal = false, expander = { bus = "WIND", signal = "GATE", required = false } }
+
+[[modules.interface.ports]]
+name = "BREATH"
+direction = "Input"
+kind = "Control"
+exposure = { panel = true, internal = false, expander = { bus = "WIND", signal = "BREATH", required = false } }
+range = { min = 0.0, max = 1.0, unit = "norm" }
+conditioning = { combine = "Sum", paths = [{ source = { PanelKnob = { default = 0.8 } }, transform = "Direct" }, { source = { CvInput = { normalled = "Ground" } }, transform = { Attenuverter = { max_abs_gain = 1.0 } } }] }
+
+[[modules.interface.ports]]
+name = "LEFT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }
+
+[[modules.interface.ports]]
+name = "RIGHT"
+direction = "Output"
+kind = "Audio"
+exposure = { panel = true, internal = false }

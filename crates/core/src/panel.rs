@@ -43,6 +43,63 @@ pub struct Cutout {
     /// A silkscreen/engraving label for this control (e.g. `"IN"`, `"OUT"`,
     /// `"RATE"`), rendered next to the cutout. `None` omits it.
     pub label: Option<String>,
+    /// What this control is, for styling. `None` renders plain.
+    pub role: Option<CutoutRole>,
+}
+
+/// What a cutout *is*, for panel styling — distinct from its shape, which is
+/// only how big a hole to cut.
+///
+/// Panels read faster when the signal path and the modulation inputs look
+/// different, so the role drives a badge on the label and the dial art around a
+/// knob. Derived from circuit topology rather than from the label text, so it
+/// cannot drift from what the module actually does: a knob whose track ends both
+/// sit on live nets is bipolar, one with an end on ground is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoutRole {
+    /// Audio in/out — the signal path.
+    Io,
+    /// A control-voltage jack. Labels get the inverted badge.
+    Cv,
+    /// A plain knob: unipolar sweep, dial dots from min to max.
+    Knob,
+    /// A toggle. No dial art — a lever has positions, not a sweep, and drawing a
+    /// 270-degree arc of dots round one would be a lie about how it moves.
+    Switch,
+    /// A knob whose centre is zero. Gets a centre detent mark, and â/+ at the
+    /// extremes, because "12 o'clock is silence" is the whole point of the
+    /// control and a player has to be able to see it.
+    Attenuverter,
+}
+
+impl CutoutRole {
+    /// The token used in a panel TOML (`role = "cv"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CutoutRole::Io => "io",
+            CutoutRole::Cv => "cv",
+            CutoutRole::Knob => "knob",
+            CutoutRole::Switch => "switch",
+            CutoutRole::Attenuverter => "attenuverter",
+        }
+    }
+    pub fn parse(s: &str) -> Option<CutoutRole> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "io" => Some(CutoutRole::Io),
+            "cv" => Some(CutoutRole::Cv),
+            "knob" | "pot" => Some(CutoutRole::Knob),
+            "switch" | "toggle" => Some(CutoutRole::Switch),
+            "attenuverter" | "attenuvertor" | "bipolar" => Some(CutoutRole::Attenuverter),
+            _ => None,
+        }
+    }
+    /// Whether this role's label is drawn as knocked-out text in a filled badge.
+    fn badged(self) -> bool {
+        self == CutoutRole::Cv
+    }
+    fn is_knob(self) -> bool {
+        matches!(self, CutoutRole::Knob | CutoutRole::Attenuverter)
+    }
 }
 
 /// The shape of a cutout, derived from its footprint name.
@@ -65,9 +122,50 @@ const JACK_BARREL_MM: f64 = 6.0;
 /// Alpha 9 mm pot bushing hole diameter (mm).
 const POT_BUSHING_MM: f64 = 7.0;
 /// Toggle switch bushing hole diameter (mm).
-const TOGGLE_MM: f64 = 6.5;
+/// Sub-miniature toggle bushing hole. From the Dailywell 2M series drawing
+/// (2MS3/2MD6 etc, what Thonk sell as DW1/DW2/DW5): panel hole 4.95mm with a
+/// 4.55mm flat for anti-rotation, 10-48 UNS bushing.
+///
+/// Was 6.5mm — a plausible number rather than a measured one, which left the
+/// switch 1.55mm loose in its hole (`legion-of-bom-tvs`). The flat is still not
+/// represented; `CutoutShape` has no circle-with-flat.
+const TOGGLE_MM: f64 = 4.95;
 const LED_5MM_MM: f64 = 5.0;
 const LED_3MM_MM: f64 = 3.0;
+
+/// Mechanical envelopes `(width, height)` mm — the space each control really
+/// occupies on a built panel, versus the much smaller hole it pokes through. Each
+/// is the larger of the panel-side hardware and the PCB body that anchors to it,
+/// measured from the parts we actually build with. See [`CutoutSpec::envelope_mm`].
+mod envelope {
+    /// Thonkiconn / PJ301M: the KiCad body is 10.0 × 14.4 mm — larger than the
+    /// ~7.6 mm nut, and larger than the ~12 mm spacing dense modules use to leave
+    /// finger room for a plug, so the body governs.
+    pub const JACK: (f64, f64) = (10.0, 14.4);
+    /// Alpha 9 mm vertical pot: the PCB body spans 13.75 × 12.82 mm including its
+    /// solder lugs; a common small Eurorack knob (Davies 1900h ≈ 13.8 mm, Rogan
+    /// 1PS ≈ 12.7 mm) is about the same, so 14 mm covers both.
+    pub const POT: (f64, f64) = (14.0, 14.0);
+    /// Sub-mini toggle: bushing plus the lever's throw and finger room.
+    pub const SWITCH: (f64, f64) = (10.0, 12.0);
+    /// An LED needs only its bezel plus a little material.
+    pub const LED: (f64, f64) = (6.0, 6.0);
+    /// Minimum panel material left between a control envelope and the panel edge —
+    /// a knob may not overhang, or it fouls the neighbouring module.
+    pub const EDGE_MM: f64 = 1.0;
+    /// Minimum gap between two adjacent control envelopes.
+    pub const GAP_MM: f64 = 2.0;
+}
+
+/// The default mechanical envelope for a control kind.
+fn kind_envelope(kind: ControlKind) -> (f64, f64) {
+    match kind {
+        ControlKind::Jack => envelope::JACK,
+        ControlKind::Pot => envelope::POT,
+        ControlKind::Switch => envelope::SWITCH,
+        ControlKind::Led => envelope::LED,
+    }
+}
 
 /// What kind of front-panel control a part is — drives panel-layout grouping
 /// (knobs/switches up top, jacks at the bottom) and label defaults.
@@ -95,12 +193,22 @@ impl ControlKind {
     }
 }
 
-/// A part's panel-mount cutout: opening geometry + control kind. This is **part
-/// data** — see [`CutoutSource`].
+/// A part's panel-mount cutout: opening geometry + control kind + the space the
+/// hardware really occupies. This is **part data** — see [`CutoutSource`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CutoutSpec {
     pub shape: CutoutShape,
     pub kind: ControlKind,
+    /// The mechanical envelope `(width, height)` in mm this control actually needs
+    /// on the panel — **not** its hole. It is the larger of the panel-side hardware
+    /// (a knob's skirt, a jack's nut plus room to grip a plug) and the PCB body the
+    /// panel anchors, because both must clear their neighbours: knobs must not
+    /// collide, and the anchored footprints must not overlap on the board.
+    ///
+    /// Deriving a panel from hole sizes alone is what produced panels that looked
+    /// fine and could not be built — a 3 HP panel is 15.24 mm wide, which cannot
+    /// hold a 13.75 mm pot body with any material left at the edges.
+    pub envelope_mm: (f64, f64),
 }
 
 /// Resolves a part to its panel-mount cutout — **the seam**. A part's mechanical
@@ -124,7 +232,26 @@ pub trait CutoutSource {
 pub struct BuiltinCutouts;
 
 impl CutoutSource for BuiltinCutouts {
-    fn cutout(&self, _mpn: Option<&str>, footprint: &str) -> Option<CutoutSpec> {
+    fn cutout(&self, mpn: Option<&str>, footprint: &str) -> Option<CutoutSpec> {
+        // MPN first. A panel control's *footprint* often says nothing about the
+        // panel — a sub-mini toggle has no KiCad THT footprint at all, so it
+        // carries a 1x03 pin header and would never keyword-match "switch".
+        // The MPN is what actually identifies the hardware, which is why this
+        // trait takes one; until the parts library carries verified mechanical
+        // data this is a small table of what we build with.
+        if let Some(mpn) = mpn {
+            let m = mpn.to_ascii_uppercase();
+            // Dailywell 1M/2M sub-miniature toggles (Thonk DW1/DW2/DW5 …).
+            if m.starts_with("1M") || m.starts_with("2M") {
+                return Some(CutoutSpec {
+                    kind: ControlKind::Switch,
+                    shape: CutoutShape::Circle {
+                        diameter_mm: TOGGLE_MM,
+                    },
+                    envelope_mm: kind_envelope(ControlKind::Switch),
+                });
+            }
+        }
         let name = footprint
             .rsplit_once(':')
             .map(|(_, r)| r)
@@ -134,6 +261,15 @@ impl CutoutSource for BuiltinCutouts {
             Some(CutoutSpec {
                 kind,
                 shape: CutoutShape::Circle { diameter_mm },
+                // An LED's envelope is its own bezel; every other kind carries the
+                // hardware/body envelope for its class.
+                envelope_mm: match kind {
+                    ControlKind::Led => {
+                        let d: f64 = diameter_mm;
+                        (d + 1.0, d + 1.0)
+                    }
+                    k => kind_envelope(k),
+                },
             })
         };
         // Exact LED sizes first (a bare "led" defaults to 5 mm below).
@@ -170,19 +306,89 @@ impl CutoutSource for BuiltinCutouts {
 /// House silkscreen-layout rules (DESIGN §7.9 — designed once, applied
 /// consistently, not invented per-panel). Millimetres.
 mod silk {
-    /// Title text height and its distance below the top edge.
-    pub const TITLE_FONT_MM: f64 = 2.0;
-    pub const TITLE_TOP_MARGIN_MM: f64 = 7.0;
+    /// Title text height and its distance below the top edge. Sized like a real
+    /// Eurorack faceplate — the module name reads across the room, not a 2 mm
+    /// whisper.
+    pub const TITLE_FONT_MM: f64 = 3.6;
+    pub const TITLE_TOP_MARGIN_MM: f64 = 8.0;
+    /// On a 1U tile the name sits in the band below the control row, this far
+    /// up from the bottom edge, and smaller — there is 39.65 mm to share.
+    pub const TILE_TITLE_BOTTOM_MM: f64 = 4.6;
+    pub const TILE_TITLE_FONT_MM: f64 = 2.6;
+
+    /// Title height for a format.
+    pub fn title_font_mm(format: super::PanelFormat) -> f64 {
+        match format.is_tile() {
+            true => TILE_TITLE_FONT_MM,
+            false => TITLE_FONT_MM,
+        }
+    }
     /// Control-label text height and its offset above the cutout centre (clears a
     /// [`super::JACK_BARREL_MM`]/2 barrel with margin).
-    pub const LABEL_FONT_MM: f64 = 1.8;
+    pub const LABEL_FONT_MM: f64 = 2.4;
     pub const LABEL_OFFSET_MM: f64 = 6.5;
+    /// A knob's label has to clear its dial art, not just its body — at the
+    /// jack offset the 12 o'clock dot lands inside the lettering.
+    pub const KNOB_LABEL_OFFSET_MM: f64 = 10.4;
     /// Brand logo: fraction of panel width, the minimum width worth drawing, and
     /// the clearances keeping it off the lowest cutout and the bottom edge/holes.
-    pub const LOGO_WIDTH_FRAC: f64 = 0.4;
+    /// The logo is the maker's mark — give it real presence in the bottom band.
+    pub const LOGO_WIDTH_FRAC: f64 = 0.66;
     pub const LOGO_MIN_WIDTH_MM: f64 = 4.0;
-    pub const LOGO_CUTOUT_GAP_MM: f64 = 2.0;
+    pub const LOGO_CUTOUT_GAP_MM: f64 = 2.5;
     pub const BOTTOM_MARGIN_MM: f64 = 6.0;
+    /// Dial art around a knob: how far the dots sit from the shaft centre, how
+    /// big each dot is, and how many across the sweep.
+    ///
+    /// A pot turns 270 degrees, so the dots run from -135 to +135 measured from
+    /// straight up. Seven reads as a scale without becoming a ruler; an even
+    /// count would put a gap where a bipolar control's zero belongs.
+    pub const DIAL_RADIUS_MM: f64 = 7.4;
+    pub const DIAL_DOT_MM: f64 = 0.45;
+    pub const DIAL_DOTS: usize = 7;
+    pub const DIAL_SWEEP_DEG: f64 = 270.0;
+    /// The centre dot on a bipolar control, drawn larger because "12 o'clock is
+    /// zero" is the one position a player needs to find without looking.
+    pub const DIAL_CENTRE_DOT_MM: f64 = 0.85;
+    /// Height of the minus/plus glyphs at a bipolar control's extremes.
+    pub const DIAL_SIGN_MM: f64 = 1.7;
+    /// Padding around a badged label, and its corner radius.
+    pub const BADGE_PAD_X_MM: f64 = 1.3;
+    pub const BADGE_PAD_Y_MM: f64 = 0.75;
+    pub const BADGE_RADIUS_MM: f64 = 0.6;
+}
+
+/// How far a control's label sits above its centre — further for a knob, whose
+/// dial art reaches past the body.
+fn label_offset(role: Option<CutoutRole>) -> f64 {
+    match role.is_some_and(CutoutRole::is_knob) {
+        true => silk::KNOB_LABEL_OFFSET_MM,
+        false => silk::LABEL_OFFSET_MM,
+    }
+}
+
+/// The dot positions for a knob's dial art, as `(dx, dy)` offsets from the shaft
+/// centre in **panel** coordinates (y up), plus whether each is the centre one.
+///
+/// Shared by both renderers so the SVG preview and the fabricated silkscreen
+/// cannot disagree about where the marks are.
+fn dial_dots() -> Vec<(f64, f64, bool)> {
+    let n = silk::DIAL_DOTS;
+    let mid = n / 2;
+    (0..n)
+        .map(|i| {
+            // 0 at full counter-clockwise, 1 at full clockwise.
+            let t = i as f64 / (n - 1) as f64;
+            let deg = -silk::DIAL_SWEEP_DEG / 2.0 + t * silk::DIAL_SWEEP_DEG;
+            let rad = deg.to_radians();
+            // Measured from straight up, turning clockwise.
+            (
+                silk::DIAL_RADIUS_MM * rad.sin(),
+                silk::DIAL_RADIUS_MM * rad.cos(),
+                n % 2 == 1 && i == mid,
+            )
+        })
+        .collect()
 }
 
 /// The cutout **geometry** for a cutout footprint/name — the render-time lookup,
@@ -209,6 +415,22 @@ pub trait PanelSpec {
     fn mounting_holes(&self) -> &[MountingHole];
     /// Anchored cutouts (jacks, pots, switches, LEDs, etc.).
     fn cutouts(&self) -> &[Cutout];
+    /// The height class. Renderers use it to place the title, which sits above
+    /// the controls on a 3U panel and below them on a tile — a 1U tile has no
+    /// clear band at the top, because the controls are already using it.
+    fn format(&self) -> PanelFormat {
+        PanelFormat::Eurorack3U
+    }
+    /// The cutout catalogue this panel's hardware resolves against, for
+    /// rendering (DXF/SVG/KiCad panel PCB) to turn a cutout's `footprint`
+    /// name into real hole geometry. Defaults to Eurorack's [`BuiltinCutouts`]
+    /// (3.5mm jacks, 9mm pot bushings); a non-Eurorack format overrides this
+    /// with its own hardware conventions — the exact "library-backed
+    /// `CutoutSource` swaps in with no change to panel/derivation code" seam
+    /// this trait's own docs describe.
+    fn cutout_source(&self) -> &dyn CutoutSource {
+        &BuiltinCutouts
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,12 +443,76 @@ const EURORACK_HOLE_DIAMETER_MM: f64 = 3.2;
 const EURORACK_HOLE_INSET_X_MM: f64 = 7.5;
 const EURORACK_HOLE_INSET_Y_MM: f64 = 3.0;
 
+/// Panel height class. Width is always HP; only the height and the row/column
+/// habit change.
+///
+/// The two 1U standards are **mutually incompatible** and both are in wide use:
+/// a case railed for one will not take the other. Pulp Logic could afford the
+/// taller tile because Vector rails have no lip; Intellijel's shorter tile fits
+/// the lipped rails a standard Eurorack case uses. So this is a property of the
+/// case the module is going into, and the spec has to name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelFormat {
+    /// Standard Eurorack 3U — 128.5 mm.
+    #[default]
+    Eurorack3U,
+    /// Intellijel 1U tile — 39.65 mm. Fits lipped rails.
+    Intellijel1U,
+    /// Pulp Logic 1U tile — 43.18 mm (1.700"). Needs lipless (Vector) rails.
+    PulpLogic1U,
+}
+
+impl PanelFormat {
+    pub fn height_mm(self) -> f64 {
+        match self {
+            PanelFormat::Eurorack3U => EURORACK_HEIGHT_MM,
+            PanelFormat::Intellijel1U => 39.65,
+            PanelFormat::PulpLogic1U => 43.18,
+        }
+    }
+
+    /// The `format` token in a panel TOML.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PanelFormat::Eurorack3U => "eurorack",
+            PanelFormat::Intellijel1U => "intellijel-1u",
+            PanelFormat::PulpLogic1U => "pulplogic-1u",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PanelFormat> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "eurorack" | "eurorack-3u" | "3u" => Some(PanelFormat::Eurorack3U),
+            "intellijel-1u" | "intellijel" | "1u" => Some(PanelFormat::Intellijel1U),
+            "pulplogic-1u" | "pulplogic" | "pulp-logic-1u" => Some(PanelFormat::PulpLogic1U),
+            _ => None,
+        }
+    }
+
+    /// A 1U tile: too short to stack controls, so they lay out in a row.
+    pub fn is_tile(self) -> bool {
+        !matches!(self, PanelFormat::Eurorack3U)
+    }
+
+    /// Vertical inset of the mounting holes from the top and bottom edges.
+    ///
+    /// UNVERIFIED for the 1U formats. Intellijel state only that "the 1U panel
+    /// size is based on the 3U size scaled down", and publish the hole spacing
+    /// as a diagram image rather than as figures, so this reuses the 3U inset.
+    /// The height is confirmed; this number is a derivation. Check it against
+    /// the vendor drawing before cutting metal — it is one constant to change.
+    fn hole_inset_y_mm(self) -> f64 {
+        EURORACK_HOLE_INSET_Y_MM
+    }
+}
+
 /// A Eurorack panel.
 ///
 /// Constructed in HP (horizontal pitch) internally, but exposes only mm
 /// through the [`PanelSpec`] trait.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EurorackPanel {
+    format: PanelFormat,
     hp: u16,
     thickness_mm: f64,
     extra_holes: Vec<MountingHole>,
@@ -239,7 +525,14 @@ impl EurorackPanel {
     /// Standard height (128.5 mm) and thickness (2.0 mm) are applied.
     /// Default mounting holes are added automatically based on HP width.
     pub fn new(hp: u16) -> Self {
+        Self::with_format(PanelFormat::Eurorack3U, hp)
+    }
+
+    /// A panel of the given height class and HP width. `1U` here means the
+    /// Intellijel tile unless the Pulp Logic variant is named explicitly.
+    pub fn with_format(format: PanelFormat, hp: u16) -> Self {
         let mut panel = EurorackPanel {
+            format,
             hp,
             thickness_mm: 2.0,
             extra_holes: Vec::new(),
@@ -264,30 +557,39 @@ impl EurorackPanel {
             footprint: footprint.into(),
             refdes: None,
             label: None,
+            role: None,
         });
         self
     }
 
     /// Add a cutout with explicit rotation, an optional anchored refdes, and an
     /// optional silkscreen/engraving label.
-    pub fn with_cutout_rotated(
-        mut self,
+    pub fn with_cutout_spec(mut self, cutout: Cutout) -> Self {
+        self.cutouts.push(cutout);
+        self
+    }
+
+    /// Add a cutout from its parts. Kept for the common case; anything carrying
+    /// a role or a label is clearer built as a [`Cutout`] and passed to
+    /// [`with_cutout_spec`](Self::with_cutout_spec).
+    pub fn with_cutout_labelled(
+        self,
         x_mm: f64,
         y_mm: f64,
-        rotation_deg: f64,
         footprint: impl Into<String>,
         refdes: Option<String>,
         label: Option<String>,
+        role: Option<CutoutRole>,
     ) -> Self {
-        self.cutouts.push(Cutout {
+        self.with_cutout_spec(Cutout {
             x_mm,
             y_mm,
-            rotation_deg,
+            rotation_deg: 0.0,
             footprint: footprint.into(),
             refdes,
             label,
-        });
-        self
+            role,
+        })
     }
 
     /// Width in mm (HP × 5.08).
@@ -300,30 +602,36 @@ impl EurorackPanel {
         self.hp
     }
 
+    /// The height class this panel is built to.
+    pub fn format(&self) -> PanelFormat {
+        self.format
+    }
+
     fn rebuild_default_holes(&mut self) {
         let w = self.width_mm_value();
-        let h = EURORACK_HEIGHT_MM;
+        let h = self.format.height_mm();
+        let inset_y = self.format.hole_inset_y_mm();
         // Left side holes (always present).
         self.extra_holes.push(MountingHole {
             x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: h - EURORACK_HOLE_INSET_Y_MM,
+            y_mm: h - inset_y,
             diameter_mm: EURORACK_HOLE_DIAMETER_MM,
         });
         self.extra_holes.push(MountingHole {
             x_mm: EURORACK_HOLE_INSET_X_MM,
-            y_mm: EURORACK_HOLE_INSET_Y_MM,
+            y_mm: inset_y,
             diameter_mm: EURORACK_HOLE_DIAMETER_MM,
         });
         // Right side holes for panels ≥ 8 HP.
         if self.hp >= 8 {
             self.extra_holes.push(MountingHole {
                 x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: h - EURORACK_HOLE_INSET_Y_MM,
+                y_mm: h - inset_y,
                 diameter_mm: EURORACK_HOLE_DIAMETER_MM,
             });
             self.extra_holes.push(MountingHole {
                 x_mm: w - EURORACK_HOLE_INSET_X_MM,
-                y_mm: EURORACK_HOLE_INSET_Y_MM,
+                y_mm: inset_y,
                 diameter_mm: EURORACK_HOLE_DIAMETER_MM,
             });
         }
@@ -331,12 +639,16 @@ impl EurorackPanel {
 }
 
 impl PanelSpec for EurorackPanel {
+    fn format(&self) -> PanelFormat {
+        self.format
+    }
+
     fn width_mm(&self) -> f64 {
         self.width_mm_value()
     }
 
     fn height_mm(&self) -> f64 {
-        EURORACK_HEIGHT_MM
+        self.format.height_mm()
     }
 
     fn thickness_mm(&self) -> f64 {
@@ -376,6 +688,11 @@ pub struct PanelFile {
     pub hp: Option<u16>,
     #[serde(default = "default_thickness")]
     pub thickness_mm: f64,
+    /// Panel finish — a named material (`black`/`silver`/`white`/`green`) or a
+    /// `#rrggbb` face color. Drives the 2D panel render's color (DESIGN §7.9).
+    /// Absent → black.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
     #[serde(default)]
     pub cutouts: Vec<CutoutFile>,
 }
@@ -397,6 +714,28 @@ pub struct CutoutFile {
     /// Silkscreen/engraving label for this control (e.g. `"IN"`, `"RATE"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `io` | `cv` | `knob` | `attenuverter` — drives the label badge and the
+    /// dial art. Absent renders plain, so older specs are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// Parse a Guitar Pedal fuzz-panel format token (`"pedal-1590b"` /
+/// `"pedal-1590bb"` / `"pedal-125b"`) into its enclosure size. `None` for
+/// anything else, so [`PanelFile::to_spec`] falls through to
+/// [`PanelFormat::parse`] for every existing (Eurorack) format string.
+fn pedal_fuzz_enclosure_size(format: &str) -> Option<crate::spec::EnclosureSize> {
+    match format
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .as_str()
+    {
+        "pedal-1590b" => Some(crate::spec::EnclosureSize::Size1590B),
+        "pedal-1590bb" => Some(crate::spec::EnclosureSize::Size1590BB),
+        "pedal-125b" => Some(crate::spec::EnclosureSize::Size125B),
+        _ => None,
+    }
 }
 
 impl PanelFile {
@@ -409,23 +748,57 @@ impl PanelFile {
     ///
     /// Returns `Err` if the format is unknown or required fields are missing.
     pub fn to_spec(&self) -> Result<Box<dyn PanelSpec>, String> {
-        match self.format.as_str() {
-            "eurorack" => {
-                let hp = self.hp.ok_or("eurorack panel requires `hp`")?;
-                let mut panel = EurorackPanel::new(hp).with_thickness(self.thickness_mm);
+        // Guitar Pedal formats are checked first: they're not PanelFormat
+        // variants (that enum is Eurorack height-class semantics, HP/tile,
+        // which don't apply here), so they'd never match PanelFormat::parse.
+        // legion-of-bom-utn.3's one concrete case: the fuzz-pedal spec's
+        // RV1 (Fuzz)/RV2 (Volume) pots, laid out by PedalPanel::fuzz_pedal.
+        // A TOML-driven, arbitrary-pedal-circuit layout (mirroring how
+        // Eurorack cutouts come from this file's own `cutouts` list) is a
+        // reasonable next generalization once a second pedal circuit exists
+        // to prove the shape against — not guessed at here.
+        if let Some(size) = pedal_fuzz_enclosure_size(&self.format) {
+            // Cutouts come from this file's own `cutouts` list, same as
+            // Eurorack below — `pedal_panel::fuzz_pedal_panel_file` is what
+            // generates that list in the first place (mirroring how a
+            // Eurorack panel is hand-authored or auto-derived TOML, not
+            // reconstructed from the format string every time).
+            let mut panel =
+                crate::pedal_panel::PedalPanel::empty(size).with_thickness(self.thickness_mm);
+            for c in &self.cutouts {
+                panel = panel.with_cutout_spec(Cutout {
+                    x_mm: c.x_mm,
+                    y_mm: c.y_mm,
+                    rotation_deg: c.rotation_deg,
+                    footprint: c.footprint.clone(),
+                    refdes: c.refdes.clone(),
+                    label: c.label.clone(),
+                    role: c.role.as_deref().and_then(CutoutRole::parse),
+                });
+            }
+            return Ok(Box::new(panel));
+        }
+        match PanelFormat::parse(&self.format) {
+            Some(format) => {
+                let hp = self
+                    .hp
+                    .ok_or_else(|| format!("{} panel requires `hp`", format.as_str()))?;
+                let mut panel =
+                    EurorackPanel::with_format(format, hp).with_thickness(self.thickness_mm);
                 for c in &self.cutouts {
-                    panel = panel.with_cutout_rotated(
-                        c.x_mm,
-                        c.y_mm,
-                        c.rotation_deg,
-                        c.footprint.clone(),
-                        c.refdes.clone(),
-                        c.label.clone(),
-                    );
+                    panel = panel.with_cutout_spec(Cutout {
+                        x_mm: c.x_mm,
+                        y_mm: c.y_mm,
+                        rotation_deg: c.rotation_deg,
+                        footprint: c.footprint.clone(),
+                        refdes: c.refdes.clone(),
+                        label: c.label.clone(),
+                        role: c.role.as_deref().and_then(CutoutRole::parse),
+                    });
                 }
                 Ok(Box::new(panel))
             }
-            other => Err(format!("unsupported panel format: {other}")),
+            None => Err(format!("unsupported panel format: {}", self.format)),
         }
     }
 
@@ -433,6 +806,111 @@ impl PanelFile {
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    /// The resolved visual finish (defaults to black).
+    pub fn resolved_finish(&self) -> PanelFinish {
+        self.finish
+            .as_deref()
+            .map(PanelFinish::named)
+            .unwrap_or_default()
+    }
+}
+
+/// The named finishes the panel editor offers as swatches; each resolves via
+/// [`PanelFinish::named`]. A `#rrggbb` custom color is also accepted.
+pub const NAMED_FINISHES: &[&str] = &["black", "silver", "white", "green", "blue", "red"];
+
+/// A panel's visual finish: the face color plus the color of its engraved /
+/// printed legends (labels, title, logo). A panel is a flat front face in a real
+/// material — not a green PCB — so it renders in this color (DESIGN §7.9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelFinish {
+    /// A human name for the finish (for UIs).
+    pub name: String,
+    /// Panel face color (CSS hex).
+    pub face: String,
+    /// Legend / logo color (CSS hex).
+    pub legend: String,
+}
+
+impl PanelFinish {
+    /// Whether `spec` is a *recognized* finish token — a known material name or a
+    /// valid `#rgb`/`#rrggbb` color. Unknown names render as black; the editor
+    /// rejects them via this check so a typo isn't silently swallowed.
+    pub fn is_recognized(spec: &str) -> bool {
+        let s = spec.trim().to_ascii_lowercase();
+        normalize_hex(spec.trim()).is_some()
+            || NAMED_FINISHES.contains(&s.as_str())
+            || matches!(s.as_str(), "aluminum" | "aluminium" | "raw" | "pcb")
+    }
+
+    /// Resolve a finish from a named material (`black`/`silver`/`white`/`green`/
+    /// `blue`/`red`) or a `#rgb`/`#rrggbb` face color (legend auto-picked for
+    /// contrast). Anything unknown falls back to black.
+    pub fn named(spec: &str) -> PanelFinish {
+        let s = spec.trim();
+        if let Some(face) = normalize_hex(s) {
+            let legend = if relative_luminance(&face) > 0.5 {
+                "#1b1c1e"
+            } else {
+                "#f2f2ef"
+            };
+            return PanelFinish {
+                name: spec.to_string(),
+                face,
+                legend: legend.to_string(),
+            };
+        }
+        let (face, legend) = match s.to_ascii_lowercase().as_str() {
+            "silver" | "aluminum" | "aluminium" | "raw" => ("#c9ccce", "#1b1c1e"),
+            "white" => ("#f4f4f0", "#1b1c1e"),
+            "green" | "pcb" => ("#0f5c3f", "#f2f2ef"),
+            "blue" => ("#1c3f8f", "#f2f2ef"),
+            "red" => ("#8f1c22", "#f2f2ef"),
+            _ => ("#1c1d1f", "#f2f2ef"), // black — the default
+        };
+        PanelFinish {
+            name: s.to_ascii_lowercase(),
+            face: face.to_string(),
+            legend: legend.to_string(),
+        }
+    }
+}
+
+impl Default for PanelFinish {
+    fn default() -> Self {
+        PanelFinish::named("black")
+    }
+}
+
+/// Normalize `#rgb` / `#rrggbb` to lowercase `#rrggbb`; `None` if not a hex color.
+fn normalize_hex(s: &str) -> Option<String> {
+    let h = s.strip_prefix('#')?;
+    if !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match h.len() {
+        6 => Some(format!("#{}", h.to_ascii_lowercase())),
+        3 => {
+            let mut out = String::from("#");
+            for c in h.chars() {
+                out.push(c.to_ascii_lowercase());
+                out.push(c.to_ascii_lowercase());
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Rough relative luminance (0..1) of a `#rrggbb` color, for legend contrast.
+fn relative_luminance(hex: &str) -> f64 {
+    let h = hex.trim_start_matches('#');
+    if h.len() != 6 {
+        return 0.0;
+    }
+    let ch = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0) as f64 / 255.0;
+    0.2126 * ch(0) + 0.7152 * ch(2) + 0.0722 * ch(4)
 }
 
 /// House rules for the derived layout (DESIGN §7.9), designed once. The pitches
@@ -441,15 +919,48 @@ impl PanelFile {
 /// even-spacing hit (a jack body is ~13 mm, so 12.8 mm spacing overlapped).
 mod derive_rules {
     /// Minimum control pitch (mm) — realistic Eurorack spacings.
-    pub const JACK_PITCH_MM: f64 = 16.0;
+    ///
+    /// Jacks at 14mm is deliberately dense — plenty of shipping modules run
+    /// 12-13mm and Doepfer sits near 15. Pots stay at 20: a knob needs finger
+    /// room to *turn*, which is a different constraint from a plug needing room
+    /// to grip, and it is the one you feel while playing.
+    ///
+    /// Note this is a *floor*, and for a Thonkiconn it does not bind: pitch is
+    /// `max(body + GAP, class)` and the body is 14.4mm, so the jack sits at
+    /// 16.4mm regardless. Reaching 14mm needs the jack rotated 90 degrees, which
+    /// makes its body 10mm tall — and that needs cutout rotation threaded
+    /// through to the board placer's anchors, which today carry position only.
+    pub const JACK_PITCH_MM: f64 = 14.0;
     pub const POT_PITCH_MM: f64 = 20.0;
     pub const SWITCH_PITCH_MM: f64 = 14.0;
     pub const LED_PITCH_MM: f64 = 9.0;
     /// Clear zones: below the top-edge title, above the bottom logo + holes.
     pub const TOP_MARGIN_MM: f64 = 14.0;
     pub const BOTTOM_MARGIN_MM: f64 = 16.0;
+    /// …and the same on a panel too narrow to spend them.
+    ///
+    /// 30mm of the 128.5 goes to these two bands. That is right on a wide panel,
+    /// where the logo has real presence; on 4 HP the logo band is a sliver
+    /// (LOGO_WIDTH_FRAC of 20mm) and is not worth four controls' worth of
+    /// column. The title is the same height either way, so the top band only
+    /// gives back what the title does not use.
+    pub const NARROW_HP: u16 = 5;
+    pub const NARROW_TOP_MARGIN_MM: f64 = 11.0;
+    pub const NARROW_BOTTOM_MARGIN_MM: f64 = 12.0;
+
+    /// The clear zones for a panel of this width.
+    pub fn margins_mm(hp: u16) -> (f64, f64) {
+        match hp <= NARROW_HP {
+            true => (NARROW_TOP_MARGIN_MM, NARROW_BOTTOM_MARGIN_MM),
+            false => (TOP_MARGIN_MM, BOTTOM_MARGIN_MM),
+        }
+    }
     /// Default Eurorack panel-PCB thickness (mm).
     pub const THICKNESS_MM: f64 = 1.6;
+    /// Where a 1U tile's control row sits, as a fraction of panel height.
+    /// Above centre: each control labels upward, and the module name takes the
+    /// band left along the bottom.
+    pub const TILE_ROW_FRAC: f64 = 0.56;
 }
 
 /// Minimum centre-to-centre pitch for a control kind.
@@ -468,14 +979,18 @@ fn control_pitch(kind: ControlKind) -> f64 {
 /// convention) — and label each from the signal net it carries. Board-only parts
 /// (passives, ICs, power headers) are skipped. Override any position by hand
 /// afterwards; this is a starting point, not a straitjacket.
-pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
-    // Split panel-facing parts into controls (top band) and jacks (bottom band).
-    let mut controls: Vec<(String, ControlKind)> = Vec::new();
-    let mut jacks: Vec<(String, ControlKind)> = Vec::new();
+/// The panel-facing controls of a circuit, in layout order (knobs/switches first,
+/// jacks last), each with the mechanical envelope it needs.
+fn panel_controls(
+    circuit: &dyn CircuitSource,
+    cutouts: &dyn CutoutSource,
+) -> Vec<(String, ControlKind, (f64, f64))> {
+    let mut controls = Vec::new();
+    let mut jacks = Vec::new();
     for part in circuit.parts() {
         let fp = part.footprint.as_deref().unwrap_or("");
         if let Some(spec) = cutouts.cutout(part.mpn.as_deref(), fp) {
-            let entry = (part.refdes.0.clone(), spec.kind);
+            let entry = (part.refdes.0.clone(), spec.kind, spec.envelope_mm);
             if spec.kind.is_jack() {
                 jacks.push(entry);
             } else {
@@ -485,41 +1000,397 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
     }
     controls.sort_by(|a, b| a.0.cmp(&b.0));
     jacks.sort_by(|a, b| a.0.cmp(&b.0));
+    // CV jacks sit above the audio I/O. A player reads a panel top-down looking
+    // for where the signal goes, and the signal path wants to be the last thing
+    // on the way to the bottom edge — modulation lives with the knobs it feeds.
+    let (cv, io): (Vec<_>, Vec<_>) = jacks
+        .into_iter()
+        .partition(|(r, _, _)| carries_cv(circuit, r));
+    controls.into_iter().chain(cv).chain(io).collect()
+}
+
+/// Whether a part sits on a control-voltage net rather than the audio path.
+///
+/// Read from net names, which is where the circuit author states intent: a jack
+/// on `CV_IN` is modulation, one on `SIG_IN`/`SIG_OUT` is the signal path.
+fn carries_cv(circuit: &dyn CircuitSource, refdes: &str) -> bool {
+    circuit
+        .nets()
+        .iter()
+        .filter(|n| n.pins.iter().any(|p| p.refdes.0 == refdes))
+        .any(|n| {
+            let u = n.name.to_ascii_uppercase();
+            !is_power_net(&u) && (u.contains("CV") || u.contains("GATE") || u.contains("TRIG"))
+        })
+}
+
+/// What a control is, for panel styling — from topology, never from the label.
+///
+/// A knob is bipolar when **both** ends of its track sit on live nets: that is
+/// what makes its centre a true zero. A knob with an end on ground is a plain
+/// attenuator or a bias control, whose centre is 50% of something and must not
+/// be marked as silence.
+fn cutout_role(circuit: &dyn CircuitSource, refdes: &str, kind: ControlKind) -> CutoutRole {
+    if kind.is_jack() {
+        return if carries_cv(circuit, refdes) {
+            CutoutRole::Cv
+        } else {
+            CutoutRole::Io
+        };
+    }
+    if matches!(kind, ControlKind::Switch) {
+        return CutoutRole::Switch;
+    }
+    if !matches!(kind, ControlKind::Pot) {
+        return CutoutRole::Knob;
+    }
+    // Pins 1 and 3 are the track ends; 2 is the wiper. Bipolar iff neither end
+    // is tied to ground.
+    let end_net = |pin: &str| -> Option<String> {
+        circuit
+            .nets()
+            .iter()
+            .find(|n| n.pins.iter().any(|p| p.refdes.0 == refdes && p.pin == pin))
+            .map(|n| n.name.to_ascii_uppercase())
+    };
+    // Both ends must sit on *signal* nets. A pot strung across the supply rails
+    // is a bias control — RATE on the slew limiter runs +12V to -12V — and its
+    // centre is not silence, so it must not get the detent mark. Only a track
+    // whose two ends are live signals has a true zero in the middle.
+    let signal_end = |pin: &str| -> bool { end_net(pin).is_some_and(|u| !is_power_net(&u)) };
+    if signal_end("1") && signal_end("3") {
+        CutoutRole::Attenuverter
+    } else {
+        CutoutRole::Knob
+    }
+}
+
+/// The narrowest panel (HP) whose **hardware actually fits** — the widest control
+/// envelope plus edge material on both sides (DESIGN §6.1).
+///
+/// This is the panel-side constraint, independent of whether the PCB's parts and
+/// traces fit (see `board::minimum_hp`); a buildable module needs both. Without
+/// it a derivation happily emits, say, a 3 HP panel (15.24 mm) carrying a 13.75 mm
+/// pot body, which cannot be built.
+pub fn min_panel_hp(circuit: &dyn CircuitSource, cutouts: &dyn CutoutSource) -> u16 {
+    min_panel_hp_for(circuit, PanelFormat::Eurorack3U, cutouts)
+}
+
+/// [`min_panel_hp`] for a given height class.
+///
+/// The constraint flips with the format. A 3U panel stacks its controls, so the
+/// width only has to clear the *widest* one. A 1U tile is 39.65 mm tall — there
+/// is no room to stack — so its controls sit in a row and the width has to hold
+/// the **sum** of them. A tile is therefore far wider than a 3U panel carrying
+/// the same hardware, and sizing it by the widest control would emit a spec that
+/// cannot be built.
+pub fn min_panel_hp_for(
+    circuit: &dyn CircuitSource,
+    format: PanelFormat,
+    cutouts: &dyn CutoutSource,
+) -> u16 {
+    let controls = panel_controls(circuit, cutouts);
+    let needed = if format.is_tile() {
+        let row: f64 = controls
+            .iter()
+            .map(|(_, k, env)| (env.0 + envelope::GAP_MM).max(control_pitch(*k)))
+            .sum();
+        if row <= 0.0 {
+            return 1;
+        }
+        row + 2.0 * envelope::EDGE_MM
+    } else {
+        let widest = controls
+            .iter()
+            .map(|(_, _, env)| env.0)
+            .fold(0.0f64, f64::max);
+        if widest <= 0.0 {
+            return 1;
+        }
+        // WIDTH ALONE IS NOT THE ANSWER. A 3U panel is a column, and a column
+        // taller than the panel does not overflow visibly — `derive_panel_for`
+        // clamps it, so every control past the end lands on the SAME point and
+        // the surplus jacks silently vanish into one hole (measured: 8
+        // Thonkiconns at 4 HP put J7 and J8 both at (10.160, 12.000), and this
+        // function returned 3). Two identical cutouts then reach the DXF and the
+        // panel PCB's Edge.Cuts as duplicate loops.
+        //
+        // So size for the COLUMNS the stack actually needs. This is the exact
+        // inverse of `derive_panel_for`'s `fits_wide`, which is what makes the
+        // two agree: it can always fit the columns this asks for.
+        let stack: f64 = controls
+            .iter()
+            .map(|(_, k, env)| (env.1 + envelope::GAP_MM).max(control_pitch(*k)))
+            .sum();
+        let width_for = |cols: f64| {
+            (cols * (widest + envelope::GAP_MM) - envelope::GAP_MM + 2.0 * envelope::EDGE_MM)
+                .max(widest + 2.0 * envelope::EDGE_MM)
+        };
+        // The usable height depends on the margins, which depend on HP, which is
+        // what we are solving for. There are only two margin buckets (narrow and
+        // wide), and each pass can only widen, so this settles immediately —
+        // bounded anyway rather than trusting that argument.
+        let mut hp = (width_for(1.0) / HP_MM).ceil().max(1.0) as u16;
+        for _ in 0..4 {
+            let (top, bot) = derive_rules::margins_mm(hp);
+            let avail = (format.height_mm() - top - bot).max(1.0);
+            let cols = (stack / avail).ceil().max(1.0);
+            let next = (width_for(cols) / HP_MM).ceil().max(1.0) as u16;
+            if next <= hp {
+                break;
+            }
+            hp = next;
+        }
+        return hp;
+    };
+    (needed / HP_MM).ceil().max(1.0) as u16
+}
+
+/// Derive a panel from a **built board**: one cutout per panel-mounted part, at
+/// the position that part actually occupies.
+///
+/// This is the direction that holds once a board exists. [`derive_panel`] lays
+/// controls out in an idealised centred column and knows nothing about the PCB,
+/// which is only ever right because the board was then placed *from* that panel
+/// — the panel was master and the board followed. The moment a board is imported,
+/// hand-placed or simply re-laid-out, that idealised panel is fiction and will
+/// not fit the hardware soldered to the board.
+///
+/// The mapping is the exact inverse of the one the placer uses: a panel's
+/// cutouts are measured from its bottom-left, a KiCad board from its top-left, so
+/// `panel_y = height − (board_y − top)`. Working from the board's own
+/// `Edge.Cuts` rather than the KiCad sheet origin means this also works for a
+/// board that was never generated here.
+///
+/// Parts with no cutout in `cutouts` are skipped — a panel hole invented for a
+/// part we can't classify is a hole in the wrong place.
+pub fn panel_from_board(
+    board_pcb: &str,
+    circuit: &dyn CircuitSource,
+    cutouts: &dyn CutoutSource,
+) -> Result<PanelFile, String> {
+    let placed = crate::guide::parse_board(board_pcb)?;
+    let (x0, y0, x1, y1) =
+        crate::guide::board_outline(board_pcb).ok_or("board has no Edge.Cuts outline")?;
+    let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
+    if w <= 0.0 || h <= 0.0 {
+        return Err("board outline has no area".into());
+    }
+    // Look each part's footprint up through the circuit, which is where the MPN
+    // lives; the board only carries the footprint id.
+    let mpn_of = |refdes: &str| {
+        circuit
+            .parts()
+            .iter()
+            .find(|p| p.refdes.0 == refdes)
+            .and_then(|p| p.mpn.clone())
+    };
+
+    let mut out: Vec<CutoutFile> = Vec::new();
+    for p in placed.iter().filter(|p| crate::guide::is_panel_mounted(p)) {
+        let Some(spec) = cutouts.cutout(mpn_of(&p.refdes).as_deref(), &p.footprint) else {
+            continue;
+        };
+        // The cutout goes where the *hardware* is, not where the footprint's
+        // origin is. An Alpha pot's origin is pin 1 and its shaft sits several
+        // millimetres away, so mapping the origin drills the hole off the shaft
+        // — and the reverse trip (cutout -> placement) already subtracts that
+        // offset, so origin-mapping made the two directions disagree and a part
+        // drift by one offset per round trip (`legion-of-bom-za4`).
+        let (hx, hy) = ((p.bbox.0 + p.bbox.2) / 2.0, (p.bbox.1 + p.bbox.3) / 2.0);
+        out.push(CutoutFile {
+            x_mm: hx - x0,
+            y_mm: h - (hy - y0),
+            rotation_deg: 0.0,
+            footprint: spec.kind.cutout_name().to_string(),
+            refdes: Some(p.refdes.clone()),
+            label: control_label(circuit, &p.refdes),
+            role: Some(
+                cutout_role(circuit, &p.refdes, spec.kind)
+                    .as_str()
+                    .to_string(),
+            ),
+        });
+    }
+    out.sort_by(|a, b| a.refdes.cmp(&b.refdes));
+
+    Ok(PanelFile {
+        format: "eurorack".into(),
+        // The board width decides the panel width, not the other way round.
+        hp: Some(((w / HP_MM).round() as u16).max(1)),
+        thickness_mm: derive_rules::THICKNESS_MM,
+        finish: None,
+        cutouts: out,
+    })
+}
+
+pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSource) -> PanelFile {
+    derive_panel_for(circuit, PanelFormat::Eurorack3U, hp, cutouts)
+}
+
+/// [`derive_panel`] for a given height class.
+///
+/// A 3U panel stacks controls in a centred column; a 1U tile lays them in a
+/// centred row, because 39.65 mm of height has nowhere to stack. The row sits a
+/// little above centre so each control's label clears it and the module name
+/// still has a band along the bottom.
+pub fn derive_panel_for(
+    circuit: &dyn CircuitSource,
+    format: PanelFormat,
+    hp: u16,
+    cutouts: &dyn CutoutSource,
+) -> PanelFile {
+    let ordered = panel_controls(circuit, cutouts);
+
+    // Never emit a panel too narrow for its own hardware — a derived spec that
+    // can't be built is worse than a wider one.
+    let hp = hp.max(min_panel_hp_for(circuit, format, cutouts));
 
     let w = f64::from(hp) * HP_MM;
     let cx = w / 2.0;
-    let h = EURORACK_HEIGHT_MM;
+    let h = format.height_mm();
 
-    // Stack controls top→bottom (knobs above jacks), each spaced by its real body
-    // pitch, and centre the whole stack in the clear zone between the title and
-    // the bottom logo/holes.
-    let ordered: Vec<(String, ControlKind)> = controls.into_iter().chain(jacks).collect();
-    let pitches: Vec<f64> = ordered.iter().map(|(_, k)| control_pitch(*k)).collect();
-    let total: f64 = pitches.iter().sum();
-    let avail_top = h - derive_rules::TOP_MARGIN_MM;
-    let avail_bot = derive_rules::BOTTOM_MARGIN_MM;
-    let avail = avail_top - avail_bot;
-    // Centre the stack; if it overflows the panel height it still lays out (tightly
-    // packed) — a signal the module has more controls than the height comfortably
-    // holds, which the caller can act on (wider HP won't help; height is fixed).
-    let mut y = avail_top - (avail - total).max(0.0) / 2.0;
-    let mut out: Vec<CutoutFile> = Vec::new();
-    for ((refdes, kind), pitch) in ordered.iter().zip(&pitches) {
-        out.push(CutoutFile {
-            x_mm: cx,
-            y_mm: y - pitch / 2.0,
-            rotation_deg: 0.0,
-            footprint: kind.cutout_name().to_string(),
-            refdes: Some(refdes.clone()),
-            label: control_label(circuit, refdes),
-        });
-        y -= pitch;
+    if format.is_tile() {
+        // One row, left to right, in the same order the column would have used:
+        // knobs first, then CV, then audio I/O — so a tile reads like the top of
+        // a 3U panel rather than in refdes order.
+        let pitches: Vec<f64> = ordered
+            .iter()
+            .map(|(_, k, env)| (env.0 + envelope::GAP_MM).max(control_pitch(*k)))
+            .collect();
+        let total: f64 = pitches.iter().sum();
+        let mut x = ((w - total) / 2.0).max(envelope::EDGE_MM);
+        // Above centre: labels go above each control, the name band goes below.
+        let row_y = h * derive_rules::TILE_ROW_FRAC;
+        let mut out: Vec<CutoutFile> = Vec::new();
+        for ((refdes, kind, _), pitch) in ordered.iter().zip(&pitches) {
+            out.push(CutoutFile {
+                x_mm: x + pitch / 2.0,
+                y_mm: row_y,
+                rotation_deg: 0.0,
+                footprint: kind.cutout_name().to_string(),
+                refdes: Some(refdes.clone()),
+                label: control_label(circuit, refdes),
+                role: Some(cutout_role(circuit, refdes, *kind).as_str().to_string()),
+            });
+            x += pitch;
+        }
+        return PanelFile {
+            format: format.as_str().into(),
+            hp: Some(hp),
+            thickness_mm: derive_rules::THICKNESS_MM,
+            finish: None,
+            cutouts: out,
+        };
     }
 
+    // Stack controls top→bottom (knobs above jacks), spaced by the real envelope
+    // each one needs plus a gap — never closer than the class minimum — and centre
+    // the stack in the clear zone between the title and the bottom logo/holes.
+    let pitches: Vec<f64> = ordered
+        .iter()
+        .map(|(_, k, env)| (env.1 + envelope::GAP_MM).max(control_pitch(*k)))
+        .collect();
+    let (top_margin, avail_bot) = derive_rules::margins_mm(hp);
+    let avail_top = h - top_margin;
+    let avail = avail_top - avail_bot;
+
+    // How many columns the width can hold, and how many the height demands.
+    //
+    // A single centred column was fine for a three-control module and fell apart
+    // past that: an eight-control board asked for 42 HP and put a jack at
+    // y = -12mm, off the panel entirely (`legion-of-bom-lau`). Height is fixed
+    // at 3U, so the only way to carry more controls is sideways.
+    let widest = ordered
+        .iter()
+        .map(|(_, _, env)| env.0)
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+    let fits_wide = (((w - 2.0 * envelope::EDGE_MM) + envelope::GAP_MM)
+        / (widest + envelope::GAP_MM))
+        .floor()
+        .max(1.0) as usize;
+    let total: f64 = pitches.iter().sum();
+    let needed = (total / avail.max(1.0)).ceil().max(1.0) as usize;
+    let cols = needed.min(fits_wide).max(1);
+
+    // Split into columns by *height*, not by count: a column of three pots is
+    // taller than a column of three jacks, and balancing the counts would leave
+    // one column overflowing while another had room.
+    let target = total / cols as f64;
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); cols];
+    let (mut g, mut run) = (0usize, 0.0f64);
+    for (i, pitch) in pitches.iter().enumerate() {
+        let remaining_cols = cols - g;
+        let remaining_items = pitches.len() - i;
+        // Leave at least one control for each remaining column.
+        if g + 1 < cols && run + pitch / 2.0 > target && remaining_items > remaining_cols {
+            g += 1;
+            run = 0.0;
+        }
+        groups[g].push(i);
+        run += pitch;
+    }
+
+    let mut out: Vec<CutoutFile> = Vec::new();
+    let col_w = (w - 2.0 * envelope::EDGE_MM) / cols as f64;
+    for (ci, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let col_x = envelope::EDGE_MM + col_w * (ci as f64 + 0.5);
+        let col_total: f64 = group.iter().map(|&i| pitches[i]).sum();
+        let mut y = avail_top - (avail - col_total).max(0.0) / 2.0;
+        for &i in group {
+            let (refdes, kind, _) = &ordered[i];
+            // Clamp inside the panel. A derived spec that puts hardware off the
+            // edge is not a spec, and it used to happen silently.
+            // The clamp is a floor, not a layout strategy. It is what silently
+            // stacked controls on one point when `min_panel_hp_for` sized by
+            // width alone: everything past the end of the column pinned to
+            // `avail_bot`. Sizing now accounts for the stack, so reaching this
+            // clamp at all means the two disagree again — see the debug_assert
+            // at the end of this branch.
+            let cy = (y - pitches[i] / 2.0).clamp(avail_bot, avail_top);
+            out.push(CutoutFile {
+                x_mm: col_x,
+                y_mm: cy,
+                rotation_deg: 0.0,
+                footprint: kind.cutout_name().to_string(),
+                refdes: Some(refdes.clone()),
+                label: control_label(circuit, refdes),
+                role: Some(cutout_role(circuit, refdes, *kind).as_str().to_string()),
+            });
+            y -= pitches[i];
+        }
+    }
+    let _ = cx;
+
+    // Two controls at one point is an unbuildable panel, and it reaches the DXF
+    // and the panel PCB's Edge.Cuts as duplicate loops rather than as an error.
+    // Sizing above is meant to make it impossible; this is how we find out if it
+    // stops being. Debug-only — a release build should not abort a derive.
+    debug_assert!(
+        {
+            let mut ok = true;
+            for (i, a) in out.iter().enumerate() {
+                for b in &out[i + 1..] {
+                    if (a.x_mm - b.x_mm).abs() < 0.01 && (a.y_mm - b.y_mm).abs() < 0.01 {
+                        ok = false;
+                    }
+                }
+            }
+            ok
+        },
+        "derived panel puts two controls in one hole — min_panel_hp_for and \
+         derive_panel_for disagree about how tall a column fits"
+    );
+
     PanelFile {
-        format: "eurorack".into(),
+        format: format.as_str().into(),
         hp: Some(hp),
         thickness_mm: derive_rules::THICKNESS_MM,
+        finish: None,
         cutouts: out,
     }
 }
@@ -527,6 +1398,21 @@ pub fn derive_panel(circuit: &dyn CircuitSource, hp: u16, cutouts: &dyn CutoutSo
 /// A short panel label for a control, from the most signal-like net it touches
 /// (excluding power/ground). `SIG_IN` → "IN", `RATE_CV` → "RATE".
 fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
+    // A switch names itself. Its nets are wiring detail — which cap a throw
+    // selects — and say nothing a player needs, so a net-derived label reads as
+    // noise ("N$2", "RANGE GLIDE"). By convention a switch's *value* field
+    // carries its function: RANGE, MODE, SHAPE. Prefer that.
+    if let Some(part) = circuit.parts().iter().find(|p| p.refdes.0 == refdes) {
+        let is_switch = part
+            .footprint
+            .as_deref()
+            .is_some_and(|f| f.to_ascii_lowercase().contains("sw"))
+            || part.refdes.0.starts_with("SW");
+        let v = part.value.trim();
+        if is_switch && !v.is_empty() && v.chars().any(|c| c.is_ascii_alphabetic()) {
+            return Some(v.to_uppercase());
+        }
+    }
     let mut sig: Vec<&str> = circuit
         .nets()
         .iter()
@@ -540,11 +1426,7 @@ fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
 
 /// Whether a net is a power rail / ground (so it isn't used as a control label).
 fn is_power_net(name: &str) -> bool {
-    let u = name.to_ascii_uppercase();
-    u == "GND"
-        || u.ends_with("GND")
-        || matches!(u.as_str(), "VCC" | "VEE" | "VDD" | "VSS")
-        || ((u.starts_with('+') || u.starts_with('-')) && u.contains('V'))
+    crate::model::is_ground_net(name) || crate::model::is_supply_rail(name)
 }
 
 /// Shorten a net name into a control label: drop a `SIG_` prefix / `_CV` suffix,
@@ -633,7 +1515,11 @@ pub fn write_dxf<W: std::fmt::Write>(w: &mut W, panel: &dyn PanelSpec) -> std::f
 
     // Cutouts.
     for cutout in panel.cutouts() {
-        match footprint_shape(&cutout.footprint) {
+        match panel
+            .cutout_source()
+            .cutout(None, &cutout.footprint)
+            .map(|s| s.shape)
+        {
             Some(CutoutShape::Circle { diameter_mm }) => {
                 write_circle(w, cutout.x_mm, cutout.y_mm, diameter_mm / 2.0)?;
             }
@@ -683,6 +1569,251 @@ pub fn panel_to_dxf(panel: &dyn PanelSpec) -> String {
 ///
 /// Panel coordinates are measured from the bottom-left; KiCad's are top-down, so
 /// Y is flipped here.
+/// Render the panel as a flat 2D SVG in its real finish color — the front face a
+/// builder sees, not a green PCB. Cutouts are drawn as holes; labels, title, and
+/// the brand logo go in the legend color, placed by the same house rules as the
+/// KiCad panel. No external tools, so it's cheap to generate per request.
+pub fn panel_to_svg(
+    panel: &dyn PanelSpec,
+    title: &str,
+    finish: &PanelFinish,
+    logo: Option<&Logo>,
+) -> String {
+    let w = panel.width_mm();
+    let h = panel.height_mm();
+    let pad = 3.0;
+    // Panel y is measured up from the bottom; SVG y runs down from the top.
+    let sy = |y: f64| h - y;
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{:.2} {:.2} {:.2} {:.2}\" \
+         width=\"{:.0}\" height=\"{:.0}\" role=\"img\" aria-label=\"{} panel\">",
+        -pad,
+        -pad,
+        w + 2.0 * pad,
+        h + 2.0 * pad,
+        (w + 2.0 * pad) * 4.0,
+        (h + 2.0 * pad) * 4.0,
+        xml_escape(title),
+    ));
+    // Panel face.
+    s.push_str(&format!(
+        "<rect x=\"0\" y=\"0\" width=\"{:.2}\" height=\"{:.2}\" rx=\"1.2\" fill=\"{}\" \
+         stroke=\"rgba(0,0,0,0.28)\" stroke-width=\"0.2\"/>",
+        w, h, finish.face
+    ));
+    // Mounting holes.
+    for mh in panel.mounting_holes() {
+        s.push_str(&svg_hole_circle(mh.x_mm, sy(mh.y_mm), mh.diameter_mm / 2.0));
+    }
+    // Control cutouts + their labels.
+    for c in panel.cutouts() {
+        let (cx, cy) = (c.x_mm, sy(c.y_mm));
+        match panel
+            .cutout_source()
+            .cutout(None, &c.footprint)
+            .map(|s| s.shape)
+        {
+            Some(CutoutShape::Circle { diameter_mm }) => {
+                s.push_str(&svg_hole_circle(cx, cy, diameter_mm / 2.0));
+            }
+            Some(CutoutShape::RoundedRect {
+                width_mm,
+                height_mm,
+                corner_radius_mm,
+            }) => {
+                s.push_str(&svg_hole_rect(
+                    cx,
+                    cy,
+                    width_mm,
+                    height_mm,
+                    corner_radius_mm,
+                ));
+            }
+            None => s.push_str(&svg_hole_circle(cx, cy, 1.5)),
+        }
+        // Dial art around a knob: dots across the sweep, and for a bipolar
+        // control a bigger centre dot with minus/plus at the extremes.
+        let role = c.role;
+        if role.is_some_and(CutoutRole::is_knob) {
+            let bipolar = role == Some(CutoutRole::Attenuverter);
+            for (dx, dy, is_centre) in dial_dots() {
+                let r = if bipolar && is_centre {
+                    silk::DIAL_CENTRE_DOT_MM
+                } else {
+                    silk::DIAL_DOT_MM
+                };
+                s.push_str(&format!(
+                    "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\"/>",
+                    cx + dx,
+                    cy - dy,
+                    r,
+                    finish.legend
+                ));
+            }
+            if bipolar {
+                let ends = dial_dots();
+                if let (Some(a), Some(b)) = (ends.first(), ends.last()) {
+                    let out = 2.0;
+                    let scale = (silk::DIAL_RADIUS_MM + out) / silk::DIAL_RADIUS_MM;
+                    s.push_str(&svg_text(
+                        cx + a.0 * scale,
+                        cy - a.1 * scale,
+                        silk::DIAL_SIGN_MM,
+                        &finish.legend,
+                        "\u{2212}",
+                    ));
+                    s.push_str(&svg_text(
+                        cx + b.0 * scale,
+                        cy - b.1 * scale,
+                        silk::DIAL_SIGN_MM,
+                        &finish.legend,
+                        "+",
+                    ));
+                }
+            }
+        }
+        if let Some(label) = &c.label {
+            let ly = cy - label_offset(role);
+            if role.is_some_and(CutoutRole::badged) {
+                // Inverted label: a filled badge with the text knocked out, so a
+                // CV input reads as a different *kind* of thing at a glance
+                // rather than as more small text.
+                let tw = label.chars().count() as f64 * silk::LABEL_FONT_MM * 0.62;
+                let (bw, bh) = (
+                    tw + 2.0 * silk::BADGE_PAD_X_MM,
+                    silk::LABEL_FONT_MM + 2.0 * silk::BADGE_PAD_Y_MM,
+                );
+                s.push_str(&format!(
+                    "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" \
+                     rx=\"{:.2}\" fill=\"{}\"/>",
+                    cx - bw / 2.0,
+                    ly - bh / 2.0,
+                    bw,
+                    bh,
+                    silk::BADGE_RADIUS_MM,
+                    finish.legend
+                ));
+                s.push_str(&svg_text(cx, ly, silk::LABEL_FONT_MM, &finish.face, label));
+            } else {
+                s.push_str(&svg_text(
+                    cx,
+                    ly,
+                    silk::LABEL_FONT_MM,
+                    &finish.legend,
+                    label,
+                ));
+            }
+        }
+    }
+    // Title, top-centre.
+    if !title.is_empty() {
+        // On a tile the controls own the top; the name goes in the bottom band.
+        let title_y = match panel.format().is_tile() {
+            true => h - silk::TILE_TITLE_BOTTOM_MM,
+            false => silk::TITLE_TOP_MARGIN_MM,
+        };
+        s.push_str(&svg_text(
+            w / 2.0,
+            title_y,
+            silk::title_font_mm(panel.format()),
+            &finish.legend,
+            title,
+        ));
+    }
+    // Brand logo in the clear band below the lowest cutout (ported house rule).
+    if let Some(logo) = logo {
+        let lowest = panel
+            .cutouts()
+            .iter()
+            .map(|c| {
+                let r = match panel
+                    .cutout_source()
+                    .cutout(None, &c.footprint)
+                    .map(|s| s.shape)
+                {
+                    Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
+                    Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
+                    None => 1.5,
+                };
+                sy(c.y_mm) + r
+            })
+            .fold(10.0, f64::max);
+        let bottom_limit = h - silk::BOTTOM_MARGIN_MM;
+        let gap = bottom_limit - lowest;
+        let (lx0, ly0, lx1, ly1) = logo.bbox();
+        let aspect = (ly1 - ly0) / (lx1 - lx0).max(1e-6);
+        let target_w = (w * silk::LOGO_WIDTH_FRAC)
+            .min((gap - silk::LOGO_CUTOUT_GAP_MM).max(0.0) / aspect.max(1e-6));
+        if target_w >= silk::LOGO_MIN_WIDTH_MM {
+            let logo_h = target_w * aspect;
+            let center = (w / 2.0, lowest + silk::LOGO_CUTOUT_GAP_MM + logo_h / 2.0);
+            let placed = logo.place(target_w, center, false);
+            let mut d = String::new();
+            for sp in &placed {
+                for (i, (x, y)) in sp.iter().enumerate() {
+                    d.push_str(&format!(
+                        "{}{:.2} {:.2} ",
+                        if i == 0 { 'M' } else { 'L' },
+                        x,
+                        y
+                    ));
+                }
+                d.push('Z');
+            }
+            if !d.is_empty() {
+                s.push_str(&format!(
+                    "<path d=\"{}\" fill=\"{}\" fill-rule=\"evenodd\"/>",
+                    d, finish.legend
+                ));
+            }
+        }
+    }
+    s.push_str("</svg>");
+    s
+}
+
+fn svg_hole_circle(cx: f64, cy: f64, r: f64) -> String {
+    format!(
+        "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"rgba(0,0,0,0.55)\" \
+         stroke=\"rgba(255,255,255,0.18)\" stroke-width=\"0.25\"/>",
+        cx, cy, r
+    )
+}
+
+fn svg_hole_rect(cx: f64, cy: f64, w: f64, h: f64, r: f64) -> String {
+    format!(
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{:.2}\" \
+         fill=\"rgba(0,0,0,0.55)\" stroke=\"rgba(255,255,255,0.18)\" stroke-width=\"0.25\"/>",
+        cx - w / 2.0,
+        cy - h / 2.0,
+        w,
+        h,
+        r
+    )
+}
+
+fn svg_text(x: f64, y: f64, size: f64, color: &str, text: &str) -> String {
+    format!(
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-family=\"'Helvetica Neue',Arial,sans-serif\" \
+         font-size=\"{:.2}\" font-weight=\"600\" fill=\"{}\" text-anchor=\"middle\" \
+         dominant-baseline=\"central\">{}</text>",
+        x,
+        y,
+        size,
+        color,
+        xml_escape(text)
+    )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo>) -> String {
     use crate::board::{det_uuid, mm};
     let (w, h) = (panel.width_mm(), panel.height_mm());
@@ -738,7 +1869,11 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
     for (i, c) in panel.cutouts().iter().enumerate() {
         let (cx, cy) = (fx(c.x_mm), fy(c.y_mm));
         let seed = format!("panel.cut.{i}");
-        match footprint_shape(&c.footprint) {
+        match panel
+            .cutout_source()
+            .cutout(None, &c.footprint)
+            .map(|s| s.shape)
+        {
             Some(CutoutShape::Circle { diameter_mm }) => {
                 s.push_str(&edge_circle(cx, cy, diameter_mm / 2.0, &seed))
             }
@@ -757,13 +1892,66 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
         }
         // Control label (IN / OUT / RATE), horizontal, just above the cutout so
         // it reads with the module upright (DESIGN 6.10 / j54.21).
+        // Dial art: silk dots across the knob's sweep, bigger at centre for a
+        // bipolar control, with minus/plus at the extremes.
+        if c.role.is_some_and(CutoutRole::is_knob) {
+            let bipolar = c.role == Some(CutoutRole::Attenuverter);
+            for (j, (dx, dy, is_centre)) in dial_dots().into_iter().enumerate() {
+                let r = if bipolar && is_centre {
+                    silk::DIAL_CENTRE_DOT_MM
+                } else {
+                    silk::DIAL_DOT_MM
+                };
+                // A filled dot is a zero-length line with a round cap of the
+                // right width — one primitive, and it plots cleanly.
+                s.push_str(&format!(
+                    "  (gr_line (start {} {}) (end {} {}) (stroke (width {}) (type solid)) \
+                     (layer \"F.SilkS\") (uuid \"{}\"))\n",
+                    mm(cx + dx),
+                    mm(cy - dy),
+                    mm(cx + dx),
+                    mm(cy - dy),
+                    mm(r * 2.0),
+                    det_uuid(&format!("panel.dial.{i}.{j}")),
+                ));
+            }
+            if bipolar {
+                let ends = dial_dots();
+                let scale = (silk::DIAL_RADIUS_MM + 2.0) / silk::DIAL_RADIUS_MM;
+                for (k, (glyph, e)) in [("-", ends.first()), ("+", ends.last())]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let Some((dx, dy, _)) = e else { continue };
+                    s.push_str(&format!(
+                        "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
+                         (effects (font (size {f} {f}) (thickness 0.3))))\n",
+                        glyph,
+                        mm(cx + dx * scale),
+                        mm(cy - dy * scale),
+                        det_uuid(&format!("panel.sign.{i}.{k}")),
+                        f = silk::DIAL_SIGN_MM,
+                    ));
+                }
+            }
+        }
         if let Some(label) = &c.label {
+            // A badged label is KiCad `knockout` text: the silkscreen prints a
+            // filled block with the glyphs left unprinted, which is exactly the
+            // negative-text look, and it is a native property rather than a
+            // rectangle we would have to punch letters out of ourselves.
+            let layer = if c.role.is_some_and(CutoutRole::badged) {
+                "\"F.SilkS\" knockout"
+            } else {
+                "\"F.SilkS\""
+            };
             s.push_str(&format!(
-                "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
+                "  (gr_text \"{}\" (at {} {} 0) (layer {}) (uuid \"{}\") \
                  (effects (font (size {f} {f}) (thickness 0.3))))\n",
                 label,
                 mm(cx),
-                mm(cy - silk::LABEL_OFFSET_MM),
+                mm(cy - label_offset(c.role)),
+                layer,
                 det_uuid(&format!("panel.label.{i}")),
                 f = silk::LABEL_FONT_MM,
             ));
@@ -771,15 +1959,20 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
     }
     // Title, horizontal, along the top edge (below the top mounting holes) so it
     // never crosses a centred control column — a vertical centre title collides
-    // with the knobs/jacks (the "writing hitting a jack" failure, j54-6f8).
+    // with the knobs/jacks (the "writing hitting a jack" failure, j54-6f8). On a
+    // 1U tile the controls already own the top, so it goes in the bottom band.
+    let title_y = match panel.format().is_tile() {
+        true => oy + h - silk::TILE_TITLE_BOTTOM_MM,
+        false => oy + silk::TITLE_TOP_MARGIN_MM,
+    };
     s.push_str(&format!(
         "  (gr_text \"{}\" (at {} {} 0) (layer \"F.SilkS\") (uuid \"{}\") \
          (effects (font (size {f} {f}) (thickness 0.3))))\n",
         title,
         mm(ox + w / 2.0),
-        mm(oy + silk::TITLE_TOP_MARGIN_MM),
+        mm(title_y),
         det_uuid("panel.title"),
-        f = silk::TITLE_FONT_MM,
+        f = silk::title_font_mm(panel.format()),
     ));
     // Brand logo on the front silk (DESIGN §7.9), placed in the clear band below
     // the lowest cutout (above the bottom mounting holes) so it doesn't land on a
@@ -790,7 +1983,11 @@ pub fn panel_to_kicad_pcb(panel: &dyn PanelSpec, title: &str, logo: Option<&Logo
             .cutouts()
             .iter()
             .map(|c| {
-                let r = match footprint_shape(&c.footprint) {
+                let r = match panel
+                    .cutout_source()
+                    .cutout(None, &c.footprint)
+                    .map(|s| s.shape)
+                {
                     Some(CutoutShape::Circle { diameter_mm }) => diameter_mm / 2.0,
                     Some(CutoutShape::RoundedRect { height_mm, .. }) => height_mm / 2.0,
                     None => 1.5,
@@ -1111,6 +2308,487 @@ fn sql_opt(s: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod panel_from_board_tests {
+    use super::*;
+    use crate::model::{Circuit, Net, Part, PinRef, RefDes};
+
+    /// 5 HP board, jack near the bottom-left, pot near the top-right.
+    const BOARD: &str = r#"(kicad_pcb
+      (gr_rect (start 100 40) (end 125.4 168.5) (layer "Edge.Cuts"))
+      (footprint "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical" (layer "F.Cu") (at 106 158 0)
+        (property "Reference" "J1") (pad "1" thru_hole circle (at 0 0) (size 2 2)))
+      (footprint "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical" (layer "F.Cu") (at 118 55 0)
+        (property "Reference" "RV1") (pad "1" thru_hole circle (at 0 0) (size 2 2)))
+      (footprint "Resistor_SMD:R_0603_1608Metric" (layer "F.Cu") (at 110 100 0)
+        (property "Reference" "R1") (pad "1" smd rect (at 0 0) (size 1 1))))"#;
+
+    fn circuit() -> Circuit {
+        Circuit {
+            name: "t".into(),
+            parts: vec![
+                Part::new("J1", "AudioJack2_SwitchT")
+                    .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+                Part::new("RV1", "100k").with_footprint(
+                    "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical",
+                ),
+                Part::new("R1", "1k").with_footprint("Resistor_SMD:R_0603_1608Metric"),
+            ],
+            nets: vec![Net {
+                name: "SIG_OUT".into(),
+                pins: vec![PinRef {
+                    refdes: RefDes("J1".into()),
+                    pin: "1".into(),
+                }],
+                net_class: None,
+            }],
+        }
+    }
+
+    /// A module with two knobs, a CV jack and audio I/O — enough to exercise
+    /// ordering, roles and badging together.
+    fn module() -> Circuit {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let pot = "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
+        let net = |name: &str, pins: &[(&str, &str)]| Net {
+            name: name.into(),
+            pins: pins
+                .iter()
+                .map(|(r, p)| PinRef {
+                    refdes: RefDes((*r).into()),
+                    pin: (*p).into(),
+                })
+                .collect(),
+            net_class: None,
+        };
+        Circuit {
+            name: "m".into(),
+            parts: vec![
+                Part::new("J1", "in").with_footprint(jack),
+                Part::new("J2", "out").with_footprint(jack),
+                Part::new("J4", "cv").with_footprint(jack),
+                Part::new("RV1", "100k").with_footprint(pot),
+                Part::new("RV2", "100k").with_footprint(pot),
+            ],
+            nets: vec![
+                net("SIG_IN", &[("J1", "1")]),
+                net("SIG_OUT", &[("J2", "1")]),
+                net("CV_IN", &[("J4", "1"), ("RV2", "1")]),
+                // RATE: a bias control strung across the supply rails.
+                net("+12V", &[("RV1", "1")]),
+                net("-12V", &[("RV1", "3")]),
+                net("RATE_CV", &[("RV1", "2")]),
+                // CV AMT: an attenuator — bottom of the track on ground.
+                net("GND", &[("RV2", "3")]),
+                net("CV_AMT", &[("RV2", "2")]),
+            ],
+        }
+    }
+
+    /// The two 1U standards are incompatible and both are real. Heights are the
+    /// load-bearing numbers: Intellijel 39.65 mm fits lipped rails, Pulp Logic
+    /// 43.18 mm (1.700") needs lipless ones.
+    #[test]
+    fn one_u_formats_have_their_published_heights() {
+        assert_eq!(PanelFormat::Eurorack3U.height_mm(), 128.5);
+        assert_eq!(PanelFormat::Intellijel1U.height_mm(), 39.65);
+        assert_eq!(PanelFormat::PulpLogic1U.height_mm(), 43.18);
+        // Bare "1u" means Intellijel — the one in wide use.
+        assert_eq!(PanelFormat::parse("1u"), Some(PanelFormat::Intellijel1U));
+        assert_eq!(
+            PanelFormat::parse("pulplogic-1u"),
+            Some(PanelFormat::PulpLogic1U)
+        );
+        assert_eq!(
+            PanelFormat::parse("eurorack"),
+            Some(PanelFormat::Eurorack3U)
+        );
+        assert_eq!(PanelFormat::parse("nonsense"), None);
+        assert!(!PanelFormat::Eurorack3U.is_tile());
+        assert!(PanelFormat::Intellijel1U.is_tile());
+    }
+
+    /// A tile has nowhere to stack, so its controls sit in a row and its width
+    /// has to hold the *sum* of them — sizing by the widest, as 3U does, emits a
+    /// tile that cannot be built.
+    #[test]
+    fn a_tile_lays_controls_in_a_row_and_sizes_by_their_sum() {
+        let c = module();
+        let tall = min_panel_hp_for(&c, PanelFormat::Eurorack3U, &BuiltinCutouts);
+        let wide = min_panel_hp_for(&c, PanelFormat::Intellijel1U, &BuiltinCutouts);
+        assert!(
+            wide > tall * 3,
+            "five controls in a row: {wide} HP vs {tall}"
+        );
+
+        let p = derive_panel_for(&c, PanelFormat::Intellijel1U, 1, &BuiltinCutouts);
+        assert_eq!(p.format, "intellijel-1u");
+        // All on one line…
+        let ys: Vec<f64> = p.cutouts.iter().map(|c| c.y_mm).collect();
+        assert!(ys.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9), "{ys:?}");
+        assert!(ys[0] < PanelFormat::Intellijel1U.height_mm());
+        // …spread across the width, in the same order the column would use.
+        let mut xs: Vec<f64> = p.cutouts.iter().map(|c| c.x_mm).collect();
+        let sorted = {
+            let mut v = xs.clone();
+            v.sort_by(f64::total_cmp);
+            v
+        };
+        assert_eq!(xs, sorted, "laid out left to right");
+        xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        assert_eq!(xs.len(), p.cutouts.len(), "no two controls share a slot");
+    }
+
+    /// On a tile the controls own the top, so the module name goes below them
+    /// rather than into a title band that does not exist.
+    #[test]
+    fn a_tiles_name_sits_below_its_controls() {
+        let p = derive_panel_for(&module(), PanelFormat::Intellijel1U, 1, &BuiltinCutouts);
+        let spec = p.to_spec().unwrap();
+        assert_eq!(spec.height_mm(), 39.65);
+        let svg = panel_to_svg(spec.as_ref(), "tile", &PanelFinish::named("black"), None);
+        // SVG y runs down, so "below the controls" is a larger y than the row.
+        let row_y_svg = 39.65 - p.cutouts[0].y_mm;
+        let title_y: f64 = regex_y(&svg, "tile");
+        assert!(title_y > row_y_svg, "name at {title_y}, row at {row_y_svg}");
+        assert!(title_y < 39.65, "and still on the panel");
+    }
+
+    /// Pull the y of the `<text>` element containing `needle`.
+    fn regex_y(svg: &str, needle: &str) -> f64 {
+        let at = svg.find(&format!(">{needle}<")).expect("text present");
+        let head = &svg[..at];
+        // A leading space, so this does not match `font-family="`.
+        let y_at = head.rfind(" y=\"").expect("y attr");
+        head[y_at + 4..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("y number")
+    }
+
+    /// The lau case: enough controls that one column cannot hold them. They must
+    /// spread sideways and every cutout must stay on the panel — the reported
+    /// failure put a jack at y = -12.1mm, off the bottom edge, and the board then
+    /// could not route against it.
+    #[test]
+    fn a_crowded_panel_uses_columns_and_never_places_hardware_off_it() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let pot = "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
+        let mut c = Circuit::new("crowded");
+        for i in 1..=4 {
+            c.parts
+                .push(Part::new(format!("RV{i}"), "100k").with_footprint(pot));
+        }
+        for i in 1..=6 {
+            c.parts
+                .push(Part::new(format!("J{i}"), "io").with_footprint(jack));
+        }
+        let hp = 8;
+        let p = derive_panel_for(&c, PanelFormat::Eurorack3U, hp, &BuiltinCutouts);
+        assert_eq!(p.cutouts.len(), 10);
+
+        let w = f64::from(hp) * HP_MM;
+        for cut in &p.cutouts {
+            assert!(
+                cut.y_mm > 0.0 && cut.y_mm < EURORACK_HEIGHT_MM,
+                "{:?} at y={} is off the panel",
+                cut.refdes,
+                cut.y_mm
+            );
+            assert!(
+                cut.x_mm > 0.0 && cut.x_mm < w,
+                "{:?} off the side",
+                cut.refdes
+            );
+        }
+        // …and it actually used more than one column rather than stacking.
+        let mut xs: Vec<f64> = p.cutouts.iter().map(|c| c.x_mm).collect();
+        xs.sort_by(f64::total_cmp);
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert!(xs.len() >= 2, "expected multiple columns, got {xs:?}");
+    }
+
+    /// **No two controls may share a hole.** A derived panel that stacks two
+    /// jacks on one point is not a tight panel, it is an unbuildable one.
+    ///
+    /// `min_panel_hp_for`'s 3U branch sized the panel by `widest + 2·EDGE` —
+    /// WIDTH ONLY. A 3U panel is a column, and nothing checked the column of
+    /// pitches against the ~105mm vertical band, so `derive_panel_for`'s
+    /// `.clamp(avail_bot, avail_top)` pinned every control past the end to
+    /// exactly `avail_bot`. Measured before the fix: 8 Thonkiconns at 4 HP put
+    /// J7 and J8 both at (10.160, 12.000), and `min_panel_hp_for` returned 3, so
+    /// the CLI's "widened to N HP" line never fired either.
+    ///
+    /// It reached the manufactured artifacts: `write_dxf` emitted two identical
+    /// CIRCLEs and `panel_to_kicad_pcb` two identical inner `Edge.Cuts` loops —
+    /// a self-overlapping outline the panel shop resolves however it likes, and
+    /// one jack with no hole at all.
+    #[test]
+    fn a_crowded_panel_never_puts_two_controls_in_one_place() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        for n in [8usize, 10, 14] {
+            let mut c = Circuit::new("crowded");
+            for i in 1..=n {
+                c.parts
+                    .push(Part::new(format!("J{i}"), "io").with_footprint(jack));
+            }
+            // Ask for a width that cannot hold them in one column, which is the
+            // case that used to stack silently.
+            let p = derive_panel_for(&c, PanelFormat::Eurorack3U, 4, &BuiltinCutouts);
+            assert_eq!(p.cutouts.len(), n, "{n} jacks in, {n} cutouts out");
+
+            for (i, a) in p.cutouts.iter().enumerate() {
+                for b in &p.cutouts[i + 1..] {
+                    let coincident =
+                        (a.x_mm - b.x_mm).abs() < 0.01 && (a.y_mm - b.y_mm).abs() < 0.01;
+                    assert!(
+                        !coincident,
+                        "{n} jacks: {:?} and {:?} share a hole at ({:.3}, {:.3})",
+                        a.refdes, b.refdes, a.x_mm, a.y_mm
+                    );
+                }
+            }
+            // And the width it settled on must be one the controls really fit in,
+            // not the 4 HP that was asked for.
+            let hp = p.hp.expect("derived panel declares its width");
+            assert!(
+                hp >= min_panel_hp_for(&c, PanelFormat::Eurorack3U, &BuiltinCutouts),
+                "{n} jacks: emitted {hp} HP below its own stated minimum"
+            );
+            // Everything still on the panel.
+            let w = f64::from(hp) * HP_MM;
+            for cut in &p.cutouts {
+                assert!(
+                    cut.x_mm > 0.0
+                        && cut.x_mm < w
+                        && cut.y_mm > 0.0
+                        && cut.y_mm < EURORACK_HEIGHT_MM,
+                    "{n} jacks: {:?} off the panel at ({:.2}, {:.2}) on {hp} HP",
+                    cut.refdes,
+                    cut.x_mm,
+                    cut.y_mm
+                );
+            }
+        }
+    }
+
+    /// A module that fits in one column keeps one — columns are a response to
+    /// crowding, not a default.
+    #[test]
+    fn a_sparse_panel_stays_a_single_centred_column() {
+        let jack = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+        let mut c = Circuit::new("sparse");
+        for i in 1..=2 {
+            c.parts
+                .push(Part::new(format!("J{i}"), "io").with_footprint(jack));
+        }
+        let p = derive_panel_for(&c, PanelFormat::Eurorack3U, 8, &BuiltinCutouts);
+        let xs: Vec<f64> = p.cutouts.iter().map(|c| c.x_mm).collect();
+        assert!(
+            xs.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+            "one column: {xs:?}"
+        );
+        assert!((xs[0] - 8.0 * HP_MM / 2.0).abs() < 0.01, "centred: {xs:?}");
+    }
+
+    /// CV inputs sit above the audio I/O: a player scans down for the signal
+    /// path, so modulation belongs up with the knobs it feeds.
+    #[test]
+    fn cv_jacks_sit_above_the_audio_io() {
+        let p = derive_panel(&module(), 8, &BuiltinCutouts);
+        let y = |r: &str| {
+            p.cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(r))
+                .unwrap()
+                .y_mm
+        };
+        // Panel y is measured up from the bottom.
+        assert!(y("J4") > y("J1"), "CV IN above IN");
+        assert!(y("J4") > y("J2"), "CV IN above OUT");
+        // …and the knobs stay above the jacks.
+        assert!(y("RV1") > y("J4") && y("RV2") > y("J4"));
+    }
+
+    /// Roles come from topology. A pot across the supply rails is a bias control
+    /// whose centre is *not* silence, so it must not get the bipolar detent — and
+    /// an attenuator with its track end on ground is not an attenuverter either.
+    #[test]
+    fn only_a_pot_with_both_track_ends_live_is_bipolar() {
+        let p = derive_panel(&module(), 8, &BuiltinCutouts);
+        let role = |r: &str| {
+            p.cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(r))
+                .unwrap()
+                .role
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(role("RV1"), "knob", "RATE spans +12V/-12V: a bias control");
+        assert_eq!(role("RV2"), "knob", "CV AMT's track end is grounded");
+        assert_eq!(role("J4"), "cv");
+        assert_eq!(role("J1"), "io");
+        assert_eq!(role("J2"), "io");
+
+        // Re-wire CV AMT's bottom onto an inverted rail and it becomes bipolar,
+        // with no panel edit — the art follows the circuit.
+        let mut c = module();
+        c.nets.retain(|n| n.name != "GND");
+        c.nets.push(Net {
+            name: "CV_IN_INV".into(),
+            pins: vec![PinRef {
+                refdes: RefDes("RV2".into()),
+                pin: "3".into(),
+            }],
+            net_class: None,
+        });
+        let p2 = derive_panel(&c, 8, &BuiltinCutouts);
+        let rv2 = p2
+            .cutouts
+            .iter()
+            .find(|x| x.refdes.as_deref() == Some("RV2"))
+            .unwrap();
+        assert_eq!(rv2.role.as_deref(), Some("attenuverter"));
+    }
+
+    /// A CV label is knocked out of a filled badge; audio I/O stays plain. On the
+    /// panel PCB that is KiCad's native `knockout`, so the silkscreen prints a
+    /// block with the glyphs unprinted rather than us punching letters out.
+    #[test]
+    fn cv_labels_are_badged_and_io_labels_are_not() {
+        let p = derive_panel(&module(), 8, &BuiltinCutouts);
+        let spec = p.to_spec().unwrap();
+        let pcb = panel_to_kicad_pcb(spec.as_ref(), "m", None);
+        assert!(
+            pcb.contains(r#"(gr_text "CV IN" (at"#) && pcb.contains(r#"knockout)"#),
+            "CV IN is knocked out: {pcb}"
+        );
+        // Exactly one knockout — the audio jacks and the knobs are plain.
+        assert_eq!(pcb.matches("knockout").count(), 1);
+
+        // Dial art: seven dots per knob, two knobs.
+        assert_eq!(pcb.matches("(gr_line").count(), 2 * silk::DIAL_DOTS);
+    }
+
+    /// The whole point: a cutout lands where the part actually is, not where an
+    /// idealised column would have put it.
+    #[test]
+    fn cutouts_land_on_the_parts_real_positions() {
+        let p = panel_from_board(BOARD, &circuit(), &BuiltinCutouts).unwrap();
+        assert_eq!(p.hp, Some(5), "board width decides the panel width");
+        // Only panel-facing parts: the 0603 is board-only.
+        assert_eq!(p.cutouts.len(), 2);
+        let by = |r: &str| {
+            p.cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(r))
+                .unwrap()
+        };
+
+        // Board is x 100..125.4, y 40..168.5 (25.4 x 128.5mm).
+        // J1 at board (106, 158): 6mm from the left edge, and 128.5-118 = 10.5mm
+        // up from the bottom — a jack near the bottom, as placed.
+        let j = by("J1");
+        assert!((j.x_mm - 6.0).abs() < 0.01, "x {}", j.x_mm);
+        assert!((j.y_mm - 10.5).abs() < 0.01, "y {}", j.y_mm);
+        // RV1 at board (118, 55): 18mm across, 113.5mm up — near the top.
+        let rv = by("RV1");
+        assert!((rv.x_mm - 18.0).abs() < 0.01, "x {}", rv.x_mm);
+        assert!((rv.y_mm - 113.5).abs() < 0.01, "y {}", rv.y_mm);
+        // Y really is flipped: the jack low on the panel is high in KiCad's frame.
+        assert!(j.y_mm < rv.y_mm);
+
+        // Classified, and labelled from the signal it carries.
+        assert_eq!(j.footprint, "Thonkiconn");
+        assert_eq!(rv.footprint, "Alpha9mm");
+        assert_eq!(j.label.as_deref(), Some("OUT")); // label_from_net drops the prefix
+    }
+
+    /// The round trip the whole "board is master" design rests on: hand-place a
+    /// control in panel space, let the board follow, derive the panel back from
+    /// the built board, and land on the position that was authored.
+    ///
+    /// If this drifts, a panel gets cut that the board will not mate with — and
+    /// the three artifacts stop describing one layout.
+    #[test]
+    fn a_hand_placement_survives_the_trip_through_the_board_and_back() {
+        use crate::board::{generate_board, BoardOptions, EurorackPlacer};
+        use crate::placement::PlacementFile;
+        let Some(dir) = crate::skidl::kicad_footprint_dir() else {
+            return;
+        };
+        let file = PlacementFile::from_toml(
+            r#"
+[[patterns.column]]
+refdes = ["J1", "J2"]
+x      = 7.0
+from_y = 12.0
+pitch  = 20.0
+"#,
+        )
+        .unwrap();
+        let (hp, h) = (3u16, EURORACK_HEIGHT_MM);
+        let w = f64::from(hp) * HP_MM;
+        let origin = (100.0, 40.0);
+        let anchors = file.anchors(h).unwrap();
+        let want = file.positions().unwrap();
+
+        let circuit = Circuit {
+            name: "rt".into(),
+            parts: vec![
+                Part::new("J1", "jack")
+                    .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+                Part::new("J2", "jack")
+                    .with_footprint("Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical"),
+            ],
+            nets: vec![],
+        };
+        let mut opts = BoardOptions::new(dir);
+        opts.placer = Box::new(EurorackPlacer {
+            width_mm: w,
+            height_mm: h,
+            origin_mm: origin,
+            anchors,
+        });
+        opts.fixed_outline = Some((origin.0, origin.1, origin.0 + w, origin.1 + h));
+        let Ok(board) = generate_board(&circuit, &opts) else {
+            return; // library layout differs; don't fail the unit suite
+        };
+
+        let derived = panel_from_board(&board, &circuit, &BuiltinCutouts).unwrap();
+        assert_eq!(derived.hp, Some(hp), "board width decides the panel width");
+        for (refdes, p) in &want {
+            let c = derived
+                .cutouts
+                .iter()
+                .find(|c| c.refdes.as_deref() == Some(refdes.as_str()))
+                .unwrap_or_else(|| panic!("{refdes} missing from the derived panel"));
+            // Within a placement grid step: the placer settles a part on its
+            // clear-spot search, so this asserts the layout survived, not that
+            // nothing may ever move.
+            assert!(
+                (c.x_mm - p.x).abs() < 1.0 && (c.y_mm - p.y).abs() < 1.0,
+                "{refdes}: authored ({:.1},{:.1}) came back as ({:.1},{:.1})",
+                p.x,
+                p.y,
+                c.x_mm,
+                c.y_mm
+            );
+        }
+    }
+
+    /// A board we cannot frame gets an error, not a panel measured from nothing.
+    #[test]
+    fn a_board_with_no_outline_is_an_error() {
+        let no_edge = r#"(kicad_pcb (footprint "X" (layer "F.Cu") (at 1 1 0)
+          (property "Reference" "J1") (pad "1" thru_hole circle (at 0 0) (size 2 2))))"#;
+        assert!(panel_from_board(no_edge, &circuit(), &BuiltinCutouts).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1120,6 +2798,55 @@ mod tests {
         assert_eq!(panel.width_mm(), 6.0 * 5.08);
         assert_eq!(panel.height_mm(), 128.5);
         assert_eq!(panel.thickness_mm(), 2.0);
+    }
+
+    #[test]
+    fn finish_resolves_materials_and_hex() {
+        assert_eq!(PanelFinish::default().face, "#1c1d1f"); // black default
+        assert_eq!(PanelFinish::named("silver").face, "#c9ccce");
+        assert_eq!(PanelFinish::named("white").legend, "#1b1c1e"); // dark legend, light face
+        assert_eq!(PanelFinish::named("green").face, "#0f5c3f");
+        assert_eq!(PanelFinish::named("bogus").face, "#1c1d1f"); // unknown → black
+                                                                 // Hex passthrough with auto-contrast legend; #rgb expands to #rrggbb.
+        let white = PanelFinish::named("#ffffff");
+        assert_eq!(white.face, "#ffffff");
+        assert_eq!(white.legend, "#1b1c1e");
+        assert_eq!(PanelFinish::named("#000").face, "#000000");
+        assert_eq!(PanelFinish::named("#000").legend, "#f2f2ef");
+    }
+
+    #[test]
+    fn panel_svg_uses_finish_color_labels_and_cutouts() {
+        let panel = EurorackPanel::new(8)
+            .with_cutout_labelled(
+                20.32,
+                100.0,
+                "Alpha9mm",
+                None,
+                Some("RATE".to_string()),
+                Some(CutoutRole::Knob),
+            )
+            .with_cutout_labelled(
+                20.32,
+                14.0,
+                "Thonkiconn",
+                None,
+                Some("OUT".to_string()),
+                Some(CutoutRole::Io),
+            );
+        let svg = panel_to_svg(&panel, "Slew Limiter", &PanelFinish::named("black"), None);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.ends_with("</svg>"));
+        assert!(svg.contains("#1c1d1f"), "black face color present");
+        assert!(svg.contains(">Slew Limiter</text>"), "title");
+        assert!(
+            svg.contains(">RATE</text>") && svg.contains(">OUT</text>"),
+            "labels"
+        );
+        assert!(
+            svg.matches("<circle").count() >= 2,
+            "control holes as circles"
+        );
     }
 
     #[test]
@@ -1144,13 +2871,13 @@ mod tests {
     #[test]
     fn cutout_label_renders_on_panel_silk() {
         let panel = EurorackPanel::new(4)
-            .with_cutout_rotated(
+            .with_cutout_labelled(
                 10.0,
                 20.0,
-                0.0,
                 "Thonkiconn",
                 Some("J1".into()),
                 Some("IN".into()),
+                Some(CutoutRole::Io),
             )
             .with_cutout(10.0, 60.0, "Alpha9mm"); // no label → no extra gr_text
         let pcb = panel_to_kicad_pcb(&panel, "Demo", None);
@@ -1224,6 +2951,58 @@ mod tests {
         assert!(c
             .cutout(None, "Connector_PinHeader_2.54mm:PinHeader_2x05")
             .is_none());
+    }
+
+    /// A derived panel must be physically buildable: every control's mechanical
+    /// envelope (knob skirt / PCB body — not the little hole) has to fit inside the
+    /// panel with edge material left, and envelopes must not overlap vertically.
+    /// Deriving from hole sizes alone produced 3 HP panels carrying 13.75 mm pot
+    /// bodies, which look fine on screen and cannot be built (5p5).
+    #[test]
+    fn derived_panel_hardware_physically_fits() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        let mut circ = Circuit::new("m");
+        circ.parts = vec![
+            Part::new("RV1", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+            Part::new("RV2", "100k").with_footprint("Potentiometer_THT:Potentiometer_Alpha_RD901F"),
+            Part::new("J1", "jack").with_footprint("Connector_Audio:Jack_3.5mm_PJ398SM"),
+        ];
+        circ.nets = vec![Net::new("SIG_IN", vec![PinRef::new("J1", "T")])];
+
+        // A pot body is 14 mm; 2 HP is 10.16 mm, so it cannot possibly fit — the
+        // derivation must widen rather than emit an unbuildable panel.
+        let min = min_panel_hp(&circ, &BuiltinCutouts);
+        assert_eq!(min, 4, "14mm control + 2x1mm edge needs 16mm => 4 HP");
+        let panel = derive_panel(&circ, 2, &BuiltinCutouts);
+        assert_eq!(panel.hp, Some(4), "asked for 2 HP, widened to what fits");
+
+        let w = f64::from(panel.hp.unwrap()) * HP_MM;
+        let env = |fp: &str| match fp {
+            "Alpha9mm" => envelope::POT,
+            "Thonkiconn" => envelope::JACK,
+            _ => (6.0, 6.0),
+        };
+        // Every envelope sits inside the panel with edge material to spare.
+        for c in &panel.cutouts {
+            let (ew, _) = env(&c.footprint);
+            assert!(
+                c.x_mm - ew / 2.0 >= envelope::EDGE_MM - 1e-9
+                    && c.x_mm + ew / 2.0 <= w - envelope::EDGE_MM + 1e-9,
+                "{:?} envelope runs off the panel",
+                c.refdes
+            );
+        }
+        // And no two envelopes overlap vertically.
+        let mut stack: Vec<(f64, f64)> = panel
+            .cutouts
+            .iter()
+            .map(|c| (c.y_mm, env(&c.footprint).1))
+            .collect();
+        stack.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for w in stack.windows(2) {
+            let gap = (w[0].0 - w[0].1 / 2.0) - (w[1].0 + w[1].1 / 2.0);
+            assert!(gap >= -1e-9, "control envelopes overlap by {:.2}mm", -gap);
+        }
     }
 
     #[test]
@@ -1308,6 +3087,44 @@ footprint = "Alpha9mm"
         let toml = r#"format = "pedal""#;
         let file = PanelFile::from_toml(toml).unwrap();
         assert!(file.to_spec().is_err());
+    }
+
+    #[test]
+    fn panel_file_resolves_a_guitar_pedal_fuzz_panel() {
+        // Cutouts round-trip through the file itself, same as Eurorack --
+        // fuzz_pedal_panel_file generates them once, to_spec() reads them
+        // back from the TOML rather than reconstructing them from the format
+        // string.
+        let generated = crate::pedal_panel::fuzz_pedal_panel_file(
+            crate::spec::EnclosureSize::Size1590B,
+            ("RV1", "RV2"),
+            1.6,
+        );
+        let toml = generated.to_toml().unwrap();
+        let file = PanelFile::from_toml(&toml).unwrap();
+        assert_eq!(file.format, "pedal-1590b");
+        let panel = file.to_spec().unwrap();
+        assert_eq!(panel.width_mm(), 60.0);
+        assert_eq!(panel.height_mm(), 112.0);
+        assert!(panel
+            .cutouts()
+            .iter()
+            .any(|c| c.refdes.as_deref() == Some("RV1")));
+        assert!(panel
+            .cutouts()
+            .iter()
+            .any(|c| c.refdes.as_deref() == Some("RV2")));
+    }
+
+    #[test]
+    fn panel_file_without_explicit_cutouts_is_an_empty_pedal_panel() {
+        // Confirms to_spec() no longer hardcodes RV1/RV2 -- an author who
+        // writes just the format token gets a cutout-free panel, same as an
+        // Eurorack PanelFile with no [[cutouts]] blocks would.
+        let toml = r#"format = "pedal-1590b""#;
+        let file = PanelFile::from_toml(toml).unwrap();
+        let panel = file.to_spec().unwrap();
+        assert!(panel.cutouts().is_empty());
     }
 
     #[test]

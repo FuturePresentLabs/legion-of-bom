@@ -150,8 +150,19 @@ fn build_subckt_model(
         .filter_map(|tok| tok.split_once('='))
         .collect();
 
-    // Order the part's pins by the subckt's declared terminal order.
-    let terminals = subckt_terminals(&include, &subckt)?;
+    // Order the part's pins by the subckt's declared terminal order. The
+    // bundled catalog resolves against its embedded text directly — see
+    // subckt_terminals_in_text's docs for why a bare "lob_builtin.lib" can't
+    // reliably resolve as a file path here.
+    let terminals = if sim_library == BUILTIN_LIB_NAME {
+        subckt_terminals_in_text(BUILTIN_LIB_TEXT, &subckt).ok_or_else(|| {
+            StageError::Other(format!(
+                "{label}: subckt '{subckt}' not found in {BUILTIN_LIB_NAME}"
+            ))
+        })?
+    } else {
+        subckt_terminals(&include, &subckt)?
+    };
     let mut pin_order = Vec::with_capacity(terminals.len());
     for terminal in &terminals {
         let pin = pin_to_terminal
@@ -180,6 +191,11 @@ fn build_subckt_model(
 pub struct SymbolData {
     /// `(pin_number, pin_name)`, sorted by pin number.
     pub pins: Vec<(String, String)>,
+    /// `(pin_number, alternate_name)` — a pin's other functions, as the
+    /// library lists them (an STM32 port pin's `SAI1_SCK_A`, `SPI4_SCK`, …).
+    /// KiCad's STM32 symbols are generated from ST's own pin data, so this is
+    /// the cited source for a pin-mux choice.
+    pub alternates: Vec<(String, String)>,
     pub datasheet: Option<String>,
     pub description: Option<String>,
 }
@@ -218,11 +234,12 @@ pub fn read_symbol(
         .map_err(|e| StageError::Other(format!("reading {}: {e}", path.display())))?;
     let root = Sexpr::parse(&text)
         .map_err(|e| StageError::Other(format!("parsing {}: {e}", path.display())))?;
-    let Some(sym) = root
-        .get_all("symbol")
-        .into_iter()
-        .find(|s| s.nth_atom(1) == Some(part))
-    else {
+    let find = |name: &str| {
+        root.get_all("symbol")
+            .into_iter()
+            .find(|s| s.nth_atom(1) == Some(name))
+    };
+    let Some(sym) = find(part) else {
         return Ok(None);
     };
 
@@ -235,9 +252,31 @@ pub fn read_symbol(
             .filter(|s| !s.is_empty())
     };
 
+    // A derived symbol (`(extends "PCM5100")` — how KiCad draws one package
+    // for a family) carries its own properties but its parent's pins. Walk
+    // the chain to the symbol that actually has them; a cycle or a missing
+    // parent is a broken library, reported rather than read as "no pins".
+    let mut body = sym;
+    let mut chain = vec![part.to_string()];
+    while let Some(parent) = body.get("extends").and_then(|e| e.nth_atom(1)) {
+        if chain.iter().any(|c| c == parent) {
+            return Err(StageError::Other(format!(
+                "symbol '{part}' in {lib} extends itself: {}",
+                chain.join(" -> ")
+            )));
+        }
+        chain.push(parent.to_string());
+        body = find(parent).ok_or_else(|| {
+            StageError::Other(format!(
+                "symbol '{part}' in {lib} extends '{parent}', which {lib} does not define"
+            ))
+        })?;
+    }
+
     let mut pins: Vec<(String, String)> = Vec::new();
+    let mut alternates: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
-    for unit in sym.get_all("symbol") {
+    for unit in body.get_all("symbol") {
         for pin in unit.get_all("pin") {
             let number = pin
                 .get("number")
@@ -251,12 +290,19 @@ pub fn read_symbol(
                 .and_then(|n| n.nth_atom(1))
                 .unwrap_or_default();
             pins.push((number.to_string(), name.to_string()));
+            for alt in pin.get_all("alternate") {
+                if let Some(a) = alt.nth_atom(1) {
+                    alternates.push((number.to_string(), a.to_string()));
+                }
+            }
         }
     }
     pins.sort_by_key(|p| pin_sort_key(&p.0));
+    alternates.sort_by_key(|p| (pin_sort_key(&p.0), p.1.clone()));
 
     Ok(Some(SymbolData {
         pins,
+        alternates,
         datasheet: prop("Datasheet"),
         description: prop("Description"),
     }))
@@ -282,6 +328,25 @@ fn expand_symbol_dir(sim_library: &str, symbol_dir: &Path) -> PathBuf {
 fn subckt_terminals(sp_path: &Path, name: &str) -> Result<Vec<String>, StageError> {
     let text = std::fs::read_to_string(sp_path)
         .map_err(|e| StageError::Other(format!("reading {}: {e}", sp_path.display())))?;
+    subckt_terminals_in_text(&text, name).ok_or_else(|| {
+        StageError::Other(format!(
+            "subckt '{name}' not found in {}",
+            sp_path.display()
+        ))
+    })
+}
+
+/// The parsing [`subckt_terminals`] does, over an already-loaded `.subckt`
+/// library text rather than a file path — the seam that lets a `Sim.Library`
+/// of exactly [`BUILTIN_LIB_NAME`] resolve against the embedded
+/// [`BUILTIN_LIB_TEXT`] directly. A bare relative filename like
+/// `"lob_builtin.lib"` has no directory to be relative *to* here (unlike
+/// `${KICAD_SYMBOL_DIR}`-prefixed paths, which do) — `subckt_terminals`
+/// reading it from disk would depend on the caller's current directory
+/// happening to match wherever `write_builtin_lib` last wrote it, which
+/// isn't guaranteed. Going through the embedded text instead needs no path
+/// resolution at all.
+fn subckt_terminals_in_text(text: &str, name: &str) -> Option<Vec<String>> {
     for line in text.lines() {
         let line = line.trim();
         if !line.to_ascii_lowercase().starts_with(".subckt ") {
@@ -293,16 +358,13 @@ fn subckt_terminals(sp_path: &Path, name: &str) -> Result<Vec<String>, StageErro
             continue;
         }
         // Terminals run until a `params:` keyword or a `key=value` param.
-        let terminals = toks
-            .take_while(|t| !t.eq_ignore_ascii_case("params:") && !t.contains('='))
-            .map(str::to_string)
-            .collect();
-        return Ok(terminals);
+        return Some(
+            toks.take_while(|t| !t.eq_ignore_ascii_case("params:") && !t.contains('='))
+                .map(str::to_string)
+                .collect(),
+        );
     }
-    Err(StageError::Other(format!(
-        "subckt '{name}' not found in {}",
-        sp_path.display()
-    )))
+    None
 }
 
 /// Filename of the bundled behavioural model library, written next to the SPICE
@@ -328,9 +390,25 @@ fn builtin_model(part: &crate::model::Part) -> Option<SpiceModel> {
         part.value
     )
     .to_ascii_uppercase();
-    // (subckt name, part pin numbers in the subckt's terminal order).
+    // (subckt name, part pin numbers in the subckt's terminal order). Each model
+    // lists ALL of the package's pins in numeric order — an unused section is
+    // left unconnected by the *circuit*, not omitted from the model, so the same
+    // entry serves a board that uses one channel and a board that uses both.
     let (subckt, pins): (&str, &[&str]) = if hay.contains("LM13700") || hay.contains("LM13600") {
-        ("LM13700", &["1", "3", "4", "5", "6", "7", "8", "11"])
+        (
+            "LM13700",
+            &[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "16",
+            ],
+        )
+    } else if hay.contains("TL074") || hay.contains("TL084") || hay.contains("LM324") {
+        (
+            "TL074",
+            &[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
+            ],
+        )
     } else if hay.contains("TL072") || hay.contains("TL082") || hay.contains("NE5532") {
         ("TL072", &["1", "2", "3", "4", "5", "6", "7", "8"])
     } else {
@@ -344,9 +422,544 @@ fn builtin_model(part: &crate::model::Part) -> Option<SpiceModel> {
     })
 }
 
+// ---------------------------------------------------------------------------
+//  Symbol *graphics* — the drawn body, for the schematic view (n5l)
+// ---------------------------------------------------------------------------
+
+/// How a symbol shape is filled. KiCad has three modes and they mean different
+/// things: `outline` paints it solid in the line colour (a jack's plug tip),
+/// `background` paints it in the *sheet* colour so it occludes what's behind
+/// without going black, and `none` leaves it open. Collapsing these to a boolean
+/// turns every background-filled body into a black blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymFill {
+    None,
+    Background,
+    Outline,
+}
+
+/// A drawable primitive from a symbol body, in KiCad symbol space (mm, Y **up**).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymShape {
+    Rect {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        fill: SymFill,
+    },
+    Poly {
+        pts: Vec<(f64, f64)>,
+        fill: SymFill,
+    },
+    Circle {
+        cx: f64,
+        cy: f64,
+        r: f64,
+        fill: SymFill,
+    },
+    /// A three-point arc (start → mid → end), as KiCad stores it.
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+    },
+}
+
+/// A symbol pin, in symbol space (mm, Y up).
+///
+/// In KiCad's format a pin's `(at x y angle)` is its **connection point** — the
+/// free end a wire attaches to — and the pin graphic runs from there *into* the
+/// body along `angle`. (A `Device:R` pin sits at y = 3.81 while the body top is
+/// 2.54: exactly one pin length away, pointing back at the body.) Reading this
+/// backwards attaches every wire to the body edge instead of the pin end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymPin {
+    /// Pin identifier. KiCad calls it the "number" but it is often a name — an
+    /// audio jack's pins are `T`, `S`, `TN` — and the netlist uses the same token,
+    /// so the two match directly.
+    pub number: String,
+    /// The pin's human name as the symbol declares it — `IABC`, `+`, `-`, `OUT`.
+    /// Empty when the symbol gives none, or names it `~`, KiCad's "no name".
+    ///
+    /// This is the only source for it: netlists carry no `pinfunction`, so a
+    /// dropped name here cannot be recovered downstream. On an LM13700 it is the
+    /// difference between a rectangle labelled 1,3,4,5 and one that shows the
+    /// reader that pin 4 is In− and pin 5 the output.
+    pub name: String,
+    /// The connection point: where a wire attaches.
+    pub x: f64,
+    pub y: f64,
+    /// Direction from the connection point toward the body, degrees CCW (0 = +X).
+    pub angle: f64,
+    pub length: f64,
+}
+
+impl SymPin {
+    /// Where the pin meets the symbol body — the inner end of the drawn lead.
+    pub fn body_end(&self) -> (f64, f64) {
+        let r = self.angle.to_radians();
+        (
+            self.x + self.length * r.cos(),
+            self.y + self.length * r.sin(),
+        )
+    }
+
+    /// Unit vector pointing *away* from the body, so a wire can leave along the
+    /// pin and read as continuing it rather than crossing it.
+    pub fn outward(&self) -> (f64, f64) {
+        let r = self.angle.to_radians();
+        (-r.cos(), -r.sin())
+    }
+}
+
+/// A symbol's drawn body plus its pins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolGraphics {
+    pub shapes: Vec<SymShape>,
+    pub pins: Vec<SymPin>,
+    /// Highest unit index in the definition. `1` is a plain single-unit part; more
+    /// means the part is drawn as several separate units on a real schematic (an
+    /// LM2904 is two amplifiers plus a power unit), which needs pin-to-unit
+    /// splitting the caller may not want to attempt.
+    pub units: usize,
+    /// Every pin's name, keyed by number, harvested across **all** units — not
+    /// just the one drawn in [`pins`](Self::pins).
+    ///
+    /// A multi-unit part keeps most of its pins in units 2+, which are declined
+    /// for drawing; those are precisely the parts that fall back to a labelled box
+    /// and most need their names. Reading names only from unit 1 left an LM13700
+    /// box showing 1,3,4,5,7,8 and nothing else. Pins the symbol leaves unnamed
+    /// (`~`, as KiCad names most op-amp outputs) are absent rather than empty.
+    pub pin_names: HashMap<String, String>,
+    /// The symbol asks for its pin names not to be drawn — `(pin_names … hide)`.
+    /// Honour it: a resistor whose pins are labelled is noise, and the symbol
+    /// author already made that call.
+    pub hide_pin_names: bool,
+}
+
+impl SymbolGraphics {
+    /// Bounding box of the body **and** pin tips: `(x0, y0, x1, y1)`.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let mut add = |x: f64, y: f64| {
+            b.0 = b.0.min(x);
+            b.1 = b.1.min(y);
+            b.2 = b.2.max(x);
+            b.3 = b.3.max(y);
+        };
+        for s in &self.shapes {
+            match s {
+                SymShape::Rect { x0, y0, x1, y1, .. } => {
+                    add(*x0, *y0);
+                    add(*x1, *y1);
+                }
+                SymShape::Poly { pts, .. } => pts.iter().for_each(|&(x, y)| add(x, y)),
+                SymShape::Circle { cx, cy, r, .. } => {
+                    add(cx - r, cy - r);
+                    add(cx + r, cy + r);
+                }
+                SymShape::Arc { start, mid, end } => {
+                    for p in [start, mid, end] {
+                        add(p.0, p.1);
+                    }
+                }
+            }
+        }
+        for p in &self.pins {
+            add(p.x, p.y);
+            let (bx, by) = p.body_end();
+            add(bx, by);
+        }
+        if b.0 > b.2 {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            b
+        }
+    }
+}
+
+/// Read a symbol's drawn body from `<lib>.kicad_sym`, following `(extends …)`
+/// inheritance (KiCad defines e.g. `TL072` as an extension of `LM2904`).
+///
+/// Returns `None` when the library or symbol isn't there — symbol libraries ship
+/// with KiCad, so a machine without it simply gets no graphics and the caller
+/// falls back to its own rendering.
+pub fn read_symbol_graphics(symbol_dir: &Path, lib: &str, part: &str) -> Option<SymbolGraphics> {
+    let text = std::fs::read_to_string(symbol_dir.join(format!("{lib}.kicad_sym"))).ok()?;
+    let root = Sexpr::parse(&text).ok()?;
+    let find = |name: &str| {
+        root.get_all("symbol")
+            .into_iter()
+            .find(|s| s.nth_atom(1) == Some(name))
+    };
+
+    // Follow the inheritance chain to the definition that carries the drawing.
+    let mut sym = find(part)?;
+    let mut hops = 0;
+    while let Some(base) = sym.field("extends") {
+        if hops > 8 {
+            break; // cycle guard
+        }
+        match find(base) {
+            Some(next) => sym = next,
+            None => break,
+        }
+        hops += 1;
+    }
+
+    let num = |e: Option<&Sexpr>, i: usize| -> Option<f64> { e?.nth_atom(i)?.parse().ok() };
+    let xy = |e: Option<&Sexpr>| -> Option<(f64, f64)> { Some((num(e, 1)?, num(e, 2)?)) };
+    let fill_of = |e: &Sexpr| -> SymFill {
+        match e.get("fill").and_then(|f| f.field("type")) {
+            Some("outline") => SymFill::Outline,
+            Some("background") => SymFill::Background,
+            _ => SymFill::None,
+        }
+    };
+
+    let mut shapes = Vec::new();
+    let mut pins: Vec<SymPin> = Vec::new();
+    let mut units = 1usize;
+    let mut pin_names: HashMap<String, String> = HashMap::new();
+    // `(pin_names (offset 0) hide)` — the `hide` may be a bare atom or `(hide yes)`.
+    let hide_pin_names = sym.get("pin_names").is_some_and(|p| {
+        p.as_list().is_some_and(|l| {
+            l.iter().any(|c| {
+                c.as_atom() == Some("hide")
+                    || (c.head() == Some("hide") && c.nth_atom(1) != Some("no"))
+            })
+        })
+    });
+
+    // Body graphics live in nested unit sub-symbols named `<NAME>_<unit>_<style>`.
+    // Unit 0 is common to every unit; unit 1 is the first real one.
+    for unit in sym.get_all("symbol") {
+        let uname = unit.nth_atom(1).unwrap_or_default();
+        let idx: usize = uname
+            .rsplit('_')
+            .nth(1)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1);
+        units = units.max(idx);
+
+        // Names come from every unit, including the ones below that we decline to
+        // draw — a boxed multi-unit part still shows all its pins, so it still
+        // needs all their names.
+        for p in unit.get_all("pin") {
+            let Some(number) = p.get("number").and_then(|n| n.nth_atom(1)) else {
+                continue;
+            };
+            if let Some(name) = p
+                .get("name")
+                .and_then(|n| n.nth_atom(1))
+                .filter(|n| *n != "~" && !n.is_empty())
+            {
+                pin_names.insert(number.to_string(), name.to_string());
+            }
+        }
+
+        if idx > 1 {
+            continue; // additional units are drawn separately on a real schematic
+        }
+
+        for r in unit.get_all("rectangle") {
+            if let (Some((x0, y0)), Some((x1, y1))) = (xy(r.get("start")), xy(r.get("end"))) {
+                shapes.push(SymShape::Rect {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    fill: fill_of(r),
+                });
+            }
+        }
+        for p in unit.get_all("polyline") {
+            if let Some(pts) = p.get("pts") {
+                let pts: Vec<(f64, f64)> = pts
+                    .get_all("xy")
+                    .into_iter()
+                    .filter_map(|e| xy(Some(e)))
+                    .collect();
+                if pts.len() >= 2 {
+                    shapes.push(SymShape::Poly {
+                        pts,
+                        fill: fill_of(p),
+                    });
+                }
+            }
+        }
+        for c in unit.get_all("circle") {
+            if let (Some((cx, cy)), Some(r)) = (xy(c.get("center")), num(c.get("radius"), 1)) {
+                shapes.push(SymShape::Circle {
+                    cx,
+                    cy,
+                    r,
+                    fill: fill_of(c),
+                });
+            }
+        }
+        for a in unit.get_all("arc") {
+            if let (Some(start), Some(mid), Some(end)) =
+                (xy(a.get("start")), xy(a.get("mid")), xy(a.get("end")))
+            {
+                shapes.push(SymShape::Arc { start, mid, end });
+            }
+        }
+        for p in unit.get_all("pin") {
+            let at = p.get("at");
+            let (Some(x), Some(y)) = (num(at, 1), num(at, 2)) else {
+                continue;
+            };
+            let number = p
+                .get("number")
+                .and_then(|n| n.nth_atom(1))
+                .unwrap_or_default()
+                .to_string();
+            if number.is_empty() {
+                continue;
+            }
+            // `~` is KiCad's explicit "this pin has no name" — treat it as absent
+            // rather than drawing a tilde on the schematic.
+            let name = p
+                .get("name")
+                .and_then(|n| n.nth_atom(1))
+                .filter(|n| *n != "~")
+                .unwrap_or_default()
+                .to_string();
+            pins.push(SymPin {
+                number,
+                name,
+                x,
+                y,
+                angle: num(at, 3).unwrap_or(0.0),
+                length: p
+                    .get("length")
+                    .and_then(|l| l.nth_atom(1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2.54),
+            });
+        }
+    }
+
+    if shapes.is_empty() && pins.is_empty() {
+        return None;
+    }
+    Some(SymbolGraphics {
+        shapes,
+        pins,
+        units,
+        pin_names,
+        hide_pin_names,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway symbol library, cleaned up on drop.
+    struct TempLib(PathBuf);
+    impl Drop for TempLib {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn temp_lib(tag: &str, body: &str) -> TempLib {
+        let dir = std::env::temp_dir().join(format!(
+            "lob-sym-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("T.kicad_sym"), body).unwrap();
+        TempLib(dir)
+    }
+
+    /// A derived symbol reads its parent's pins (PCM5102A is drawn as
+    /// `(extends "PCM5100")`, and read naively has none), and a port pin's
+    /// alternate functions come back with it — the cited source for an STM32
+    /// pin-mux choice.
+    #[test]
+    fn a_derived_symbol_has_its_parents_pins_and_their_alternates() {
+        let lib = temp_lib(
+            "extends",
+            r#"(kicad_symbol_lib
+                 (symbol "BASE"
+                   (property "Datasheet" "https://example.com/base.pdf")
+                   (symbol "BASE_1_1"
+                     (pin bidirectional line (at 0 0 0) (length 2.54)
+                       (name "PE5") (number "4")
+                       (alternate "SAI1_SCK_A" bidirectional line)
+                       (alternate "SPI4_MISO" bidirectional line))
+                     (pin power_in line (at 0 2.54 0) (length 2.54)
+                       (name "VDD") (number "10"))))
+                 (symbol "DERIVED" (extends "BASE")
+                   (property "Datasheet" "https://example.com/derived.pdf"))
+                 (symbol "LOOP" (extends "LOOP")))"#,
+        );
+        let d = read_symbol(&lib.0, "T", "DERIVED").unwrap().expect("found");
+        assert_eq!(
+            d.pins,
+            vec![("4".into(), "PE5".into()), ("10".into(), "VDD".into())]
+        );
+        assert_eq!(
+            d.alternates,
+            vec![
+                ("4".into(), "SAI1_SCK_A".into()),
+                ("4".into(), "SPI4_MISO".into())
+            ]
+        );
+        assert_eq!(
+            d.datasheet.as_deref(),
+            Some("https://example.com/derived.pdf"),
+            "the derived symbol's own properties win"
+        );
+        assert!(
+            read_symbol(&lib.0, "T", "LOOP").is_err(),
+            "a cycle is a broken library, not a part with no pins"
+        );
+    }
+
+    /// KiCad has three fill modes and they are not interchangeable: `outline` is
+    /// solid in the line colour, `background` paints the sheet colour so a body
+    /// occludes what is behind it, `none` is open. Treating them as one boolean
+    /// turned every background-filled symbol (an audio jack) into a black blob.
+    #[test]
+    fn reads_body_shapes_pins_and_distinguishes_fill_modes() {
+        let lib = temp_lib(
+            "fill",
+            r#"(kicad_symbol_lib (symbol "P"
+                 (symbol "P_0_1"
+                   (rectangle (start -1 -2) (end 1 2) (fill (type none)))
+                   (polyline (pts (xy 0 0) (xy 1 1)) (fill (type background)))
+                   (circle (center 0 0) (radius 0.5) (fill (type outline))))
+                 (symbol "P_1_1"
+                   (pin passive line (at 0 3.81 270) (length 1.27) (number "1"))
+                   (pin passive line (at 0 -3.81 90) (length 1.27) (number "2")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "P").expect("graphics");
+        assert_eq!(g.units, 1);
+        assert_eq!(g.pins.len(), 2);
+        let fills: Vec<SymFill> = g
+            .shapes
+            .iter()
+            .map(|s| match s {
+                SymShape::Rect { fill, .. }
+                | SymShape::Poly { fill, .. }
+                | SymShape::Circle { fill, .. } => *fill,
+                SymShape::Arc { .. } => SymFill::None,
+            })
+            .collect();
+        assert!(fills.contains(&SymFill::None));
+        assert!(fills.contains(&SymFill::Background));
+        assert!(fills.contains(&SymFill::Outline));
+
+        // A pin's `(at …)` IS the wire connection point, and the drawn lead runs
+        // from there *into* the body, one `length` along `angle`. Reading it the
+        // other way round attaches every wire to the body edge instead of the pin.
+        let p1 = g.pins.iter().find(|p| p.number == "1").unwrap();
+        assert_eq!((p1.x, p1.y), (0.0, 3.81), "connection point is the `at`");
+        let (bx, by) = p1.body_end();
+        assert!(
+            bx.abs() < 1e-9 && (by - 2.54).abs() < 1e-9,
+            "body end sits one pin length toward the body, got ({bx},{by})"
+        );
+        // …and a wire leaves the opposite way, continuing the pin outward.
+        let (ox, oy) = p1.outward();
+        assert!(ox.abs() < 1e-9 && (oy - 1.0).abs() < 1e-9, "({ox},{oy})");
+    }
+
+    /// KiCad defines many parts by inheritance — `TL072` is `(extends "LM2904")` —
+    /// so the graphics live on the base symbol and the chain must be followed.
+    #[test]
+    fn follows_extends_to_the_symbol_that_holds_the_drawing() {
+        let lib = temp_lib(
+            "ext",
+            r#"(kicad_symbol_lib
+                 (symbol "Base"
+                   (symbol "Base_0_1" (rectangle (start -1 -1) (end 1 1) (fill (type none))))
+                   (symbol "Base_1_1" (pin passive line (at 0 2 270) (length 1) (number "1"))))
+                 (symbol "Derived" (extends "Base")))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "Derived").expect("inherited graphics");
+        assert_eq!(g.shapes.len(), 1);
+        assert_eq!(g.pins.len(), 1);
+    }
+
+    /// A part drawn as several units (an op-amp is two amplifiers plus a power
+    /// unit) needs its pins split across separately-placed units, so callers are
+    /// told the unit count and can decline.
+    #[test]
+    fn reports_multi_unit_parts() {
+        let lib = temp_lib(
+            "units",
+            r#"(kicad_symbol_lib (symbol "Dual"
+                 (symbol "Dual_1_1" (pin passive line (at 0 2 270) (length 1) (number "1")))
+                 (symbol "Dual_2_1" (pin passive line (at 0 2 270) (length 1) (number "5")))
+                 (symbol "Dual_3_1" (pin power_in line (at 0 2 270) (length 1) (number "8")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "Dual").expect("graphics");
+        assert_eq!(g.units, 3, "three units detected");
+        // Only unit 1 is drawn; the rest belong to separate placements.
+        assert_eq!(g.pins.len(), 1);
+    }
+
+    /// Pin *names* come from every unit, not just the drawn one. A multi-unit part
+    /// keeps most of its pins in units 2+ and is exactly the part that falls back
+    /// to a labelled box, so harvesting only unit 1 left an LM13700 box showing
+    /// bare numbers (`legion-of-bom-sto`).
+    #[test]
+    fn pin_names_are_read_from_every_unit_not_just_the_drawn_one() {
+        let lib = temp_lib(
+            "names",
+            r#"(kicad_symbol_lib (symbol "OTA"
+                 (symbol "OTA_1_1" (pin input line (at 0 2 270) (length 1)
+                    (name "+") (number "3")))
+                 (symbol "OTA_2_1" (pin input line (at 0 2 270) (length 1)
+                    (name "DIODE_BIAS") (number "2")))
+                 (symbol "OTA_3_1" (pin output line (at 0 2 270) (length 1)
+                    (name "~") (number "5")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "OTA").expect("graphics");
+        assert_eq!(g.units, 3);
+        assert_eq!(g.pins.len(), 1, "still only unit 1 is drawn");
+        assert_eq!(g.pin_names.get("3").map(String::as_str), Some("+"));
+        assert_eq!(
+            g.pin_names.get("2").map(String::as_str),
+            Some("DIODE_BIAS"),
+            "a name from unit 2 is kept even though the unit is not drawn"
+        );
+        assert!(
+            !g.pin_names.contains_key("5"),
+            "`~` is KiCad's explicit no-name and must not become a label"
+        );
+        assert!(!g.hide_pin_names);
+    }
+
+    /// `(pin_names … hide)` is the symbol author saying "do not label these" —
+    /// what keeps a resistor from growing two labels.
+    #[test]
+    fn a_symbol_can_ask_for_its_pin_names_not_to_be_drawn() {
+        let lib = temp_lib(
+            "hidden",
+            r#"(kicad_symbol_lib (symbol "R" (pin_names (offset 0) hide)
+                 (symbol "R_1_1" (pin passive line (at 0 2 270) (length 1)
+                    (name "A") (number "1")))))"#,
+        );
+        let g = read_symbol_graphics(&lib.0, "T", "R").expect("graphics");
+        assert!(g.hide_pin_names);
+        // The name is still *read* — hiding is a drawing decision, not a data one.
+        assert_eq!(g.pin_names.get("1").map(String::as_str), Some("A"));
+    }
+
+    #[test]
+    fn missing_symbol_or_library_is_not_an_error() {
+        let lib = temp_lib("none", r#"(kicad_symbol_lib (symbol "X"))"#);
+        assert!(read_symbol_graphics(&lib.0, "T", "Nope").is_none());
+        assert!(read_symbol_graphics(&lib.0, "NoSuchLib", "X").is_none());
+    }
 
     #[test]
     fn builtin_catalog_models_active_parts_without_a_symbol_model() {
@@ -369,6 +982,40 @@ mod tests {
         assert_eq!(subckt("U1"), Some("LM13700"));
         assert_eq!(subckt("U2"), Some("TL072"));
         assert!(!models.contains_key("R1"), "a resistor carries no model");
+    }
+
+    #[test]
+    fn explicit_sim_fields_naming_the_builtin_lib_need_no_real_file() {
+        // legion-of-bom-utn.2 regression: a part that names the bundled
+        // catalog directly via Sim.Library (not the name-sniffed
+        // builtin_model() path above) must resolve against BUILTIN_LIB_TEXT,
+        // not a file read that only works if the caller's current directory
+        // happens to match wherever write_builtin_lib last wrote it.
+        let mut part = crate::model::Part::new("Q1", "MMBT3904");
+        part.sim = Some(crate::model::SimModel {
+            device: "SUBCKT".into(),
+            name: "NPN_GENERIC".into(),
+            library: Some(BUILTIN_LIB_NAME.into()),
+            pins: Some("B=b E=e C=c".into()),
+        });
+        let c = crate::model::Circuit {
+            name: "fuzz".into(),
+            parts: vec![part],
+            nets: vec![],
+        };
+        // A symbol_dir that doesn't exist proves this path touches no disk.
+        let models = resolve_models(&c, Path::new("/definitely/does/not/exist")).unwrap();
+        match models.get("Q1") {
+            Some(SpiceModel::Subckt {
+                subckt, pin_order, ..
+            }) => {
+                assert_eq!(subckt, "NPN_GENERIC");
+                // NPN_GENERIC's own terminal order is "c b e" (lob_builtin.lib);
+                // pin_order is the part's pin ids in THAT order, i.e. C, B, E.
+                assert_eq!(pin_order, &["C", "B", "E"]);
+            }
+            other => panic!("expected a resolved NPN_GENERIC subckt, got {other:?}"),
+        }
     }
 
     #[test]

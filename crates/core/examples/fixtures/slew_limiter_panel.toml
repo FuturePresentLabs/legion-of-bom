@@ -1,0 +1,43 @@
+format = "eurorack"
+hp = 8
+thickness_mm = 1.6
+
+[[cutouts]]
+x_mm = 20.319999999999993
+y_mm = 30.0
+rotation_deg = 0.0
+footprint = "Thonkiconn"
+refdes = "J1"
+label = "IN"
+
+[[cutouts]]
+x_mm = 20.319999999999993
+y_mm = 14.0
+rotation_deg = 0.0
+footprint = "Thonkiconn"
+refdes = "J2"
+label = "OUT"
+
+[[cutouts]]
+x_mm = 17.0
+y_mm = 75.386364
+rotation_deg = 0.0
+footprint = "Thonkiconn"
+refdes = "J4"
+label = "CV IN"
+
+[[cutouts]]
+x_mm = 20.319999999999993
+y_mm = 100.0
+rotation_deg = 0.0
+footprint = "Alpha9mm"
+refdes = "RV1"
+label = "RATE"
+
+[[cutouts]]
+x_mm = 17.25
+y_mm = 47.840908999999996
+rotation_deg = 0.0
+footprint = "Alpha9mm"
+refdes = "RV2"
+label = "CV AMT"

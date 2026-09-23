@@ -5,6 +5,7 @@
 //! compares that against the cutoff the ngspice AC sweep actually produced and
 //! passes only if they agree within tolerance.
 
+use crate::model::is_ground_net;
 use crate::source::CircuitSource;
 use crate::spice::AcResult;
 use crate::stage::{Finding, StageOutcome};
@@ -86,10 +87,6 @@ pub fn check_rc_cutoff(
 /// Output net + ground convention (matches [`SimConfig`](crate::spice::SimConfig)
 /// defaults) used to identify the feedback vs ground resistor topologically.
 const OUTPUT_NET: &str = "OUT";
-
-fn is_ground_net(name: &str) -> bool {
-    name.eq_ignore_ascii_case("GND") || name == "0"
-}
 
 /// Net names a given reference designator connects to.
 fn nets_of<'a>(circuit: &'a dyn CircuitSource, refdes: &str) -> Vec<&'a str> {
@@ -173,6 +170,79 @@ pub fn check_noninverting_gain(
     );
 
     Some(if rel_err <= rel_tol {
+        StageOutcome::passed(STAGE).with(Finding::info(msg))
+    } else {
+        StageOutcome::failed(STAGE, msg)
+    })
+}
+
+/// Check that one channel of a multi-channel circuit does not disturb another.
+///
+/// Self-selecting like the analytic checks: returns `None` unless the circuit
+/// presents at least two signal channels (`SIG_IN1`/`SIG_OUT1`, `SIG_IN2`/…),
+/// so it costs a single-channel board nothing.
+///
+/// `aggressor` is the driven channel's output waveform and `victim` the *un*driven
+/// channel's, from the same stimulus. The check fails if the victim moved more
+/// than `max_ratio` of the aggressor's swing — and also if the aggressor barely
+/// moved, because a simulation that drove nothing would otherwise "pass" while
+/// measuring nothing.
+///
+/// WHAT THIS DOES AND DOES NOT PROVE. A netlist has ideal supplies and a
+/// zero-impedance ground, so the only coupling it can express is a *shared node*
+/// — two channels accidentally sharing a net, a resistor, or an op-amp section.
+/// That is exactly the failure mode of a dual built by instantiating one channel
+/// twice (a net name that didn't get its per-channel suffix), which is why this
+/// is worth gating on. Coupling through shared rail/return impedance, and
+/// through a shared die, are physical and cannot appear here — see the product
+/// repo's `circuits/dual_slew_limiter/dual_slew_limiter_crosstalk.cir` for the
+/// first (it sweeps the shared ground return) and the bench for the second.
+pub fn check_channel_crosstalk(
+    circuit: &dyn CircuitSource,
+    aggressor: &crate::spice::TranResult,
+    victim: &crate::spice::TranResult,
+    max_ratio: f64,
+) -> Option<StageOutcome> {
+    let channels = crate::spice::signal_channels(circuit);
+    if channels.len() < 2 {
+        return None;
+    }
+    let (Some(driven), Some(leaked)) = (aggressor.peak_to_peak_v(), victim.peak_to_peak_v()) else {
+        return Some(StageOutcome::failed(
+            STAGE,
+            "channel crosstalk: no waveform data to compare".to_string(),
+        ));
+    };
+    // Guard against a vacuous pass: if the aggressor didn't swing, the ratio is
+    // meaningless however small the victim's excursion is.
+    const MIN_DRIVEN_V: f64 = 0.1;
+    if driven < MIN_DRIVEN_V {
+        return Some(StageOutcome::failed(
+            STAGE,
+            format!(
+                "channel crosstalk: the driven channel ({}) only moved {driven:.4} V — \
+                 the stimulus never reached it, so isolation was not measured",
+                channels[0].1
+            ),
+        ));
+    }
+
+    let ratio = leaked / driven;
+    let db = if ratio > 0.0 {
+        format!("{:.1} dB", 20.0 * ratio.log10())
+    } else {
+        "-inf dB".to_string()
+    };
+    let msg = format!(
+        "channel crosstalk: drove {} → {} swung {driven:.3} Vpp; undriven {} moved \
+         {leaked:.6} Vpp — {ratio:.3e} ({db}, limit {max_ratio:.1e}); \
+         {} channels, ideal supplies",
+        channels[0].0,
+        channels[0].1,
+        channels[1].1,
+        channels.len()
+    );
+    Some(if ratio <= max_ratio {
         StageOutcome::passed(STAGE).with(Finding::info(msg))
     } else {
         StageOutcome::failed(STAGE, msg)
@@ -284,6 +354,7 @@ mod tests {
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
                     mpn: None,
                     sim: None,
+                    sim_excluded: false,
                     side: None,
                 },
                 Part::new("R1", rf), // feedback: OUT ↔ FB
@@ -350,10 +421,84 @@ mod tests {
     #[test]
     fn analytic_check_runs_the_matching_check() {
         // Op-amp circuit → gain check applies and passes.
-        assert!(analytic_check(&opamp_amp("9k", "1k"), &flat_response(20.0), 0.02).passed);
+        let gain = analytic_check(&opamp_amp("9k", "1k"), &flat_response(20.0), 0.02);
+        assert!(gain.passed, "{:?}", gain.findings);
+        assert!(
+            gain.findings
+                .iter()
+                .any(|f| f.message.contains("non-inverting gain")),
+            "gain check did not contribute its finding: {:?}",
+            gain.findings
+        );
         // RC circuit → cutoff check applies and passes.
         let rc = rc_circuit("1k", "159n");
-        assert!(analytic_check(&rc, &response_with_cutoff(1000.97), 0.02).passed);
+        let cutoff = analytic_check(&rc, &response_with_cutoff(1000.97), 0.02);
+        assert!(cutoff.passed, "{:?}", cutoff.findings);
+        assert!(
+            cutoff.findings.iter().any(|f| f.message.contains("cutoff")),
+            "RC cutoff check did not contribute its finding: {:?}",
+            cutoff.findings
+        );
+    }
+
+    fn dual_circuit() -> Circuit {
+        Circuit {
+            name: "dual".into(),
+            parts: vec![Part::new("U1", "LM13700")],
+            nets: vec![
+                Net::new("SIG_IN1", vec![PinRef::new("U1", "3")]),
+                Net::new("SIG_OUT1", vec![PinRef::new("U1", "5")]),
+                Net::new("SIG_IN2", vec![PinRef::new("U1", "14")]),
+                Net::new("SIG_OUT2", vec![PinRef::new("U1", "12")]),
+            ],
+        }
+    }
+
+    /// A waveform swinging `pp` volts peak-to-peak.
+    fn swing(pp: f64) -> crate::spice::TranResult {
+        use crate::spice::TranPoint;
+        crate::spice::TranResult {
+            points: vec![
+                TranPoint { t_s: 0.0, v: 0.0 },
+                TranPoint { t_s: 1.0, v: pp },
+                TranPoint { t_s: 2.0, v: 0.0 },
+            ],
+        }
+    }
+
+    #[test]
+    fn crosstalk_passes_when_channels_are_independent() {
+        let outcome = check_channel_crosstalk(&dual_circuit(), &swing(4.0), &swing(0.0), 1e-3)
+            .expect("crosstalk check applies to a dual");
+        assert!(outcome.passed, "{:?}", outcome.findings);
+    }
+
+    #[test]
+    fn crosstalk_fails_when_a_node_is_shared() {
+        // The failure this exists for: a dual built by instantiating one channel
+        // twice, with a net that didn't get its per-channel suffix. The undriven
+        // output then follows the driven one.
+        let outcome = check_channel_crosstalk(&dual_circuit(), &swing(2.0), &swing(2.0), 1e-3)
+            .expect("crosstalk check applies to a dual");
+        assert!(!outcome.passed);
+        assert!(outcome.has_errors());
+    }
+
+    #[test]
+    fn crosstalk_does_not_vacuously_pass_on_a_dead_stimulus() {
+        // Victim at 0 and aggressor at 0 is perfect isolation by arithmetic and
+        // no measurement at all — it must fail, not pass.
+        let outcome = check_channel_crosstalk(&dual_circuit(), &swing(0.0), &swing(0.0), 1e-3)
+            .expect("crosstalk check applies to a dual");
+        assert!(!outcome.passed);
+    }
+
+    #[test]
+    fn crosstalk_bows_out_of_a_single_channel_circuit() {
+        assert!(
+            check_channel_crosstalk(&rc_circuit("1k", "159n"), &swing(4.0), &swing(0.0), 1e-3)
+                .is_none()
+        );
     }
 
     #[test]

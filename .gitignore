@@ -18,6 +18,10 @@ skidl.cfg
 # Local pipeline outputs / scratch (generated netlists, boards, gerbers)
 /out/
 
+# Durable local ooda decision-capture logs (per-binary, for fine-tuning) —
+# local machine state, not something to version with the repo.
+/.ooda/
+
 # Secrets — API keys/tokens. NEVER commit. Commit .env.example (unignored) instead.
 .env
 .env.*

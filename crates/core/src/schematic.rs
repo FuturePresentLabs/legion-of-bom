@@ -1,0 +1,1419 @@
+//! Schematic rendering — a readable circuit diagram straight from the model (agr).
+//!
+//! Drawn here rather than shelled out: SKiDL's own schematic generator is
+//! experimental, and the alternatives (netlistsvg, graphviz) are external tools the
+//! dashboard can't rely on. Working from [`CircuitSource`] instead keeps this
+//! DSL-agnostic (DESIGN 2.3/3.3) — any circuit producer gets a diagram — and makes
+//! it as cheap and always-available as [`crate::panel::panel_to_svg`].
+//!
+//! Layout follows how a person reads a circuit: signal flows left→right, so parts
+//! are ranked by their distance from the input net and stacked in columns. Signal
+//! nets route through a vertical trunk between columns. Power and ground are drawn
+//! as rail stubs at each part rather than wires — standard schematic practice, and
+//! the thing that keeps a diagram legible, since a rail touches nearly everything.
+
+use std::collections::{HashMap, VecDeque};
+
+use crate::model::{is_ground_net as is_ground, is_supply_rail as is_rail};
+use crate::source::CircuitSource;
+use crate::symbols::{read_symbol_graphics, SymFill, SymShape, SymbolGraphics};
+
+/// The sheet colour — also what a `background`-filled symbol shape paints with.
+const SHEET_BG: &str = "#fbfbf7";
+
+/// Sheet geometry (px). The diagram is emitted at these units and scaled by the
+/// viewer's `viewBox`.
+mod sheet {
+    /// Fixed clearance between one column's real content and the next
+    /// column's — the wire-trunk + net-label channel. Kept as a flat
+    /// constant deliberately: it is the "small fixed clearance" term next to
+    /// two *computed* half-extents (see [`super::Placed::content_size`]), not
+    /// a stand-in for either column's own size the way the old `COL_W` was.
+    pub const COL_CHANNEL: f64 = 92.0;
+    /// Extra width budgeted for a column when its part's refdes/value caption
+    /// prints *beside* the body rather than below it (every pin runs
+    /// vertically — a resistor, a cap). Sized for a short refdes plus an
+    /// 11-char ellipsized value at their real font sizes, so tightening a
+    /// column to its symbol's real width doesn't relocate the label
+    /// collision transmog hit onto this caption instead.
+    pub const CAPTION_SIDE_W: f64 = 80.0;
+    /// Fixed vertical budget *above* a part's body for its rail stub and
+    /// label. Not derived from the body's own height — a label needs this
+    /// room regardless of how small the symbol above it is.
+    pub const ROW_TOP_BUDGET: f64 = 32.0;
+    /// Fixed vertical budget *below* a part's body: the ground stub + its
+    /// label, then the refdes/value caption under all of it — about 33 + 26
+    /// px, plus a few px of slack. Same reasoning as [`ROW_TOP_BUDGET`]: this
+    /// is label space, budgeted separately from body-to-body clearance so it
+    /// is never the thing that gets squeezed when a row's body is short.
+    pub const ROW_BOTTOM_BUDGET: f64 = 64.0;
+    /// Floor under a column's/row's real content size, so a degenerate
+    /// near-zero symbol still gets breathing room for its stubs and leads.
+    pub const MIN_CONTENT: f64 = 16.0;
+    pub const BOX_W: f64 = 108.0;
+    pub const BOX_H: f64 = 46.0;
+    /// Clear space between the sheet frame and the drawing, so net labels and rail
+    /// symbols sit inside it rather than on it.
+    pub const MARGIN: f64 = 62.0;
+    /// Extra room on the right for a trunk + net label hanging off the last column.
+    pub const GUTTER: f64 = 70.0;
+    /// Preferred symbol scale, and the slot a symbol is fitted into.
+    pub const SYM_PX_PER_MM: f64 = 6.5;
+    pub const SYM_MAX_W: f64 = 104.0;
+    pub const SYM_MAX_H: f64 = 74.0;
+    /// How far a wire runs out along its pin before turning toward the trunk.
+    pub const PIN_STUB: f64 = 10.0;
+    /// How far a power/ground stub runs out from its pin before its glyph.
+    pub const RAIL_STUB: f64 = 13.0;
+    /// Sheet frame inset, and the title block that sits in its bottom-right corner.
+    pub const FRAME: f64 = 12.0;
+    pub const TITLE_W: f64 = 300.0;
+    pub const TITLE_H: f64 = 64.0;
+}
+
+/// A part awaiting placement: refdes, value, its resolved symbol, the pins the
+/// box fallback must lay out, that part's pin number→name map, and its orientation.
+type PendingPart<'a> = (
+    &'a str,
+    &'a str,
+    Option<SymbolGraphics>,
+    Vec<String>,
+    HashMap<String, String>,
+    (bool, bool),
+);
+
+/// Where a net attaches to one part: the part, the pin's connection point, and
+/// the breakout point a short way out along the pin.
+type Attach<'a> = (&'a Placed, (f64, f64), (f64, f64));
+
+/// A part positioned on the sheet, with its KiCad symbol when one resolved.
+struct Placed {
+    refdes: String,
+    value: String,
+    col: usize,
+    row: usize,
+    /// The drawn body from the KiCad symbol library. `None` — no library, unknown
+    /// symbol, or a multi-unit part — falls back to a labelled box.
+    sym: Option<SymbolGraphics>,
+    /// Pin identifiers used by the box fallback, in netlist order, so a symbol-less
+    /// part still has one distinct attach point per pin.
+    box_pins: Vec<String>,
+    /// Pin number → the symbol's name for it (`5` → `OUT`, `1` → `IABC`), for the
+    /// pins that have one.
+    ///
+    /// Read from the symbol library even for parts whose symbol we decline to
+    /// *draw*, because those are exactly the parts that need it: a multi-unit IC
+    /// falls back to a box, and a box labelled 1,3,4,5 hides the topology. On the
+    /// slew limiter, pins 4 and 5 both landing on SLEW_NODE *is* the circuit — the
+    /// OTA output charging C1 and the cap feeding back to the inverting input —
+    /// and nothing on the page said which was which. The netlist carries no
+    /// `pinfunction`, so the symbol is the only source.
+    pin_names: HashMap<String, String>,
+    /// Quarter-turn the symbol, so a part wired in series along the signal path
+    /// lies across it instead of standing on end and making the router detour.
+    rot90: bool,
+    /// Mirror the symbol, so its pins face the side its wires actually come from.
+    flip: bool,
+    /// This part's resolved top-left corner in sheet px, computed once by
+    /// [`layout`] from every column's/row's *real* content — see
+    /// [`Placed::content_size`]. Not a `col`/`row` × fixed-pitch formula: a
+    /// resistor no longer gets the same berth as a switch.
+    sheet_x: f64,
+    sheet_y: f64,
+    /// The column's own resolved content width (the widest part placed in it),
+    /// shared by every part in the column. Kept alongside each part rather
+    /// than recomputed from `placed` at each use site, so the wire-trunk
+    /// channel (which must clear the whole column, not just the one part a
+    /// net happens to leave from) can't drift out of sync with the spacing
+    /// [`layout`] actually used.
+    col_w: f64,
+}
+
+impl Placed {
+    fn x(&self) -> f64 {
+        self.sheet_x
+    }
+    fn y(&self) -> f64 {
+        self.sheet_y
+    }
+    fn cx(&self) -> f64 {
+        self.x() + self.content_size().0 / 2.0
+    }
+    fn cy(&self) -> f64 {
+        self.y() + self.content_size().1 / 2.0
+    }
+
+    /// This part's own real drawn footprint: the KiCad symbol's oriented,
+    /// scaled bounding box when one resolved, else the fallback box's fixed
+    /// size. Everything a column's/row's spacing is sized from — a resistor
+    /// scaled down to a few px no longer sits in the middle of the same slot
+    /// a switch or a jack needs.
+    fn content_size(&self) -> (f64, f64) {
+        match self.oriented_bounds() {
+            Some((x0, y0, x1, y1)) => {
+                let scale = self.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
+                (((x1 - x0) * scale).max(1.0), ((y1 - y0) * scale).max(1.0))
+            }
+            None => (sheet::BOX_W, sheet::BOX_H),
+        }
+    }
+
+    /// True when any of this part's pins run sideways (left/right) once its
+    /// orientation is applied — a jack's contacts, a header's two rows. Those
+    /// pins occupy the sides, so the refdes/value caption is drawn below the
+    /// body instead of beside it, and the column needs no side-caption budget
+    /// for this part (see [`sheet::CAPTION_SIDE_W`]).
+    fn pins_sideways(&self) -> bool {
+        self.sym.as_ref().is_some_and(|g| {
+            g.pins
+                .iter()
+                .any(|q| self.orient_dir(q.outward()).0.abs() > 0.5)
+        })
+    }
+
+    /// Apply this part's orientation to a symbol-space point or vector: mirror
+    /// first, then the quarter turn. Both are axis-aligned, so the same routine
+    /// serves points, directions and bounding-box corners.
+    fn orient(&self, x: f64, y: f64) -> (f64, f64) {
+        let x = if self.flip { -x } else { x };
+        if self.rot90 {
+            (-y, x)
+        } else {
+            (x, y)
+        }
+    }
+
+    /// Orientation applied to a direction vector.
+    fn orient_dir(&self, (x, y): (f64, f64)) -> (f64, f64) {
+        self.orient(x, y)
+    }
+
+    /// The symbol's bounds after orientation.
+    fn oriented_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        let (x0, y0, x1, y1) = self.sym.as_ref()?.bounds();
+        let mut b = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            let (px, py) = self.orient(x, y);
+            b = (b.0.min(px), b.1.min(py), b.2.max(px), b.3.max(py));
+        }
+        Some(b)
+    }
+
+    /// Symbol-space → sheet-px transform: `(scale, bcx, bcy)`, sized so the symbol
+    /// fits its slot without being blown up past [`sheet::SYM_PX_PER_MM`].
+    fn sym_fit(&self) -> Option<(f64, f64, f64)> {
+        let (x0, y0, x1, y1) = self.oriented_bounds()?;
+        let (bw, bh) = ((x1 - x0).max(0.1), (y1 - y0).max(0.1));
+        let scale = (sheet::SYM_MAX_W / bw)
+            .min(sheet::SYM_MAX_H / bh)
+            .min(sheet::SYM_PX_PER_MM);
+        Some((scale, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    }
+
+    /// A symbol point in sheet px, oriented. KiCad symbol space is Y-**up**, the
+    /// sheet Y-down.
+    fn sym_px(&self, x: f64, y: f64) -> (f64, f64) {
+        let (x, y) = self.orient(x, y);
+        match self.sym_fit() {
+            Some((s, bcx, bcy)) => (self.cx() + (x - bcx) * s, self.cy() - (y - bcy) * s),
+            None => (self.cx(), self.cy()),
+        }
+    }
+
+    /// Where a wire attaches for this part's `pin`, and the sheet-space direction
+    /// it should leave along: the pin's connection point and its outward vector.
+    ///
+    /// A part with no symbol still gets real, distinct pin positions — its pins are
+    /// laid down the sides of its box in netlist order — so a boxed multi-unit part
+    /// shows which pin is which instead of every wire meeting at one point.
+    fn pin_anchor(&self, pin: &str) -> Option<((f64, f64), (f64, f64))> {
+        match self.sym.as_ref() {
+            Some(g) => {
+                let p = g.pins.iter().find(|p| p.number == pin)?;
+                let (ox, oy) = self.orient_dir(p.outward());
+                // Symbol space is Y-up, the sheet Y-down, so the vertical flips.
+                Some((self.sym_px(p.x, p.y), (ox, -oy)))
+            }
+            None => {
+                let i = self.box_pins.iter().position(|n| n == pin)?;
+                let n = self.box_pins.len().max(1);
+                // Odd pins left, even pins right, stepping down the box.
+                let left = i % 2 == 0;
+                let rows = n.div_ceil(2);
+                let slot = (i / 2) as f64 + 0.5;
+                let y = self.y() + sheet::BOX_H * slot / rows as f64;
+                if left {
+                    Some(((self.x(), y), (-1.0, 0.0)))
+                } else {
+                    Some(((self.x() + sheet::BOX_W, y), (1.0, 0.0)))
+                }
+            }
+        }
+    }
+}
+
+impl Placed {
+    /// Where a power/ground stub should attach. On a real symbol that's the pin
+    /// itself; on a fallback box, rails go out the top and grounds out the bottom —
+    /// how an IC's supplies are drawn anyway — which also keeps them off the sides
+    /// where the signal pins live, and stops a left-hand pin firing its rail
+    /// symbol off the edge of the sheet.
+    fn power_anchor(
+        &self,
+        pin: &str,
+        rail: bool,
+        slot: usize,
+        of: usize,
+    ) -> ((f64, f64), (f64, f64)) {
+        if self.sym.is_some() {
+            if let Some(a) = self.pin_anchor(pin) {
+                return a;
+            }
+        }
+        let x = self.x() + sheet::BOX_W * (slot as f64 + 0.5) / of.max(1) as f64;
+        if rail {
+            ((x, self.y()), (0.0, -1.0))
+        } else {
+            ((x, self.y() + sheet::BOX_H), (0.0, 1.0))
+        }
+    }
+}
+
+/// Power and ground are drawn as stubs, not routed wires.
+fn is_power(name: &str) -> bool {
+    is_ground(name) || is_rail(name)
+}
+
+/// Rank parts left→right by hops from the input net over signal nets, so the
+/// diagram reads the way the signal flows. Parts the search never reaches (an
+/// isolated decoupling cap, say) land after the ones it did.
+fn rank_parts(circuit: &dyn CircuitSource) -> HashMap<String, usize> {
+    // Signal-net adjacency: power rails would make everything adjacent to
+    // everything, so they're excluded.
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for net in circuit.nets() {
+        if is_power(&net.name) {
+            continue;
+        }
+        let refs: Vec<&str> = {
+            let mut r: Vec<&str> = net.pins.iter().map(|p| p.refdes.0.as_str()).collect();
+            r.sort_unstable();
+            r.dedup();
+            r
+        };
+        for &a in &refs {
+            for &b in &refs {
+                if a != b {
+                    adj.entry(a).or_default().push(b);
+                }
+            }
+        }
+    }
+
+    // Seed from whatever looks like the input; else the alphabetically first part,
+    // so the layout is deterministic either way.
+    let input_like = ["IN", "SIG_IN", "INPUT", "AUDIO_IN", "IN_L"];
+    let mut seeds: Vec<&str> = circuit
+        .nets()
+        .iter()
+        .filter(|n| input_like.iter().any(|c| n.name.eq_ignore_ascii_case(c)))
+        .flat_map(|n| n.pins.iter().map(|p| p.refdes.0.as_str()))
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
+    if seeds.is_empty() {
+        let mut all: Vec<&str> = circuit
+            .parts()
+            .iter()
+            .map(|p| p.refdes.0.as_str())
+            .collect();
+        all.sort_unstable();
+        seeds.extend(all.first().copied());
+    }
+
+    let mut rank: HashMap<String, usize> = HashMap::new();
+    let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
+    for s in &seeds {
+        rank.insert(s.to_string(), 0);
+        queue.push_back((s, 0));
+    }
+    while let Some((r, d)) = queue.pop_front() {
+        let mut next: Vec<&str> = adj.get(r).cloned().unwrap_or_default();
+        next.sort_unstable();
+        next.dedup();
+        for n in next {
+            if !rank.contains_key(n) {
+                rank.insert(n.to_string(), d + 1);
+                queue.push_back((n, d + 1));
+            }
+        }
+    }
+    // Anything unreached goes in a final column.
+    let max = rank.values().copied().max().unwrap_or(0);
+    for p in circuit.parts() {
+        rank.entry(p.refdes.0.clone()).or_insert(max + 1);
+    }
+    rank
+}
+
+/// Lay parts out in columns by rank, stacked in refdes order within a column.
+/// A symbol's pin number → name map, across every unit.
+fn pin_names_of(g: Option<&SymbolGraphics>) -> HashMap<String, String> {
+    g.map(|g| g.pin_names.clone()).unwrap_or_default()
+}
+
+fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
+    let rank = rank_parts(circuit);
+    // Resolve each part's KiCad symbol once, cached by `lib:part` since a circuit
+    // reuses the same handful. Multi-unit parts (an op-amp is two amplifiers plus a
+    // power unit) are declined here: drawing them properly means splitting their
+    // pins across separately-placed units, so they fall back to a box.
+    let dir = crate::skidl::kicad_symbol_dir();
+    let mut cache: HashMap<String, Option<SymbolGraphics>> = HashMap::new();
+    // The *unfiltered* read. Multi-unit parts are declined for drawing below, but
+    // their pin names are still wanted — they are the parts that fall back to a
+    // box, and a box is where a name matters most.
+    let mut graphics_for = |lib_part: Option<&str>| -> Option<SymbolGraphics> {
+        let dir = dir.as_ref()?;
+        let key = lib_part?;
+        let (lib, part) = key.split_once(':')?;
+        cache
+            .entry(key.to_string())
+            .or_insert_with(|| read_symbol_graphics(dir.path(), lib, part))
+            .clone()
+    };
+
+    // Pins each part actually uses, in netlist order — the box fallback lays these
+    // down its sides so every pin still gets its own attach point.
+    let mut used_pins: HashMap<&str, Vec<String>> = HashMap::new();
+    for net in circuit.nets() {
+        // Power pins are drawn as rail/ground stubs off the top and bottom, so they
+        // must not also claim a slot on the box's sides — a pin shown in two places
+        // is worse than a pin shown in one.
+        if is_power(&net.name) {
+            continue;
+        }
+        for pin in &net.pins {
+            let e = used_pins.entry(pin.refdes.0.as_str()).or_default();
+            if !e.contains(&pin.pin) {
+                e.push(pin.pin.clone());
+            }
+        }
+    }
+
+    // Orientation, decided from the netlist rather than from pixels.
+    //
+    // A part wired between two *signal* nets sits in the flow, so it's turned to lie
+    // across it — a resistor in series reads (and routes) far better lying down than
+    // standing on end. A part with a leg on a rail or ground (a pull-down, a bypass
+    // cap) stays upright, because that leg wants to point at its rail symbol.
+    //
+    // Then, if a part's pins face one way while its wires come from the other — an
+    // output jack whose contacts point away from the stage feeding it, a pot whose
+    // wiper points away from the net it drives — it gets mirrored.
+    let mut orient: HashMap<&str, (bool, bool)> = HashMap::new();
+    for part in circuit.parts() {
+        let r = part.refdes.0.as_str();
+        let my_col = rank.get(r).copied().unwrap_or(0) as f64;
+        // Per signal pin: which side its net lies on.
+        let mut signal_pins: Vec<(&str, f64)> = Vec::new();
+        let mut on_power = false;
+        for net in circuit.nets() {
+            if !net.pins.iter().any(|p| p.refdes.0 == r) {
+                continue;
+            }
+            if is_power(&net.name) {
+                on_power = true;
+                continue;
+            }
+            let toward: f64 = net
+                .pins
+                .iter()
+                .filter(|p| p.refdes.0 != r)
+                .map(|o| rank.get(o.refdes.0.as_str()).copied().unwrap_or(0) as f64 - my_col)
+                .sum();
+            for p in net.pins.iter().filter(|p| p.refdes.0 == r) {
+                signal_pins.push((p.pin.as_str(), toward));
+            }
+        }
+        let sym = graphics_for(part.library_part.as_deref()).filter(|g| g.units == 1);
+        let Some(g) = sym.as_ref() else {
+            orient.insert(r, (false, false));
+            continue;
+        };
+        let upright = g.pins.iter().all(|q| q.outward().0.abs() < 0.5);
+        let rot90 = upright && !on_power && signal_pins.len() >= 2;
+
+        // A mirror is horizontal, so only pins that point sideways get a say in it.
+        // A pot's wiper is its one horizontal pin; its two end pins run up and down
+        // and would otherwise cancel the wiper's vote and leave the part unflipped.
+        let (mut want, mut have) = (0.0f64, 0.0f64);
+        for (pin, toward) in &signal_pins {
+            let Some(q) = g.pins.iter().find(|q| &q.number == pin) else {
+                continue;
+            };
+            let (ox, oy) = q.outward();
+            let dir = if rot90 { -oy } else { ox };
+            want += dir.abs() * toward;
+            have += dir;
+        }
+        let flip = have.abs() > 1e-6 && want.abs() > 1e-6 && have.signum() != want.signum();
+        orient.insert(r, (rot90, flip));
+    }
+
+    let mut by_col: HashMap<usize, Vec<PendingPart>> = HashMap::new();
+    for p in circuit.parts() {
+        let c = rank.get(&p.refdes.0).copied().unwrap_or(0);
+        let g = graphics_for(p.library_part.as_deref());
+        let pin_names = pin_names_of(g.as_ref());
+        let sym = g.filter(|g| g.units == 1);
+        let pins = used_pins
+            .get(p.refdes.0.as_str())
+            .cloned()
+            .unwrap_or_default();
+        by_col.entry(c).or_default().push((
+            p.refdes.0.as_str(),
+            p.value.as_str(),
+            sym,
+            pins,
+            pin_names,
+            orient
+                .get(p.refdes.0.as_str())
+                .copied()
+                .unwrap_or((false, false)),
+        ));
+    }
+    let mut out = Vec::new();
+    let mut cols: Vec<usize> = by_col.keys().copied().collect();
+    cols.sort_unstable();
+    // Each column's left edge follows the previous column's *real* content,
+    // not a fixed pitch: `col_left += col_w + COL_CHANNEL`, where `col_w` is
+    // that column's own widest part. A column of resistors no longer costs
+    // the same width as a column holding a switch.
+    let mut col_left = sheet::MARGIN;
+    for (ci, c) in cols.iter().enumerate() {
+        let mut parts = by_col.remove(c).unwrap_or_default();
+        parts.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut column: Vec<Placed> = parts
+            .into_iter()
+            .enumerate()
+            .map(
+                |(ri, (refdes, value, sym, box_pins, pin_names, (rot90, flip)))| Placed {
+                    refdes: refdes.to_string(),
+                    value: value.to_string(),
+                    col: ci,
+                    row: ri,
+                    sym,
+                    box_pins,
+                    pin_names,
+                    rot90,
+                    flip,
+                    sheet_x: 0.0,
+                    sheet_y: 0.0,
+                    col_w: 0.0,
+                },
+            )
+            .collect();
+
+        // `content_size`/`pins_sideways` need only `sym`/`rot90`/`flip`, not a
+        // resolved position, so every part's real footprint can be measured
+        // before any position in this column is finalised.
+        let footprint_w = |p: &Placed| {
+            let (w, _) = p.content_size();
+            if p.sym.is_some() && !p.pins_sideways() {
+                // The caption prints beside the body for this part; budget
+                // for it here so shrinking the column to its symbol's real
+                // width doesn't push that caption into the next column's
+                // territory — the label-collision trap transmog's naive fix
+                // fell into.
+                w + sheet::CAPTION_SIDE_W
+            } else {
+                w
+            }
+        };
+        let col_w = column
+            .iter()
+            .map(footprint_w)
+            .fold(0.0_f64, f64::max)
+            .max(sheet::MIN_CONTENT);
+
+        let mut row_top = sheet::MARGIN;
+        for p in &mut column {
+            let (_, h) = p.content_size();
+            p.sheet_x = col_left;
+            p.sheet_y = row_top;
+            p.col_w = col_w;
+            // The label budgets above/below are fixed regardless of the
+            // body's real height — shrinking them along with a short body is
+            // exactly the mistake that put a stage name on top of the next
+            // part's rail in transmog's first attempt.
+            row_top += sheet::ROW_TOP_BUDGET + h.max(sheet::MIN_CONTENT) + sheet::ROW_BOTTOM_BUDGET;
+        }
+
+        out.extend(column);
+        col_left += col_w + sheet::COL_CHANNEL;
+    }
+    out
+}
+
+/// Render the circuit as a standalone SVG schematic diagram.
+pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
+    let placed = layout(circuit);
+    let pos: HashMap<&str, &Placed> = placed.iter().map(|p| (p.refdes.as_str(), p)).collect();
+
+    // Sheet extent from what is actually drawn, not `cols * COL_W` /
+    // `rows * ROW_H`: every part's real content now determines its own
+    // column's width and row's height (see `layout`), so the sheet itself
+    // must be sized from where that content actually ends up, not a fixed
+    // per-column/per-row pitch multiplied out.
+    let content_right = placed
+        .iter()
+        .map(|p| p.x() + p.content_size().0)
+        .fold(0.0_f64, f64::max);
+    let w = (content_right + sheet::COL_CHANNEL + sheet::GUTTER + sheet::MARGIN)
+        .max(sheet::TITLE_W + 2.0 * sheet::FRAME + 40.0);
+    let content_bottom = placed
+        .iter()
+        .map(|p| p.y() + p.content_size().1)
+        .fold(0.0_f64, f64::max);
+    // Room under the drawing for the ground stub + caption, the frame and the
+    // title block.
+    let h =
+        content_bottom + sheet::ROW_BOTTOM_BUDGET + sheet::MARGIN + sheet::TITLE_H + sheet::FRAME;
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w:.0} {h:.0}\" \
+         width=\"{w:.0}\" height=\"{h:.0}\" role=\"img\" aria-label=\"{} schematic\">\
+         <rect width=\"{w:.0}\" height=\"{h:.0}\" fill=\"{SHEET_BG}\"/>",
+        xml_escape(circuit.name()),
+    ));
+
+    // Signal nets first, so wires sit behind the part boxes. Nets that start in the
+    // same column would otherwise share one trunk line — and stack their labels on
+    // top of each other — so each column's channel is divided into lanes.
+    let ink = "#2a2a28";
+    // Each connection is a (part, attach-point): the pin's own tip when the symbol
+    // resolved, else the middle of the fallback box.
+    let mut routed: Vec<(&str, Vec<Attach>)> = Vec::new();
+    for net in circuit.nets() {
+        if is_power(&net.name) {
+            continue;
+        }
+        let mut pts: Vec<Attach> = Vec::new();
+        for pin in &net.pins {
+            let Some(p) = pos.get(pin.refdes.0.as_str()).copied() else {
+                continue;
+            };
+            if pts.iter().any(|(q, _, _)| q.refdes == p.refdes) {
+                continue; // one attach point per part is enough to read
+            }
+            // Leave the pin along its own direction before turning toward the
+            // trunk, so the wire continues the pin instead of striking it
+            // side-on. Parts with no resolved symbol just break out sideways.
+            let (at, (dx, dy)) = p.pin_anchor(&pin.pin).unwrap_or_else(|| {
+                // Pin lookup failed (a net names a pin the resolved symbol/box
+                // doesn't have): leave from this part's own real right edge,
+                // not its middle, so the wire still starts on the outline.
+                ((p.x() + p.content_size().0, p.cy()), (1.0, 0.0))
+            });
+            let breakout = (at.0 + dx * sheet::PIN_STUB, at.1 + dy * sheet::PIN_STUB);
+            pts.push((p, at, breakout));
+        }
+        pts.sort_by_key(|(p, _, _)| (p.col, p.row));
+        if pts.len() >= 2 {
+            routed.push((net.name.as_str(), pts));
+        }
+    }
+    // Lane assignment: index within the group of nets leaving the same column.
+    let mut lane_of: Vec<(usize, usize)> = Vec::with_capacity(routed.len()); // (lane, lanes)
+    {
+        let mut per_col: HashMap<usize, usize> = HashMap::new();
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for (_, pts) in &routed {
+            *counts.entry(pts[0].0.col).or_default() += 1;
+        }
+        for (_, pts) in &routed {
+            let c = pts[0].0.col;
+            let i = per_col.entry(c).or_insert(0);
+            lane_of.push((*i, counts[&c]));
+            *i += 1;
+        }
+    }
+
+    for (idx, (name, pts)) in routed.iter().enumerate() {
+        let (lane, lanes) = lane_of[idx];
+        // Spread trunks evenly across the channel between this column's real
+        // content and the next, so parallel nets stay visually distinct. Uses
+        // the *column's* resolved width (`col_w`, shared by every part in
+        // it), not this one part's own — the channel has to clear whichever
+        // part in the column is widest, not just the one a given net leaves
+        // from.
+        let channel = sheet::COL_CHANNEL;
+        let trunk =
+            pts[0].0.x() + pts[0].0.col_w + channel * (lane as f64 + 1.0) / (lanes as f64 + 1.0);
+        let (y0, y1) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), (_, _, b)| {
+                (lo.min(b.1), hi.max(b.1))
+            });
+        s.push_str(&format!(
+            "<path d=\"M{trunk:.1} {y0:.1} L{trunk:.1} {y1:.1}\" stroke=\"{ink}\" \
+             stroke-width=\"1.3\" fill=\"none\"/>"
+        ));
+        for (_, (ax, ay), (bx, by)) in pts.iter() {
+            // pin end → out along the pin → across to the trunk.
+            s.push_str(&format!(
+                "<path d=\"M{ax:.1} {ay:.1} L{bx:.1} {by:.1} L{trunk:.1} {by:.1}\" \
+                 stroke=\"{ink}\" stroke-width=\"1.3\" fill=\"none\"/>"
+            ));
+            // Junction dot where a branch tees off a trunk that carries on past it.
+            // Without one, a wire crossing and a wire joining look identical — the
+            // ambiguity real schematics use this dot to settle. The ends of the
+            // trunk are plain corners, so only interior joins get one.
+            if *by > y0 + 0.5 && *by < y1 - 0.5 {
+                s.push_str(&format!(
+                    "<circle cx=\"{trunk:.1}\" cy=\"{by:.1}\" r=\"2.6\" fill=\"{ink}\"/>"
+                ));
+            }
+        }
+        // Net label at the top of the trunk, on a small backing so it stays legible
+        // where it crosses a wire.
+        let label = ellipsize(name, 14);
+        let lw = label.chars().count() as f64 * 6.0 + 6.0;
+        // Stagger by lane as well as by x: two nets leaving the same column at the
+        // same height would otherwise print their labels on top of each other.
+        // Never let the stagger push a label off the top of the sheet.
+        let ly = (y0 - 6.0 - lane as f64 * 12.0).max(14.0);
+        s.push_str(&format!(
+            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{lw:.1}\" height=\"12\" fill=\"{SHEET_BG}\"/>\
+             <text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"10\" fill=\"#6b7280\" text-anchor=\"middle\">{}</text>",
+            trunk - lw / 2.0,
+            ly - 10.0,
+            trunk,
+            ly,
+            xml_escape(&label)
+        ));
+    }
+
+    // Power / ground: drawn as a rail bar or ground symbol at each connected pin
+    // rather than routed across the sheet — standard practice, and the thing that
+    // keeps a diagram legible since a rail touches nearly everything. Attaching at
+    // the *pin* (not a fixed offset from the box) is what makes a 10-pin header or
+    // a jack's sleeve read as actually connected. Records how far each part's
+    // drawing extends downward, so captions can clear it.
+    // How many rail / ground stubs each part gets, so a box can space them out.
+    let mut slot_count: HashMap<(&str, bool), usize> = HashMap::new();
+    for net in circuit.nets() {
+        if !is_power(&net.name) {
+            continue;
+        }
+        for pin in &net.pins {
+            *slot_count
+                .entry((pin.refdes.0.as_str(), is_rail(&net.name)))
+                .or_default() += 1;
+        }
+    }
+    let mut slots: HashMap<(&str, bool), usize> = HashMap::new();
+    let mut lowest: HashMap<&str, f64> = HashMap::new();
+    for p in &placed {
+        let bottom = match p.sym.as_ref() {
+            Some(g) => p.sym_px(0.0, g.bounds().1).1,
+            None => p.y() + sheet::BOX_H,
+        };
+        lowest.insert(p.refdes.as_str(), bottom);
+    }
+    for net in circuit.nets() {
+        if !is_power(&net.name) {
+            continue;
+        }
+        let rail = is_rail(&net.name);
+        for pin in &net.pins {
+            let Some(p) = pos.get(pin.refdes.0.as_str()).copied() else {
+                continue;
+            };
+            let slot = *slots.entry((pin.refdes.0.as_str(), rail)).or_insert(0);
+            slots.insert((pin.refdes.0.as_str(), rail), slot + 1);
+            let of = *slot_count.get(&(pin.refdes.0.as_str(), rail)).unwrap_or(&1);
+            let (at, dir) = p.power_anchor(&pin.pin, rail, slot, of);
+            let (dx, dy) = dir;
+            let end = (at.0 + dx * sheet::RAIL_STUB, at.1 + dy * sheet::RAIL_STUB);
+            // Perpendicular to the stub, for the glyph's bars.
+            let (px, py) = (-dy, dx);
+            s.push_str(&format!(
+                "<path d=\"M{:.1} {:.1} L{:.1} {:.1}\" stroke=\"{ink}\" \
+                 stroke-width=\"1.2\" fill=\"none\"/>",
+                at.0, at.1, end.0, end.1
+            ));
+            if rail {
+                // A single bar across the end of the stub.
+                s.push_str(&format!(
+                    "<path d=\"M{:.1} {:.1} L{:.1} {:.1}\" stroke=\"{ink}\" \
+                     stroke-width=\"1.6\"/>",
+                    end.0 - px * 7.0,
+                    end.1 - py * 7.0,
+                    end.0 + px * 7.0,
+                    end.1 + py * 7.0
+                ));
+            } else {
+                // Ground: three shortening bars stepping further along the stub, so
+                // the glyph points the way the pin does whatever its orientation.
+                for (step, half) in [(0.0, 7.0), (2.5, 4.5), (5.0, 2.0)] {
+                    let c = (end.0 + dx * step, end.1 + dy * step);
+                    s.push_str(&format!(
+                        "<path d=\"M{:.1} {:.1} L{:.1} {:.1}\" stroke=\"{ink}\" \
+                         stroke-width=\"1.4\"/>",
+                        c.0 - px * half,
+                        c.1 - py * half,
+                        c.0 + px * half,
+                        c.1 + py * half
+                    ));
+                }
+            }
+            // Label just past the glyph, along the stub.
+            let lx = end.0 + dx * 15.0;
+            let ly = end.1 + dy * 15.0 + if dy.abs() < 0.5 { 3.0 } else { 0.0 };
+            s.push_str(&format!(
+                "<text x=\"{lx:.1}\" y=\"{ly:.1}\" font-family=\"ui-monospace,monospace\" \
+                 font-size=\"9\" fill=\"#6b7280\" text-anchor=\"middle\">{}</text>",
+                xml_escape(&net.name)
+            ));
+            if let Some(cur) = lowest.get_mut(pin.refdes.0.as_str()) {
+                *cur = cur.max(ly + 4.0);
+            }
+        }
+    }
+
+    // Parts on top: the real KiCad symbol where one resolved, else a labelled box.
+    for p in &placed {
+        // Caption placement. A symbol's pins run out of its top and bottom and the
+        // wires leave along them, so putting the caption underneath drops it right
+        // on a wire — which is what made a resistor look like it had a third lead.
+        // Beside the body instead, the way KiCad does it. A fallback box is wide and
+        // has its pins on the sides, so that one keeps its caption below.
+        // Beside the body when every pin runs vertically (a resistor, a cap): the
+        // sides are clear, and putting it underneath would drop it on the wire
+        // leaving the bottom pin. When any pin runs sideways — a jack's contacts, a
+        // header's two rows — the sides are exactly where the stubs and their
+        // labels are, so the caption goes below instead.
+        // Judge on the pins as *drawn* — a resistor turned into the signal path now
+        // has horizontal pins, so it needs the below-caption too.
+        let sideways = p.pins_sideways();
+        let (label_x, label_y, value_y, anchor) = match p.sym.as_ref() {
+            Some(_) if !sideways => {
+                // Oriented, scaled half-width: after a quarter turn the symbol's
+                // right edge is not where the raw symbol's was.
+                let half = p.content_size().0 / 2.0;
+                (p.cx() + half + 7.0, p.cy() - 2.0, p.cy() + 11.0, "start")
+            }
+            Some(_) => {
+                let below = lowest
+                    .get(p.refdes.as_str())
+                    .copied()
+                    .unwrap_or(p.y() + sheet::BOX_H);
+                (p.cx(), below + 14.0, below + 26.0, "middle")
+            }
+            None => {
+                let below = lowest
+                    .get(p.refdes.as_str())
+                    .copied()
+                    .unwrap_or(p.y() + sheet::BOX_H);
+                (p.cx(), below + 14.0, below + 26.0, "middle")
+            }
+        };
+        match p.sym.as_ref() {
+            Some(g) => {
+                s.push_str(&symbol_svg(p, g, ink));
+            }
+            None => {
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.0}\" height=\"{:.0}\" rx=\"4\" \
+                     fill=\"#ffffff\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    p.x(),
+                    p.y(),
+                    sheet::BOX_W,
+                    sheet::BOX_H
+                ));
+                // Show the pins on the box too, so a boxed part isn't a black hole
+                // that every wire disappears into.
+                for pin in &p.box_pins {
+                    let Some(((ax, ay), (dx, _))) = p.pin_anchor(pin) else {
+                        continue;
+                    };
+                    // "5 OUT", not "5". The number stays because it is what the
+                    // netlist and the datasheet's pinout both key on; the name is
+                    // what makes the connection mean something. Pins alternate
+                    // sides of a 108-wide box, so each label has ~11 monospace
+                    // characters before it would meet the one opposite.
+                    let label = match p.pin_names.get(pin) {
+                        Some(name) => ellipsize(&format!("{pin} {name}"), 11),
+                        None => pin.clone(),
+                    };
+                    // Centred on its own lead rather than sitting above it: the
+                    // topmost pin is only ~8px below the box edge, so a raised
+                    // baseline put the label's cap height through the border.
+                    s.push_str(&format!(
+                        "<path d=\"M{ax:.1} {ay:.1} L{:.1} {ay:.1}\" stroke=\"{ink}\" \
+                         stroke-width=\"1.2\"/>\
+                         <text x=\"{:.1}\" y=\"{ay:.1}\" font-family=\"ui-monospace,monospace\" \
+                         font-size=\"8\" fill=\"#6b7280\" text-anchor=\"{}\" \
+                         dominant-baseline=\"middle\">{}</text>",
+                        ax + dx * 6.0,
+                        ax - dx * 4.0,
+                        if dx < 0.0 { "start" } else { "end" },
+                        xml_escape(&label)
+                    ));
+                }
+            }
+        }
+        s.push_str(&format!(
+            "<text x=\"{label_x:.1}\" y=\"{label_y:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"12\" font-weight=\"600\" fill=\"{ink}\" text-anchor=\"{anchor}\">{}</text>",
+            xml_escape(&p.refdes)
+        ));
+        if !p.value.is_empty() {
+            // Beside a symbol there is only the column gutter to play with.
+            let value = ellipsize(&p.value, if anchor == "start" { 11 } else { 18 });
+            s.push_str(&format!(
+                "<text x=\"{label_x:.1}\" y=\"{value_y:.1}\" font-family=\"ui-monospace,monospace\" \
+                 font-size=\"10\" fill=\"#6b7280\" text-anchor=\"{anchor}\">{}</text>",
+                xml_escape(&value)
+            ));
+        }
+    }
+
+    s.push_str(&frame_and_title_svg(w, h, circuit, &placed, ink));
+    s.push_str("</svg>");
+    s
+}
+
+/// The sheet frame plus a KiCad-style title block in its bottom-right corner.
+/// Deliberately carries only what the model actually knows — the circuit name, the
+/// part count, and the tool — rather than inventing a date or a revision, which on
+/// a drawing people may print and file would be worse than leaving blank.
+fn frame_and_title_svg(
+    w: f64,
+    h: f64,
+    circuit: &dyn CircuitSource,
+    placed: &[Placed],
+    ink: &str,
+) -> String {
+    let f = sheet::FRAME;
+    let mut s = format!(
+        "<rect x=\"{f:.1}\" y=\"{f:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"none\" \
+         stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+        w - 2.0 * f,
+        h - 2.0 * f
+    );
+    let (tx, ty) = (w - f - sheet::TITLE_W, h - f - sheet::TITLE_H);
+    s.push_str(&format!(
+        "<rect x=\"{tx:.1}\" y=\"{ty:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+         fill=\"{SHEET_BG}\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+        sheet::TITLE_W,
+        sheet::TITLE_H
+    ));
+    // Divider under the title line.
+    s.push_str(&format!(
+        "<path d=\"M{tx:.1} {:.1} L{:.1} {:.1}\" stroke=\"{ink}\" stroke-width=\"1.0\"/>",
+        ty + 30.0,
+        tx + sheet::TITLE_W,
+        ty + 30.0
+    ));
+    s.push_str(&format!(
+        "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
+         font-size=\"15\" font-weight=\"600\" fill=\"{ink}\">{}</text>",
+        tx + 10.0,
+        ty + 21.0,
+        xml_escape(circuit.name())
+    ));
+    let symbols = placed.iter().filter(|p| p.sym.is_some()).count();
+    for (i, line) in [
+        format!("{} parts · {} nets", placed.len(), circuit.nets().len()),
+        format!("{symbols} drawn from KiCad symbols"),
+        "legion-of-bom · schematic view".to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        s.push_str(&format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"9\" fill=\"#6b7280\">{}</text>",
+            tx + 10.0,
+            ty + 42.0 + i as f64 * 10.0,
+            xml_escape(line)
+        ));
+    }
+    s
+}
+
+/// Draw a resolved KiCad symbol: its body primitives plus a lead for every pin,
+/// mapped from symbol space (mm, Y up) into sheet px.
+///
+/// Fill and stroke are drawn as two separate passes over `g.shapes` — every
+/// shape's fill first, then every shape's stroke on top — rather than one
+/// fill+stroke element per shape in file order. A KiCad symbol's declaration
+/// order does not reliably put its body (`fill background`) first: `SW_SPDT`
+/// declares its lever, pivot dot and throw-contact circles (all `fill none`)
+/// in `SW_SPDT_0_1` *before* its body rectangle in `SW_SPDT_1_1`, the opposite
+/// of `AudioJack2`, whose body rectangle happens to precede its distinguishing
+/// polylines. Drawing shapes as single combined elements in that order let the
+/// later-declared filled body paint over — and completely hide — the
+/// earlier-declared unfilled detail shapes, rendering every SW_SPDT as a bare
+/// rectangle. Splitting fill from stroke guarantees a solid fill always sits
+/// behind every stroke, whatever order the symbol declared its shapes in —
+/// the same fill-then-stroke convention real schematic renderers use.
+fn symbol_svg(p: &Placed, g: &SymbolGraphics, ink: &str) -> String {
+    let mut s = String::new();
+    // KiCad fill modes: `outline` is solid in the line colour, `background` is the
+    // sheet colour (it occludes, it doesn't go black), `none` is open.
+    let paint = |f: SymFill| match f {
+        SymFill::Outline => ink,
+        SymFill::Background => SHEET_BG,
+        SymFill::None => "none",
+    };
+    let pt = |x: f64, y: f64| p.sym_px(x, y);
+    let scale = p.sym_fit().map(|(sc, _, _)| sc).unwrap_or(1.0);
+
+    // Pass 1: fills only, `fill=none` shapes contribute nothing here.
+    for shape in &g.shapes {
+        match shape {
+            SymShape::Rect {
+                x0,
+                y0,
+                x1,
+                y1,
+                fill,
+            } if *fill != SymFill::None => {
+                let (ax, ay) = pt(*x0, *y0);
+                let (bx, by) = pt(*x1, *y1);
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                     fill=\"{}\"/>",
+                    ax.min(bx),
+                    ay.min(by),
+                    (bx - ax).abs(),
+                    (by - ay).abs(),
+                    paint(*fill),
+                ));
+            }
+            SymShape::Poly { pts, fill } if *fill != SymFill::None => {
+                // A polyline's fill closes the point list implicitly (SVG
+                // always fills as if closed), so this needs no `polygon`.
+                let d: Vec<String> = pts
+                    .iter()
+                    .map(|&(x, y)| {
+                        let (px, py) = pt(x, y);
+                        format!("{px:.1},{py:.1}")
+                    })
+                    .collect();
+                s.push_str(&format!(
+                    "<polyline points=\"{}\" fill=\"{}\"/>",
+                    d.join(" "),
+                    paint(*fill)
+                ));
+            }
+            SymShape::Circle { cx, cy, r, fill } if *fill != SymFill::None => {
+                let (px, py) = pt(*cx, *cy);
+                let rr = r * scale;
+                s.push_str(&format!(
+                    "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"{rr:.1}\" fill=\"{}\"/>",
+                    paint(*fill)
+                ));
+            }
+            // `fill == None`, or an arc (which carries no fill at all).
+            _ => {}
+        }
+    }
+
+    // Pass 2: strokes only, every shape, in original declaration order.
+    for shape in &g.shapes {
+        match shape {
+            SymShape::Rect { x0, y0, x1, y1, .. } => {
+                let (ax, ay) = pt(*x0, *y0);
+                let (bx, by) = pt(*x1, *y1);
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                     fill=\"none\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                    ax.min(bx),
+                    ay.min(by),
+                    (bx - ax).abs(),
+                    (by - ay).abs(),
+                ));
+            }
+            SymShape::Poly { pts, .. } => {
+                let d: Vec<String> = pts
+                    .iter()
+                    .map(|&(x, y)| {
+                        let (px, py) = pt(x, y);
+                        format!("{px:.1},{py:.1}")
+                    })
+                    .collect();
+                s.push_str(&format!(
+                    "<polyline points=\"{}\" fill=\"none\" stroke=\"{ink}\" \
+                     stroke-width=\"1.4\" stroke-linejoin=\"round\"/>",
+                    d.join(" "),
+                ));
+            }
+            SymShape::Circle { cx, cy, r, .. } => {
+                let (px, py) = pt(*cx, *cy);
+                let rr = r * scale;
+                s.push_str(&format!(
+                    "<circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"{rr:.1}\" fill=\"none\" \
+                     stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+                ));
+            }
+            SymShape::Arc { start, mid, end } => {
+                // Three-point arc → SVG arc. The radius comes from the
+                // circumcircle of the three points; degenerate (collinear) cases
+                // fall back to a straight line, which is what they look like.
+                let (ax, ay) = pt(start.0, start.1);
+                let (mx, my) = pt(mid.0, mid.1);
+                let (bx, by) = pt(end.0, end.1);
+                let d = 2.0 * (ax * (my - by) + mx * (by - ay) + bx * (ay - my));
+                if d.abs() < 1e-6 {
+                    s.push_str(&format!(
+                        "<path d=\"M{ax:.1} {ay:.1} L{bx:.1} {by:.1}\" fill=\"none\" \
+                         stroke=\"{ink}\" stroke-width=\"1.4\"/>"
+                    ));
+                    continue;
+                }
+                let ux = ((ax * ax + ay * ay) * (my - by)
+                    + (mx * mx + my * my) * (by - ay)
+                    + (bx * bx + by * by) * (ay - my))
+                    / d;
+                let uy = ((ax * ax + ay * ay) * (bx - mx)
+                    + (mx * mx + my * my) * (ax - bx)
+                    + (bx * bx + by * by) * (mx - ax))
+                    / d;
+                let r = ((ax - ux).powi(2) + (ay - uy).powi(2)).sqrt();
+                // Sweep direction from the sign of the cross product at the mid point.
+                let sweep = if (mx - ax) * (by - ay) - (my - ay) * (bx - ax) > 0.0 {
+                    1
+                } else {
+                    0
+                };
+                s.push_str(&format!(
+                    "<path d=\"M{ax:.1} {ay:.1} A{r:.1} {r:.1} 0 0 {sweep} {bx:.1} {by:.1}\" \
+                     fill=\"none\" stroke=\"{ink}\" stroke-width=\"1.4\"/>"
+                ));
+            }
+        }
+    }
+
+    // Pin leads: from the connection point in to where the pin meets the body.
+    for pin in &g.pins {
+        let (rx, ry) = pt(pin.x, pin.y);
+        let (bx, by) = pin.body_end();
+        let (tx, ty) = pt(bx, by);
+        s.push_str(&format!(
+            "<path d=\"M{rx:.1} {ry:.1} L{tx:.1} {ty:.1}\" stroke=\"{ink}\" \
+             stroke-width=\"1.2\" fill=\"none\"/>"
+        ));
+        // A named pin gets its name just inside the body, KiCad's own convention.
+        // Symbols that ask for names to be hidden don't get them — that is how a
+        // resistor stays a resistor instead of growing two labels — and most
+        // passives name their pins `~` anyway, so this draws nothing for them.
+        if g.hide_pin_names || pin.name.is_empty() {
+            continue;
+        }
+        let (ox, _) = p.orient_dir(pin.outward());
+        s.push_str(&format!(
+            "<text x=\"{:.1}\" y=\"{ty:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"8\" fill=\"#6b7280\" text-anchor=\"{}\" dominant-baseline=\"middle\">{}</text>",
+            tx - ox * 3.0,
+            if ox < 0.0 { "start" } else { "end" },
+            xml_escape(&ellipsize(&pin.name, 8))
+        ));
+    }
+    s
+}
+
+/// Shorten a string to `max` chars with an ellipsis, so a long value (a full
+/// footprint name, say) can't spill out of its part box.
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{keep}…")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Circuit, Net, Part, PinRef};
+
+    fn demo() -> Circuit {
+        let mut c = Circuit::new("demo");
+        c.parts = vec![
+            Part::new("J1", "in"),
+            Part::new("R1", "10k"),
+            Part::new("U1", "TL072"),
+            Part::new("J2", "out"),
+            Part::new("C1", "100nF"),
+        ];
+        c.nets = vec![
+            Net::new("IN", vec![PinRef::new("J1", "T"), PinRef::new("R1", "1")]),
+            Net::new("MID", vec![PinRef::new("R1", "2"), PinRef::new("U1", "3")]),
+            Net::new("OUT", vec![PinRef::new("U1", "1"), PinRef::new("J2", "T")]),
+            Net::new("+12V", vec![PinRef::new("U1", "8"), PinRef::new("C1", "1")]),
+            Net::new("GND", vec![PinRef::new("J1", "S"), PinRef::new("C1", "2")]),
+        ];
+        c
+    }
+
+    /// A drawn symbol labels its named pins, and honours a symbol that asks for
+    /// its names to be hidden — the difference between an op-amp that says which
+    /// input is which and a resistor cluttered with two labels it never wanted.
+    #[test]
+    fn a_drawn_symbol_labels_named_pins_unless_the_symbol_hides_them() {
+        use crate::symbols::{SymPin, SymbolGraphics};
+        fn pin(number: &str, name: &str) -> SymPin {
+            SymPin {
+                number: number.into(),
+                name: name.into(),
+                x: -5.08,
+                y: 2.54,
+                angle: 0.0,
+                length: 2.54,
+            }
+        }
+        let mut g = SymbolGraphics {
+            shapes: Vec::new(),
+            pins: vec![pin("2", "-"), pin("3", "")],
+            units: 1,
+            pin_names: HashMap::new(),
+            hide_pin_names: false,
+        };
+        let p = Placed {
+            refdes: "U1".into(),
+            value: "TL072".into(),
+            col: 0,
+            row: 0,
+            sym: Some(g.clone()),
+            box_pins: Vec::new(),
+            pin_names: HashMap::new(),
+            rot90: false,
+            flip: false,
+            sheet_x: 0.0,
+            sheet_y: 0.0,
+            col_w: sheet::BOX_W,
+        };
+        let out = symbol_svg(&p, &g, "#000");
+        assert!(out.contains(">-<"), "named pin is labelled: {out}");
+        assert_eq!(
+            out.matches("<text").count(),
+            1,
+            "the unnamed pin gets no label: {out}"
+        );
+
+        g.hide_pin_names = true;
+        let hidden = symbol_svg(&p, &g, "#000");
+        assert!(
+            !hidden.contains("<text"),
+            "a symbol that hides names gets none: {hidden}"
+        );
+    }
+
+    /// legion-of-bom-<schematic switch symbols render as blank rectangles>
+    /// regression: a KiCad symbol's shape declaration order is not guaranteed
+    /// to put its body (a `background`-filled shape) before its
+    /// distinguishing detail graphics. `Switch:SW_SPDT` declares its lever,
+    /// pivot dot and throw-contact circles (all `fill none`) in `SW_SPDT_0_1`
+    /// *before* its body rectangle in `SW_SPDT_1_1` — the opposite of
+    /// `Connector_Audio:AudioJack2`, whose body rectangle happens to precede
+    /// its distinguishing polylines. Drawing one fill+stroke element per shape
+    /// in file order let the later-declared filled body paint over the
+    /// earlier-declared unfilled detail shapes and erase them outright, so
+    /// every switch rendered as a bare rectangle with no lever or pivot dot.
+    #[test]
+    fn a_background_fill_body_never_hides_shapes_declared_before_it() {
+        use crate::symbols::{SymFill, SymShape, SymbolGraphics};
+        let g = SymbolGraphics {
+            shapes: vec![
+                // Detail declared FIRST, like SW_SPDT's lever polyline.
+                SymShape::Poly {
+                    pts: vec![(-1.0, 0.0), (1.0, 1.0)],
+                    fill: SymFill::None,
+                },
+                // Body declared SECOND, like SW_SPDT_1_1's rectangle.
+                SymShape::Rect {
+                    x0: -2.0,
+                    y0: -2.0,
+                    x1: 2.0,
+                    y1: 2.0,
+                    fill: SymFill::Background,
+                },
+            ],
+            pins: Vec::new(),
+            units: 1,
+            pin_names: HashMap::new(),
+            hide_pin_names: false,
+        };
+        let p = Placed {
+            refdes: "SW1".into(),
+            value: "SW_SPDT".into(),
+            col: 0,
+            row: 0,
+            sym: Some(g.clone()),
+            box_pins: Vec::new(),
+            pin_names: HashMap::new(),
+            rot90: false,
+            flip: false,
+            sheet_x: 0.0,
+            sheet_y: 0.0,
+            col_w: sheet::BOX_W,
+        };
+        let out = symbol_svg(&p, &g, "#000");
+        // The body's *fill* is emitted in pass 1 (before any stroke), so it
+        // must appear earlier in the document than the detail shape's
+        // *stroke*, which is emitted in pass 2 — otherwise the fill would
+        // paint over the stroke and hide it, the exact bug this regresses.
+        let body_fill = out.find("<rect").expect("body fill emitted");
+        let detail_stroke = out.find("<polyline").expect("detail stroke emitted");
+        assert!(
+            body_fill < detail_stroke,
+            "the body's fill must be painted before the detail shape's \
+             stroke, or it hides it: {out}"
+        );
+        // And the detail shape must still actually be visible: its stroke
+        // must not be `none`.
+        let stroke_snippet = &out[detail_stroke..];
+        assert!(
+            stroke_snippet.contains("stroke=\"#000\""),
+            "the detail polyline must be stroked: {out}"
+        );
+    }
+
+    /// Orientation is decided from the netlist: a part bridging two *signal* nets
+    /// lies across the signal path, a part with a leg on a rail stays upright so
+    /// that leg points at its rail symbol, and a part whose pins face away from
+    /// where its wires come from gets mirrored.
+    #[test]
+    fn orients_parts_from_their_connections() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        fn lib_part(refdes: &str, value: &str, lib: &str) -> Part {
+            let mut p = Part::new(refdes, value);
+            p.library_part = Some(lib.to_string());
+            p
+        }
+        let mut c = Circuit::new("o");
+        c.parts = vec![
+            Part::new("J1", "in"),
+            lib_part("R1", "10k", "Device:R"),
+            lib_part("R2", "10k", "Device:R"),
+            lib_part("U1", "TL072", "Amplifier_Operational:TL072"),
+        ];
+        c.nets = vec![
+            Net::new("IN", vec![PinRef::new("J1", "T"), PinRef::new("R1", "1")]),
+            // R1 bridges two signal nets → lies across the path.
+            Net::new("MID", vec![PinRef::new("R1", "2"), PinRef::new("U1", "3")]),
+            // R2 has a leg on a rail → stays upright.
+            Net::new("MID2", vec![PinRef::new("R2", "1"), PinRef::new("U1", "2")]),
+            Net::new("-12V", vec![PinRef::new("R2", "2")]),
+        ];
+        let placed = layout(&c);
+        let by = |r: &str| placed.iter().find(|p| p.refdes == r).unwrap();
+        // Only meaningful when the KiCad symbol libraries are present.
+        if by("R1").sym.is_none() {
+            return;
+        }
+        assert!(by("R1").rot90, "series resistor should lie across the path");
+        assert!(!by("R2").rot90, "resistor with a rail leg stays upright");
+        // A multi-unit op-amp keeps its box, and a box is never re-oriented.
+        assert!(!by("U1").rot90 && !by("U1").flip);
+    }
+
+    /// A mirror is horizontal, so only pins that point sideways may vote on it. A
+    /// pot has two end pins running up and down and one wiper running across; if
+    /// the end pins get a vote they cancel the wiper's and the part never flips,
+    /// leaving the wiper pointing away from the net it drives.
+    #[test]
+    fn only_sideways_pins_vote_on_a_mirror() {
+        use crate::model::{Circuit, Net, Part, PinRef};
+        let mut c = Circuit::new("p");
+        let mut pot = Part::new("RV1", "100k");
+        pot.library_part = Some("Device:R_Potentiometer".into());
+        c.parts = vec![Part::new("R1", "1k"), pot, Part::new("J1", "in")];
+        // Ranking seeds at J1 and fans right, so J1 is left of RV1 and R1 right of
+        // it: the wiper's net lies to the LEFT while an end pin reaches RIGHT.
+        // Summed naively those cancel; weighted by how sideways each pin is, only
+        // the wiper — the pot's one horizontal pin — gets a vote.
+        c.nets = vec![
+            Net::new(
+                "WIPE",
+                vec![PinRef::new("J1", "T"), PinRef::new("RV1", "2")],
+            ),
+            Net::new("TOP", vec![PinRef::new("RV1", "1"), PinRef::new("R1", "1")]),
+        ];
+        let placed = layout(&c);
+        let rv1 = placed.iter().find(|p| p.refdes == "RV1").unwrap();
+        let Some(g) = rv1.sym.as_ref() else { return }; // needs KiCad libraries
+        assert_eq!(g.units, 1, "a pot is a single-unit symbol");
+        assert!(
+            rv1.flip,
+            "wiper should be mirrored to face the net it drives"
+        );
+    }
+
+    #[test]
+    fn ranks_parts_by_signal_flow_from_the_input() {
+        let c = demo();
+        let r = rank_parts(&c);
+        // J1 is on IN, so it seeds at 0 and the chain fans out left→right.
+        assert_eq!(r["J1"], 0);
+        assert!(r["R1"] < r["U1"], "R1 should sit left of U1");
+        assert!(r["U1"] < r["J2"], "U1 should sit left of the output jack");
+    }
+
+    /// Power rails must not drive the ranking — a rail touches nearly every part,
+    /// so including it would collapse the whole circuit into one column.
+    #[test]
+    fn power_nets_do_not_collapse_the_layout() {
+        let c = demo();
+        let r = rank_parts(&c);
+        let cols: std::collections::HashSet<usize> = c
+            .parts
+            .iter()
+            .map(|p| r[p.refdes.0.as_str()])
+            .collect::<std::collections::HashSet<_>>();
+        assert!(cols.len() >= 3, "expected several columns, got {cols:?}");
+    }
+
+    #[test]
+    fn svg_is_well_formed_and_labels_every_part() {
+        let c = demo();
+        let svg = schematic_to_svg(&c);
+        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
+        for p in &c.parts {
+            assert!(
+                svg.contains(&format!(">{}<", p.refdes.0)),
+                "missing {}",
+                p.refdes.0
+            );
+        }
+        // Rails are drawn as stubs, not routed as trunk wires.
+        assert!(svg.contains("+12V") && svg.contains("GND"));
+    }
+
+    #[test]
+    fn handles_a_circuit_with_no_recognisable_input() {
+        let mut c = Circuit::new("x");
+        c.parts = vec![Part::new("R1", "1k"), Part::new("R2", "2k")];
+        c.nets = vec![Net::new(
+            "N$1",
+            vec![PinRef::new("R1", "2"), PinRef::new("R2", "1")],
+        )];
+        let svg = schematic_to_svg(&c);
+        assert!(svg.contains(">R1<") && svg.contains(">R2<"));
+    }
+}

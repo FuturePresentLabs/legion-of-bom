@@ -2,25 +2,29 @@
 //!
 //! Single-vendor to start (the multi-vendor JLC/LCSC/DigiKey fallback is
 //! deliberately deferred). The key comes from `MOUSER_API_KEY` (loaded from
-//! `.env` at CLI startup). Kept thin over `ureq` so it stays snappy.
+//! `.env` at CLI startup). The request/response mechanics — URL, JSON shape,
+//! how a response maps onto [`PartPrice`] — live in `assets/distributors/
+//! mouser.lua`, loaded via [`crate::distributor_lua`]: swapping in a
+//! different pricing API means editing that script, not this file.
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
-const SEARCH_URL: &str = "https://api.mouser.com/api/v1/search/partnumber";
+use crate::distributor_lua::{load_named_script, DistributorScript, DistributorScriptError};
+
+const SCRIPT_NAME: &str = "mouser.lua";
+const REQUIRED_FNS: &[&str] = &["search_mpn", "search_keyword"];
 
 /// Errors from Mouser lookups.
 #[derive(Debug, thiserror::Error)]
 pub enum MouserError {
     #[error("MOUSER_API_KEY is not set (put it in .env)")]
     MissingKey,
-    #[error("Mouser API error: {0}")]
-    Api(String),
-    #[error("Mouser request failed: {0}")]
-    Http(String),
+    #[error("Mouser: {0}")]
+    Script(#[from] DistributorScriptError),
 }
 
 /// One quantity price break.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PriceBreak {
     pub quantity: u64,
     pub unit_price: f64,
@@ -28,7 +32,7 @@ pub struct PriceBreak {
 }
 
 /// Live pricing/stock for a part, as returned by Mouser.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartPrice {
     /// The manufacturer part number Mouser actually matched (may be a variant).
     pub mpn: String,
@@ -54,135 +58,87 @@ impl PartPrice {
     }
 }
 
+#[derive(Serialize)]
+struct MpnRequest<'a> {
+    api_key: &'a str,
+    mpn: &'a str,
+}
+
+#[derive(Serialize)]
+struct KeywordRequest<'a> {
+    api_key: &'a str,
+    keyword: &'a str,
+    records: u16,
+}
+
 /// A Mouser Search API client.
-#[derive(Debug, Clone)]
 pub struct MouserClient {
     api_key: String,
+    script: DistributorScript,
 }
 
 impl MouserClient {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        MouserClient {
+    pub fn new(api_key: impl Into<String>) -> Result<Self, MouserError> {
+        let script = load_named_script(SCRIPT_NAME, REQUIRED_FNS)?;
+        Ok(MouserClient {
             api_key: api_key.into(),
-        }
+            script,
+        })
     }
 
     /// Build from `MOUSER_API_KEY` in the environment.
     pub fn from_env() -> Result<Self, MouserError> {
         match std::env::var("MOUSER_API_KEY") {
-            Ok(key) if !key.trim().is_empty() => Ok(MouserClient::new(key)),
+            Ok(key) if !key.trim().is_empty() => MouserClient::new(key),
             _ => Err(MouserError::MissingKey),
         }
     }
 
     /// Search Mouser by manufacturer part number; returns the best match.
     pub fn search_mpn(&self, mpn: &str) -> Result<Option<PartPrice>, MouserError> {
-        let url = format!("{SEARCH_URL}?apiKey={}", self.api_key);
-        let body = serde_json::json!({
-            "SearchByPartRequest": { "mouserPartNumber": mpn, "partSearchOptions": "" }
-        });
-        let response = ureq::post(&url)
-            .send_json(body)
-            .map_err(|e| MouserError::Http(e.to_string()))?;
-        let value: Value = response
-            .into_json()
-            .map_err(|e| MouserError::Http(e.to_string()))?;
-        parse_search(&value, mpn)
-    }
-}
-
-/// Parse a Mouser search response, preferring an exact MPN match.
-fn parse_search(value: &Value, wanted: &str) -> Result<Option<PartPrice>, MouserError> {
-    if let Some(errors) = value.get("Errors").and_then(Value::as_array) {
-        if !errors.is_empty() {
-            let msg = errors
-                .iter()
-                .filter_map(|e| e.get("Message").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(MouserError::Api(if msg.is_empty() {
-                "unknown error".into()
-            } else {
-                msg
-            }));
-        }
+        Ok(self.script.call(
+            "search_mpn",
+            &MpnRequest {
+                api_key: &self.api_key,
+                mpn,
+            },
+        )?)
     }
 
-    let Some(parts) = value
-        .get("SearchResults")
-        .and_then(|r| r.get("Parts"))
-        .and_then(Value::as_array)
-        .filter(|p| !p.is_empty())
-    else {
-        return Ok(None);
-    };
-
-    let part = parts
-        .iter()
-        .find(|p| p.get("ManufacturerPartNumber").and_then(Value::as_str) == Some(wanted))
-        .unwrap_or(&parts[0]);
-    Ok(Some(part_from_json(part)))
-}
-
-fn part_from_json(p: &Value) -> PartPrice {
-    let string = |key: &str| {
-        p.get(key)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-
-    let price_breaks = p
-        .get("PriceBreaks")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|b| {
-                    Some(PriceBreak {
-                        quantity: b.get("Quantity").and_then(Value::as_u64)?,
-                        unit_price: b
-                            .get("Price")
-                            .and_then(Value::as_str)
-                            .and_then(parse_price)?,
-                        currency: b
-                            .get("Currency")
-                            .and_then(Value::as_str)
-                            .unwrap_or("USD")
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    PartPrice {
-        mpn: string("ManufacturerPartNumber").unwrap_or_default(),
-        manufacturer: string("Manufacturer"),
-        in_stock: p
-            .get("AvailabilityInStock")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse().ok()),
-        datasheet_url: string("DataSheetUrl"),
-        product_url: string("ProductDetailUrl"),
-        image_url: string("ImagePath"),
-        price_breaks,
+    /// Search Mouser by free-text keyword — the path from a *generic* value
+    /// (`"10k resistor 0805"`) to real MPNs, which `search_mpn` (exact-lookup)
+    /// can't do. Returns up to `records` in-stock candidates, ranked by Mouser's
+    /// own relevance (we re-rank in [`crate::sourcing`]). `records` is clamped to
+    /// Mouser's 1..=50 window; 0 means "use the default (10)".
+    pub fn search_keyword(
+        &self,
+        keyword: &str,
+        records: u16,
+    ) -> Result<Vec<PartPrice>, MouserError> {
+        Ok(self.script.call(
+            "search_keyword",
+            &KeywordRequest {
+                api_key: &self.api_key,
+                keyword,
+                records,
+            },
+        )?)
     }
-}
-
-/// Parse a Mouser price string like `"$1.48"` or `"$1,234.50"` into a number.
-/// Assumes a `.`-decimal currency (USD); strips the currency symbol and thousands
-/// separators.
-fn parse_price(s: &str) -> Option<f64> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    cleaned.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// The real shipped script — these tests exercise its actual parsing
+    /// logic (no live API key / network needed: `parse_search_response` and
+    /// `parse_keyword_response` are pure functions of a JSON fixture).
+    fn script() -> DistributorScript {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/distributors/mouser.lua");
+        DistributorScript::load(&path, REQUIRED_FNS).expect("load mouser.lua")
+    }
 
     const FIXTURE: &str = r#"{
       "Errors": [],
@@ -203,18 +159,23 @@ mod tests {
       }
     }"#;
 
-    #[test]
-    fn parses_price_strings() {
-        assert_eq!(parse_price("$1.48"), Some(1.48));
-        assert_eq!(parse_price("$0.858"), Some(0.858));
-        assert_eq!(parse_price("$1,234.50"), Some(1234.50));
-        assert_eq!(parse_price(""), None);
+    #[derive(Serialize)]
+    struct SearchReq<'a> {
+        json: &'a str,
+        wanted: &'a str,
     }
 
     #[test]
     fn parses_response_and_prefers_exact_match() {
-        let value: Value = serde_json::from_str(FIXTURE).unwrap();
-        let price = parse_search(&value, "LM13700M/NOPB").unwrap().unwrap();
+        let price: PartPrice = script()
+            .call(
+                "parse_search_response",
+                &SearchReq {
+                    json: FIXTURE,
+                    wanted: "LM13700M/NOPB",
+                },
+            )
+            .unwrap();
         assert_eq!(price.mpn, "LM13700M/NOPB");
         assert_eq!(price.in_stock, Some(8156));
         assert_eq!(
@@ -226,15 +187,96 @@ mod tests {
         assert_eq!(price.unit_price_at(1), Some(1.48));
         assert_eq!(price.unit_price_at(50), Some(1.07));
         assert_eq!(price.unit_price_at(1000), Some(0.858));
+
+        // $1,234.50 (thousands separator) parses correctly too.
+        let other: PartPrice = script()
+            .call(
+                "parse_search_response",
+                &SearchReq {
+                    json: FIXTURE,
+                    wanted: "LM13700MX/NOPB",
+                },
+            )
+            .unwrap();
+        assert_eq!(other.unit_price_at(1), Some(1234.50));
     }
 
     #[test]
     fn reports_api_errors_and_empty() {
-        let err: Value = serde_json::from_str(r#"{"Errors":[{"Message":"Invalid key"}]}"#).unwrap();
-        assert!(matches!(parse_search(&err, "X"), Err(MouserError::Api(_))));
+        let err_fixture = r#"{"Errors":[{"Message":"Invalid key"}]}"#;
+        let result: Result<Option<PartPrice>, _> = script().call(
+            "parse_search_response",
+            &SearchReq {
+                json: err_fixture,
+                wanted: "X",
+            },
+        );
+        assert!(result.is_err());
 
-        let empty: Value =
-            serde_json::from_str(r#"{"Errors":[],"SearchResults":{"Parts":[]}}"#).unwrap();
-        assert_eq!(parse_search(&empty, "X").unwrap(), None);
+        let empty_fixture = r#"{"Errors":[],"SearchResults":{"Parts":[]}}"#;
+        let empty: Option<PartPrice> = script()
+            .call(
+                "parse_search_response",
+                &SearchReq {
+                    json: empty_fixture,
+                    wanted: "X",
+                },
+            )
+            .unwrap();
+        assert_eq!(empty, None);
+    }
+
+    // A keyword search ("10k resistor 0805") returns several unrelated candidates —
+    // the whole point is turning a generic value into real MPNs. Same
+    // `SearchResults.Parts[]` shape as the partnumber search.
+    const KEYWORD_FIXTURE: &str = r#"{
+      "Errors": [],
+      "SearchResults": {
+        "NumberOfResult": 3,
+        "Parts": [
+          { "ManufacturerPartNumber": "RC0805FR-0710KL", "Manufacturer": "YAGEO",
+            "AvailabilityInStock": "425000", "DataSheetUrl": "https://y/ds.pdf",
+            "ProductDetailUrl": "https://mouser.com/rc0805",
+            "PriceBreaks": [
+              {"Quantity": 1, "Price": "$0.10", "Currency": "USD"},
+              {"Quantity": 100, "Price": "$0.012", "Currency": "USD"}
+            ] },
+          { "ManufacturerPartNumber": "CRCW080510K0FKEA", "Manufacturer": "Vishay",
+            "AvailabilityInStock": "200000",
+            "PriceBreaks": [{"Quantity": 1, "Price": "$0.11", "Currency": "USD"}] },
+          { "ManufacturerPartNumber": "ERJ-6ENF1002V", "Manufacturer": "Panasonic",
+            "AvailabilityInStock": "0",
+            "PriceBreaks": [{"Quantity": 1, "Price": "$0.09", "Currency": "USD"}] }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn keyword_search_returns_all_candidates() {
+        let hits: Vec<PartPrice> = script()
+            .call("parse_keyword_response", &KEYWORD_FIXTURE)
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].mpn, "RC0805FR-0710KL");
+        assert_eq!(hits[0].manufacturer.as_deref(), Some("YAGEO"));
+        assert_eq!(hits[0].in_stock, Some(425000));
+        assert_eq!(hits[0].unit_price_at(1), Some(0.10));
+        // Out-of-stock candidates are still parsed (ranking, not filtering, is the
+        // sourcing layer's job).
+        assert_eq!(hits[2].in_stock, Some(0));
+    }
+
+    #[test]
+    fn keyword_search_errors_and_empty() {
+        let err_fixture = r#"{"Errors":[{"Message":"Too many"}]}"#;
+        let result: Result<Vec<PartPrice>, _> =
+            script().call("parse_keyword_response", &err_fixture);
+        assert!(result.is_err());
+
+        let empty_fixture = r#"{"SearchResults":{"Parts":[]}}"#;
+        let empty: Vec<PartPrice> = script()
+            .call("parse_keyword_response", &empty_fixture)
+            .unwrap();
+        assert_eq!(empty.len(), 0);
     }
 }

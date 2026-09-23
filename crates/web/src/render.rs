@@ -1,0 +1,522 @@
+//! On-demand board + panel renders (beads bzg + jg4 + hk0).
+//!
+//! `GET /api/circuits/{name}/render?view=board-top|board-bottom|board-layout|panel`:
+//! - **board-top/bottom** rasterize `out/<name>/<name>.kicad_pcb` (photoreal PNG,
+//!   core `render_board_png`, kicad-cli), disk-cached by source mtime.
+//! - **board-layout** is the flat 2D layout SVG (copper + silk + fab + edge, core
+//!   `export_board_svg`, kicad-cli), cached alongside.
+//! - **panel** is a flat 2D **SVG in the panel's real finish color** (core
+//!   `panel_to_svg`, from the declared spec + the repo brand logo) — no kicad-cli.
+//!
+//! Board errors: missing kicad-cli → 503, unbuilt board → 404. Panel errors:
+//! undeclared/absent spec → 404. Bad view → 400.
+
+use std::hash::{Hash, Hasher};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+
+use axum::extract::{Path, Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use serde_json::json;
+
+use legion_of_bom_core::{
+    board_sides, default_image_cache_dir, export_board_svg, kicad_cli_path, layers_to_svg,
+    panel_to_svg, parse_netlist_file, read_layers, render_board_png, schematic_to_svg, strip_smd,
+    LayerKind, Logo, PanelFile, Populate, Quality,
+};
+
+use crate::state::AppState;
+
+#[derive(Deserialize)]
+pub struct RenderQuery {
+    #[serde(default)]
+    view: Option<String>,
+    /// `smd=0` hides surface-mount parts from a board view — the through-hole-only
+    /// picture a builder of a mixed kit actually works on (a2r).
+    #[serde(default)]
+    smd: Option<u8>,
+    /// For `view=gerber`: comma-separated layer keys to draw (`cu-top,silk-top`).
+    /// Absent or empty draws the whole stack.
+    #[serde(default)]
+    layers: Option<String>,
+}
+
+/// A rasterized board render or a vector panel.
+enum Rendered {
+    Png(Vec<u8>),
+    Svg(String),
+}
+
+/// `GET /api/circuits/{name}/sides` — what is mounted on each face of the built
+/// board: `{"front":{"tht":6,"smd":0},"back":{"tht":0,"smd":8}}`.
+///
+/// The viewer asks once, so its SMD filter can say what it will do before you
+/// click it. Hiding SMD on a face that has none is a no-op, and a control that
+/// silently no-ops is indistinguishable from a broken one.
+pub async fn sides(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let board = state
+        .root()
+        .join("out")
+        .join(&name)
+        .join(format!("{name}.kicad_pcb"));
+    let Ok(src) = std::fs::read_to_string(&board) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            &format!("board not built — run `lob build {name}`"),
+        );
+    };
+    let s = board_sides(&src);
+    axum::Json(json!({
+        "front": { "tht": s.front.tht, "smd": s.front.smd },
+        "back": { "tht": s.back.tht, "smd": s.back.smd },
+    }))
+    .into_response()
+}
+
+/// `GET /api/circuits/{name}/rules` — every design rule the built board is held
+/// to, and where it stands.
+///
+/// The layout loop already computes this to choose between attempts and to
+/// decide what it had to relax, but until now it only ever reached CLI stdout —
+/// so a board could ship with a decoupling cap 89mm from its chip and the
+/// dashboard would look perfectly happy. Reading it from the *built* board
+/// rather than re-running a placer means the panel reports what was actually
+/// manufactured.
+pub async fn rules(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let root = state.root().to_path_buf();
+    let board = root
+        .join("out")
+        .join(&name)
+        .join(format!("{name}.kicad_pcb"));
+    let netlist = root.join("out").join(&name).join(format!("{name}.net"));
+    let (Ok(pcb), Ok(circuit)) = (
+        std::fs::read_to_string(&board),
+        parse_netlist_file(&netlist),
+    ) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            &format!("circuit not built — run `lob build {name}`"),
+        );
+    };
+    let Ok(placements) = legion_of_bom_core::guide::placements_from_board(&pcb) else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "board did not parse");
+    };
+    let facts = legion_of_bom_core::skidl::kicad_footprint_dir()
+        .and_then(|dir| legion_of_bom_core::build_facts(&circuit, &dir).ok());
+    let derived = legion_of_bom_core::rules::derive_in(
+        &circuit,
+        &legion_of_bom_core::rules::Context {
+            facts: facts.as_ref(),
+            outline: legion_of_bom_core::guide::board_outline(&pcb),
+        },
+    );
+    let assessed = legion_of_bom_core::rules::assess(&derived, &placements);
+    let tier = |t: legion_of_bom_core::Tier| match t {
+        legion_of_bom_core::Tier::Physical => "physical",
+        legion_of_bom_core::Tier::Electrical => "electrical",
+        legion_of_bom_core::Tier::Preference => "preference",
+    };
+    let rules: Vec<_> = assessed
+        .iter()
+        .map(|a| {
+            json!({
+                "tier": tier(a.tier),
+                "subject": a.subject,
+                "detail": a.detail,
+                "margin_mm": a.margin_mm,
+                "ok": a.ok(),
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "rules": rules,
+        "broken": assessed.iter().filter(|a| !a.ok()).count(),
+        "checked": assessed.len(),
+    }))
+    .into_response()
+}
+
+/// `GET /api/circuits/{name}/render?view=…` — a PNG (board) or SVG (panel).
+pub async fn render(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<RenderQuery>,
+) -> Response {
+    let view = q.view.unwrap_or_else(|| "board-top".to_string());
+    let show_smd = q.smd != Some(0);
+    let layer_sel = q.layers.clone().unwrap_or_default();
+
+    // The circuit must exist; grab its panel spec + the repo brand logo.
+    let (panel_rel, logo_rel, import_rel) = match state.project() {
+        Ok(v) => match v.circuit(&name) {
+            Some(c) => (c.panel.clone(), v.repo.logo.clone(), c.import.clone()),
+            None => return err(StatusCode::NOT_FOUND, &format!("no circuit '{name}'")),
+        },
+        Err(e) => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("repo unavailable: {e}"),
+            )
+        }
+    };
+
+    let root = state.root().to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        render_view(&RenderReq {
+            root: &root,
+            name: &name,
+            view: &view,
+            show_smd,
+            layer_sel: &layer_sel,
+            panel_rel: panel_rel.as_deref(),
+            logo_rel: logo_rel.as_deref(),
+            import_rel: import_rel.as_deref(),
+        })
+    })
+    .await
+    {
+        Ok(Ok(Rendered::Png(b))) => png_response(b),
+        Ok(Ok(Rendered::Svg(s))) => svg_response(s),
+        Ok(Err(e)) => e.into_response(),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "render task panicked"),
+    }
+}
+
+/// A render failure mapped to an HTTP status the dashboard can act on.
+enum RenderErr {
+    NoKicad,
+    NotBuilt(String),
+    NoPanel,
+    BadView(String),
+    Failed(String),
+}
+
+impl IntoResponse for RenderErr {
+    fn into_response(self) -> Response {
+        let (code, msg) = match self {
+            RenderErr::NoKicad => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "kicad-cli not found — install KiCad to see board renders".to_string(),
+            ),
+            RenderErr::NotBuilt(m) => (StatusCode::NOT_FOUND, m),
+            RenderErr::NoPanel => (
+                StatusCode::NOT_FOUND,
+                "no panel spec declared for this circuit".to_string(),
+            ),
+            RenderErr::BadView(v) => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown view '{v}' (board-top | board-bottom | board-layout | panel | \
+                     schematic | gerber | gerber-panel)"
+                ),
+            ),
+            RenderErr::Failed(m) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("render failed: {m}"),
+            ),
+        };
+        err(code, &msg)
+    }
+}
+
+/// Everything one render needs: which circuit, which drawing, and where its
+/// declared inputs live.
+struct RenderReq<'a> {
+    root: &'a FsPath,
+    name: &'a str,
+    view: &'a str,
+    show_smd: bool,
+    layer_sel: &'a str,
+    panel_rel: Option<&'a str>,
+    logo_rel: Option<&'a str>,
+    import_rel: Option<&'a str>,
+}
+
+fn render_view(req: &RenderReq<'_>) -> Result<Rendered, RenderErr> {
+    let RenderReq {
+        root,
+        name,
+        view,
+        show_smd,
+        layer_sel,
+        panel_rel,
+        logo_rel,
+        import_rel,
+    } = *req;
+    match view {
+        "panel" => {
+            let rel = panel_rel.ok_or(RenderErr::NoPanel)?;
+            let spec = root.join(rel);
+            if !spec.is_file() {
+                return Err(RenderErr::NoPanel);
+            }
+            // Cache keyed by the spec's mtime (its hp/finish/cutouts live there),
+            // so an unchanged panel serves instantly instead of re-parsing the
+            // logo and rebuilding the SVG on every poll.
+            let cache = cache_path(&spec, view, "svg");
+            if let Ok(svg) = std::fs::read_to_string(&cache) {
+                return Ok(Rendered::Svg(svg));
+            }
+            let svg = render_panel_svg(root, &spec, name, logo_rel)?;
+            write_cache(&cache, svg.as_bytes());
+            Ok(Rendered::Svg(svg))
+        }
+        "board-top" | "board-bottom" => {
+            let board = board_path(root, name)?;
+            let back = view == "board-bottom";
+            // Serve a cached render when the board hasn't changed since. The SMD
+            // filter is part of the key — the two variants are different pictures.
+            let key = if show_smd {
+                view.to_string()
+            } else {
+                format!("{view}-tht")
+            };
+            let cache = cache_path(&board, &key, "png");
+            if let Ok(bytes) = std::fs::read(&cache) {
+                return Ok(Rendered::Png(bytes));
+            }
+            let kicad = kicad_cli_path().ok_or(RenderErr::NoKicad)?;
+            // Populated: seeing the parts standing on the board is most of the
+            // value of a photoreal render. The SMD filter hides surface-mount
+            // *bodies* and leaves their pads — it is a view of the board, not an
+            // edit of it.
+            let populate = if show_smd {
+                Populate::All
+            } else {
+                Populate::ThtOnly
+            };
+            // `basic` quality, not the guide's `high`: this render sits behind an
+            // interactive control, and 4.7s per click reads as a broken tool where
+            // 0.9s reads as a slow one. The printed guide still pays for `high`.
+            let png = render_board_png(&board, &kicad, populate, back, Quality::Basic)
+                .map_err(|e| RenderErr::Failed(e.to_string()))?
+                .0;
+            write_cache(&cache, &png);
+            Ok(Rendered::Png(png))
+        }
+        "gerber" | "gerber-panel" => {
+            // The gerbers a board house receives: the circuit's fab package, or the
+            // panel's own — `lob panel pcb` writes those next to the spec.
+            let (dir, missing) = if view == "gerber-panel" {
+                let stem = panel_rel
+                    .and_then(|p| FsPath::new(p).file_stem().and_then(|s| s.to_str()))
+                    .ok_or(RenderErr::NoPanel)?;
+                (
+                    root.join(format!("{stem}-panel-gerbers")),
+                    format!("no panel gerbers — run `lob panel pcb {stem}.toml`"),
+                )
+            } else if let Some(pkg) = import_rel {
+                // An imported circuit's gerbers came with it.
+                (
+                    root.join(pkg).join("gerbers"),
+                    format!("imported package at {pkg} has no gerbers/ directory"),
+                )
+            } else {
+                (
+                    root.join("out").join(name).join("fab").join("gerbers"),
+                    format!("no fab package — run `lob build {name}`"),
+                )
+            };
+            if !dir.is_dir() {
+                return Err(RenderErr::NotBuilt(missing));
+            }
+            let cache = cache_path(&dir, &format!("{view}:{layer_sel}"), "svg");
+            if let Ok(svg) = std::fs::read_to_string(&cache) {
+                return Ok(Rendered::Svg(svg));
+            }
+            let layers = read_layers(&dir).map_err(|e| RenderErr::Failed(e.to_string()))?;
+            let show: Vec<LayerKind> = layer_sel
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|k| {
+                    LAYER_KEYS
+                        .iter()
+                        .find(|(key, _)| *key == k)
+                        .map(|(_, v)| *v)
+                })
+                .collect();
+            let svg = layers_to_svg(&layers, &show);
+            write_cache(&cache, svg.as_bytes());
+            Ok(Rendered::Svg(svg))
+        }
+        "schematic" => {
+            // Drawn from the parsed netlist — no kicad-cli, so it's always
+            // available once the circuit has been built.
+            let netlist = root.join("out").join(name).join(format!("{name}.net"));
+            let model = parse_netlist_file(&netlist).map_err(|_| {
+                RenderErr::NotBuilt(format!("circuit not built — run `lob build {name}`"))
+            })?;
+            let cache = cache_path(&netlist, view, "svg");
+            if let Ok(svg) = std::fs::read_to_string(&cache) {
+                return Ok(Rendered::Svg(svg));
+            }
+            let svg = schematic_to_svg(&model);
+            write_cache(&cache, svg.as_bytes());
+            Ok(Rendered::Svg(svg))
+        }
+        "board-layout" => {
+            // The flat 2D layout: copper + silk + fab + edge, as a scalable SVG.
+            let board = board_path(root, name)?;
+            let key = if show_smd {
+                view.to_string()
+            } else {
+                format!("{view}-tht")
+            };
+            let cache = cache_path(&board, &key, "svg");
+            if let Ok(svg) = std::fs::read_to_string(&cache) {
+                return Ok(Rendered::Svg(svg));
+            }
+            let kicad = kicad_cli_path().ok_or(RenderErr::NoKicad)?;
+            let board = if show_smd {
+                board
+            } else {
+                tht_only_board(&board, name)?
+            };
+            let svg =
+                export_board_svg(&board, &kicad).map_err(|e| RenderErr::Failed(e.to_string()))?;
+            write_cache(&cache, svg.as_bytes());
+            Ok(Rendered::Svg(svg))
+        }
+        other => Err(RenderErr::BadView(other.to_string())),
+    }
+}
+
+/// Build the panel SVG from its declared spec, in its finish color, with the
+/// brand logo placed by the house rules (best-effort — a missing/bad logo is
+/// simply omitted).
+fn render_panel_svg(
+    root: &FsPath,
+    spec_path: &FsPath,
+    name: &str,
+    logo_rel: Option<&str>,
+) -> Result<String, RenderErr> {
+    let toml = std::fs::read_to_string(spec_path).map_err(|e| RenderErr::Failed(e.to_string()))?;
+    let file = PanelFile::from_toml(&toml).map_err(|e| RenderErr::Failed(e.to_string()))?;
+    let spec = file.to_spec().map_err(RenderErr::Failed)?;
+    let finish = file.resolved_finish();
+    let logo = logo_rel.and_then(|rel| {
+        std::fs::read_to_string(root.join(rel))
+            .ok()
+            .and_then(|svg| Logo::from_svg(&svg).ok())
+    });
+    Ok(panel_to_svg(
+        spec.as_ref(),
+        &pretty_title(name),
+        &finish,
+        logo.as_ref(),
+    ))
+}
+
+/// Write a through-hole-only copy of the board to the cache dir and return its
+/// path, so `kicad-cli` renders the picture a builder of a mixed kit works on.
+fn tht_only_board(board: &FsPath, name: &str) -> Result<PathBuf, RenderErr> {
+    let src = std::fs::read_to_string(board).map_err(|e| RenderErr::Failed(e.to_string()))?;
+    let out = default_image_cache_dir()
+        .join("lob-render")
+        .join(format!("{name}-tht.kicad_pcb"));
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&out, strip_smd(&src)).map_err(|e| RenderErr::Failed(e.to_string()))?;
+    Ok(out)
+}
+
+/// URL keys the gerber view accepts, in the order the layer list shows them.
+const LAYER_KEYS: &[(&str, LayerKind)] = &[
+    ("cu-top", LayerKind::CopperTop),
+    ("cu-bot", LayerKind::CopperBottom),
+    ("silk-top", LayerKind::SilkTop),
+    ("silk-bot", LayerKind::SilkBottom),
+    ("mask-top", LayerKind::MaskTop),
+    ("mask-bot", LayerKind::MaskBottom),
+    ("paste-top", LayerKind::PasteTop),
+    ("paste-bot", LayerKind::PasteBottom),
+    ("drill", LayerKind::Drill),
+    ("outline", LayerKind::Outline),
+    ("other", LayerKind::Other),
+];
+
+/// The board file for `name`, or `NotBuilt` when it hasn't been built.
+fn board_path(root: &FsPath, name: &str) -> Result<PathBuf, RenderErr> {
+    let board = root
+        .join("out")
+        .join(name)
+        .join(format!("{name}.kicad_pcb"));
+    if board.is_file() {
+        Ok(board)
+    } else {
+        Err(RenderErr::NotBuilt(format!(
+            "board not built — run `lob build {name}`"
+        )))
+    }
+}
+
+/// Cache path keyed by the source file's absolute path + mtime + view, so a
+/// changed board produces a fresh key (and the stale render is ignored).
+fn cache_path(source: &FsPath, view: &str, ext: &str) -> PathBuf {
+    let mtime = std::fs::metadata(source)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    view.hash(&mut h);
+    mtime.hash(&mut h);
+    default_image_cache_dir()
+        .join("lob-render")
+        .join(format!("{:016x}.{ext}", h.finish()))
+}
+
+/// Best-effort write to the render cache (creating the dir).
+fn write_cache(path: &FsPath, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, bytes);
+}
+
+/// "slew_limiter" → "Slew Limiter" for the panel masthead.
+fn pretty_title(name: &str) -> String {
+    name.split(['_', '-'])
+        .filter(|s| !s.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().chain(c).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn png_response(bytes: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+fn svg_response(svg: String) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        svg,
+    )
+        .into_response()
+}
+
+fn err(code: StatusCode, msg: &str) -> Response {
+    (code, axum::Json(json!({ "error": msg }))).into_response()
+}

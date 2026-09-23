@@ -1,0 +1,28 @@
+[package]
+name = "legion-of-bom-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local dashboard backend for legion-of-bom: an axum head over the same core (DESIGN 2.2)."
+
+[features]
+# Bake the compiled SPA (web/dist) into the binary. Release/packaged builds turn
+# this on; dev builds serve web/dist from disk so the front end can be rebuilt
+# without recompiling Rust.
+embed-assets = ["dep:rust-embed"]
+
+[dependencies]
+legion-of-bom-core.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rust-embed = { workspace = true, optional = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

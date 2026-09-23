@@ -91,6 +91,57 @@ const OUTPUT_NETS: &[&str] = &[
     "AUDIO_OUT_L",
 ];
 
+/// The channel number a net name carries, if it is a candidate I/O name with a
+/// channel suffix — `SIG_IN1` → 1, `SIG_IN_2` → 2. `None` when the name isn't
+/// `candidate` plus a number.
+///
+/// A multi-channel board has no bare `SIG_IN`: a dual slew limiter's jacks are
+/// `SIG_IN1`/`SIG_IN2`, and without this the harness reports "simulation needs a
+/// net named 'IN'" and no two-channel circuit can be simulated at all.
+fn channel_suffix(name: &str, candidate: &str) -> Option<u32> {
+    let rest = name
+        .get(..candidate.len())
+        .filter(|head| head.eq_ignore_ascii_case(candidate))
+        .map(|_| &name[candidate.len()..])?;
+    let digits = rest.strip_prefix('_').unwrap_or(rest);
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
+/// Every channel-suffixed net matching any of `candidates`, ordered by channel
+/// number — `[SIG_IN1, SIG_IN2]` for a dual. Empty for a single-channel board,
+/// whose I/O nets are unsuffixed.
+fn channel_nets(names: &[&str], candidates: &[&str]) -> Vec<String> {
+    let mut found: Vec<(u32, String)> = names
+        .iter()
+        .filter_map(|n| {
+            candidates
+                .iter()
+                .find_map(|c| channel_suffix(n, c))
+                .map(|ch| (ch, n.to_string()))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found.into_iter().map(|(_, n)| n).collect()
+}
+
+/// The circuit's per-channel signal inputs and outputs, paired by channel and
+/// ordered by channel number. Empty unless the circuit really is multi-channel
+/// (at least two inputs *and* two outputs) — so a single-channel board is
+/// unaffected and nothing downstream has to ask "is this a dual?".
+pub fn signal_channels(circuit: &dyn CircuitSource) -> Vec<(String, String)> {
+    let names: Vec<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    let ins = channel_nets(&names, INPUT_NETS);
+    let outs = channel_nets(&names, OUTPUT_NETS);
+    if ins.len() < 2 || outs.len() < 2 {
+        return Vec::new();
+    }
+    ins.into_iter().zip(outs).collect()
+}
+
 /// The DC voltage a net name implies if it's a supply rail — `+12V`→+12, `-12V`→
 /// −12, `+5V`→5, `+3V3`→3.3, or the named rails VCC/VDD (+12) / VEE/VSS (−12).
 /// `None` for anything that isn't rail-shaped (signals, ground, IABC, …).
@@ -128,6 +179,11 @@ impl SimConfig {
                 if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(c)) {
                     return n.to_string();
                 }
+            }
+            // No bare candidate — fall back to the lowest-numbered channel, so a
+            // multi-channel board simulates channel 1 by default.
+            if let Some(n) = channel_nets(&names, cands).into_iter().next() {
+                return n;
             }
             fallback.to_string()
         };
@@ -273,7 +329,10 @@ fn netlist_body(
         // Connectors and mechanical parts (jacks, headers, mounting holes, test
         // points) carry no SPICE device — their pins are just net junctions. Skip
         // them rather than demanding a model.
-        if is_electrical_noop(part) {
+        // Parts the circuit declares out of simulation (`Sim.Enable = 0`) are
+        // skipped the same way; if one sat in the middle of an analog path its
+        // nodes float and SPICE says so, which is the right failure.
+        if is_electrical_noop(part) || part.sim_excluded {
             continue;
         }
 
@@ -288,9 +347,15 @@ fn netlist_body(
             includes.insert(include.clone());
             let mut nodes = Vec::with_capacity(pin_order.len());
             for pin in pin_order {
-                let node = node_at(refdes, pin).ok_or_else(|| {
-                    StageError::Other(format!("{refdes}: pin {pin} is not connected to a net"))
-                })?;
+                // A pin that's on no net gets its own dangling node rather than
+                // failing the whole deck. A multi-section device legitimately
+                // leaves sections open — the mono slew limiter uses OTA A of an
+                // LM13700 and leaves B's seven pins unconnected, and both
+                // channels leave the diode-linearisation pins open (the
+                // datasheet's own test configuration). Whether an open pin is a
+                // *mistake* is ERC's judgement, not the simulator's; `.options
+                // rshunt` keeps the node well-conditioned either way.
+                let node = node_at(refdes, pin).unwrap_or_else(|| format!("{refdes}_nc{pin}"));
                 nodes.push(node);
             }
             let mut line = format!("X{refdes} {} {subckt}", nodes.join(" "));
@@ -320,6 +385,16 @@ fn netlist_body(
             }
         }
 
+        // A mechanical switch (`SW…`) contributes no device: the netlist records
+        // its *wiring*, never which way the lever is thrown, so there is nothing
+        // to instantiate. Its contacts are therefore open — for the slew
+        // limiter's RANGE switch that is the centre detent, the documented
+        // fastest range. A closed-contact model has to arrive the same way every
+        // other device model does, carried by the part.
+        if refdes.to_ascii_uppercase().starts_with("SW") {
+            continue;
+        }
+
         // Otherwise a SPICE primitive, by reference-designator letter.
         match refdes.chars().next().unwrap_or('?').to_ascii_uppercase() {
             'R' | 'C' | 'L' => {
@@ -346,6 +421,63 @@ fn netlist_body(
 /// mechanical part (jack, header, mounting hole, test point) that contributes no
 /// SPICE device, only net junctions. Recognised by the `J` reference prefix or a
 /// connector/mechanical footprint.
+/// Whether `from` reaches `to` through parts that are actually simulated — i.e.
+/// whether there is an **analog** signal path to run AC/transient analysis on.
+///
+/// `Err` lists the declared-out-of-simulation parts (`Sim.Enable = 0`) that the
+/// two nets *are* joined through, which is what a converter board looks like:
+/// line in reaches line out only by way of an ADC, a processor and a DAC, and
+/// "the passband gain of IN_L to OUT_L" is not a question SPICE can answer.
+/// Connectors and test points join nothing (their pins are separate nets).
+pub fn analog_path(circuit: &dyn CircuitSource, from: &str, to: &str) -> Result<(), Vec<String>> {
+    use std::collections::{HashSet, VecDeque};
+    let reach = |through_excluded: bool| {
+        let mut seen: HashSet<&str> = HashSet::from([from]);
+        let mut queue: VecDeque<&str> = VecDeque::from([from]);
+        let mut via: HashSet<&str> = HashSet::new();
+        while let Some(net) = queue.pop_front() {
+            for part in circuit.parts() {
+                if is_electrical_noop(part) || (part.sim_excluded && !through_excluded) {
+                    continue;
+                }
+                let r = part.refdes.0.as_str();
+                let on: Vec<&str> = circuit
+                    .nets()
+                    .iter()
+                    .filter(|n| n.pins.iter().any(|p| p.refdes.0 == r))
+                    .map(|n| n.name.as_str())
+                    .collect();
+                if !on.contains(&net) {
+                    continue;
+                }
+                if part.sim_excluded {
+                    via.insert(r);
+                }
+                // Rails and ground are AC ground, not signal: every part touches
+                // one, so walking them would join everything to everything.
+                for n in on {
+                    let rail = crate::model::is_ground_net(n) || crate::model::is_supply_rail(n);
+                    if !rail && seen.insert(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+        (seen.contains(to), via)
+    };
+    if reach(false).0 {
+        return Ok(());
+    }
+    let (joined, via) = reach(true);
+    let mut via: Vec<String> = if joined {
+        via.into_iter().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
+    via.sort();
+    Err(via)
+}
+
 fn is_electrical_noop(part: &crate::model::Part) -> bool {
     if part.refdes.0.starts_with('J') {
         return true;
@@ -458,7 +590,7 @@ impl Default for TranAnalysis {
 }
 
 /// One point of a transient waveform.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct TranPoint {
     pub t_s: f64,
     pub v: f64,
@@ -480,6 +612,16 @@ impl TranResult {
                 (dt > 0.0).then(|| ((w[1].v - w[0].v) / dt).abs())
             })
             .fold(None, |m, s| Some(m.map_or(s, |mx: f64| mx.max(s))))
+    }
+
+    /// Peak-to-peak excursion of the waveform (V) — how far the probed net moved
+    /// in total. On a driven channel that's the signal; on an undriven one it's
+    /// whatever leaked in.
+    pub fn peak_to_peak_v(&self) -> Option<f64> {
+        let mut it = self.points.iter().map(|p| p.v);
+        let first = it.next()?;
+        let (lo, hi) = it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        Some(hi - lo)
     }
 
     /// 10%→90% rise time between the initial and final output levels (s), for a
@@ -589,6 +731,14 @@ pub fn simulate_tran(
     let data_path = work_dir.join(format!("{name}_tran.dat"));
     let deck_path = work_dir.join(format!("{name}_tran.cir"));
 
+    // Before resolving models: a part whose Sim.Library names the bundled
+    // catalog by its bare filename (crate::symbols::BUILTIN_LIB_NAME) needs
+    // that file to already exist here, because model resolution reads it to
+    // discover the subckt's terminal order (crate::symbols::subckt_terminals)
+    // -- unlike the auto-detected builtin_model() path (op-amp/LM13700),
+    // which hardcodes pin order and never reads the file until ngspice runs.
+    crate::symbols::write_builtin_lib(&work_dir)?;
+
     let models = match crate::skidl::kicad_symbol_dir() {
         Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
         None => HashMap::new(),
@@ -596,7 +746,157 @@ pub fn simulate_tran(
 
     let deck = generate_tran_deck(circuit, config, tran, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
+
+    let output = Command::new(&ngspice)
+        .arg("-b")
+        .arg(&deck_path)
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|e| StageError::ToolNotFound(format!("ngspice {}: {e}", ngspice.display())))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StageError::ToolFailed {
+            tool: "ngspice".into(),
+            code: output.status.code().unwrap_or(-1),
+            stderr: tail(&stderr, 20),
+        });
+    }
+
+    let data = std::fs::read_to_string(&data_path).map_err(|e| {
+        StageError::Other(format!(
+            "ngspice produced no data at {}: {e}",
+            data_path.display()
+        ))
+    })?;
+    let points = parse_tran_data(&data);
+    if points.is_empty() {
+        return Err(StageError::Other(
+            "ngspice produced no transient data points".into(),
+        ));
+    }
+    Ok(TranResult { points })
+}
+
+/// A **driven** transient: an arbitrary piecewise-linear stimulus played into the
+/// input net (instead of [`TranAnalysis`]'s single step), so a caller can drive a
+/// sequence / LFO into the circuit and scope the response — the basis of the
+/// dashboard scope (5hr).
+#[derive(Debug, Clone)]
+pub struct TranDrive {
+    /// `.tran` time step (s).
+    pub step_s: f64,
+    /// `.tran` stop time (s).
+    pub stop_s: f64,
+    /// Input-source breakpoints `(t_s, volts)`, ascending in time — emitted as one
+    /// PWL source on the input net.
+    pub pwl: Vec<(f64, f64)>,
+    /// Extra forced nets: `(net, breakpoints)` each emitted as its own PWL source.
+    /// Drive a control net (e.g. `RATE_CV`) here to sweep a parameter — turning the
+    /// slew rate down into the musical range, or modulating it with an LFO.
+    pub cv: Vec<(String, Vec<(f64, f64)>)>,
+    /// Net to probe; defaults to `config.output_net` when `None`.
+    pub probe_net: Option<String>,
+}
+
+/// A `Vlob_src … PWL(t0 v0 t1 v1 …)` line from breakpoints.
+fn pwl_source_line(in_node: &str, pwl: &[(f64, f64)]) -> String {
+    let body = pwl
+        .iter()
+        .map(|(t, v)| format!("{} {}", fmt_num(*t), fmt_num(*v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("Vlob_src {in_node} 0 PWL({body})")
+}
+
+/// Like [`generate_tran_deck`] but with an arbitrary PWL stimulus + chosen probe.
+fn generate_tran_deck_drive(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    drive: &TranDrive,
+    models: &HashMap<String, SpiceModel>,
+    data_path: &Path,
+) -> Result<String, StageError> {
+    let net_names: HashSet<&str> = circuit.nets().iter().map(|n| n.name.as_str()).collect();
+    require_net(circuit, &net_names, &config.input_net)?;
+    let probe = drive.probe_net.as_deref().unwrap_or(&config.output_net);
+    require_net(circuit, &net_names, probe)?;
+
+    let (includes, components) = netlist_body(circuit, config, models)?;
+    let in_node = config.node(&config.input_net);
+    if in_node == "0" {
+        return Err(StageError::Other(format!(
+            "input net '{}' maps to ground",
+            config.input_net
+        )));
+    }
+    let probe_node = config.node(probe);
+
+    let mut lines = vec![format!(
+        "* legion-of-bom driven transient deck for {}",
+        circuit.name()
+    )];
+    lines.push(".options rshunt=1e12 gmin=1e-10 itl1=1000".into());
+    for include in &includes {
+        lines.push(format!(".include {}", include.display()));
+    }
+    lines.extend(supply_lines(config, &net_names));
+    lines.extend(components);
+    lines.push(pwl_source_line(&in_node, &drive.pwl));
+    // Extra forced control nets (e.g. RATE_CV), each its own PWL source. A net the
+    // circuit doesn't have is skipped (not an error) so a generic control — a RATE
+    // knob — is harmless on a circuit without it.
+    for (i, (net, pwl)) in drive.cv.iter().enumerate() {
+        let node = config.node(net);
+        if node == "0" || !net_names.contains(net.as_str()) {
+            continue; // grounded or absent — can't force it
+        }
+        let body = pwl
+            .iter()
+            .map(|(t, v)| format!("{} {}", fmt_num(*t), fmt_num(*v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(format!("Vlob_cv{i} {node} 0 PWL({body})"));
+    }
+    lines.push(".control".into());
+    lines.push(format!(
+        "tran {} {}",
+        fmt_num(drive.step_s),
+        fmt_num(drive.stop_s)
+    ));
+    lines.push(format!("wrdata {} v({probe_node})", data_path.display()));
+    lines.push(".endc".into());
+    lines.push(".end".into());
+    Ok(lines.join("\n") + "\n")
+}
+
+/// Run a **driven** transient (arbitrary PWL stimulus) and parse the probed
+/// waveform. Same ngspice invocation as [`simulate_tran`]; artifacts go under
+/// `work_dir` as `<name>_scope.{cir,dat}`.
+pub fn simulate_tran_drive(
+    circuit: &dyn CircuitSource,
+    config: &SimConfig,
+    drive: &TranDrive,
+    work_dir: &Path,
+) -> Result<TranResult, StageError> {
+    let ngspice =
+        find_on_path("ngspice").ok_or_else(|| StageError::ToolNotFound("ngspice".into()))?;
+    std::fs::create_dir_all(work_dir)?;
+    let work_dir = work_dir.canonicalize()?;
+    let name = sanitize(circuit.name());
+    let data_path = work_dir.join(format!("{name}_scope.dat"));
+    let deck_path = work_dir.join(format!("{name}_scope.cir"));
+
+    // See simulate_tran: must happen before resolve_models, which reads this
+    // file for any part whose Sim.Library names it directly.
     crate::symbols::write_builtin_lib(&work_dir)?;
+
+    let models = match crate::skidl::kicad_symbol_dir() {
+        Some(dir) => crate::symbols::resolve_models(circuit, dir.path())?,
+        None => HashMap::new(),
+    };
+
+    let deck = generate_tran_deck_drive(circuit, config, drive, &models, &data_path)?;
+    std::fs::write(&deck_path, &deck)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")
@@ -644,6 +944,10 @@ pub fn simulate_ac(
     let data_path = work_dir.join(format!("{name}_ac.dat"));
     let deck_path = work_dir.join(format!("{name}.cir"));
 
+    // See simulate_tran: must happen before resolve_models, which reads this
+    // file for any part whose Sim.Library names it directly.
+    crate::symbols::write_builtin_lib(&work_dir)?;
+
     // Resolve each modelled component's SPICE model from its symbol (the parts
     // library will be this source later). Without a symbol dir, only primitives
     // (R/C/L) can be simulated.
@@ -654,7 +958,6 @@ pub fn simulate_ac(
 
     let deck = generate_ac_deck(circuit, config, &models, &data_path)?;
     std::fs::write(&deck_path, &deck)?;
-    crate::symbols::write_builtin_lib(&work_dir)?;
 
     let output = Command::new(&ngspice)
         .arg("-b")
@@ -726,6 +1029,52 @@ mod tests {
     use super::*;
     use crate::model::{Circuit, Net, Part, PinRef};
 
+    /// A line-in → ADC → DAC → line-out board has no analog path to simulate;
+    /// an RC filter does, and sharing a ground with the converters does not
+    /// join the two sides.
+    #[test]
+    fn an_analog_path_goes_through_simulated_parts_and_not_through_ground() {
+        let excluded = |r: &str| Part {
+            sim_excluded: true,
+            ..Part::new(r, "CODEC")
+        };
+        let net = |name: &str, pins: &[(&str, &str)]| {
+            Net::new(
+                name,
+                pins.iter().map(|(r, p)| PinRef::new(*r, *p)).collect(),
+            )
+        };
+        let converter = Circuit {
+            name: "converter".into(),
+            parts: vec![
+                Part::new("C1", "1u"),
+                excluded("U1"),
+                Part::new("R1", "470"),
+                Part::new("R2", "10k"),
+            ],
+            nets: vec![
+                net("IN_L", &[("C1", "1")]),
+                net("ADC_IN", &[("C1", "2"), ("U1", "1")]),
+                net("DAC_OUT", &[("U1", "2"), ("R1", "1")]),
+                net("OUT_L", &[("R1", "2"), ("R2", "1")]),
+                net("GND", &[("R2", "2"), ("U1", "3")]),
+            ],
+        };
+        assert_eq!(
+            analog_path(&converter, "IN_L", "OUT_L"),
+            Err(vec!["U1".to_string()])
+        );
+
+        let mut filter = converter.clone();
+        filter.parts[1].sim_excluded = false;
+        assert_eq!(
+            analog_path(&filter, "IN_L", "OUT_L"),
+            Ok(()),
+            "an un-excluded part — even one with no model yet — is a path, so a \
+             missing model still fails the simulation loudly"
+        );
+    }
+
     fn rc_lowpass() -> Circuit {
         Circuit {
             name: "rc_lowpass".into(),
@@ -779,6 +1128,110 @@ mod tests {
             ("IN", "OUT")
         );
         assert_eq!(rc.supplies, SimConfig::default().supplies);
+    }
+
+    /// A two-channel circuit shaped like the dual slew limiter: per-channel I/O
+    /// nets and one shared device.
+    fn dual_channel_circuit() -> Circuit {
+        Circuit {
+            name: "dual".into(),
+            parts: vec![Part::new("U1", "LM13700")],
+            nets: vec![
+                Net::new("SIG_IN1", vec![PinRef::new("U1", "3")]),
+                Net::new("SIG_OUT1", vec![PinRef::new("U1", "5")]),
+                Net::new("SIG_IN2", vec![PinRef::new("U1", "14")]),
+                Net::new("SIG_OUT2", vec![PinRef::new("U1", "12")]),
+                Net::new("+12V", vec![PinRef::new("U1", "11")]),
+                Net::new("-12V", vec![PinRef::new("U1", "6")]),
+            ],
+        }
+    }
+
+    #[test]
+    fn channel_suffix_reads_a_channel_number() {
+        assert_eq!(channel_suffix("SIG_IN1", "SIG_IN"), Some(1));
+        assert_eq!(channel_suffix("SIG_IN_2", "SIG_IN"), Some(2));
+        assert_eq!(channel_suffix("sig_out12", "SIG_OUT"), Some(12));
+        // Not a suffixed form of the candidate.
+        assert_eq!(channel_suffix("SIG_IN", "SIG_IN"), None);
+        assert_eq!(channel_suffix("SIG_INA", "SIG_IN"), None);
+        assert_eq!(channel_suffix("SLEW_NODE1", "SIG_IN"), None);
+    }
+
+    #[test]
+    fn infer_finds_channel_one_on_a_multi_channel_board() {
+        // A dual has no bare SIG_IN — before channel-suffix inference this failed
+        // with "simulation needs a net named 'IN'" and no dual could be simulated.
+        let cfg = SimConfig::infer(&dual_channel_circuit());
+        assert_eq!(cfg.input_net, "SIG_IN1");
+        assert_eq!(cfg.output_net, "SIG_OUT1");
+    }
+
+    #[test]
+    fn signal_channels_pairs_channels_and_ignores_single_channel_boards() {
+        let chans = signal_channels(&dual_channel_circuit());
+        assert_eq!(
+            chans,
+            vec![
+                ("SIG_IN1".to_string(), "SIG_OUT1".to_string()),
+                ("SIG_IN2".to_string(), "SIG_OUT2".to_string()),
+            ]
+        );
+        // A one-channel board is not multi-channel, so the dual-only checks bow out.
+        assert!(signal_channels(&rc_lowpass()).is_empty());
+    }
+
+    #[test]
+    fn unconnected_subckt_pins_get_dangling_nodes() {
+        // The mono slew limiter uses OTA A of an LM13700 and leaves channel B's
+        // pins open. That must produce a deck, not an error — a whole-package
+        // model is what lets the same entry serve mono and dual boards.
+        let c = Circuit {
+            name: "mono".into(),
+            parts: vec![Part::new("U1", "LM13700")],
+            nets: vec![
+                Net::new("IN", vec![PinRef::new("U1", "3")]),
+                Net::new("OUT", vec![PinRef::new("U1", "5")]),
+            ],
+        };
+        let mut models = HashMap::new();
+        models.insert(
+            "U1".to_string(),
+            SpiceModel::Subckt {
+                subckt: "LM13700".into(),
+                include: PathBuf::from("lob_builtin.lib"),
+                pin_order: (1..=16).map(|p| p.to_string()).collect(),
+                params: None,
+            },
+        );
+        let deck =
+            generate_ac_deck(&c, &SimConfig::default(), &models, Path::new("/tmp/x.dat")).unwrap();
+        assert!(
+            deck.contains("XU1 U1_nc1 U1_nc2 IN U1_nc4 OUT "),
+            "connected pins keep their nets, open ones get unique nodes:\n{deck}"
+        );
+        // Every open pin gets its OWN node — collapsing them would short the
+        // unused channel's inputs together.
+        assert!(deck.contains("U1_nc16"), "deck:\n{deck}");
+    }
+
+    #[test]
+    fn a_switch_contributes_no_device() {
+        // A netlist records a switch's wiring, never its position, so there is
+        // nothing to instantiate — and demanding a model would make every board
+        // with a panel switch unsimulatable.
+        let mut c = rc_lowpass();
+        c.parts.push(Part::new("SW1", "RANGE"));
+        c.nets
+            .push(Net::new("THROW", vec![PinRef::new("SW1", "1")]));
+        let deck = generate_ac_deck(
+            &c,
+            &SimConfig::default(),
+            &HashMap::new(),
+            Path::new("/tmp/x.dat"),
+        )
+        .unwrap();
+        assert!(!deck.contains("SW1"), "deck:\n{deck}");
     }
 
     #[test]
@@ -841,6 +1294,7 @@ mod tests {
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
                     mpn: None,
                     sim: None,
+                    sim_excluded: false,
                     side: None,
                 },
                 Part::new("R1", "9k"),

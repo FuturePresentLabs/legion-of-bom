@@ -15,7 +15,7 @@ Status: DRAFT — sections 1-3 filled in, 4-15 pending.
    2.3 Canonical circuit representation (the IR that DSLs compile to / tools read from)
    2.4 Repo & project structure
    2.5 Multi-tenancy & auth
-   2.6 Storage split: Dolt vs. git-native
+   2.6 Storage split: SQL stores vs. git-native
 
 3. **Circuit Definition Layer**
    3.1 SKiDL (v1, Python)
@@ -175,14 +175,21 @@ OAuth vs something else) only get designed once the core pipeline loop — schem
 through inventory — actually works end-to-end for one user. Not designing this now
 on purpose; revisit in Section 14 roadmap.
 
-### 2.6 Storage split: Dolt vs. git-native
+### 2.6 Storage split: SQL stores vs. git-native
 Circuit definitions (SKiDL files, KiCad projects) stay in plain git — they're
-file-based already and git's native diff/PR tooling works well on them. Inventory
-data (parts, stock levels, shared components across SKUs, reorder thresholds) lives
-in Dolt instead — a SQL database that's version-controlled the same way git is
-(branches, commits, diffs, merges, all addressable via refs). This gives inventory a
-real query/aggregation layer (which plain files can't do well) while keeping the
-same versioning model as the rest of the system.
+file-based already and git's native diff/PR tooling works well on them. Structured,
+cross-project data (parts, panel orders, and eventually stock levels/reorder
+thresholds) lives in a SQL store instead, for the query/aggregation layer plain
+files can't do well.
+
+Which SQL store is deliberately not one answer for every table. The **parts
+library** (Section 6.8, `crates/core/src/parts.rs`) is a single local SQLite file
+via `sqlx` — no per-write history, a write just overwrites what was there; nothing
+in its verification-gate workflow needed git-like branching/diffing, so paying
+for it was pure overhead. **Panel orders** (Section 7.5, `crates/core/src/panel.rs`)
+are still Dolt-backed, unmigrated — that store keeps the git-like versioning this
+section originally described for all of inventory, until it's revisited on its
+own.
 
 ---
 
@@ -254,7 +261,7 @@ schema being built.
 
 `define_circuit` — whether invoked directly (writing SKiDL by hand), via the
 `lob` CLI, or via an MCP-driving agent (see MCP.md) — resolves parts by MPN
-against a **global, Dolt-backed parts library**, not model/training memory and
+against a **global, SQLite-backed parts library**, not model/training memory and
 not a per-project file. This is core `legion-of-bom-core` architecture, not an
 agent-only construct: the same trust rules apply regardless of entry point.
 
@@ -556,10 +563,11 @@ generates the correct DXF, a human uploads it and places the order on the
 vendor's site. What *is* automatable is tracking status of that manual step,
 so it doesn't get lost the way an untracked step easily does.
 
-**Storage: a `panel_orders` table in the same Dolt-backed store used for
-inventory (Section 2.6, Section 11)** — this is structured, queryable,
-cross-project data, the same category as parts verification and inventory,
-not project-specific circuit content that belongs in git.
+**Storage: a `panel_orders` table in its own Dolt-backed store (Section 2.6,
+Section 11)** — structured, queryable, cross-project data, the same category
+as parts verification and inventory, not project-specific circuit content
+that belongs in git. (Not the same store as the parts library, which moved to
+plain SQLite — see 2.6.)
 
 ```sql
 CREATE TABLE panel_orders (

@@ -21,13 +21,10 @@ use crate::stage::StageError;
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DrcReport {
     /// Design-rule violations (clearance, shorts, silk, holes, …).
-    #[serde(default)]
     pub violations: Vec<DrcViolation>,
     /// Ratsnest items with no copper connection.
-    #[serde(default)]
     pub unconnected_items: Vec<DrcViolation>,
     /// Board-vs-schematic parity problems.
-    #[serde(default)]
     pub schematic_parity: Vec<DrcViolation>,
 }
 
@@ -138,6 +135,11 @@ pub fn run_drc(board: &Path, kicad_cli: &Path) -> Result<DrcReport, StageError> 
         .and_then(|s| s.to_str())
         .unwrap_or("board");
     let out_path = std::env::temp_dir().join(format!("lob-{stem}-drc.json"));
+    // Clear any previous report FIRST. This path is reused across runs, and if
+    // kicad-cli fails for any reason we would otherwise read the last run's JSON
+    // and report it as this board's result — which is how the same circuit at
+    // the same width came back with 6 errors and then 4.
+    let _ = std::fs::remove_file(&out_path);
 
     let output = Command::new(kicad_cli)
         .args([
@@ -211,7 +213,7 @@ mod tests {
              "items":[{"description":"Text 'C7'","pos":{"x":110.0,"y":95.0}}]},
             {"type":"silk_over_copper","severity":"warning","description":"Silk over pad","items":[]},
             {"type":"clearance","severity":"error","description":"Clearance","items":[]}
-        ]}"#;
+        ],"unconnected_items":[],"schematic_parity":[]}"#;
         let r = DrcReport::from_json(json).unwrap();
         assert_eq!(r.silkscreen_collision_count(), 2);
         assert!(r
@@ -224,15 +226,26 @@ mod tests {
 
     #[test]
     fn clean_report_is_clean() {
-        let r = DrcReport::from_json(r#"{"violations":[],"unconnected_items":[]}"#).unwrap();
+        let r = DrcReport::from_json(
+            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
+        )
+        .unwrap();
         assert!(r.is_clean());
         assert_eq!(r.error_count(), 0);
     }
 
     #[test]
-    fn tolerates_missing_fields() {
-        // A report with only some keys still parses (serde defaults).
-        let r = DrcReport::from_json("{}").unwrap();
-        assert!(r.is_clean());
+    fn rejects_json_that_is_not_the_kicad_drc_schema() {
+        for json in [
+            "{}",
+            r#"{"violations":[],"unconnected_items":[]}"#,
+            r#"{"violations":[],"unconnectedItems":[],"schematic_parity":[]}"#,
+            r#"{"violations":{},"unconnected_items":[],"schematic_parity":[]}"#,
+        ] {
+            assert!(
+                DrcReport::from_json(json).is_err(),
+                "invalid DRC JSON parsed as clean: {json}"
+            );
+        }
     }
 }

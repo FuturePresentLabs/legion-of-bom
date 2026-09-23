@@ -10,6 +10,10 @@ pub const MM: f64 = 72.0 / 25.4;
 /// A4 page size in points.
 pub const A4_W: f64 = 210.0 * MM;
 pub const A4_H: f64 = 297.0 * MM;
+/// US Letter page size in points — the default for the printed build guide,
+/// since that is what "standard paper" loads in the tray where these get built.
+pub const LETTER_W: f64 = 216.0 * MM;
+pub const LETTER_H: f64 = 279.0 * MM;
 
 /// Which built-in font a text run uses.
 #[derive(Clone, Copy)]
@@ -86,6 +90,134 @@ pub struct Page {
     ops: String,
 }
 
+/// One segment of a [`Page::path`] call, matching SVG path-data commands.
+#[derive(Clone, Copy, Debug)]
+pub enum PathOp {
+    MoveTo(f64, f64),
+    LineTo(f64, f64),
+    /// An SVG elliptical arc ending at `(x, y)` — same parameters as the SVG
+    /// `A` command (`rx ry x-axis-rotation large-arc-flag sweep-flag x y`).
+    ArcTo {
+        rx: f64,
+        ry: f64,
+        x_rotation_deg: f64,
+        large_arc: bool,
+        sweep: bool,
+        x: f64,
+        y: f64,
+    },
+    /// Closes back to the path's start point (PDF `h`).
+    ClosePath,
+}
+
+/// The SVG spec's endpoint-to-center arc parameterization (Appendix F.6),
+/// converted to a sequence of cubic Bézier segments (each `[c1, c2, end]`,
+/// PDF `c`-operator order) no wider than 90° so the standard
+/// Bézier-circle-approximation error stays negligible at any page scale.
+fn arc_to_beziers(
+    start: (f64, f64),
+    rx: f64,
+    ry: f64,
+    x_rotation_deg: f64,
+    large_arc: bool,
+    sweep: bool,
+    end: (f64, f64),
+) -> Vec<[(f64, f64); 3]> {
+    let (x1, y1) = start;
+    let (x2, y2) = end;
+    if (x1 - x2).abs() < 1e-9 && (y1 - y2).abs() < 1e-9 {
+        return Vec::new(); // a zero-length arc is a no-op, matching the SVG spec
+    }
+    let (mut rx, mut ry) = (rx.abs(), ry.abs());
+    if rx < 1e-9 || ry < 1e-9 {
+        return vec![[start, end, end]]; // degenerate radius: a straight line (matches a 3-point bezier collapsing to one)
+    }
+    let phi = x_rotation_deg.to_radians();
+    let (cos_phi, sin_phi) = (phi.cos(), phi.sin());
+
+    // Step 1: (x1,y1) in the rotated, origin-at-midpoint frame.
+    let dx2 = (x1 - x2) / 2.0;
+    let dy2 = (y1 - y2) / 2.0;
+    let x1p = cos_phi * dx2 + sin_phi * dy2;
+    let y1p = -sin_phi * dx2 + cos_phi * dy2;
+
+    // Step 2: correct out-of-range radii (spec F.6.6), then find the center
+    // in that same frame.
+    let lambda = (x1p / rx).powi(2) + (y1p / ry).powi(2);
+    if lambda > 1.0 {
+        let s = lambda.sqrt();
+        rx *= s;
+        ry *= s;
+    }
+    let sign = if large_arc == sweep { -1.0 } else { 1.0 };
+    let num = (rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p).max(0.0);
+    let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    let co = sign * (num / den.max(1e-12)).sqrt();
+    let cxp = co * rx * y1p / ry;
+    let cyp = -co * ry * x1p / rx;
+
+    // Step 3: center back in the original (unrotated) frame.
+    let cx = cos_phi * cxp - sin_phi * cyp + (x1 + x2) / 2.0;
+    let cy = sin_phi * cxp + cos_phi * cyp + (y1 + y2) / 2.0;
+
+    let angle = |ux: f64, uy: f64, vx: f64, vy: f64| -> f64 {
+        let dot = ux * vx + uy * vy;
+        let len = ((ux * ux + uy * uy) * (vx * vx + vy * vy)).sqrt();
+        let a = (dot / len.max(1e-12)).clamp(-1.0, 1.0).acos();
+        if ux * vy - uy * vx < 0.0 {
+            -a
+        } else {
+            a
+        }
+    };
+    let theta1 = angle(1.0, 0.0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+    let mut dtheta = angle(
+        (x1p - cxp) / rx,
+        (y1p - cyp) / ry,
+        (-x1p - cxp) / rx,
+        (-y1p - cyp) / ry,
+    );
+    if !sweep && dtheta > 0.0 {
+        dtheta -= std::f64::consts::TAU;
+    } else if sweep && dtheta < 0.0 {
+        dtheta += std::f64::consts::TAU;
+    }
+
+    // Step 4: walk theta1..theta1+dtheta in <=90-degree steps, one cubic
+    // Bézier per step (the same kappa = 4/3 * tan(step/4) construction
+    // Page::circle uses for a full circle, generalized to a partial arc).
+    let segments = (dtheta.abs() / (std::f64::consts::FRAC_PI_2))
+        .ceil()
+        .max(1.0) as usize;
+    let step = dtheta / segments as f64;
+    let kappa = 4.0 / 3.0 * (step / 4.0).tan();
+    let pt = |theta: f64| -> (f64, f64) {
+        let (ex, ey) = (rx * theta.cos(), ry * theta.sin());
+        (
+            cos_phi * ex - sin_phi * ey + cx,
+            sin_phi * ex + cos_phi * ey + cy,
+        )
+    };
+    let deriv = |theta: f64| -> (f64, f64) {
+        let (ex, ey) = (-rx * theta.sin(), ry * theta.cos());
+        (cos_phi * ex - sin_phi * ey, sin_phi * ex + cos_phi * ey)
+    };
+    let mut out = Vec::with_capacity(segments);
+    let mut theta = theta1;
+    for _ in 0..segments {
+        let theta_next = theta + step;
+        let p0 = pt(theta);
+        let p3 = pt(theta_next);
+        let d0 = deriv(theta);
+        let d3 = deriv(theta_next);
+        let c1 = (p0.0 + kappa * d0.0, p0.1 + kappa * d0.1);
+        let c2 = (p3.0 - kappa * d3.0, p3.1 - kappa * d3.1);
+        out.push([c1, c2, p3]);
+        theta = theta_next;
+    }
+    out
+}
+
 impl Page {
     pub fn new() -> Self {
         Page::default()
@@ -103,6 +235,49 @@ impl Page {
 
     pub fn rect(&mut self, x: f64, y: f64, w: f64, h: f64, paint: Paint) {
         let _ = writeln!(self.ops, "{x:.2} {y:.2} {w:.2} {h:.2} re {}", paint.op());
+    }
+
+    /// A multi-segment path (straight lines and elliptical arcs, matching
+    /// SVG's `M`/`L`/`A` path-data commands — no cubic/quadratic Béziers are
+    /// emitted anywhere upstream of this, so none are supported here).
+    /// `ops[0]` must be a [`PathOp::MoveTo`].
+    pub fn path(&mut self, ops: &[PathOp], paint: Paint) {
+        let mut cur = (0.0, 0.0);
+        for op in ops {
+            match *op {
+                PathOp::MoveTo(x, y) => {
+                    let _ = writeln!(self.ops, "{x:.2} {y:.2} m");
+                    cur = (x, y);
+                }
+                PathOp::LineTo(x, y) => {
+                    let _ = writeln!(self.ops, "{x:.2} {y:.2} l");
+                    cur = (x, y);
+                }
+                PathOp::ArcTo {
+                    rx,
+                    ry,
+                    x_rotation_deg,
+                    large_arc,
+                    sweep,
+                    x,
+                    y,
+                } => {
+                    for seg in arc_to_beziers(cur, rx, ry, x_rotation_deg, large_arc, sweep, (x, y))
+                    {
+                        let [(c1x, c1y), (c2x, c2y), (ex, ey)] = seg;
+                        let _ = writeln!(
+                            self.ops,
+                            "{c1x:.2} {c1y:.2} {c2x:.2} {c2y:.2} {ex:.2} {ey:.2} c"
+                        );
+                    }
+                    cur = (x, y);
+                }
+                PathOp::ClosePath => {
+                    let _ = writeln!(self.ops, "h");
+                }
+            }
+        }
+        let _ = writeln!(self.ops, "{}", paint.op());
     }
 
     /// A circle centred at `(cx, cy)`, radius `r`, via four Bézier arcs.
@@ -188,6 +363,13 @@ fn escape(s: &str) -> String {
             '→' => out.push_str("->"),
             '“' | '”' => out.push('"'),
             '‘' | '’' => out.push('\''),
+            // In WinAnsi these have real code points — emit the byte rather than
+            // transliterating, so a separator stays a separator on the page.
+            '·' => out.push_str("\\267"),
+            '°' => out.push_str("\\260"),
+            'µ' | 'μ' => out.push_str("\\265"),
+            '±' => out.push_str("\\261"),
+            'Ω' => out.push_str("ohm"),
             c if (c as u32) < 128 => out.push(c),
             _ => out.push('?'),
         }
@@ -195,10 +377,11 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Assemble `pages` into a complete PDF document (A4). Each image in `images` is
+/// Assemble `pages` into a complete PDF document at `(page_w, page_h)` points —
+/// [`LETTER_W`]×[`LETTER_H`] or [`A4_W`]×[`A4_H`]. Each image in `images` is
 /// embedded once as `/Im0`, `/Im1`, … (shared across pages) and referenced by a
 /// page's [`draw_image`](Page::draw_image) via its index.
-pub fn document(pages: &[Page], images: &[&Image]) -> Vec<u8> {
+pub fn document(pages: &[Page], images: &[&Image], (page_w, page_h): (f64, f64)) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &str| {
@@ -250,7 +433,7 @@ pub fn document(pages: &[Page], images: &[&Image]) -> Vec<u8> {
             &mut out,
             &mut offsets,
             &format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {A4_W:.2} {A4_H:.2}] \
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w:.2} {page_h:.2}] \
                  /Resources << /Font << /F1 3 0 R /F2 4 0 R >>{xobject} >> \
                  /Contents {content_obj} 0 R >>"
             ),
@@ -310,6 +493,9 @@ mod tests {
         assert_eq!(escape("a(b)c\\d"), "a\\(b\\)c\\\\d");
         // Common Unicode punctuation transliterates to ASCII, not '?'.
         assert_eq!(escape("2 — 3 × 4"), "2 - 3 x 4");
+        // WinAnsi has a middot; transliterating it to '?' looked like a bug.
+        assert_eq!(escape("a · b"), "a \\267 b");
+        assert_eq!(escape("\u{2603}"), "?"); // no WinAnsi slot — honest fallback
     }
 
     #[test]
@@ -318,7 +504,7 @@ mod tests {
         p.set_fill(1.0, 0.0, 0.0);
         p.rect(10.0, 10.0, 50.0, 20.0, Paint::Fill);
         p.text(10.0, 40.0, 12.0, Font::Bold, "Step 1");
-        let bytes = document(&[p], &[]);
+        let bytes = document(&[p], &[], (LETTER_W, LETTER_H));
         assert!(bytes.starts_with(b"%PDF-1.7"));
         assert!(bytes.ends_with(b"%%EOF\n"));
         let s = String::from_utf8_lossy(&bytes);
