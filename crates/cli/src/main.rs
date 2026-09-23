@@ -241,11 +241,12 @@ enum Command {
     },
     /// Concept -> spec: ask every typed decision for a design brief and write
     /// a spec -- raw text plus a machine-readable JSON, no schematic
-    /// (legion-of-bom-utn). Needs SYSTEMONE_API_KEY (and optionally
-    /// SYSTEMONE_BASE_URL for a local dev endpoint) in .env. Follow with
+    /// (legion-of-bom-utn). Needs OODA_API_KEY (and optionally OODA_BASE_URL
+    /// for a local dev endpoint) -- see .env.example. Follow with
     /// `lob schematic` to render the circuit from the written spec.
     Spec {
-        /// Circuit family from the curated library (today: "fuzz-pedal").
+        /// Circuit family from the curated library: "fuzz-pedal" or
+        /// "stm32-codec".
         family: String,
         /// Free-text design brief, carried as decision context (not parsed for
         /// control flow -- the decisions, not the brief, choose the circuit).
