@@ -1,0 +1,26 @@
+{
+  "mpn": "S322532M10PF10PPM",
+  "manufacturer": "Sichuan Source-Set (SOSET)",
+  "lcsc": "C7568731",
+  "summary": "32 MHz fundamental crystal, 10 pF load, ±10 ppm, 40 ohm max ESR, 3.2x2.5 mm 4-pad SMD; pads 1/3 crystal, 2/4 ground. Matches the SX1262's 32 MHz / 10 pF crystal spec",
+  "symbol": {"kicad": "Device:Crystal_GND24"},
+  "footprint": "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/0cdb0d72e7c40d6b3fa1c7734d4c86c4.pdf",
+    "sha256": "50dc5e99855214c0b3c4ba79457c101280c5f87bd7587dfcf2a84deff560fbf0"
+  },
+  "provides": ["crystal"],
+  "sim_excluded": true,
+  "params": {
+    "freq_hz": {"value": 32000000, "cite": {"page": 2, "quote": "1 Nominal Frequency F0 32.000000 MHz"}},
+    "cl_pf": {"value": 10, "cite": {"page": 2, "quote": "7 Load capacitance CL - 10 - pF"}}
+  },
+  "interfaces": [
+    {"kind": "hse", "role": "source", "signals": {"in": "pin:1", "out": "pin:3"},
+     "cite": {"reading": "Pin table on the dimensions page is an image: #1,#3 X'tal; #2,#4 GND", "page": 3}}
+  ],
+  "support": [
+    {"between": ["pin:G", "net:GND"], "part": "tie", "each_pin": true,
+     "cite": {"reading": "Pin table on the dimensions page is an image: #1,#3 X'tal; #2,#4 GND", "page": 3}}
+  ]
+}

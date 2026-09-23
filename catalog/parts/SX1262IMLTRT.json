@@ -3,39 +3,169 @@
   "manufacturer": "Semtech",
   "lcsc": "C191341",
   "summary": "LoRa/(G)FSK sub-GHz transceiver, 150-960 MHz, up to +22 dBm; SPI slave (mode 0, up to 16 MHz) plus BUSY, DIO1 IRQ and NRESET lines; 32 MHz crystal with internal trim caps (no load caps) or TCXO on XTA; 1.8-3.7 V. Entry wires the LDO regulation option (no DC-DC inductor). The RF front end (PA feed choke, TX match/LPF, RX balun, RF switch on DIO2) is NOT modelled here: its component values are only in Semtech's reference design, so node:rf is not fab-ready until that network is added",
-  "symbol": {"kicad": "RF:SX1262IMLTRT"},
+  "symbol": {
+    "kicad": "RF:SX1262IMLTRT"
+  },
   "footprint": "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm_EP2.6x2.6mm",
   "datasheet": {
     "url": "https://datasheet.lcsc.com/datasheet/pdf/28cfa981266da05d26af56ac0d14b1fd.pdf",
     "sha256": "a0fd29d13e779c1d49130d71442c91260448ab2c453ce9b9d9ff630184830606"
   },
-  "provides": ["radio-subghz"],
+  "provides": [
+    "radio-subghz"
+  ],
   "sim_excluded": true,
   "params": {
-    "xtal_freq_hz": {"value": 32000000, "cite": {"page": 15, "quote": "FXOSC Crystal oscillator frequency - 32 - MHz"}},
-    "xtal_cl_pf": {"value": 10, "cite": {"page": 15, "quote": "CLOAD Crystal load capacitance - 10 - pF"}},
-    "spi_max_hz": {"value": 16000000, "cite": {"page": 49, "quote": "The SPI runs on the external SCK clock to allow high speed up to 16 MHz."}}
+    "xtal_freq_hz": {
+      "value": 32000000,
+      "cite": {
+        "page": 15,
+        "quote": "FXOSC Crystal oscillator frequency - 32 - MHz"
+      }
+    },
+    "xtal_cl_pf": {
+      "value": 10,
+      "cite": {
+        "page": 15,
+        "quote": "CLOAD Crystal load capacitance - 10 - pF"
+      }
+    },
+    "spi_max_hz": {
+      "value": 16000000,
+      "cite": {
+        "page": 49,
+        "quote": "The SPI runs on the external SCK clock to allow high speed up to 16 MHz."
+      }
+    },
+    "xtal_load_internal": {
+      "value": 1,
+      "cite": {
+        "page": 23,
+        "quote": "The SX1261/2 does not require the user to set external foot capacitors on the XTAL supplying the 32 MHz clock."
+      }
+    }
   },
   "interfaces": [
-    {"kind": "spi", "role": "slave",
-     "signals": {"sck": "pin:SCK", "mosi": "pin:MOSI", "miso": "pin:MISO", "cs": "pin:NSS"},
-     "cite": {"page": 49, "quote": "= 0 and CPHA = 0 in Motorola/Freescale nomenclature. Only the slave side is implemented."}},
-    {"kind": "gpio", "role": "slave",
-     "signals": {"busy": "pin:BUSY", "irq": "pin:DIO1", "reset": "pin:~{RESET}"},
-     "cite": {"page": 49, "quote": "be used for IRQ and the BUSY line is mandatory to ensure the host controller is ready to accept the commands."}},
-    {"kind": "hse", "role": "needs",
-     "signals": {"in": "pin:XTA", "out": "pin:XTB"},
-     "cite": {"page": 23, "quote": "The SX1261/2 does not require the user to set external foot capacitors on the XTAL supplying the 32 MHz clock."}},
-    {"kind": "rf", "role": "port",
-     "signals": {"rf": "node:rf"},
-     "cite": {"reading": "node:rf is the 50 ohm antenna side of the RF front end in Figure 14-2 (RFIO/SMA): RFO and RFI_P/RFI_N reach it through L1 (VR_PA feed), L2-L6/C3-C13 match and LPF, a PE4259 RF switch driven by DIO2, and C8-C10/L5. Figure 14-2 gives no values for any of these; confirm topology and values against Semtech's SX1262 reference design for the chosen band (SX1262MB2xAS / SX1262 reference design files on semtech.com), which the datasheet note on the same page defers to. Not expressible in this schema today (no inductor support part).", "page": 100}}
+    {
+      "kind": "spi",
+      "role": "slave",
+      "signals": {
+        "sck": "pin:SCK",
+        "mosi": "pin:MOSI",
+        "miso": "pin:MISO",
+        "cs": "pin:NSS"
+      },
+      "cite": {
+        "page": 49,
+        "quote": "= 0 and CPHA = 0 in Motorola/Freescale nomenclature. Only the slave side is implemented."
+      }
+    },
+    {
+      "kind": "gpio",
+      "role": "slave",
+      "signals": {
+        "busy": "pin:BUSY",
+        "irq": "pin:DIO1",
+        "reset": "pin:~{RESET}"
+      },
+      "cite": {
+        "page": 49,
+        "quote": "be used for IRQ and the BUSY line is mandatory to ensure the host controller is ready to accept the commands."
+      }
+    },
+    {
+      "kind": "hse",
+      "role": "needs",
+      "signals": {
+        "in": "pin:XTA",
+        "out": "pin:XTB"
+      },
+      "cite": {
+        "page": 23,
+        "quote": "The SX1261/2 does not require the user to set external foot capacitors on the XTAL supplying the 32 MHz clock."
+      }
+    },
+    {
+      "kind": "rf",
+      "role": "port",
+      "signals": {
+        "rf": "node:rf"
+      },
+      "cite": {
+        "reading": "node:rf is the 50 ohm antenna side of the RF front end in Figure 14-2 (RFIO/SMA): RFO and RFI_P/RFI_N reach it through L1 (VR_PA feed), L2-L6/C3-C13 match and LPF, a PE4259 RF switch driven by DIO2, and C8-C10/L5. Figure 14-2 gives no values for any of these; confirm topology and values against Semtech's SX1262 reference design for the chosen band (SX1262MB2xAS / SX1262 reference design files on semtech.com), which the datasheet note on the same page defers to. Not expressible in this schema today (no inductor support part).",
+        "page": 100
+      }
+    }
   ],
   "support": [
-    {"between": ["pin:VBAT", "net:+3V3"], "part": "tie", "cite": {"page": 14, "quote": "Supply voltage, applies to VBAT and VBAT_IO 1.8 - 3.7 V"}},
-    {"between": ["pin:VBAT_IO", "net:+3V3"], "part": "tie", "cite": {"page": 36, "quote": "Both power supplies can be connected together in application."}},
-    {"between": ["pin:VDD_IN", "net:+3V3"], "part": "tie", "cite": {"page": 12, "quote": "SX1262: connected to pin 10"}},
-    {"between": ["pin:GND", "net:GND"], "part": "tie", "each_pin": true, "cite": {"page": 12, "quote": "0 GND - Exposed Ground pad"}},
-    {"between": ["pin:VBAT", "net:GND"], "part": "C", "value": "100nF", "cite": {"reading": "Figure 14-2: C18 100nF from VDD_RADIO (VBAT and VBAT_IO tied) to GND", "page": 100}},
-    {"between": ["pin:VREG", "net:GND"], "part": "C", "value": "470nF", "cite": {"reading": "Figure 14-2: C17 470nF from the VREG node to GND (drawn with the DC-DC option's L7 15uH to DCC_SW; this entry uses the LDO option of Section 5.1.4, p.35, where DCC_SW is left unconnected - confirm DCC_SW handling against the Semtech reference design)", "page": 100}}
+    {
+      "between": [
+        "pin:VBAT",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 14,
+        "quote": "Supply voltage, applies to VBAT and VBAT_IO 1.8 - 3.7 V"
+      }
+    },
+    {
+      "between": [
+        "pin:VBAT_IO",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 36,
+        "quote": "Both power supplies can be connected together in application."
+      }
+    },
+    {
+      "between": [
+        "pin:VDD_IN",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 12,
+        "quote": "SX1262: connected to pin 10"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 12,
+        "quote": "0 GND - Exposed Ground pad"
+      }
+    },
+    {
+      "between": [
+        "pin:VBAT",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 14-2: C18 100nF from VDD_RADIO (VBAT and VBAT_IO tied) to GND",
+        "page": 100
+      }
+    },
+    {
+      "between": [
+        "pin:VREG",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "470nF",
+      "cite": {
+        "reading": "Figure 14-2: C17 470nF from the VREG node to GND (drawn with the DC-DC option's L7 15uH to DCC_SW; this entry uses the LDO option of Section 5.1.4, p.35, where DCC_SW is left unconnected - confirm DCC_SW handling against the Semtech reference design)",
+        "page": 100
+      }
+    }
   ]
 }

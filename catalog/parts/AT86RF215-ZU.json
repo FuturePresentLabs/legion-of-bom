@@ -479,6 +479,13 @@
         "page": 188,
         "quote": "CLEAD_ Lead capacitance of the AT86RF215 5 pF"
       }
+    },
+    "xtal_load_internal": {
+      "value": 0,
+      "cite": {
+        "page": 67,
+        "quote": "the external capacitors CX and parasitic capacitances of PCB traces and IC pins."
+      }
     }
   },
   "interfaces": [
@@ -522,25 +529,25 @@
     },
     {
       "kind": "rf",
-      "role": "port",
+      "role": "source",
       "instance": "RF09",
       "signals": {
         "rf": "node:rf09"
       },
       "cite": {
-        "reading": "node:rf09 is the single-ended 50 ohm antenna side of a sub-1GHz balun/match on RFP09/RFN09. p.9 states only that the pins want a 50 ohm differential load and need AC coupling if the load has a DC path to supply or ground; Figure 3-1 (p.11) draws a bare Sub-1GHz Front-end block. Balun part, match topology and values: confirm against Microchip ATREB215-XPRO(-A) reference design / AT86RF215 hardware design guidelines. Not expressible in this schema today (no inductor or balun support part)",
+        "reading": "Balun left as a reading: the datasheet states only the port requirement (p.9: a 50 ohm differential load at RFP09/RFN09; AC coupling if the load has a DC path to supply or ground) and Figure 3-1 (p.11) draws a bare Sub-1GHz Front-end block, so there is no topology or value to cite. node:rf09 is the single-ended 50 ohm antenna side of that balun; confirm balun part, match and values against Microchip ATREB215-XPRO(-A) reference design / AT86RF215 hardware design guidelines",
         "page": 9
       }
     },
     {
       "kind": "rf",
-      "role": "port",
+      "role": "source",
       "instance": "RF24",
       "signals": {
         "rf": "node:rf24"
       },
       "cite": {
-        "reading": "node:rf24 is the single-ended 50 ohm antenna side of a 2.4 GHz balun/match on RFP24/RFN24; same constraints and same confirming documents as node:rf09 (ATREB215-XPRO reference design). Not expressible in this schema today",
+        "reading": "Balun left as a reading: same as RF09 (p.9 gives only a 50 ohm differential load at RFP24/RFN24). node:rf24 is the single-ended 50 ohm antenna side; confirm against the ATREB215-XPRO reference design",
         "page": 9
       }
     }

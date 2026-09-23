@@ -1,0 +1,25 @@
+{
+  "mpn": "NX3225SA-26MHZ-STD-CQR-1",
+  "manufacturer": "NDK (Nihon Dempa Kogyo)",
+  "lcsc": "C156251",
+  "summary": "26 MHz fundamental crystal, 8 pF load, ±15 ppm, 50 ohm max ESR, 3.2x2.5 mm 4-pad SMD; pads 1/3 crystal, 2/4 ground (cover). Fits the AT86RF215 (26 MHz, 8 pF) and the CC1101 (26 MHz; load caps external)",
+  "symbol": {"kicad": "Device:Crystal_GND24"},
+  "footprint": "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/956f0f7fcef6c3084f2382d1c4999041.pdf",
+    "sha256": "5b6eb3948f7623bf8a2c0c727341ef6bc5146f6aa85de49c67ba2d7c9400b891"
+  },
+  "provides": ["crystal"],
+  "sim_excluded": true,
+  "params": {
+    "freq_hz": {"value": 26000000, "cite": {"page": 3, "quote": "26.000 ●"}},
+    "cl_pf": {"value": 8, "cite": {"page": 2, "quote": "Load capacitance CL - 8 - pF"}}
+  },
+  "interfaces": [
+    {"kind": "hse", "role": "source", "signals": {"in": "pin:1", "out": "pin:3"},
+     "cite": {"page": 5, "quote": "#1, #3: Xtal"}}
+  ],
+  "support": [
+    {"between": ["pin:G", "net:GND"], "part": "tie", "each_pin": true, "cite": {"page": 5, "quote": "#2, #4: GND (CONNECTION COVER)"}}
+  ]
+}

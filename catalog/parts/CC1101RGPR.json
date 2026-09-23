@@ -2,7 +2,7 @@
   "mpn": "CC1101RGPR",
   "manufacturer": "Texas Instruments",
   "lcsc": "C29953",
-  "summary": "Sub-1 GHz (315/433/868/915 MHz bands) FSK/GFSK/ASK/OOK/MSK transceiver, up to +12 dBm; 4-wire SPI slave plus GDO0/GDO2 general outputs (IRQ/FIFO status); 26-27 MHz crystal with external load caps; 1.8-3.6 V; no reset pin (reset by SRES strobe). Differential RF_P/RF_N need a band-specific balun and LC filter (inductors) that this entry does NOT model, so node:rf is not fab-ready until that network is added",
+  "summary": "Sub-1 GHz (315/433/868/915 MHz bands) FSK/GFSK/ASK/OOK/MSK transceiver, up to +12 dBm; 4-wire SPI slave plus GDO0/GDO2 general outputs (IRQ/FIFO status); 26-27 MHz crystal with EXTERNAL load caps (no internal trim); 1.8-3.6 V; no reset pin (reset by SRES strobe). Encoded for the 868/915 MHz band: the Figure 11 balun + LC filter with Table 21 values runs from RF_P/RF_N to node:rf, a 50 ohm single-ended antenna port (no RF switch needed). The optional C126/L125 699 MHz filter is omitted. For 315/433 MHz the network topology and values differ (Figure 10, Table 21)",
   "symbol": {
     "pins": [
       {
@@ -219,6 +219,13 @@
         "page": 23,
         "quote": "Total parasitic capacitance is typically 2.5 pF."
       }
+    },
+    "xtal_load_internal": {
+      "value": 0,
+      "cite": {
+        "page": 23,
+        "quote": "addition, loading capacitors (C81 and C101)"
+      }
     }
   },
   "interfaces": [
@@ -262,13 +269,13 @@
     },
     {
       "kind": "rf",
-      "role": "port",
+      "role": "source",
       "signals": {
         "rf": "node:rf"
       },
       "cite": {
-        "reading": "node:rf is the 50 ohm antenna point of Figure 10 (315/433 MHz) / Figure 11 (868/915 MHz) on p.25: RF_P/RF_N reach it through a band-specific balun and LC filter (C121-C126, C131, L121-L125, L131-L132) whose values are in Table 21 on p.26. Not expressible in this schema today (no inductor support part); p.23 says to follow the CC1101EM reference designs [1] swrr046 / [2] swrr045, which confirm layout and values",
-        "page": 25
+        "page": 25,
+        "quote": "Figure 11: Typical Application and Evaluation Circuit 868/915 MHz (excluding supply"
       }
     }
   ],
@@ -378,6 +385,162 @@
       "cite": {
         "reading": "Supply decoupling values are not in SWRS061I: p.24 says the application circuit excludes them and to follow the CC1101EM reference designs [1] swrr046 / [2] swrr045. 100nF per supply pin is a placeholder, not from any TI document; confirm against the CC1101EM schematic",
         "page": 24
+      }
+    },
+    {
+      "between": [
+        "pin:RF_N",
+        "node:bn"
+      ],
+      "part": "L",
+      "value": "12nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "L131 33 nH ± 5%, 0402 27 nH ± 5%, 0402 12 nH ± 5%, 0402 Murata LQG15HS series (315/433 MHz)"
+      }
+    },
+    {
+      "between": [
+        "pin:RF_P",
+        "node:bp"
+      ],
+      "part": "L",
+      "value": "12nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "L121 33 nH ± 5%, 0402 27 nH ± 5%, 0402 12 nH ± 5%, 0402 Murata LQG15HS series (315/433 MHz)"
+      }
+    },
+    {
+      "between": [
+        "node:bn",
+        "node:bp"
+      ],
+      "part": "C",
+      "value": "1.0pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "C121 6.8 pF ± 0.5 pF, 3.9 pF ± 0.25 pF, 1.0 pF ± 0.25 pF, Murata GRM1555C series"
+      }
+    },
+    {
+      "between": [
+        "node:bn",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1.5pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "C131 6.8 pF ± 0.5 pF, 3.9 pF ± 0.25 pF, 1.5 pF ± 0.25 pF, Murata GRM1555C series"
+      }
+    },
+    {
+      "between": [
+        "node:bn",
+        "node:bj"
+      ],
+      "part": "L",
+      "value": "18nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "L132 18 nH ± 5%, 0402 Murata LQG15HS series (315/433 MHz)"
+      }
+    },
+    {
+      "between": [
+        "node:bp",
+        "node:bj"
+      ],
+      "part": "C",
+      "value": "1.5pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "C122 12 pF ± 5%, 0402 8.2 pF ± 0.5 pF, 1.5 pF ± 0.25 pF, Murata GRM1555C series"
+      }
+    },
+    {
+      "between": [
+        "node:bp",
+        "node:bdc"
+      ],
+      "part": "L",
+      "value": "18nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "L122 18 nH ± 5%, 0402 22 nH ± 5%, 0402 18 nH ± 5%, 0402 Murata LQG15HS series (315/433 MHz)"
+      }
+    },
+    {
+      "between": [
+        "node:bdc",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "C124 220 pF ± 5%, 220 pF ± 5%, 0402 100 pF ± 5%, 0402 Murata GRM1555C series"
+      }
+    },
+    {
+      "between": [
+        "node:bj",
+        "node:f1"
+      ],
+      "part": "L",
+      "value": "12nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "L123 33 nH ± 5%, 0402 27 nH ± 5%, 0402 12 nH ± 5%, 0402 Murata LQG15HS series (315/433 MHz)"
+      }
+    },
+    {
+      "between": [
+        "node:f1",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "3.3pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "C123 6.8 pF ± 0.5 pF, 5.6 pF ± 0.5 pF, 3.3 pF ± 0.25 pF, Murata GRM1555C series"
+      }
+    },
+    {
+      "between": [
+        "node:f1",
+        "node:f2"
+      ],
+      "part": "L",
+      "value": "12nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "L124 12 nH ± 5%, 0402 Murata LQG15HS series (315/433 MHz)"
+      }
+    },
+    {
+      "between": [
+        "node:f2",
+        "node:rf"
+      ],
+      "part": "C",
+      "value": "12pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 26,
+        "quote": "C125 220 pF ± 5%, 220 pF ± 5%, 0402 12 pF ± 5%, 0402 Murata GRM1555C series"
       }
     }
   ]
