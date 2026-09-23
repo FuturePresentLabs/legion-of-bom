@@ -14,13 +14,14 @@ use serde_json::json;
 use crate::model::{Circuit, Net, Part, PinRef, RefDes};
 use crate::source::CircuitSource;
 
-pub const DEFAULT_JACK_FOOTPRINT: &str = "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical";
+pub const DEFAULT_JACK_FOOTPRINT: &str =
+    "Connector_Audio:Jack_3.5mm_QingPu_WQP-PJ398SM_Vertical_CircularHoles";
 pub const DEFAULT_POT_FOOTPRINT: &str =
     "Potentiometer_THT:Potentiometer_Alpha_RD901F-40-00D_Single_Vertical";
 pub const DEFAULT_RESISTOR_FOOTPRINT: &str = "Resistor_SMD:R_0805_2012Metric";
 pub const DEFAULT_CAPACITOR_FOOTPRINT: &str = "Capacitor_SMD:C_0805_2012Metric";
 pub const DEFAULT_DIODE_FOOTPRINT: &str = "Diode_SMD:D_SOD-323";
-pub const DEFAULT_OPAMP_FOOTPRINT: &str = "Package_SO:SOIC-8_3.9x4.9mm";
+pub const DEFAULT_OPAMP_FOOTPRINT: &str = "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm";
 pub const DEFAULT_TESTPOINT_FOOTPRINT: &str = "TestPoint:TestPoint_Pad_D1.5mm";
 pub const DEFAULT_EXPANDER_HEADER_FOOTPRINT: &str =
     "Connector_PinHeader_2.54mm:PinHeader_2x05_P2.54mm_Vertical";
