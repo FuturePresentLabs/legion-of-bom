@@ -288,6 +288,11 @@ const RIPUP_MAX_ITERS: usize = 16;
 const DIAG_NUM: i64 = 1414;
 const DENOM: i64 = 1000;
 
+/// Least slack (cells) a windowed search keeps around a connection's endpoints
+/// — room to detour round an obstacle between them. A quarter of the
+/// connection's own span is added when that is more.
+const SEARCH_MARGIN_CELLS: usize = 50;
+
 impl Router for GridRouter {
     /// Route all nets with **rip-up-and-reroute**: route in an order; any net that
     /// can't reach a pad reports which committed nets boxed it in (blame); those
@@ -444,6 +449,9 @@ fn topo_order(base: &[usize], before: &[(usize, usize)]) -> Vec<usize> {
 /// board identically — otherwise their results are not comparable, and a board
 /// that routes under one would fail DRC under the other for reasons that have
 /// nothing to do with the routing algorithm.
+///
+/// Every keep-out is a Chebyshev radius in cells around a copper centre within
+/// which no *other* net's track centreline may sit (see [`keepout_cells`]).
 struct Surface {
     /// Pads and their clearance halos only. Traces are never committed here:
     /// [`GridRouter`] adds them as it goes, [`PathfinderRouter`] keeps them in a
@@ -454,12 +462,26 @@ struct Surface {
     res: f64,
     minx: f64,
     miny: f64,
-    /// Clearance halo radius in cells: how far another net must stay from copper.
-    halo: isize,
-    /// A via is bigger than a track, so it needs a wider keep-out.
+    /// Keep-out around a track centreline: another track's centreline must be a
+    /// full clearance plus a track width away. A disc of cell offsets — see
+    /// [`keepout_disc`].
+    track_disc: Vec<(isize, isize)>,
+    /// [`track_disc`](Self::track_disc)'s radius in cells, for searches that
+    /// only need to know how far a net's influence reaches.
+    track_halo: isize,
+    /// Keep-out around a via: far enough for a track centreline *and* for
+    /// another via, whichever is bigger.
+    via_disc: Vec<(isize, isize)>,
+    /// Square radius a via's body must find clear of other nets' pads.
     via_halo: isize,
+    /// [`via_halo`](Self::via_halo) answered for every cell up front, against
+    /// the pads-only grid — see [`ViaTable`].
+    via_table: ViaTable,
     /// Per routable net: each pad's cell and the layers it connects.
     pad_cells: Vec<Vec<((usize, usize), PadLayer)>>,
+    /// Routable pads whose own centre cell lies inside another net's pad
+    /// keep-out at this resolution: pads the router could never leave.
+    buried_pads: usize,
     costs: Costs,
 }
 
@@ -470,28 +492,193 @@ impl Surface {
     }
 }
 
+/// Air (mm) kept beyond every clearance, so a separation that is exact on paper
+/// is not lost to rounding in KiCad's DRC.
+const CLEARANCE_MARGIN_MM: f64 = 0.001;
+
+/// The finest grid [`build_surface`] will drop to. Below this a board-sized grid
+/// stops being a sensible thing to search; a pitch that needs finer is reported
+/// through the buried pads' conflicts rather than routed.
+const MIN_GRID_MM: f64 = 0.025;
+
+/// Chebyshev keep-out radius, in cells, for a required centre-to-centre
+/// separation of `d_mm`: the nearest cell *outside* it is `radius + 1` cells
+/// away on some axis, so at least `d_mm` away in true (Euclidean) distance.
+///
+/// Measured from each item's own required separation rather than summed from
+/// separately rounded-up parts: rounding a pad's half-width and the clearance up
+/// to whole cells *independently* over-inflated every pad by up to two cells,
+/// which at 0.5mm pitch swallowed each pin's only exit (legion-of-bom-y17.1).
+fn keepout_cells(d_mm: f64, res: f64) -> isize {
+    (((d_mm + CLEARANCE_MARGIN_MM) / res).ceil() as isize - 1).max(0)
+}
+
+/// The cell offsets around a copper centre where another net's centreline may
+/// not sit, for a required centre-to-centre separation of `d_mm` — a **disc**.
+///
+/// A box ([`keepout_cells`]) is exact along the axes but ~41% too wide on the
+/// diagonal, so two tracks running 45° side by side had to be 0.6mm apart
+/// where 0.45mm is legal, and a QFP fan-out could not turn. A step between two
+/// cells outside the disc cuts across it by at most `res² / 4d` (a chord of a
+/// diagonal step), which is added to the radius so every segment, not just
+/// every cell, keeps the separation.
+fn keepout_disc(d_mm: f64, res: f64) -> Vec<(isize, isize)> {
+    let reach = (d_mm + CLEARANCE_MARGIN_MM + res * res / (4.0 * d_mm.max(res))) / res;
+    let r = reach.ceil() as isize;
+    let mut offsets = Vec::new();
+    for dr in -r..=r {
+        for dc in -r..=r {
+            if ((dc * dc + dr * dr) as f64) < reach * reach {
+                offsets.push((dc, dr));
+            }
+        }
+    }
+    offsets
+}
+
+/// How the maze search decides whether a via may drop at a cell.
+#[derive(Clone, Copy)]
+enum ViaCheck<'a> {
+    /// Scan the live grid (it changes as [`GridRouter`] commits copper).
+    Live(isize),
+    /// Look the answer up — for a grid that never changes during the search.
+    Table(&'a ViaTable),
+}
+
+/// Whether a via's body (a `±radius` square on both layers) is clear of other
+/// nets' pads, answered for every cell at once.
+///
+/// Scanning that square per search step was the router's hot loop: at the
+/// 0.05mm grid a fine-pitch board needs, it is ~1,600 cells per step. Summed-
+/// area tables over the pads-only grid make it four lookups: the window must
+/// hold no blocked cell, and every owned cell in it must belong to one net —
+/// tested exactly as "the owners' ids have zero variance" (count, sum and sum of
+/// squares), so no per-cell list is needed.
+struct ViaTable {
+    cols: usize,
+    rows: usize,
+    radius: isize,
+    /// `(cols + 1) × (rows + 1)` prefix sums of `[blocked, owned, Σid, Σid²]`
+    /// over both layers.
+    sat: Vec<[i64; 4]>,
+}
+
+impl ViaTable {
+    fn new(grid: &Grid, radius: isize) -> Self {
+        let (cols, rows) = (grid.cols, grid.rows);
+        let w = cols + 1;
+        let mut sat = vec![[0i64; 4]; w * (rows + 1)];
+        for r in 0..rows {
+            for c in 0..cols {
+                let mut v = [0i64; 4];
+                for layer in [FRONT, BACK] {
+                    match grid.get(c, r, layer) {
+                        Cell::Free => {}
+                        Cell::Blocked => v[0] += 1,
+                        Cell::Owner(n) => {
+                            let n = n as i64;
+                            v[1] += 1;
+                            v[2] += n;
+                            v[3] += n * n;
+                        }
+                    }
+                }
+                let (up, left, diag) = (sat[r * w + c + 1], sat[(r + 1) * w + c], sat[r * w + c]);
+                let cell = &mut sat[(r + 1) * w + c + 1];
+                for k in 0..4 {
+                    cell[k] = v[k] + up[k] + left[k] - diag[k];
+                }
+            }
+        }
+        ViaTable {
+            cols,
+            rows,
+            radius,
+            sat,
+        }
+    }
+
+    fn allows(&self, c: usize, r: usize, net: usize) -> bool {
+        let rad = self.radius;
+        let (c0, r0) = (c as isize - rad, r as isize - rad);
+        let (c1, r1) = (c as isize + rad + 1, r as isize + rad + 1);
+        // Too near the grid edge for its clearance, as the live scan says too.
+        if c0 < 0 || r0 < 0 || c1 > self.cols as isize || r1 > self.rows as isize {
+            return false;
+        }
+        let w = self.cols + 1;
+        let at = |cc: isize, rr: isize| self.sat[rr as usize * w + cc as usize];
+        let (a, b, cc, d) = (at(c1, r1), at(c0, r1), at(c1, r0), at(c0, r0));
+        let sum = |k: usize| a[k] - b[k] - cc[k] + d[k];
+        let (owned, n) = (sum(1), net as i64);
+        sum(0) == 0 && sum(2) == n * owned && sum(3) == n * n * owned
+    }
+}
+
 /// Discretise the board and paint the pads. See [`Surface`].
+///
+/// The grid resolution is **derived from the pads**, not configured:
+/// `opts.grid_mm` is the coarsest the board is searched at, and the grid halves
+/// until every routable pad can at least be left — i.e. no pad's centre sits
+/// inside a neighbour's keep-out. A board of 2.54mm headers never leaves the
+/// coarse grid; a 0.5mm-pitch QFP drops it to where the pin axis is on a cell.
 fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions) -> Surface {
-    let res = opts.grid_mm.max(0.01);
+    let mut res = opts.grid_mm.max(0.01);
+    loop {
+        let surface = paint_surface(nets, routable, opts, res);
+        if surface.buried_pads == 0 || res / 2.0 < MIN_GRID_MM - 1e-9 {
+            return surface;
+        }
+        res /= 2.0;
+    }
+}
+
+/// [`build_surface`] at one fixed resolution.
+fn paint_surface(
+    nets: &[RouteNet],
+    routable: &[&RouteNet],
+    opts: &RouteOptions,
+    res: f64,
+) -> Surface {
     // `bounds`, when given, is the board outline: inset the routable area by the
     // edge clearance plus the widest copper half (a via) so no track/via lands
     // within `edge_clearance_mm` of the edge. The pad-bbox fallback has no board
     // edge, so it is used as-is.
-    let (minx, miny, maxx, maxy) = match opts.bounds {
+    let (bounded, (minx, miny, maxx, maxy)) = match opts.bounds {
         Some((x0, y0, x1, y1)) => {
             let inset = opts.edge_clearance_mm
                 + (opts.via_size_mm / 2.0).max(opts.signal_width_mm / 2.0)
-                + res / 2.0;
+                + CLEARANCE_MARGIN_MM;
             if x1 - x0 > 2.0 * inset && y1 - y0 > 2.0 * inset {
-                (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
+                (true, (x0 + inset, y0 + inset, x1 - inset, y1 - inset))
             } else {
-                (x0, y0, x1, y1) // too small to inset — leave it (surfaces as conflicts)
+                (false, (x0, y0, x1, y1)) // too small to inset — leave it (surfaces as conflicts)
             }
         }
-        None => bounds_of(nets, 2.0),
+        None => (false, bounds_of(nets, 2.0)),
     };
-    let cols = (((maxx - minx) / res).ceil() as usize).max(1) + 1;
-    let rows = (((maxy - miny) / res).ceil() as usize).max(1) + 1;
+    // The grid sits on the absolute `res` lattice, so a part placed on it has
+    // its pins on cell centres — at 0.5mm pitch there is 0.025mm of slack
+    // either side of a pin's axis, and an arbitrary origin would throw it away.
+    // Inside a real outline the lattice rounds *inward*, never into the edge band.
+    let (minx, miny) = if bounded {
+        (
+            (minx / res - 1e-9).ceil() * res,
+            (miny / res - 1e-9).ceil() * res,
+        )
+    } else {
+        ((minx / res).floor() * res, (miny / res).floor() * res)
+    };
+    let span = |lo: f64, hi: f64| {
+        let n = (hi - lo) / res;
+        let n = if bounded {
+            (n + 1e-9).floor()
+        } else {
+            n.ceil()
+        };
+        (n.max(0.0) as usize).max(1) + 1
+    };
+    let (cols, rows) = (span(minx, maxx), span(miny, maxy));
     let cell_of = |x: f64, y: f64| {
         let c = (((x - minx) / res).round() as isize).clamp(0, cols as isize - 1) as usize;
         let r = (((y - miny) / res).round() as isize).clamp(0, rows as isize - 1) as usize;
@@ -503,9 +690,12 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
         rows,
         cells: vec![Cell::Free; cols * rows * 2],
     };
-    let halo = ((opts.clearance_mm + opts.signal_width_mm / 2.0) / res).ceil() as isize;
-    let via_halo = ((opts.via_size_mm / 2.0 + opts.clearance_mm + opts.signal_width_mm / 2.0) / res)
-        .ceil() as isize;
+    let (clr, half_track) = (opts.clearance_mm, opts.signal_width_mm / 2.0);
+    let track_sep = clr + 2.0 * half_track;
+    let via_sep = opts.via_size_mm / 2.0 + clr + half_track.max(opts.via_size_mm / 2.0);
+    let (track_disc, via_disc) = (keepout_disc(track_sep, res), keepout_disc(via_sep, res));
+    let track_halo = keepout_cells(track_sep, res);
+    let via_halo = keepout_cells(via_sep, res);
 
     // Paint every pad (and its clearance halo) as its net's territory. Do the
     // cores first so a halo never overwrites a real pad connection point.
@@ -524,16 +714,25 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
     }
     for net in nets {
         for pad in &net.pads {
+            // Keep-out is the pad's real rectangle grown by a clearance plus a
+            // track half-width, in board coordinates: a cell is out when its
+            // centre is strictly inside. Exact, so it neither loses the slack a
+            // fine-pitch pin has nor depends on which cell the pad snapped to.
+            let d = clr + half_track + CLEARANCE_MARGIN_MM;
+            let lo = |v: f64, o: f64| ((v - o) / res).floor() as isize + 1;
+            let hi = |v: f64, o: f64| ((v - o) / res).ceil() as isize - 1;
+            let (c0, c1) = (
+                lo(pad.x_mm - pad.w_mm / 2.0 - d, minx),
+                hi(pad.x_mm + pad.w_mm / 2.0 + d, minx),
+            );
+            let (r0, r1) = (
+                lo(pad.y_mm - pad.h_mm / 2.0 - d, miny),
+                hi(pad.y_mm + pad.h_mm / 2.0 + d, miny),
+            );
             for layer in [FRONT, BACK] {
-                if !pad.layer.on(layer) {
-                    continue;
+                if pad.layer.on(layer) {
+                    grid.halo_span(c0..=c1, r0..=r1, layer, net.net_idx);
                 }
-                let (cc, cr) = cell_of(pad.x_mm, pad.y_mm);
-                let (pw, ph) = (
-                    (pad.w_mm / 2.0 / res).ceil() as isize,
-                    (pad.h_mm / 2.0 / res).ceil() as isize,
-                );
-                grid.halo(cc, cr, layer, net.net_idx, pw + halo, ph + halo);
             }
         }
     }
@@ -542,11 +741,19 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
     // connection point on every layer it touches — so a through-hole pad is
     // reachable on both, letting the router meet it without a via.
     let mut pad_cells: Vec<Vec<((usize, usize), PadLayer)>> = Vec::new();
+    let mut buried_pads = 0;
     for net in routable {
         let mut cells = Vec::new();
         for pad in &net.pads {
             let (c, r) = cell_of(pad.x_mm, pad.y_mm);
-            for &layer in pad.layer.layers() {
+            let layers = pad.layer.layers();
+            if layers
+                .iter()
+                .any(|&l| grid.get(c, r, l) != Cell::Owner(net.net_idx))
+            {
+                buried_pads += 1;
+            }
+            for &layer in layers {
                 grid.set(c, r, layer, Cell::Owner(net.net_idx));
             }
             cells.push(((c, r), pad.layer));
@@ -554,6 +761,7 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
         pad_cells.push(cells);
     }
 
+    let via_table = ViaTable::new(&grid, via_halo);
     Surface {
         grid,
         cols,
@@ -561,9 +769,13 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
         res,
         minx,
         miny,
-        halo,
+        via_table,
+        track_disc,
+        track_halo,
+        via_disc,
         via_halo,
         pad_cells,
+        buried_pads,
         costs: Costs {
             step: (res * 1000.0) as i64,
             via: (opts.via_cost_mm * 1000.0) as i64,
@@ -591,16 +803,17 @@ fn route_pass(
     let mut out = RouteOutput::default();
     // Same discretisation as `PathfinderRouter`, so the two are comparable.
     let mut surface = build_surface(nets, routable, opts);
-    let (cols, rows, halo, via_halo, res) = (
+    let (cols, rows, track_halo, via_halo, res) = (
         surface.cols,
         surface.rows,
-        surface.halo,
+        surface.track_halo,
         surface.via_halo,
         surface.res,
     );
     let (minx, miny) = (surface.minx, surface.miny);
     let mm_of = move |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
     let pad_cells = surface.pad_cells.clone();
+    let (track_disc, via_disc) = (surface.track_disc.clone(), surface.via_disc.clone());
     let grid = &mut surface.grid;
 
     // Route each net in the given order, growing a tree from pad 0.
@@ -609,7 +822,7 @@ fn route_pass(
     // boxes in one of its pads (candidates to rip up and reroute).
     let mut blame: HashMap<usize, HashSet<usize>> = HashMap::new();
     // How far around an unreachable pad to look for the nets fencing it in.
-    let blame_radius = (halo * 3).max(6);
+    let blame_radius = (track_halo * 3).max(6);
     for &ni in order {
         let net = routable[ni];
         let costs = Costs {
@@ -637,14 +850,14 @@ fn route_pass(
                 &connected,
                 &targets,
                 costs,
-                via_halo,
+                ViaCheck::Live(via_halo),
                 learned,
                 0,
             ) {
                 Some(path) => {
                     emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
                     for &(c, r, l) in &path {
-                        grid.commit(c, r, l, net.net_idx, halo);
+                        grid.commit(c, r, l, net.net_idx, &track_disc);
                         if !connected.contains(&(c, r, l)) {
                             connected.push((c, r, l));
                         }
@@ -658,7 +871,7 @@ fn route_pass(
                     // Reserve each via's wider body so later nets keep clear.
                     for w in path.windows(2) {
                         if w[0].2 != w[1].2 {
-                            grid.commit_via(w[0].0, w[0].1, net.net_idx, via_halo);
+                            grid.commit_via(w[0].0, w[0].1, net.net_idx, &via_disc);
                         }
                     }
                 }
@@ -726,15 +939,22 @@ impl Grid {
             Cell::Blocked => {}
         }
     }
-    /// Paint a clearance halo (`±rx, ±ry` cells) as `net`'s territory; where it
-    /// meets another net's territory the pinch is [`Cell::Blocked`].
-    fn halo(&mut self, cc: usize, cr: usize, layer: usize, net: usize, rx: isize, ry: isize) {
-        for dr in -ry..=ry {
-            for dc in -rx..=rx {
-                let (c, r) = (cc as isize + dc, cr as isize + dr);
-                if c < 0 || r < 0 || c >= self.cols as isize || r >= self.rows as isize {
-                    continue;
-                }
+    /// Paint a clearance halo over a cell rectangle (clipped to the grid) as
+    /// `net`'s territory; where it meets another net's territory the pinch is
+    /// [`Cell::Blocked`].
+    fn halo_span(
+        &mut self,
+        cols: std::ops::RangeInclusive<isize>,
+        rows: std::ops::RangeInclusive<isize>,
+        layer: usize,
+        net: usize,
+    ) {
+        let c0 = (*cols.start()).max(0);
+        let c1 = (*cols.end()).min(self.cols as isize - 1);
+        let r0 = (*rows.start()).max(0);
+        let r1 = (*rows.end()).min(self.rows as isize - 1);
+        for r in r0..=r1 {
+            for c in c0..=c1 {
                 let (c, r) = (c as usize, r as usize);
                 match self.get(c, r, layer) {
                     Cell::Free => self.set(c, r, layer, Cell::Owner(net)),
@@ -753,16 +973,39 @@ impl Grid {
             Cell::Blocked => false,
         }
     }
-    /// Commit a routed cell plus its clearance halo to `net`.
-    fn commit(&mut self, c: usize, r: usize, layer: usize, net: usize, halo: isize) {
+    /// Paint `offsets` around `(cc, cr)` as `net`'s territory, the way
+    /// [`halo_span`](Self::halo_span) paints a rectangle.
+    fn halo_offsets(
+        &mut self,
+        cc: usize,
+        cr: usize,
+        layer: usize,
+        net: usize,
+        offsets: &[(isize, isize)],
+    ) {
+        for &(dc, dr) in offsets {
+            let (c, r) = (cc as isize + dc, cr as isize + dr);
+            if c < 0 || r < 0 || c >= self.cols as isize || r >= self.rows as isize {
+                continue;
+            }
+            let (c, r) = (c as usize, r as usize);
+            match self.get(c, r, layer) {
+                Cell::Free => self.set(c, r, layer, Cell::Owner(net)),
+                Cell::Owner(m) if m != net => self.set(c, r, layer, Cell::Blocked),
+                _ => {}
+            }
+        }
+    }
+    /// Commit a routed cell plus its clearance disc to `net`.
+    fn commit(&mut self, c: usize, r: usize, layer: usize, net: usize, disc: &[(isize, isize)]) {
         self.set(c, r, layer, Cell::Owner(net));
-        self.halo(c, r, layer, net, halo, halo);
+        self.halo_offsets(c, r, layer, net, disc);
     }
     /// Reserve a via's body + clearance at `(c, r)` on both layers for `net`.
-    fn commit_via(&mut self, c: usize, r: usize, net: usize, via_halo: isize) {
+    fn commit_via(&mut self, c: usize, r: usize, net: usize, disc: &[(isize, isize)]) {
         for layer in [FRONT, BACK] {
             self.set(c, r, layer, Cell::Owner(net));
-            self.halo(c, r, layer, net, via_halo, via_halo);
+            self.halo_offsets(c, r, layer, net, disc);
         }
     }
     /// Is a via's whole body (`±via_halo` on both layers) free for `net`? Also
@@ -804,47 +1047,105 @@ impl Grid {
         sources: &[(usize, usize, usize)],
         targets: &[(usize, usize, usize)],
         costs: Costs,
-        via_halo: isize,
+        vias: ViaCheck<'_>,
         cong: &Congestion,
         p_fac: i64,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        // Search a window around the connection first. A connection that can
+        // be made at all nearly always can be made near its own endpoints, and
+        // at a fine-pitch board's 0.05mm grid the whole board is millions of
+        // cells — searching (and allocating) all of it per connection is what
+        // made a 24-pin LQFP board take minutes. Only a connection the window
+        // cannot make pays for the whole board.
+        //
+        // The window spans the targets and the one source nearest them — not
+        // every source: a net's sources are its whole routed tree so far, and
+        // for a 24-pad GND that tree spans the board, which would make every
+        // window the board.
+        let chebyshev = |a: &(usize, usize, usize), b: &(usize, usize, usize)| {
+            a.0.abs_diff(b.0).max(a.1.abs_diff(b.1))
+        };
+        let nearest = sources
+            .iter()
+            .min_by_key(|s| targets.iter().map(|t| chebyshev(s, t)).min().unwrap_or(0));
+        let (mut c0, mut r0, mut c1, mut r1) = (usize::MAX, usize::MAX, 0, 0);
+        for &(c, r, _) in nearest.into_iter().chain(targets) {
+            (c0, r0, c1, r1) = (c0.min(c), r0.min(r), c1.max(c), r1.max(r));
+        }
+        let span = (c1 - c0).max(r1 - r0);
+        let margin = (SEARCH_MARGIN_CELLS).max(span / 4);
+        let window = (
+            c0.saturating_sub(margin),
+            r0.saturating_sub(margin),
+            (c1 + margin).min(self.cols - 1),
+            (r1 + margin).min(self.rows - 1),
+        );
+        let whole = (0, 0, self.cols - 1, self.rows - 1);
+        let search = |w| self.search(net, sources, targets, costs, vias, cong, p_fac, w);
+        search(window).or_else(|| (window != whole).then(|| search(whole)).flatten())
+    }
+
+    /// [`route_one_soft`](Self::route_one_soft) confined to the inclusive cell
+    /// rectangle `(c0, r0, c1, r1)`, with search state sized to it.
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        &self,
+        net: usize,
+        sources: &[(usize, usize, usize)],
+        targets: &[(usize, usize, usize)],
+        costs: Costs,
+        vias: ViaCheck<'_>,
+        cong: &Congestion,
+        p_fac: i64,
+        (c0, r0, c1, r1): (usize, usize, usize, usize),
     ) -> Option<Vec<(usize, usize, usize)>> {
         let Costs {
             step,
             via: via_cost,
             back: back_penalty,
         } = costs;
-        let n = self.cols * self.rows * 2;
-        let cr = self.cols * self.rows;
-        let mut dist = vec![i64::MAX; n];
-        let mut prev = vec![usize::MAX; n];
-        let heuristic = |i: usize| -> i64 {
-            let rem = i % cr;
-            let (c, r) = ((rem % self.cols) as isize, (rem / self.cols) as isize);
+        let (ww, wh) = (c1 - c0 + 1, r1 - r0 + 1);
+        let wa = ww * wh;
+        // Local (window) index <-> cell.
+        let local = |c: usize, r: usize, l: usize| (l * wh + (r - r0)) * ww + (c - c0);
+        let cell = |i: usize| {
+            let (l, rem) = (i / wa, i % wa);
+            (c0 + rem % ww, r0 + rem / ww, l)
+        };
+        let mut dist = vec![i64::MAX; wa * 2];
+        let mut prev = vec![usize::MAX; wa * 2];
+        let heuristic = |c: usize, r: usize| -> i64 {
             targets
                 .iter()
                 .map(|&(tc, tr, _)| {
-                    let (dc, dr) = ((c - tc as isize).abs(), (r - tr as isize).abs());
-                    let (lo, hi) = (dc.min(dr) as i64, dc.max(dr) as i64);
+                    let (dc, dr) = (c.abs_diff(tc) as i64, r.abs_diff(tr) as i64);
+                    let (lo, hi) = (dc.min(dr), dc.max(dr));
                     hi * step + lo * (DIAG_NUM - DENOM) * step / DENOM
                 })
                 .min()
                 .unwrap_or(0)
         };
-        // What entering cell `j` really costs, once contention is priced in.
+        // What entering cell `j` (a global index) really costs, once contention
+        // is priced in.
         let toll = |j: usize, base: i64| -> i64 {
             let present = (PF_ONE + p_fac.saturating_mul(cong.contest(j))).min(PF_PRESENT_MAX);
             let scaled = base.saturating_mul(present) / PF_ONE;
             scaled.saturating_mul(cong.hist_at(j)) / PF_ONE
         };
+        let inside = |c: usize, r: usize| c >= c0 && c <= c1 && r >= r0 && r <= r1;
         let mut heap: BinaryHeap<Reverse<(i64, i64, usize)>> = BinaryHeap::new();
-        for &(c, r, l) in sources {
-            let i = self.idx(c, r, l);
+        for &(c, r, l) in sources.iter().filter(|&&(c, r, _)| inside(c, r)) {
+            let i = local(c, r, l);
             if dist[i] != 0 {
                 dist[i] = 0;
-                heap.push(Reverse((heuristic(i), 0i64, i)));
+                heap.push(Reverse((heuristic(c, r), 0i64, i)));
             }
         }
-        let tgt: Vec<usize> = targets.iter().map(|&(c, r, l)| self.idx(c, r, l)).collect();
+        let tgt: Vec<usize> = targets
+            .iter()
+            .filter(|&&(c, r, _)| inside(c, r))
+            .map(|&(c, r, l)| local(c, r, l))
+            .collect();
         while let Some(Reverse((_f, g, i))) = heap.pop() {
             if g > dist[i] {
                 continue;
@@ -853,17 +1154,13 @@ impl Grid {
                 let mut path = Vec::new();
                 let mut cur = i;
                 while cur != usize::MAX {
-                    let layer = cur / cr;
-                    let rem = cur % cr;
-                    path.push((rem % self.cols, rem / self.cols, layer));
+                    path.push(cell(cur));
                     cur = prev[cur];
                 }
                 path.reverse();
                 return Some(path);
             }
-            let layer = i / cr;
-            let rem = i % cr;
-            let (c, r) = (rem % self.cols, rem / self.cols);
+            let (c, r, layer) = cell(i);
             let neigh = [
                 (-1isize, 0isize),
                 (1, 0),
@@ -876,7 +1173,7 @@ impl Grid {
             ];
             for (dc, dr) in neigh {
                 let (nc, nr) = (c as isize + dc, r as isize + dr);
-                if nc < 0 || nr < 0 || nc >= self.cols as isize || nr >= self.rows as isize {
+                if nc < c0 as isize || nr < r0 as isize || nc > c1 as isize || nr > r1 as isize {
                     continue;
                 }
                 let (nc, nr) = (nc as usize, nr as usize);
@@ -896,11 +1193,10 @@ impl Grid {
                     step
                 };
                 let base = straight + if layer == BACK { back_penalty } else { 0 };
-                let j = self.idx(nc, nr, layer);
                 relax(
-                    j,
-                    g + toll(j, base),
-                    heuristic(j),
+                    local(nc, nr, layer),
+                    g + toll(self.idx(nc, nr, layer), base),
+                    heuristic(nc, nr),
                     i,
                     &mut dist,
                     &mut prev,
@@ -910,12 +1206,15 @@ impl Grid {
             // A via still needs its whole body clear of *pads*; other nets' copper
             // there is priced by the toll like any other contention.
             let other = layer ^ 1;
-            if self.via_area_clear(c, r, net, via_halo) {
-                let j = self.idx(c, r, other);
+            let via_ok = match vias {
+                ViaCheck::Live(via_halo) => self.via_area_clear(c, r, net, via_halo),
+                ViaCheck::Table(t) => t.allows(c, r, net),
+            };
+            if via_ok {
                 relax(
-                    j,
-                    g + toll(j, via_cost),
-                    heuristic(j),
+                    local(c, r, other),
+                    g + toll(self.idx(c, r, other), via_cost),
+                    heuristic(c, r),
                     i,
                     &mut dist,
                     &mut prev,
@@ -1047,15 +1346,13 @@ impl NetRoute {
     fn claim(&mut self, s: &Surface) {
         let mut core: Vec<usize> = Vec::new();
         let mut halo: Vec<usize> = Vec::new();
-        let disc = |v: &mut Vec<usize>, c: usize, r: usize, l: usize, rad: isize| {
-            for dr in -rad..=rad {
-                for dc in -rad..=rad {
-                    let (nc, nr) = (c as isize + dc, r as isize + dr);
-                    if nc < 0 || nr < 0 || nc >= s.cols as isize || nr >= s.rows as isize {
-                        continue;
-                    }
-                    v.push(s.grid.idx(nc as usize, nr as usize, l));
+        let disc = |v: &mut Vec<usize>, c: usize, r: usize, l: usize, offs: &[(isize, isize)]| {
+            for &(dc, dr) in offs {
+                let (nc, nr) = (c as isize + dc, r as isize + dr);
+                if nc < 0 || nr < 0 || nc >= s.cols as isize || nr >= s.rows as isize {
+                    continue;
                 }
+                v.push(s.grid.idx(nc as usize, nr as usize, l));
             }
         };
         for path in &self.paths {
@@ -1067,14 +1364,14 @@ impl NetRoute {
                 if w[0].2 != w[1].2 {
                     for l in [FRONT, BACK] {
                         core.push(s.grid.idx(w[0].0, w[0].1, l));
-                        disc(&mut halo, w[0].0, w[0].1, l, s.via_halo);
+                        disc(&mut halo, w[0].0, w[0].1, l, &s.via_disc);
                     }
                 }
             }
         }
         for path in &self.paths {
             for &(c, r, l) in path {
-                disc(&mut halo, c, r, l, s.halo);
+                disc(&mut halo, c, r, l, &s.track_disc);
             }
         }
         core.sort_unstable();
@@ -1358,7 +1655,7 @@ fn route_net_soft(
             &connected,
             &targets,
             s.costs,
-            s.via_halo,
+            ViaCheck::Table(&s.via_table),
             cong,
             p_fac,
         ) {
@@ -2338,13 +2635,16 @@ mod tests {
                 name: "SIG".into(),
                 pads: vec![pad("A", "1", 5.0, 0.6), pad("B", "1", 15.0, 0.6)],
             }];
-            // A vertical wall at x = 10 starts at y = 2. The path at y ~= 0.6 is
-            // deliberately available only when the router may use the edge band.
-            for y in 2..=10 {
+            // A vertical wall at x = 10 whose lowest pad's copper ends at
+            // y = 1.0, so a track must pass with its centre at y <= 0.675. The
+            // path at y ~= 0.6 is deliberately available only when the router
+            // may use the edge band (with 0.5mm edge clearance the grid starts
+            // at y = 1.0).
+            for k in 0..=8 {
                 nets.push(RouteNet {
                     net_idx: 0,
                     name: String::new(),
-                    pads: vec![pad_on("W", "1", 10.0, y as f64, PadLayer::Both)],
+                    pads: vec![pad_on("W", "1", 10.0, 1.5 + k as f64, PadLayer::Both)],
                 });
             }
             GridRouter.route(&nets, &opts)
@@ -2365,5 +2665,206 @@ mod tests {
             out.tracks.iter().all(|t| t.net_idx != 1),
             "the boxed-in net must not be routed into the edge band"
         );
+    }
+
+    // ---- fine-pitch escape (legion-of-bom-y17.1) ---------------------------
+
+    /// Distance from point `p` to segment `a`-`b`.
+    fn pt_seg(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 == 0.0 {
+            0.0
+        } else {
+            (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+        };
+        let (qx, qy) = (a.0 + t * dx, a.1 + t * dy);
+        ((p.0 - qx).powi(2) + (p.1 - qy).powi(2)).sqrt()
+    }
+
+    fn segs_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+        let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+            (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+        };
+        let (o1, o2) = (orient(a, b, c), orient(a, b, d));
+        let (o3, o4) = (orient(c, d, a), orient(c, d, b));
+        o1 * o2 < 0.0 && o3 * o4 < 0.0
+    }
+
+    fn seg_seg(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> f64 {
+        if segs_cross(a, b, c, d) {
+            return 0.0;
+        }
+        pt_seg(a, c, d)
+            .min(pt_seg(b, c, d))
+            .min(pt_seg(c, a, b))
+            .min(pt_seg(d, a, b))
+    }
+
+    /// Distance from segment `a`-`b` to a pad's rectangle (0 if they touch).
+    fn seg_pad(a: (f64, f64), b: (f64, f64), p: &PadPoint) -> f64 {
+        let (x0, y0) = (p.x_mm - p.w_mm / 2.0, p.y_mm - p.h_mm / 2.0);
+        let (x1, y1) = (p.x_mm + p.w_mm / 2.0, p.y_mm + p.h_mm / 2.0);
+        let inside = |q: (f64, f64)| q.0 >= x0 && q.0 <= x1 && q.1 >= y0 && q.1 <= y1;
+        if inside(a) || inside(b) {
+            return 0.0;
+        }
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+        (0..4)
+            .map(|i| seg_seg(a, b, corners[i], corners[(i + 1) % 4]))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// The test oracle the router is judged by: every pair of copper items on
+    /// different nets, measured edge to edge in exact geometry — not on the
+    /// router's own grid, which is the thing under test. Returns one line per
+    /// violation (empty = clean).
+    fn clearance_violations(nets: &[RouteNet], out: &RouteOutput, clr: f64) -> Vec<String> {
+        const TOL: f64 = 1e-6;
+        let layer_of = |name: &str| if name == "F.Cu" { FRONT } else { BACK };
+        let mut bad = Vec::new();
+        for (i, t) in out.tracks.iter().enumerate() {
+            let l = layer_of(&t.layer);
+            for u in &out.tracks[i + 1..] {
+                if u.net_idx == t.net_idx || layer_of(&u.layer) != l {
+                    continue;
+                }
+                let gap = seg_seg(t.start, t.end, u.start, u.end) - (t.width_mm + u.width_mm) / 2.0;
+                if gap < clr - TOL {
+                    bad.push(format!(
+                        "track {} / track {}: {gap:.4}",
+                        t.net_idx, u.net_idx
+                    ));
+                }
+            }
+            for net in nets.iter().filter(|n| n.net_idx != t.net_idx) {
+                for p in net.pads.iter().filter(|p| p.layer.on(l)) {
+                    let gap = seg_pad(t.start, t.end, p) - t.width_mm / 2.0;
+                    if gap < clr - TOL {
+                        bad.push(format!(
+                            "track {} / pad {}.{}: {gap:.4}",
+                            t.net_idx, p.refdes, p.pad
+                        ));
+                    }
+                }
+            }
+            for v in out.vias.iter().filter(|v| v.net_idx != t.net_idx) {
+                let gap = pt_seg(v.at, t.start, t.end) - (t.width_mm + v.size_mm) / 2.0;
+                if gap < clr - TOL {
+                    bad.push(format!("track {} / via {}: {gap:.4}", t.net_idx, v.net_idx));
+                }
+            }
+        }
+        for v in &out.vias {
+            for net in nets.iter().filter(|n| n.net_idx != v.net_idx) {
+                for p in &net.pads {
+                    let gap = seg_pad(v.at, v.at, p) - v.size_mm / 2.0;
+                    if gap < clr - TOL {
+                        bad.push(format!(
+                            "via {} / pad {}.{}: {gap:.4}",
+                            v.net_idx, p.refdes, p.pad
+                        ));
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    /// A 7x7mm LQFP-48 at 0.5mm pitch, pads exactly as KiCad's
+    /// `Package_QFP:LQFP-48_7x7mm_P0.5mm` places them (1.475 x 0.3mm), centred
+    /// at `(cx, cy)`. Pads `1..=48` in KiCad order: left side top-down, then
+    /// bottom, right, top.
+    fn lqfp48(cx: f64, cy: f64) -> Vec<PadPoint> {
+        let (row, len, wid) = (4.1625, 1.475, 0.3);
+        (0..48)
+            .map(|i| {
+                let k = (i % 12) as f64 * 0.5 - 2.75;
+                let (x, y, w, h) = match i / 12 {
+                    0 => (-row, k, len, wid),
+                    1 => (k, row, wid, len),
+                    2 => (row, -k, len, wid),
+                    _ => (-k, -row, wid, len),
+                };
+                PadPoint {
+                    refdes: "U1".into(),
+                    pad: (i + 1).to_string(),
+                    x_mm: cx + x,
+                    y_mm: cy + y,
+                    w_mm: w,
+                    h_mm: h,
+                    layer: PadLayer::Front,
+                }
+            })
+            .collect()
+    }
+
+    /// The LQFP's bottom and left rows each fanned out to a row of 1mm test
+    /// pads 5mm away at 1.27mm pitch; every other LQFP pad is a distinct,
+    /// unrouted net, so it is copper the fan-out must keep clear of — exactly
+    /// the situation of an MCU whose unused pins sit between the used ones.
+    fn lqfp_fanout_board() -> (Vec<RouteNet>, RouteOptions) {
+        let (cx, cy) = (15.0, 15.0);
+        let mut nets = Vec::new();
+        for (i, p) in lqfp48(cx, cy).into_iter().enumerate() {
+            let side = i / 12;
+            let k = (i % 12) as f64 * 1.27 - 5.5 * 1.27;
+            let mut pads = vec![p];
+            match side {
+                0 => pads.push(pad("TP", &format!("L{i}"), cx - 10.0, cy + k)),
+                1 => pads.push(pad("TP", &format!("B{i}"), cx + k, cy + 10.0)),
+                _ => {}
+            }
+            nets.push(RouteNet {
+                net_idx: i + 1,
+                name: format!("N{}", i + 1),
+                pads,
+            });
+        }
+        let opts = RouteOptions {
+            bounds: Some((0.0, 0.0, 30.0, 30.0)),
+            ..RouteOptions::default()
+        };
+        (nets, opts)
+    }
+
+    #[test]
+    fn the_clearance_oracle_can_fail() {
+        // Two parallel tracks 0.3mm apart centre to centre with 0.25mm width
+        // leave 0.05mm of air: the oracle must say so, or every "clean" below
+        // is vacuous.
+        let track = |y: f64, net_idx| Track {
+            start: (0.0, y),
+            end: (5.0, y),
+            width_mm: 0.25,
+            layer: "F.Cu".into(),
+            net_idx,
+        };
+        let out = RouteOutput {
+            tracks: vec![track(0.0, 1), track(0.3, 2)],
+            ..RouteOutput::default()
+        };
+        assert_eq!(clearance_violations(&[], &out, 0.2).len(), 1);
+        let out = RouteOutput {
+            tracks: vec![track(0.0, 1), track(0.45, 2)],
+            ..RouteOutput::default()
+        };
+        assert!(
+            clearance_violations(&[], &out, 0.2).is_empty(),
+            "exactly at clearance is legal"
+        );
+    }
+
+    /// An MCU's 0.5mm-pitch pins have to be escapable at all before any MCU
+    /// board can route: at 0.25mm track / 0.2mm clearance there is 0.025mm of
+    /// slack either side of each pin's axis, so this is a test of whether the
+    /// grid measures clearance honestly, not of routing cleverness.
+    #[test]
+    fn pathfinder_escapes_a_half_millimetre_pitch_qfp_drc_clean() {
+        let (nets, opts) = lqfp_fanout_board();
+        let out = PathfinderRouter::default().route(&nets, &opts);
+        assert!(out.conflicts.is_empty(), "unrouted: {:#?}", out.conflicts);
+        let bad = clearance_violations(&nets, &out, opts.clearance_mm);
+        assert!(bad.is_empty(), "clearance violations: {bad:#?}");
     }
 }

@@ -1874,6 +1874,23 @@ pub fn generate_board_artifacts(
         crate::legalize::legalize_pinning(&mut placements, &rules, &facts, &pinned);
     }
 
+    // Fine-pitch parts go on the pin lattice, last, so nothing moves them off
+    // it. At 0.5mm pitch a pin's escape has ~0.025mm of slack either side of its
+    // axis; the router's grid sits on the absolute lattice, so a part whose pins
+    // are on it can be left along the axis, and one that is not loses the slack
+    // to rounding (legion-of-bom-y17.1). The move is at most half a lattice step.
+    for (refdes, _, _, _, pads) in &loaded {
+        if pinned.contains(*refdes) {
+            continue;
+        }
+        if let Some(p) = placements.get_mut(*refdes) {
+            if let Some(step) = pin_lattice_mm(pads, *p) {
+                p.x_mm = (p.x_mm / step).round() * step;
+                p.y_mm = (p.y_mm / step).round() * step;
+            }
+        }
+    }
+
     // Height/collision check (DESIGN 6.7): a sub-board stands off the main board on
     // its headers; a taller part directly under it on the same side would hit it.
     // Surfaced (never silently moved) — the author raises the standoff, moves the
@@ -2183,6 +2200,52 @@ struct FpPad {
     w: f64,
     h: f64,
     layer: PadLayer,
+}
+
+/// Below this centre-to-centre pin spacing (mm) a part's pins need the routing
+/// lattice: at 0.8mm and up a pin's escape has slack to spare at any grid the
+/// router uses, so aligning it would only move a part for nothing.
+const FINE_PITCH_MM: f64 = 0.8;
+
+/// The lattice (mm) a fine-pitch part must sit on so that every pin's axis —
+/// the coordinate *across* its row — lands on a lattice point, or `None` if the
+/// part is not fine-pitch or no candidate lattice fits it. The candidates are
+/// the router's own grid ladder (0.2mm halved down to 0.025mm), coarsest first,
+/// so the router need not go finer than the part really requires.
+fn pin_lattice_mm(pads: &[FpPad], placement: Placement) -> Option<f64> {
+    let turned = Placement {
+        x_mm: 0.0,
+        y_mm: 0.0,
+        ..placement
+    };
+    let pins: Vec<((f64, f64), (f64, f64))> = pads
+        .iter()
+        .map(|p| {
+            (
+                place_point(turned, p.px, p.py),
+                place_pad_extent(turned, p.w, p.h),
+            )
+        })
+        .collect();
+    let pitch = pins
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| pins[i + 1..].iter().map(move |b| (a.0, b.0)))
+        .map(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1))
+        .fold(f64::INFINITY, f64::min);
+    if pitch >= FINE_PITCH_MM {
+        return None;
+    }
+    // A pin whose pad is taller than wide escapes vertically, so its x is the
+    // coordinate that must be on the lattice (and vice versa).
+    let axes: Vec<f64> = pins
+        .iter()
+        .map(|&((x, y), (w, h))| if w < h { x } else { y })
+        .collect();
+    [0.2, 0.1, 0.05, 0.025].into_iter().find(|&step| {
+        axes.iter()
+            .all(|v| ((v / step).round() * step - v).abs() < 1e-6)
+    })
 }
 
 /// A footprint's pads (number, local offset, size, side) for pads carrying an
@@ -4156,6 +4219,47 @@ mod tests {
         let rest = &pcb[start + needle.len()..];
         let end = rest.find("(pad \"").unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    /// A row of `n` pins at `pitch`, pads `w x h`, centred on the origin along
+    /// x at height `y` — one side of a QFP/TSSOP as KiCad lays it out.
+    fn pin_row(n: usize, pitch: f64, y: f64, w: f64, h: f64) -> Vec<FpPad> {
+        (0..n)
+            .map(|i| FpPad {
+                num: (i + 1).to_string(),
+                px: (i as f64 - (n as f64 - 1.0) / 2.0) * pitch,
+                py: y,
+                w,
+                h,
+                layer: PadLayer::Front,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fine_pitch_parts_get_the_coarsest_lattice_their_pins_sit_on() {
+        let at = |rotation_deg| Placement {
+            x_mm: 12.34,
+            y_mm: 5.67,
+            rotation_deg,
+            back: false,
+        };
+        // LQFP-48 bottom row: pins at +-2.75 in 0.5 steps (multiples of 0.25),
+        // pad tip at the non-round 4.1625 — which must not matter, it is along
+        // the escape direction.
+        let lqfp = pin_row(12, 0.5, 4.1625, 0.3, 1.475);
+        assert_eq!(pin_lattice_mm(&lqfp, at(0.0)), Some(0.05));
+        assert_eq!(
+            pin_lattice_mm(&lqfp, at(90.0)),
+            Some(0.05),
+            "turned, y is the axis"
+        );
+        // TSSOP at 0.65mm: pins at multiples of 0.325, so only 0.025 fits.
+        let tssop = pin_row(10, 0.65, 2.85, 0.45, 1.475);
+        assert_eq!(pin_lattice_mm(&tssop, at(0.0)), Some(0.025));
+        // SOIC at 1.27mm is not fine pitch: it is left exactly where it was put.
+        let soic = pin_row(4, 1.27, 2.475, 0.6, 1.95);
+        assert_eq!(pin_lattice_mm(&soic, at(0.0)), None);
     }
 
     #[test]
