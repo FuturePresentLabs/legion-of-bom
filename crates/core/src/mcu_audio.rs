@@ -220,6 +220,8 @@ struct Board {
     mux: Vec<(String, &'static str, &'static str)>,
     /// Designator counters per prefix.
     next: BTreeMap<&'static str, usize>,
+    /// Design decisions that belong to no one part (a component left out).
+    notes: Vec<Evidence>,
 }
 
 const C_0603: &str = "Capacitor_SMD:C_0603_1608Metric";
@@ -328,6 +330,7 @@ impl Board {
     /// Every piece of evidence the board rests on.
     fn evidence(&self) -> Vec<Evidence> {
         let mut out: Vec<Evidence> = self.parts.iter().map(|p| p.why).collect();
+        out.extend(self.notes.iter().copied());
         for p in &self.parts {
             if let Symbol::Inline(pins) = p.symbol {
                 out.extend(pins.iter().map(|(_, _, _, e)| *e));
@@ -551,21 +554,55 @@ fn power(b: &mut Board) {
 
 /// The audio I/O header: line out L/R, line in L/R, grounds.
 fn audio_header(b: &mut Board) {
+    header(
+        b,
+        "Audio I/O",
+        &["OUT_L", "OUT_R", "GND", "IN_L", "IN_R", "GND"],
+        unsourced("line-level audio I/O on a header (jacks are a later option)"),
+    );
+}
+
+/// A 1xN 2.54mm pin header carrying `nets` in pin order.
+fn header(b: &mut Board, value: &str, nets: &[&str], why: Evidence) {
+    const HEADERS: [(&str, &str); 6] = [
+        (
+            "Conn_01x01",
+            "Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical",
+        ),
+        (
+            "Conn_01x02",
+            "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical",
+        ),
+        (
+            "Conn_01x03",
+            "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical",
+        ),
+        (
+            "Conn_01x04",
+            "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical",
+        ),
+        (
+            "Conn_01x05",
+            "Connector_PinHeader_2.54mm:PinHeader_1x05_P2.54mm_Vertical",
+        ),
+        (
+            "Conn_01x06",
+            "Connector_PinHeader_2.54mm:PinHeader_1x06_P2.54mm_Vertical",
+        ),
+    ];
+    let (symbol, footprint) = HEADERS[nets.len() - 1];
     let j = b.designator("J");
     b.parts.push(BoardPart {
         reference: j.clone(),
-        symbol: Symbol::Kicad("Connector_Generic", "Conn_01x06"),
-        value: "Audio I/O".into(),
-        footprint: "Connector_PinHeader_2.54mm:PinHeader_1x06_P2.54mm_Vertical",
+        symbol: Symbol::Kicad("Connector_Generic", symbol),
+        value: value.into(),
+        footprint,
         mpn: None,
         lcsc: None,
-        why: unsourced("line-level audio I/O on a header (jacks are a later option)"),
+        why,
         sim_excluded: false,
     });
-    for (n, net) in ["OUT_L", "OUT_R", "GND", "IN_L", "IN_R", "GND"]
-        .iter()
-        .enumerate()
-    {
+    for (n, net) in nets.iter().enumerate() {
         b.connect(net, &j, Pin::Num(n as u32 + 1));
     }
 }
@@ -863,6 +900,25 @@ fn wm8731(b: &mut Board, mcu: &str) {
         b.passive("R", "47k", R_0603, &mid, "GND", line_out);
         b.passive("R", "100", R_0603, &mid, out, line_out);
     }
+    // Microphone: MICBIAS through R1 to the mic node, R2 and C1 to ground, C2
+    // in series to MICIN (p.24).
+    let mic = quote(
+        &WM8731_DS,
+        24,
+        "Recommended component values are C1 = 220pF (npo ceramic), C2 = 1\u{b5}F, R1 = 680 \u{3a9}, R2 = 47k.",
+    );
+    b.pin("WM_MICBIAS", &u, "MICBIAS");
+    b.passive("R", "680", R_0603, "WM_MICBIAS", "MIC", mic);
+    b.passive("R", "47k", R_0603, "MIC", "GND", mic);
+    b.passive("C", "220pF", C_0603, "MIC", "GND", mic);
+    b.pin("WM_MICIN", &u, "MICIN");
+    b.passive("C", "1uF", C_0603, "MIC", "WM_MICIN", mic);
+    b.notes.push(figure(
+        &WM8731_DS,
+        60,
+        "Figure 57's gain-dependent Rmic between C2 and MICIN is omitted (0 \u{3a9}): mic gain set in the codec's registers",
+    ));
+    header(b, "Mic in", &["MIC", "GND"], mic);
 }
 
 fn es8388(b: &mut Board, mcu: &str) {

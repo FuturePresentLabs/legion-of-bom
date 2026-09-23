@@ -173,7 +173,10 @@ pub fn normalize(s: &str) -> String {
     let folded: String = s
         .chars()
         .map(|c| match c {
-            '\u{3bc}' => '\u{b5}',                       // Greek mu -> micro sign
+            '\u{3bc}' => '\u{b5}', // Greek mu -> micro sign
+            // Symbol-font mu: PDFs set in Adobe Symbol carry its "m" glyph as the
+            // private-use U+F06D, invisible in a terminal ("C2 = 1F" is 1 µF).
+            '\u{f06d}' => '\u{b5}',
             '\u{2126}' => '\u{3a9}',                     // ohm sign -> Omega
             '\u{2013}' | '\u{2014}' | '\u{2212}' => '-', // dashes, minus
             '\u{a0}' | '\u{2009}' | '\u{202f}' => ' ',   // nbsp, thin spaces
@@ -271,6 +274,19 @@ mod tests {
         };
         let err = check(&invented, &pages).unwrap_err();
         assert!(err.contains("anywhere in the document"), "{err}");
+    }
+
+    /// WM8731 p.24 really reads "C2 = 1\u{f06d}F": the Symbol font's µ as a
+    /// private-use character a terminal shows as nothing at all.
+    #[test]
+    fn a_symbol_font_mu_is_a_mu() {
+        let pages = pages_of(&["C2 = 1\u{f06d}F, R1 = 680 \u{2126}"]);
+        let c = Citation {
+            source: &DS,
+            page: 1,
+            quote: "C2 = 1\u{b5}F, R1 = 680 \u{3a9}",
+        };
+        assert_eq!(check(&c, &pages), Ok(()));
     }
 
     #[test]
