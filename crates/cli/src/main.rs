@@ -77,6 +77,11 @@ enum Command {
         #[command(subcommand)]
         action: PartsCmd,
     },
+    /// The catalog of known-good parts synthesis chooses from (catalog/parts).
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogCmd,
+    },
     /// Generate a BOM for a circuit, optionally priced live from Mouser.
     Bom {
         /// Path to the circuit definition (e.g. a SKiDL script).
@@ -304,6 +309,23 @@ enum Command {
         /// check the circuit against without a further design decision.
         #[arg(long)]
         panel: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogCmd {
+    /// Check a catalog: it loads, every pin name and alternate exists in its
+    /// KiCad symbol, and every quote is on its page of the pinned datasheet
+    /// (fetched into the datasheet store). Exits non-zero on any problem.
+    Check {
+        /// Catalog directory (default: this checkout's catalog/parts).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// List the parts and the roles each can fill.
+    List {
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -563,6 +585,7 @@ fn main() -> ExitCode {
         Command::Doctor => doctor::run(),
         Command::Init { dry_run } => init_cmd(dry_run),
         Command::Parts { action } => parts_cmd(action),
+        Command::Catalog { action } => catalog_cmd(action),
         Command::Bom {
             circuit,
             price,
@@ -4379,4 +4402,44 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Handle `lob catalog`.
+fn catalog_cmd(action: CatalogCmd) -> Result<()> {
+    use legion_of_bom_core::catalog::{self, Catalog};
+    let dir_or_default = |d: Option<PathBuf>| d.unwrap_or_else(catalog::default_catalog_dir);
+    match action {
+        CatalogCmd::List { dir } => {
+            let cat = Catalog::load(&dir_or_default(dir))?;
+            for p in &cat.parts {
+                println!("{:<28} {}", p.mpn, p.provides.join(", "));
+            }
+        }
+        CatalogCmd::Check { dir } => {
+            let dir = dir_or_default(dir);
+            let cat = Catalog::load(&dir)?;
+            let symbols = kicad_symbol_dir()
+                .context("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")?;
+            let mut problems = catalog::check_symbols(&cat, symbols.path())?;
+            problems.extend(catalog::check_quotes(
+                &cat,
+                &legion_of_bom_core::datasheet::default_cache_dir(),
+            )?);
+            let unconfirmed: usize = cat.parts.iter().map(|p| p.unconfirmed().len()).sum();
+            for p in &problems {
+                println!("  ✗ {p}");
+            }
+            println!(
+                "{} part(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
+                cat.parts.len(),
+                cat.parts.iter().map(|p| p.quotes().len()).sum::<usize>(),
+                unconfirmed,
+                problems.len()
+            );
+            if !problems.is_empty() {
+                anyhow::bail!("catalog check failed");
+            }
+        }
+    }
+    Ok(())
 }

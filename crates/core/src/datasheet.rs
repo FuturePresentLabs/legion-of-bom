@@ -90,15 +90,17 @@ impl Evidence {
     }
 }
 
-/// The shared datasheet cache (override with `LOB_DATASHEET_CACHE`), keyed by
-/// hash so a revised upstream PDF can never overwrite a pinned one.
+/// The shared datasheet store (override with `LOB_DATASHEET_CACHE`), keyed by
+/// hash so a revised upstream PDF can never overwrite a pinned one. Durable
+/// data, not a cache: these are the evidence every catalog fact cites, kept
+/// for Research-Wing to ingest, and a distributor's link can die.
 pub fn default_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("LOB_DATASHEET_CACHE") {
         return PathBuf::from(dir);
     }
-    let base = std::env::var_os("XDG_CACHE_HOME")
+    let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("legion-of-bom").join("datasheets")
 }
