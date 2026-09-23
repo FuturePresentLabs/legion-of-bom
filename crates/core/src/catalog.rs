@@ -259,10 +259,114 @@ impl Scoped {
     }
 }
 
+/// A board **form factor** — a standard's outline and mounting holes, or a
+/// free outline with holes in its corners (legion-of-bom-3wbu). One JSON file
+/// per form factor under `catalog/formfactors/`, named `<name>.json`; which
+/// one a board uses is a typed decision from its brief.
+///
+/// Coordinates are board-local millimetres from the top-left corner, x right,
+/// y down (KiCad's sense) — a drawing dimensioned from the bottom left is
+/// converted when the file is written, and the cite says so.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormFactor {
+    pub name: String,
+    /// What a decider is told about it.
+    pub summary: String,
+    /// The standard's drawing its quotes are on.
+    #[serde(default)]
+    pub source: Option<DatasheetRef>,
+    /// The fixed outline; none means the board is sized to its parts.
+    #[serde(default)]
+    pub outline: Option<Outline>,
+    #[serde(default)]
+    pub holes: Option<Holes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Outline {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    pub cite: Cite,
+}
+
+/// Mounting holes: one KiCad footprint (`Lib:Name`, whose pad and courtyard
+/// are the hole's geometry and keep-out), either in the corners of the board
+/// or at the standard's points.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Holes {
+    pub footprint: String,
+    #[serde(default)]
+    pub corners: bool,
+    #[serde(default)]
+    pub at: Vec<HolePoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HolePoint {
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub cite: Cite,
+}
+
+impl FormFactor {
+    fn shape_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(h) = &self.holes {
+            if h.footprint.split_once(':').is_none() {
+                out.push(format!("hole footprint {:?} is not Lib:Name", h.footprint));
+            }
+            match (h.corners, h.at.is_empty()) {
+                (true, false) => out.push("holes are in the corners or at points, not both".into()),
+                (false, true) => out.push("holes name no corners and no points".into()),
+                _ => {}
+            }
+            if let Some(o) = &self.outline {
+                for p in &h.at {
+                    if p.x_mm <= 0.0
+                        || p.y_mm <= 0.0
+                        || p.x_mm >= o.width_mm
+                        || p.y_mm >= o.height_mm
+                    {
+                        out.push(format!("hole at ({}, {}) is off the board", p.x_mm, p.y_mm));
+                    }
+                }
+            } else if !h.at.is_empty() {
+                out.push("holes at points need a fixed outline to be on".into());
+            }
+        }
+        if self.source.is_none() && !self.quotes().is_empty() {
+            out.push("quotes a source but names none".into());
+        }
+        out
+    }
+
+    fn cites(&self) -> Vec<&Cite> {
+        let mut out: Vec<&Cite> = self.outline.iter().map(|o| &o.cite).collect();
+        out.extend(self.holes.iter().flat_map(|h| h.at.iter().map(|p| &p.cite)));
+        out
+    }
+
+    /// Every quote from its standard, as `(page, quote)`.
+    pub fn quotes(&self) -> Vec<(usize, &str)> {
+        quotes_of(self.cites())
+    }
+
+    /// Every reading no person has confirmed yet.
+    pub fn unconfirmed(&self) -> Vec<String> {
+        unconfirmed_of(&self.name, self.cites())
+    }
+}
+
 /// The loaded catalog.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
     pub parts: Vec<CatalogPart>,
+    /// Board form factors (`formfactors/` beside the parts directory).
+    pub form_factors: Vec<FormFactor>,
     /// Reusable circuits over the parts (`subcircuits/` beside the parts
     /// directory).
     pub subcircuits: Vec<Subcircuit>,
@@ -356,6 +460,24 @@ impl Catalog {
             }
             catalog.subcircuits.push(sub);
         }
+        let ff_dir = dir.parent().map(|p| p.join("formfactors"));
+        for (path, ff) in match ff_dir.filter(|d| d.is_dir()) {
+            Some(d) => read_json_dir::<FormFactor>(&d)?,
+            None => Vec::new(),
+        } {
+            let mut problems = Vec::new();
+            if path.file_stem().and_then(|s| s.to_str()) != Some(ff.name.as_str()) {
+                problems.push(format!("file name must be {}.json", ff.name));
+            }
+            problems.extend(ff.shape_problems());
+            if !problems.is_empty() {
+                return Err(CatalogError::Invalid {
+                    path,
+                    message: problems.join("; "),
+                });
+            }
+            catalog.form_factors.push(ff);
+        }
         // The vocabulary sits beside the parts; a parts-only directory has none.
         let features_path = dir.parent().map(|p| p.join("features.json"));
         let features = match features_path.filter(|p| p.is_file()) {
@@ -395,6 +517,14 @@ impl Catalog {
             );
             h.update([0]);
         }
+        for f in &self.form_factors {
+            h.update(
+                serde_json::to_string(f)
+                    .expect("a form factor serializes")
+                    .as_bytes(),
+            );
+            h.update([0]);
+        }
         h.update(
             serde_json::to_string(&self.features)
                 .expect("features serialize")
@@ -415,6 +545,10 @@ impl Catalog {
         self.parts
             .iter()
             .filter(move |p| p.provides.iter().any(|r| r == role))
+    }
+
+    pub fn form_factor(&self, name: &str) -> Option<&FormFactor> {
+        self.form_factors.iter().find(|f| f.name == name)
     }
 
     pub fn subcircuit(&self, name: &str) -> Option<&Subcircuit> {
@@ -774,6 +908,23 @@ pub fn check_symbols(catalog: &Catalog, symbol_dir: &Path) -> Result<Vec<String>
     Ok(problems)
 }
 
+/// Every footprint a form factor names must exist in the KiCad library. One
+/// line per problem.
+pub fn check_footprints(catalog: &Catalog, footprint_dir: &Path) -> Vec<String> {
+    catalog
+        .form_factors
+        .iter()
+        .filter_map(|f| f.holes.as_ref().map(|h| (&f.name, &h.footprint)))
+        .filter_map(|(who, fp)| {
+            let (lib, name) = fp.split_once(':')?;
+            let path = footprint_dir
+                .join(format!("{lib}.pretty"))
+                .join(format!("{name}.kicad_mod"));
+            (!path.is_file()).then(|| format!("{who}: no KiCad footprint {fp}"))
+        })
+        .collect()
+}
+
 /// Check every quote in the catalog against its part's pinned datasheet.
 /// One line per failure; empty means every quote is on its page.
 pub fn check_quotes(catalog: &Catalog, cache_dir: &Path) -> Result<Vec<String>, StageError> {
@@ -785,8 +936,12 @@ pub fn check_quotes(catalog: &Catalog, cache_dir: &Path) -> Result<Vec<String>, 
         .subcircuits
         .iter()
         .map(|s| (&s.name, &s.source, s.quotes()));
+    let form_factors = catalog
+        .form_factors
+        .iter()
+        .map(|f| (&f.name, &f.source, f.quotes()));
     let mut failures = Vec::new();
-    for (who, source, quotes) in parts.chain(subs) {
+    for (who, source, quotes) in parts.chain(subs).chain(form_factors) {
         let Some(ds) = source else {
             continue;
         };

@@ -37,6 +37,8 @@ pub enum BoardError {
     FootprintParse { lib_part: String, msg: String },
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("board frame: {0}")]
+    Frame(String),
     #[error("{0}")]
     Other(String),
 }
@@ -1656,6 +1658,17 @@ pub fn minimum_free_outline(
     circuit: &dyn CircuitSource,
     facts: &HashMap<String, PartFacts>,
 ) -> (f64, f64) {
+    minimum_framed_outline(circuit, facts, &crate::frame::BoardFrame::default())
+}
+
+/// [`minimum_free_outline`] with a frame's parts pinned at every trial size:
+/// a corner mounting hole moves with its corner, so the board it reports has
+/// room for the holes *and* the parts.
+pub fn minimum_framed_outline(
+    circuit: &dyn CircuitSource,
+    facts: &HashMap<String, PartFacts>,
+    frame: &crate::frame::BoardFrame,
+) -> (f64, f64) {
     const MAX_SIDE_MM: f64 = 300.0;
     let area: f64 = circuit
         .parts()
@@ -1670,7 +1683,7 @@ pub fn minimum_free_outline(
         .fold(0.0, f64::max);
     let mut side = area.sqrt().max(widest).ceil();
     while side < MAX_SIDE_MM {
-        if fits_outline(circuit, facts, side, side, HashMap::new()) {
+        if fits_outline(circuit, facts, side, side, frame.anchors(side, side, facts)) {
             return (side, side);
         }
         side += 1.0;
@@ -1687,9 +1700,27 @@ pub fn free_outline_template(
     circuit: &dyn CircuitSource,
     options: &mut BoardOptions,
 ) -> Result<SeededPlacer, BoardError> {
+    framed_template(circuit, options, &crate::frame::BoardFrame::default())
+}
+
+/// A board with no panel, laid out in `frame`: its fixed outline, or one sized
+/// to the parts ([`minimum_framed_outline`]), with the frame's parts pinned.
+/// Sets the outline and placer on `options` and returns the template for
+/// [`crate::layout::run_layout_loop`].
+pub fn framed_template(
+    circuit: &dyn CircuitSource,
+    options: &mut BoardOptions,
+    frame: &crate::frame::BoardFrame,
+) -> Result<SeededPlacer, BoardError> {
     let facts = build_facts(circuit, &options.footprint_dir)?;
-    let (w, h) = minimum_free_outline(circuit, &facts);
-    let template = SeededPlacer::new(w, h, (0.0, 0.0), HashMap::new());
+    frame
+        .check(&facts)
+        .map_err(|e| BoardError::Frame(e.to_string()))?;
+    let (w, h) = match frame.outline {
+        Some(s) => (s.width_mm, s.height_mm),
+        None => minimum_framed_outline(circuit, &facts, frame),
+    };
+    let template = SeededPlacer::new(w, h, (0.0, 0.0), frame.anchors(w, h, &facts));
     options.fixed_outline = Some((0.0, 0.0, w, h));
     options.placer = Box::new(template.clone());
     Ok(template)

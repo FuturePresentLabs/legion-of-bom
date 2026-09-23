@@ -1,0 +1,5 @@
+{
+  "name": "free-m2.5-corners",
+  "summary": "No standard: a rectangle sized to the parts, with a non-plated M2.5 mounting hole in each corner for standoffs or screws into an enclosure",
+  "holes": {"footprint": "MountingHole:MountingHole_2.7mm_M2.5", "corners": true}
+}

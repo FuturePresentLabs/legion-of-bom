@@ -28,6 +28,7 @@ pub mod edit;
 pub mod fab;
 pub mod family;
 pub mod fetch;
+pub mod frame;
 pub mod gerber;
 pub mod git;
 pub mod gltf;
@@ -91,10 +92,10 @@ pub use api500::{
     API500_PHANTOM_LIMIT_MA, API500_PIN_COUNT, API500_PIN_PITCH_MM, API500_PLUS_16_LIMIT_MA,
 };
 pub use board::{
-    build_facts, decoupling_pairs, free_outline_template, generate_board, generate_board_artifacts,
-    generate_board_report, minimum_free_outline, minimum_hp, BoardArtifacts, BoardError,
-    BoardOptions, EurorackPlacer, GridPlacer, PartFacts, Placement, Placer, SeededPlacer,
-    SilkLegend, SilkValues,
+    build_facts, decoupling_pairs, framed_template, free_outline_template, generate_board,
+    generate_board_artifacts, generate_board_report, minimum_framed_outline, minimum_free_outline,
+    minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
+    Placement, Placer, SeededPlacer, SilkLegend, SilkValues,
 };
 pub use bom::{generate_bom, Bom, BomLine, LineKind};
 pub use bom_repair::{

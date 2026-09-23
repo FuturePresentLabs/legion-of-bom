@@ -12,25 +12,25 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use legion_of_bom_core::family;
+use legion_of_bom_core::frame::BoardFrame;
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_board_glb, export_cpl, export_gerbers, fetch_from_jlcpcb,
-    fetch_from_kicad, free_outline_template, generate_board_artifacts, generate_bom,
-    generate_fuzz_chain, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules,
-    kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key,
-    panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
-    photo_source, plan_repair, png_to_jpeg, render_board_png, render_spec_text, rules, run_drc,
-    run_layout_loop, schematic_to_svg, simulate_ac, simulate_tran, simulate_tran_drive,
-    suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key, zip_dir,
-    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
-    CircuitSource, EnclosureSize, EurorackPlacer, Finding, FuzzConstraints, GuideOptions, HpSearch,
-    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
-    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
-    TranDrive,
+    fetch_from_kicad, framed_template, generate_board_artifacts, generate_bom, generate_fuzz_chain,
+    guide, guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
+    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
+    render_board_png, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg,
+    simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
+    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
+    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer,
+    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
+    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
+    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
+    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
+    SourcingClients, StageOutcome, TranAnalysis, TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -901,6 +901,13 @@ fn spec_cmd(
                     sel.how
                 ));
             }
+            if let Some(ff) = &d.form_factor {
+                t.push_str(&format!(
+                    "\nForm factor: {} ({})\n",
+                    ff.chosen.join(" + "),
+                    ff.how
+                ));
+            }
             t.push_str(&format!("\nCatalog: {}\n", d.catalog));
             t
         }
@@ -1078,6 +1085,23 @@ fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Re
         for f in &unconfirmed {
             println!("      - {f}");
         }
+    }
+
+    // A synthesized board's frame (form factor outline + pinned holes) goes
+    // beside the circuit, where `lob board` looks for it; a stale one from an
+    // earlier spec must not outlive it.
+    let frame_out = out.with_extension("frame.toml");
+    match spec.frame()? {
+        Some(frame) => {
+            std::fs::write(&frame_out, frame.to_toml().context("serializing frame")?)
+                .with_context(|| format!("writing {}", frame_out.display()))?;
+            println!("  frame: {}", frame_out.display());
+        }
+        None if frame_out.exists() => {
+            std::fs::remove_file(&frame_out)
+                .with_context(|| format!("removing stale frame {}", frame_out.display()))?;
+        }
+        None => {}
     }
 
     // A family with no panel writes none: `lob board` then derives the
@@ -1456,6 +1480,24 @@ fn board_options_with_panel_and_placement(
     Ok(opts)
 }
 
+/// The board frame `lob schematic` wrote beside a circuit, if there is one:
+/// `<circuit-dir>/<stem>.frame.toml`.
+fn read_frame(circuit: &Path, stem: &str) -> Result<Option<BoardFrame>> {
+    let path = circuit
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("{stem}.frame.toml"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let frame =
+        BoardFrame::from_toml(&text).with_context(|| format!("parsing {}", path.display()))?;
+    println!("  frame: {}", path.display());
+    Ok(Some(frame))
+}
+
 /// The hand-placement file that goes with a circuit, if the author wrote one:
 /// `<circuit-dir>/<stem>.placement.toml`.
 fn placement_path(circuit: &Path, stem: &str) -> PathBuf {
@@ -1613,15 +1655,27 @@ fn build_layout(
     model: &legion_of_bom_core::Circuit,
     mut options: BoardOptions,
     panel: &Option<PathBuf>,
+    frame: Option<&BoardFrame>,
     cfg: &LayoutLoop,
 ) -> Result<Layout> {
+    if panel.is_some() && frame.is_some() {
+        anyhow::bail!("the board has both a panel and a form-factor frame; it can have only one");
+    }
     let template = match seeded_template(panel)? {
         Some(template) => template,
         None => {
-            let template = free_outline_template(model, &mut options)?;
+            let frame = frame.cloned().unwrap_or_default();
+            let template = framed_template(model, &mut options, &frame)?;
+            let how = if frame.outline.is_some() {
+                "the form factor's"
+            } else {
+                "no panel: sized to the parts"
+            };
             println!(
-                "  outline: {:.0} x {:.0} mm (no panel â sized to the parts)",
-                template.width_mm, template.height_mm
+                "  outline: {:.1} x {:.1} mm ({how}), {} part(s) pinned",
+                template.width_mm,
+                template.height_mm,
+                frame.pinned.len() + frame.corners.len()
             );
             template
         }
@@ -1747,6 +1801,7 @@ fn board_cmd(
     // Default: the PCB drives the panel â auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
+    let frame = read_frame(&circuit, stem)?;
     let mut options =
         board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
@@ -1769,7 +1824,7 @@ fn board_cmd(
         conflicts,
         collisions,
         not_placed,
-    } = build_layout(&model, options, &panel, &cfg)?;
+    } = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?;
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
     let tracks = board.matches("(segment").count();
@@ -2115,6 +2170,7 @@ fn fab_cmd(
     // Default: the PCB drives the panel â auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
+    let frame = read_frame(&circuit, stem)?;
     let mut options =
         board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
@@ -2137,7 +2193,7 @@ fn fab_cmd(
     };
     let Layout {
         board, conflicts, ..
-    } = build_layout(&model, options, &panel, &cfg)?;
+    } = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?;
 
     let pkg = out.unwrap_or_else(|| work_dir.join("fab"));
     std::fs::create_dir_all(&pkg)?;
@@ -2664,6 +2720,7 @@ fn guide_cmd(
     // Default: the PCB drives the panel â auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
+    let frame = read_frame(&circuit, stem)?;
     let options = board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
     // The SAME layout the fab package gets. This used to be a single one-shot
     // `generate_board_report` â no iteration, no scoring, no best-of â so the
@@ -2679,7 +2736,7 @@ fn guide_cmd(
         kicad_cli: None,
         drc_every_iter: false,
     };
-    let board = build_layout(&model, options, &panel, &cfg)?.board;
+    let board = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?.board;
 
     let guide_opts = GuideOptions {
         include_smd: resolved.guide_smd,
@@ -4225,6 +4282,23 @@ fn catalog_cmd(action: CatalogCmd) -> Result<()> {
                     slots.join(", ")
                 );
             }
+            for f in &cat.form_factors {
+                let outline = f
+                    .outline
+                    .as_ref()
+                    .map_or("sized to parts".to_string(), |o| {
+                        format!("{} x {} mm", o.width_mm, o.height_mm)
+                    });
+                let holes = f.holes.as_ref().map_or("no holes".to_string(), |h| {
+                    let at = if h.corners {
+                        "corners".to_string()
+                    } else {
+                        format!("{} points", h.at.len())
+                    };
+                    format!("{} at {at}", h.footprint)
+                });
+                println!("{:<28} form factor: {outline}, {holes}", f.name);
+            }
         }
         CatalogCmd::Check { dir } => {
             let dir = dir_or_default(dir);
@@ -4232,6 +4306,9 @@ fn catalog_cmd(action: CatalogCmd) -> Result<()> {
             let symbols = kicad_symbol_dir()
                 .context("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")?;
             let mut problems = catalog::check_symbols(&cat, symbols.path())?;
+            let footprints = kicad_footprint_dir()
+                .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
+            problems.extend(catalog::check_footprints(&cat, &footprints));
             problems.extend(catalog::check_quotes(
                 &cat,
                 &legion_of_bom_core::datasheet::default_cache_dir(),
@@ -4245,20 +4322,31 @@ fn catalog_cmd(action: CatalogCmd) -> Result<()> {
                     .subcircuits
                     .iter()
                     .map(|s| s.unconfirmed().len())
+                    .sum::<usize>()
+                + cat
+                    .form_factors
+                    .iter()
+                    .map(|f| f.unconfirmed().len())
                     .sum::<usize>();
             let quotes: usize = cat.parts.iter().map(|p| p.quotes().len()).sum::<usize>()
                 + cat
                     .subcircuits
                     .iter()
                     .map(|s| s.quotes().len())
+                    .sum::<usize>()
+                + cat
+                    .form_factors
+                    .iter()
+                    .map(|f| f.quotes().len())
                     .sum::<usize>();
             for p in &problems {
                 println!("  ✗ {p}");
             }
             println!(
-                "{} part(s), {} subcircuit(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
+                "{} part(s), {} subcircuit(s), {} form factor(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
                 cat.parts.len(),
                 cat.subcircuits.len(),
+                cat.form_factors.len(),
                 quotes,
                 unconfirmed,
                 problems.len()

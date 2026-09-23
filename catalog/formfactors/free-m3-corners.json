@@ -1,0 +1,5 @@
+{
+  "name": "free-m3-corners",
+  "summary": "No standard: a rectangle sized to the parts, with a non-plated M3 mounting hole in each corner for standoffs or screws into an enclosure",
+  "holes": {"footprint": "MountingHole:MountingHole_3.2mm_M3", "corners": true}
+}

@@ -14,6 +14,7 @@ use ooda::{Client, Trace};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{default_catalog_dir, Catalog, CatalogError};
+use crate::frame::BoardFrame;
 use crate::panel::PanelFile;
 use crate::pedal_panel::fuzz_pedal_panel_file;
 use crate::spec::{generate_fuzz_pedal_spec, render_skidl, FuzzPedalSpec, SpecError};
@@ -124,6 +125,19 @@ impl Spec {
         }
     }
 
+    /// The frame a synthesized board is laid out in — its form factor's
+    /// outline and pinned mounting holes. `None` for a family with a panel
+    /// instead, or a board spec with no form factor.
+    pub fn frame(&self) -> Result<Option<BoardFrame>, FamilyError> {
+        match self {
+            Spec::Board(d) => {
+                let catalog = Catalog::load(&default_catalog_dir())?;
+                Ok(synth::frame(d, &catalog)?)
+            }
+            Spec::FuzzPedal(_) | Spec::FuzzChain(_) => Ok(None),
+        }
+    }
+
     /// The panel the board is built against, when the family has one — also
     /// a pure function of the spec. `None` means the board has no panel and
     /// its outline is derived from the parts.
@@ -175,6 +189,7 @@ mod tests {
             )]
             .into(),
             bindings: Default::default(),
+            form_factor: None,
             catalog: "0123456789abcdef".into(),
         });
         let json = serde_json::to_value(&spec).unwrap();

@@ -54,6 +54,10 @@ pub struct DesignSpec {
     pub parts: BTreeMap<String, Selection>,
     /// Bus kind → MCU peripheral instance: `i2s` → `SAI1`.
     pub bindings: BTreeMap<String, Selection>,
+    /// The board's form factor (a `catalog/formfactors` name); none on a spec
+    /// decided before form factors existed, which is sized to its parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_factor: Option<Selection>,
     /// The catalog these were chosen from ([`Catalog::fingerprint`]).
     pub catalog: String,
 }
@@ -392,6 +396,25 @@ pub fn design(
             .unwrap_or_default()
     };
 
+    // 2. The board's form factor: a standard, or a free outline with or
+    // without corner standoffs.
+    let form_factor = if catalog.form_factors.is_empty() {
+        None
+    } else {
+        Some(pick(
+            client,
+            trace,
+            brief,
+            "form_factor",
+            "What form factor should the board have?",
+            catalog
+                .form_factors
+                .iter()
+                .map(|f| (f.name.clone(), f.summary.clone()))
+                .collect(),
+        )?)
+    };
+
     // 2a. The function parts: minimal covers of the required roles.
     let roles: BTreeSet<&str> = wanted.iter().map(|f| f.role.as_str()).collect();
     let options = minimal_covers(catalog, &roles)
@@ -646,6 +669,7 @@ pub fn design(
         requirements,
         parts,
         bindings,
+        form_factor,
         catalog: catalog.fingerprint(),
     })
 }
@@ -1244,6 +1268,23 @@ pub fn circuit(
         let net = net_name(&mut nets, &key);
         c.connect(&net, &reference, pin);
     }
+    // Mounting holes: parts like any other, so they are placed, kept out of
+    // and routed around; the frame pins where they go.
+    if let Some(holes) = spec_form_factor(spec, catalog)?.and_then(|f| f.holes.as_ref()) {
+        for reference in hole_refs(holes) {
+            c.parts.push(EmitPart {
+                reference,
+                symbol: SymbolSrc::Kicad("Mechanical".into(), "MountingHole".into()),
+                value: holes
+                    .footprint
+                    .split_once(':')
+                    .map_or("", |(_, n)| n)
+                    .into(),
+                footprint: holes.footprint.clone(),
+                fields: BTreeMap::from([("Sim.Enable".to_string(), "0".to_string())]),
+            });
+        }
+    }
     let (mut nc, mut nr, mut nl) = (0usize, 0usize, 0usize);
     for (kind, value, fp, a, b) in passives {
         let (prefix, n) = match kind {
@@ -1276,6 +1317,64 @@ pub fn circuit(
     Ok(c)
 }
 
+/// The form factor a spec chose, if it chose one.
+fn spec_form_factor<'a>(
+    spec: &DesignSpec,
+    catalog: &'a Catalog,
+) -> Result<Option<&'a crate::catalog::FormFactor>, SynthError> {
+    let Some(sel) = &spec.form_factor else {
+        return Ok(None);
+    };
+    let name = &sel.chosen[0];
+    catalog.form_factor(name).map(Some).ok_or_else(|| {
+        SynthError::Invalid(format!(
+            "spec names form factor {name}, which the catalog lacks"
+        ))
+    })
+}
+
+/// The designators of a form factor's mounting holes, in order.
+fn hole_refs(holes: &crate::catalog::Holes) -> Vec<String> {
+    let n = if holes.corners { 4 } else { holes.at.len() };
+    (1..=n).map(|i| format!("H{i}")).collect()
+}
+
+/// The board frame a spec's form factor makes: its outline, and where its
+/// mounting holes are pinned. `None` for a spec with no form factor.
+pub fn frame(
+    spec: &DesignSpec,
+    catalog: &Catalog,
+) -> Result<Option<crate::frame::BoardFrame>, SynthError> {
+    use crate::frame::{BoardFrame, Point, Size};
+    let Some(ff) = spec_form_factor(spec, catalog)? else {
+        return Ok(None);
+    };
+    let mut frame = BoardFrame {
+        outline: ff.outline.as_ref().map(|o| Size {
+            width_mm: o.width_mm,
+            height_mm: o.height_mm,
+        }),
+        ..BoardFrame::default()
+    };
+    if let Some(holes) = &ff.holes {
+        let refs = hole_refs(holes);
+        if holes.corners {
+            frame.corners = refs;
+        } else {
+            for (r, p) in refs.into_iter().zip(&holes.at) {
+                frame.pinned.insert(
+                    r,
+                    Point {
+                        x_mm: p.x_mm,
+                        y_mm: p.y_mm,
+                    },
+                );
+            }
+        }
+    }
+    Ok(Some(frame))
+}
+
 /// Every reading no person has confirmed yet, across the parts and
 /// subcircuits a spec uses.
 pub fn unconfirmed(spec: &DesignSpec, catalog: &Catalog) -> Vec<String> {
@@ -1289,6 +1388,13 @@ pub fn unconfirmed(spec: &DesignSpec, catalog: &Catalog) -> Vec<String> {
                 .iter()
                 .filter_map(|m| catalog.subcircuit(m))
                 .flat_map(|s| s.unconfirmed()),
+        )
+        .chain(
+            spec_form_factor(spec, catalog)
+                .ok()
+                .flatten()
+                .map(|f| f.unconfirmed())
+                .unwrap_or_default(),
         )
         .collect();
     out.sort();
@@ -1555,6 +1661,81 @@ mod tests {
                 .any(|(_, p)| *p == PinRef::Name("RF_P".into())),
             "{radio_side:?}"
         );
+    }
+
+    fn board_in(form_factor: &'static str) -> (Catalog, DesignSpec) {
+        let cat = catalog();
+        let decider = Decider {
+            yes: &["line_out"],
+            // The decider holds its preferences for the whole run.
+            prefer: Box::leak(Box::new([
+                ("form_factor", form_factor),
+                ("function", "PCM5102APWR"),
+                ("mcu", "STM32G431KBU6"),
+            ])),
+        };
+        let spec = design(&decider, &mut Trace::new(), "a DAC board", &cat, None).expect("designs");
+        (cat, spec)
+    }
+
+    #[test]
+    fn corner_standoffs_become_four_holes_in_the_frames_corners() {
+        let (cat, spec) = board_in("free-m3-corners");
+        assert_eq!(
+            spec.form_factor.as_ref().map(|s| s.chosen.clone()),
+            Some(vec!["free-m3-corners".to_string()])
+        );
+        let frame = frame(&spec, &cat)
+            .unwrap()
+            .expect("a form factor makes a frame");
+        assert_eq!(frame.outline, None, "a free outline is sized to the parts");
+        assert_eq!(frame.corners, ["H1", "H2", "H3", "H4"]);
+        assert!(frame.pinned.is_empty());
+    }
+
+    #[test]
+    fn a_hat_fixes_the_outline_and_pins_its_holes() {
+        let (cat, spec) = board_in("rpi-hat");
+        let frame = frame(&spec, &cat).unwrap().unwrap();
+        let o = frame.outline.expect("a HAT has a fixed outline");
+        assert_eq!((o.width_mm, o.height_mm), (65.0, 56.5));
+        assert_eq!(frame.pinned.len(), 4);
+        assert!(frame.corners.is_empty());
+        assert!(
+            unconfirmed(&spec, &cat)
+                .iter()
+                .any(|u| u.starts_with("rpi-hat")),
+            "the HAT drawing's readings are the spec's too"
+        );
+    }
+
+    #[test]
+    fn a_spec_from_before_form_factors_has_no_frame() {
+        let (cat, mut spec) = board_in("free");
+        spec.form_factor = None;
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(
+            json.get("form_factor").is_none(),
+            "old specs stay byte-identical"
+        );
+        assert_eq!(frame(&spec, &cat).unwrap(), None);
+    }
+
+    #[test]
+    #[ignore = "needs KiCad symbols"]
+    fn mounting_holes_are_parts_on_the_board() {
+        let (cat, spec) = board_in("free-m3-corners");
+        let dir = crate::skidl::kicad_symbol_dir().expect("KiCad symbol library");
+        let c = circuit(&spec, &cat, dir.path()).unwrap();
+        let holes: Vec<&EmitPart> = c
+            .parts
+            .iter()
+            .filter(|p| p.reference.starts_with('H'))
+            .collect();
+        assert_eq!(holes.len(), 4);
+        assert!(holes
+            .iter()
+            .all(|h| h.footprint == "MountingHole:MountingHole_3.2mm_M3"));
     }
 
     #[test]

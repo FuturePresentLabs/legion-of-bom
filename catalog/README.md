@@ -131,6 +131,38 @@ schematic) or is a reading.
 - A part that is not a working function on its own (a radio die with no
   front end) should not `provide` the board-level role. The subcircuit does.
 
+## Form factors
+
+What shape a board is — a standard's outline and mounting holes, or a free
+outline with holes in the corners — is one file under
+`catalog/formfactors/<name>.json`, and which one a board gets is a typed
+decision from its brief (`form_factor` in the spec).
+
+```json
+{
+  "name": "rpi-hat",
+  "summary": "what a decider is told",
+  "source": {"url": "…", "sha256": "…"},
+  "outline": {"width_mm": 65.0, "height_mm": 56.5, "cite": {…}},
+  "holes": {
+    "footprint": "MountingHole:MountingHole_2.7mm_M2.5",
+    "at": [{"x_mm": 3.5, "y_mm": 4.0, "cite": {…}}]
+  }
+}
+```
+
+- **Coordinates** are board-local mm from the **top-left**, y down (KiCad's
+  sense). Most drawings are dimensioned from the bottom left: convert, and
+  say so in the cite.
+- **No `outline`** means the board is sized to its parts.
+- **Holes** are one KiCad footprint, which *is* the hole's geometry and
+  keep-out (drill, courtyard): either `"corners": true` (four, each inset so
+  its keep-out stays on the board, moving with the corners as the board is
+  sized) or `at` the standard's points. They become parts `H1…`, placed and
+  routed around like any other.
+- `lob schematic` writes the chosen form factor as `<stem>.frame.toml`
+  beside the circuit; `lob board` lays the board out in it.
+
 ## Support entries
 
 Every tie, capacitor and resistor the part needs, between two endpoints —

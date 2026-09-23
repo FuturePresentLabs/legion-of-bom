@@ -1,0 +1,18 @@
+{
+  "name": "rpi-hat",
+  "summary": "Raspberry Pi HAT: a 65 x 56.5 mm board that stacks on a Raspberry Pi's 40-pin GPIO header, with four M2.5 holes on the Pi's 58 x 49 mm pattern for 15-16 mm standoffs. For a board that is an add-on to a Raspberry Pi",
+  "source": {
+    "url": "https://raw.githubusercontent.com/raspberrypi/hats/348dbf88d870bf50d6b4f23dbe2b64d60363f23c/hat-board-mechanical.pdf",
+    "sha256": "fcbb8efbe6ea8988b9fa8f5398f987b445ddc60367306ec4e46e3d33c46fe1eb"
+  },
+  "outline": {"width_mm": 65.0, "height_mm": 56.5, "cite": {"reading": "Raspberry Pi HAT board mechanical drawing (hat-board-mechanical.pdf, p.1; its text layer is empty). The drawing is dimensioned from the bottom-left corner, y up; converted to top-left, y down for a 56.5 mm board. 65 x 56.5 mm with an SMT GPIO header (56.0 mm with a through-hole one), 3 mm corner radius (not modelled: the outline is rectangular)", "page": 1}},
+  "holes": {
+    "footprint": "MountingHole:MountingHole_2.7mm_M2.5",
+    "at": [
+      {"x_mm": 3.5, "y_mm": 4.0, "cite": {"reading": "Raspberry Pi HAT board mechanical drawing (hat-board-mechanical.pdf, p.1; its text layer is empty). The drawing is dimensioned from the bottom-left corner, y up; converted to top-left, y down for a 56.5 mm board. Holes 3.5 mm in from the left and bottom edges on a 58 x 49 mm pattern: drawing (3.5, 52.5); drill 2.75 +/-0.05 mm, non-plated preferred, >= 6.2 mm land (the footprint is 2.7 mm NPTH, 5.9 mm courtyard, plus the placer's clearance)", "page": 1}},
+      {"x_mm": 61.5, "y_mm": 4.0, "cite": {"reading": "Raspberry Pi HAT board mechanical drawing (hat-board-mechanical.pdf, p.1; its text layer is empty). The drawing is dimensioned from the bottom-left corner, y up; converted to top-left, y down for a 56.5 mm board. Drawing (61.5, 52.5)", "page": 1}},
+      {"x_mm": 3.5, "y_mm": 53.0, "cite": {"reading": "Raspberry Pi HAT board mechanical drawing (hat-board-mechanical.pdf, p.1; its text layer is empty). The drawing is dimensioned from the bottom-left corner, y up; converted to top-left, y down for a 56.5 mm board. Drawing (3.5, 3.5)", "page": 1}},
+      {"x_mm": 61.5, "y_mm": 53.0, "cite": {"reading": "Raspberry Pi HAT board mechanical drawing (hat-board-mechanical.pdf, p.1; its text layer is empty). The drawing is dimensioned from the bottom-left corner, y up; converted to top-left, y down for a 56.5 mm board. Drawing (61.5, 3.5)", "page": 1}}
+    ]
+  }
+}
