@@ -1,7 +1,7 @@
-//! `lob` — the legion-of-bom command-line interface.
+//! `lob` â the legion-of-bom command-line interface.
 //!
 //! A thin wrapper over `legion-of-bom-core`. The `run` subcommand runs the full
-//! Phase 0 pipeline — SKiDL run → parse → validate → simulate → verify → BOM —
+//! Phase 0 pipeline â SKiDL run â parse â validate â simulate â verify â BOM â
 //! and reports per-stage pass/fail, exiting non-zero on any failure.
 
 mod doctor;
@@ -60,10 +60,10 @@ enum Command {
         /// Circuit name from lob.toml; omit to build all circuits.
         circuit: Option<String>,
     },
-    /// Show each circuit's build state — which artifacts exist and whether they
+    /// Show each circuit's build state â which artifacts exist and whether they
     /// are stale relative to the source + manifest. No network.
     Status,
-    /// Serve the local web dashboard (localhost, no auth) for this repo — the
+    /// Serve the local web dashboard (localhost, no auth) for this repo â the
     /// read-only Forestry-style viewer over the same core.
     Serve {
         /// Address to bind (host:port).
@@ -88,7 +88,7 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Also write a Visual BOM (HTML): a part photo per line (Thonk, then
-        /// EasyEDA/LCSC — both keyless), with through-hole resistors shown as
+        /// EasyEDA/LCSC â both keyless), with through-hole resistors shown as
         /// their color code.
         #[arg(long)]
         visual: bool,
@@ -120,13 +120,13 @@ enum Command {
         #[arg(long)]
         logo: Option<PathBuf>,
         /// Also write a combined, named, colored 3D scene (.glb) of the
-        /// placed board — for an external model viewer, never a rendered
+        /// placed board â for an external model viewer, never a rendered
         /// image. See `legion_of_bom_core::export_board_glb`.
         #[arg(long)]
         model: Option<PathBuf>,
     },
     /// Render a readable schematic diagram (symbols + routed nets) from a
-    /// circuit — SVG for viewing/iterating, PDF for a shareable final export.
+    /// circuit â SVG for viewing/iterating, PDF for a shareable final export.
     /// At least one of --svg/--pdf is required.
     Diagram {
         /// Path to the circuit definition (e.g. a SKiDL script).
@@ -139,10 +139,10 @@ enum Command {
         pdf: Option<PathBuf>,
     },
     /// Drive a sine sweep into a circuit's recognized input net and measure
-    /// gain compression / flat-topping — "does this circuit actually clip
+    /// gain compression / flat-topping â "does this circuit actually clip
     /// like a fuzz" as a measured SPICE claim, not a schematic read. Exits
     /// non-zero only if the measurement itself couldn't run (SKiDL/netlist
-    /// failure, or no recognizable input net) — a low/uninteresting
+    /// failure, or no recognizable input net) â a low/uninteresting
     /// flat-top is still exit 0, since "it doesn't clip at this drive
     /// level" is a valid, successfully-measured answer. Threshold
     /// pass/fail against a task's rubric is the caller's job (see
@@ -209,7 +209,7 @@ enum Command {
         #[arg(long)]
         panel: Option<PathBuf>,
         /// Assembly kit type: auto (default; detects from pad types) | tht | smd |
-        /// mixed. THT-first framing + copy — most DIY kits are through-hole.
+        /// mixed. THT-first framing + copy â most DIY kits are through-hole.
         #[arg(long, default_value = "auto")]
         kit: String,
         /// Layout cost-function mode: analog | digital | mixed.
@@ -228,7 +228,7 @@ enum Command {
     /// Set up (or tidy) a circuits repo: write the .gitignore for lob's
     /// generated outputs, and report any generated files that are tracked.
     ///
-    /// Idempotent — safe to re-run after upgrading lob to pick up new patterns.
+    /// Idempotent â safe to re-run after upgrading lob to pick up new patterns.
     Init {
         /// Report what would change without writing anything.
         #[arg(long)]
@@ -331,7 +331,7 @@ enum PartsCmd {
     /// alike on the bench. Takes a URL or a path; a path inside the repo is
     /// stored relative to it so the library travels with a clone.
     Photo {
-        /// Part kind (jack, pot, resistor, ...) — as shown by `lob parts house`.
+        /// Part kind (jack, pot, resistor, ...) â as shown by `lob parts house`.
         kind: String,
         /// Value, or `-` for a part that has none (a jack, an IC).
         value: String,
@@ -345,7 +345,7 @@ enum PartsCmd {
         /// Only this kind (resistor, capacitor, jack, pot, ic, ...).
         #[arg(long)]
         kind: Option<String>,
-        /// Write CSV instead of a table — a reviewable, diffable export, since
+        /// Write CSV instead of a table â a reviewable, diffable export, since
         /// the SQLite file itself isn't (the same split as `.beads`).
         #[arg(long)]
         csv: bool,
@@ -379,7 +379,7 @@ enum PartsCmd {
         #[arg(long, default_value = "cli-user")]
         by: String,
     },
-    /// Set a part's Visual-BOM photo by MPN — a URL or a local image file. For
+    /// Set a part's Visual-BOM photo by MPN â a URL or a local image file. For
     /// boutique parts a distributor lookup can't cover (Thonkiconn jacks, pots);
     /// `scripts/pull_part_image.py` populates these from Thonk/Tayda/EasyEDA.
     SetImage {
@@ -388,7 +388,7 @@ enum PartsCmd {
         /// Image URL (http/https) or a path to a local image file.
         source: String,
     },
-    /// Set a part's build-guide assembly notes by MPN — ordered part-specific tips
+    /// Set a part's build-guide assembly notes by MPN â ordered part-specific tips
     /// (e.g. "snap off the locating tab if unused") that augment the generic
     /// per-kind copy. Pass no notes to clear them.
     SetAssembly {
@@ -402,7 +402,7 @@ enum PartsCmd {
         circuit: PathBuf,
     },
     /// Suggest real MPNs for a circuit's *generic* parts (no MPN yet), using
-    /// Mouser keyword search + the LCSC/EasyEDA catalog. SUGGEST-ONLY — it prints
+    /// Mouser keyword search + the LCSC/EasyEDA catalog. SUGGEST-ONLY â it prints
     /// ranked candidates for a human to confirm (`lob parts fetch` + `verify`);
     /// it never assigns or orders. Degrades gracefully when a distributor key is
     /// absent (LCSC is keyless; Mouser needs MOUSER_API_KEY).
@@ -416,7 +416,7 @@ enum PartsCmd {
     },
     /// Verification gate: fail if any MPN-bearing part isn't human-verified.
     ///
-    /// This is the check `layout` / real BOM ordering enforce (okm.4) — the
+    /// This is the check `layout` / real BOM ordering enforce (okm.4) â the
     /// structural block against unverified part data.
     Gate {
         circuit: PathBuf,
@@ -428,7 +428,7 @@ enum ImportCmd {
     /// Read an Eagle schematic (and optionally its board) into a circuit.
     ///
     /// Unlike a fab package, an Eagle schematic carries the netlist, so the
-    /// result is a circuit the pipeline can work on — and can be re-emitted as
+    /// result is a circuit the pipeline can work on â and can be re-emitted as
     /// SKiDL to become a definition you edit and re-run.
     Eagle {
         /// The `.sch` file.
@@ -475,7 +475,7 @@ enum PanelCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Generate a panel PCB (.kicad_pcb) + gerbers from a panel spec TOML — the
+    /// Generate a panel PCB (.kicad_pcb) + gerbers from a panel spec TOML â the
     /// "PCB panel" many Eurorack builders order instead of milled aluminium.
     Pcb {
         /// Path to the panel spec TOML.
@@ -488,19 +488,19 @@ enum PanelCmd {
         logo: Option<PathBuf>,
     },
     /// Derive an editable panel spec (TOML) from a circuit's panel-facing parts
-    /// (jacks/pots/switches) — instead of hand-writing cutout coordinates.
+    /// (jacks/pots/switches) â instead of hand-writing cutout coordinates.
     Derive {
         /// Path to the circuit definition (e.g. a SKiDL script).
         circuit: PathBuf,
-        /// Panel width in HP. Omit to size to the minimum HP the PCB fits in —
+        /// Panel width in HP. Omit to size to the minimum HP the PCB fits in â
         /// the PCB drives the panel (DESIGN 6.1), which is the default.
         #[arg(long)]
         hp: Option<u16>,
         /// Height class: `eurorack` (3U, default), `intellijel-1u`, or
         /// `pulplogic-1u`. Bare `1u` means Intellijel.
         ///
-        /// The two 1U standards are mutually incompatible — a case railed for
-        /// one will not take the other — so this is a property of the case the
+        /// The two 1U standards are mutually incompatible â a case railed for
+        /// one will not take the other â so this is a property of the case the
         /// module goes into, not a preference.
         #[arg(long)]
         format: Option<String>,
@@ -523,7 +523,7 @@ enum PanelCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Compute the minimum Eurorack HP that fits a circuit — the PCB drives the
+    /// Compute the minimum Eurorack HP that fits a circuit â the PCB drives the
     /// panel width (DESIGN 6.1).
     Fit {
         /// Path to the circuit definition (e.g. a SKiDL script).
@@ -644,7 +644,7 @@ fn main() -> ExitCode {
 
 /// Run the pipeline against a circuit and report per-stage pass/fail.
 ///
-/// Stages: SKiDL run → parse → simulate (ngspice AC) → verify (textbook cutoff).
+/// Stages: SKiDL run â parse â simulate (ngspice AC) â verify (textbook cutoff).
 /// Validate (ERC as structured findings) and BOM are the remaining Phase 0 tasks
 /// and slot into the same report. Exits non-zero if any stage fails.
 fn run(circuit: PathBuf) -> Result<()> {
@@ -663,7 +663,7 @@ fn run(circuit: PathBuf) -> Result<()> {
 
     let mut report = PipelineReport::new();
 
-    // Stage: SKiDL — run the script, capture the netlist + ERC report.
+    // Stage: SKiDL â run the script, capture the netlist + ERC report.
     let runner = SkidlRunner::discover(&work_dir);
     let skidl_run = runner
         .run(&circuit)
@@ -682,20 +682,20 @@ fn run(circuit: PathBuf) -> Result<()> {
         model.nets().len()
     ))));
 
-    // Stage: validate — surface ERC results as structured findings.
+    // Stage: validate â surface ERC results as structured findings.
     report.push(validate_erc(skidl_run.erc_report.as_deref()));
 
-    // Stage: simulate — generate a SPICE deck and run an ngspice AC sweep. Infer
+    // Stage: simulate â generate a SPICE deck and run an ngspice AC sweep. Infer
     // the I/O and supply nets from the circuit (SIG_IN/SIG_OUT, +12V/-12V) rather
-    // than assuming IN/OUT/±15 V (tus.9).
+    // than assuming IN/OUT/Â±15 V (tus.9).
     //
-    // Not every circuit has an audio-style signal path to sweep — a Pierce
+    // Not every circuit has an audio-style signal path to sweep â a Pierce
     // oscillator's resonator network (crate::oscillator) has no IN/OUT at
     // all, only OSC_IN/OSC_OUT net labels with no consuming circuit. That's
     // not a broken circuit, it's a genuinely different shape (verified
-    // analytically, not by SPICE — see that module's docs), and used to
+    // analytically, not by SPICE â see that module's docs), and used to
     // hard-fail the *entire* pipeline here the same way a missing footprint
-    // used to hard-fail the entire board (see the `not_placed` fix) — fixed
+    // used to hard-fail the entire board (see the `not_placed` fix) â fixed
     // the same way: skip what doesn't apply, don't refuse what does.
     let sim_config = SimConfig::infer(&model);
     let net_names: std::collections::HashSet<&str> =
@@ -727,7 +727,7 @@ fn run(circuit: PathBuf) -> Result<()> {
             ac.passband_gain_db().unwrap_or(0.0)
         ))));
 
-        // Stage: transient — a step response, which shows time-domain behaviour (a
+        // Stage: transient â a step response, which shows time-domain behaviour (a
         // slew limiter's peak slew rate) that an AC sweep can't (tus.10). Soft: a
         // circuit whose step response won't converge is surfaced, not fatal.
         match simulate_tran(&model, &sim_config, &TranAnalysis::default(), &work_dir) {
@@ -747,7 +747,7 @@ fn run(circuit: PathBuf) -> Result<()> {
             ),
         }
 
-        // Stage: crosstalk — a multi-channel circuit has a question a single-channel
+        // Stage: crosstalk â a multi-channel circuit has a question a single-channel
         // one does not: do the channels stay independent? Drive channel 1 with a step
         // sequence, hold every other channel's input at 0, and probe both outputs
         // (tus.13 / 9wh). Self-selecting: skipped entirely on a single-channel board.
@@ -758,7 +758,7 @@ fn run(circuit: PathBuf) -> Result<()> {
         Some(ac)
     } else if let Some(via) = converter_only {
         report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
-            "'{}' reaches '{}' only through {} (declared Sim.Enable = 0) — a \
+            "'{}' reaches '{}' only through {} (declared Sim.Enable = 0) â a \
              converter path, not an analog one; AC/transient/crosstalk analysis \
              doesn't apply",
             sim_config.input_net,
@@ -768,7 +768,7 @@ fn run(circuit: PathBuf) -> Result<()> {
         None
     } else {
         report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
-            "no recognizable signal-path net ('{}'/'{}' not present — have: {}) — \
+            "no recognizable signal-path net ('{}'/'{}' not present â have: {}) â \
              this circuit has no audio-style I/O; AC/transient/crosstalk analysis \
              doesn't apply, see the circuit's own docs for how it's verified instead",
             sim_config.input_net,
@@ -782,17 +782,17 @@ fn run(circuit: PathBuf) -> Result<()> {
         None
     };
 
-    // Stage: verify — assert the simulated response against the textbook value
-    // for this topology (RC cutoff, op-amp gain, …). Only meaningful when
+    // Stage: verify â assert the simulated response against the textbook value
+    // for this topology (RC cutoff, op-amp gain, â¦). Only meaningful when
     // there was an AC sweep to check.
     match &ac_result {
         Some(ac) => report.push(analytic_check(&model, ac, 0.02)),
         None => report.push(StageOutcome::passed("verify").with(Finding::info(
-            "skipped — no AC sweep to check (see simulate stage)",
+            "skipped â no AC sweep to check (see simulate stage)",
         ))),
     }
 
-    // Stage: bom — group parts into a BOM, write CSV, summarize.
+    // Stage: bom â group parts into a BOM, write CSV, summarize.
     let bom = generate_bom(&model);
     let csv_path = work_dir.join(format!("{stem}_bom.csv"));
     std::fs::write(&csv_path, bom.to_csv()).with_context(|| "writing BOM CSV")?;
@@ -1011,6 +1011,17 @@ fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Re
         out.display()
     );
 
+    let unconfirmed = spec.unconfirmed_facts();
+    if !unconfirmed.is_empty() {
+        println!(
+            "  ⚠ {} fact(s) await human confirmation before this board is fab-ready:",
+            unconfirmed.len()
+        );
+        for f in &unconfirmed {
+            println!("      - {f}");
+        }
+    }
+
     // A family with no panel writes none: `lob board` then derives the
     // outline from the parts, and a stale panel file from an earlier run
     // must not be mistaken for this spec's.
@@ -1037,8 +1048,7 @@ fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Re
 
     println!(
         "\nNext: `lob run {out}` to validate + simulate; `lob parts gate {out}` \
-         before real board/BOM generation (the transistor MPN is not \
-         verified_by_human yet -- see the generated file's docstring).",
+         before real board/BOM generation (parts not verified_by_human yet).",
         out = out.display()
     );
     Ok(())
@@ -1058,7 +1068,7 @@ fn with_extension_appended(path: &std::path::Path, ext: &str) -> PathBuf {
 /// limiter at its mid-rate setting (~40 V/s) to finish a 4 V transition.
 const CROSSTALK_DWELL_S: f64 = 0.15;
 
-/// A step *sequence* — a sequencer feeding the module, not a single edge (tus.13).
+/// A step *sequence* â a sequencer feeding the module, not a single edge (tus.13).
 /// Each level is held for [`CROSSTALK_DWELL_S`] and reached by a 0.1 ms edge, so
 /// the stimulus asks for far more slew rate than the circuit can deliver and the
 /// output is genuinely rate-limited rather than following the input.
@@ -1078,8 +1088,8 @@ fn step_sequence(levels: &[f64]) -> Vec<(f64, f64)> {
 /// how much of it reaches channel 2's output. `None` on a single-channel circuit,
 /// which has no such question.
 ///
-/// Two transient runs with an identical, deterministic stimulus — one probing
-/// the driven output, one the undriven one — because a driven transient probes a
+/// Two transient runs with an identical, deterministic stimulus â one probing
+/// the driven output, one the undriven one â because a driven transient probes a
 /// single net. Soft-failing on a simulation error: a circuit whose transient
 /// won't converge is surfaced as a warning, matching the step-response stage.
 fn crosstalk_stage(
@@ -1093,7 +1103,7 @@ fn crosstalk_stage(
     }
     let pwl = step_sequence(&[0.0, 2.0, -2.0, 1.0, 0.0]);
     let stop_s = pwl.last().map(|(t, _)| *t).unwrap_or(1.0);
-    // Every channel but the first is held at 0 V — nothing patched in, so any
+    // Every channel but the first is held at 0 V â nothing patched in, so any
     // movement on its output arrived from the channel that *is* being driven.
     let quiet: Vec<(String, Vec<(f64, f64)>)> = channels[1..]
         .iter()
@@ -1125,18 +1135,18 @@ fn crosstalk_stage(
             );
         }
     };
-    // 1e-3 = −60 dB. A netlist with ideal supplies should be orders below that;
+    // 1e-3 = â60 dB. A netlist with ideal supplies should be orders below that;
     // anything near it means the channels share a node.
     legion_of_bom_core::check_channel_crosstalk(model, &aggressor, &victim, 1e-3)
 }
 
-/// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
+/// Handle `lob board <circuit> [--out]` â netlist â .kicad_pcb.
 /// Build board options, using panel-anchored Eurorack placement when a panel
 /// spec is given: jacks/pots are anchored to the panel's cutouts (Y flipped from
 /// the panel's bottom-up frame to KiCad top-down) and the board outline becomes
 /// the panel size (vertical 3U). Otherwise the default grid placement.
 /// Shared panel geometry both the board outline and the placer need: panel size
-/// (mm), the sheet origin that centres it on A4, and refdes→(x,y) anchors (Y
+/// (mm), the sheet origin that centres it on A4, and refdesâ(x,y) anchors (Y
 /// flipped from the panel's bottom-up cutouts to KiCad top-down).
 type PanelGeometry = (
     f64,
@@ -1160,18 +1170,18 @@ fn panel_geometry(spec_path: &std::path::Path) -> Result<PanelGeometry> {
             anchors.insert(refdes.clone(), (c.x_mm, h - c.y_mm));
         }
     }
-    // Centre the board on KiCad's A4 sheet (297×210 landscape) rather than jamming
+    // Centre the board on KiCad's A4 sheet (297Ã210 landscape) rather than jamming
     // it in the (0,0) corner.
     let ox = ((297.0 - w) / 2.0).max(10.0);
     let oy = ((210.0 - h) / 2.0).max(10.0);
     Ok((w, h, (ox, oy), anchors))
 }
 
-/// Handle `lob board <circuit> [--out]` — netlist → .kicad_pcb.
+/// Handle `lob board <circuit> [--out]` â netlist â .kicad_pcb.
 /// Build board options, using panel-anchored Eurorack placement when a panel
 /// The panel spec to build against: the one explicitly given (a `--panel` flag or
 /// the manifest's `panel` field), otherwise a panel **auto-derived from the
-/// circuit at the minimum HP the PCB fits in** (DESIGN 6.1 — the PCB drives the
+/// circuit at the minimum HP the PCB fits in** (DESIGN 6.1 â the PCB drives the
 /// panel). The derived spec is written into the work dir as `<stem>_auto_panel.toml`
 /// so downstream reads it like any other. `None` only when the circuit has no
 /// panel-facing controls (a plain board).
@@ -1186,13 +1196,13 @@ fn effective_panel(
         // A declared panel is the author's file and is never written to.
         //
         // This used to regenerate the declared spec in place. The intent was
-        // sound — a panel missing a cutout cannot mate the board, so faithfully
-        // rebuilding a wrong panel is worse than useless — but the cost was
+        // sound â a panel missing a cutout cannot mate the board, so faithfully
+        // rebuilding a wrong panel is worse than useless â but the cost was
         // destroying hand-authored work: comments, a deliberate two-column
         // layout, a chosen HP. A command that reads like a read must not rewrite
         // tracked source (`legion-of-bom-byh`).
         let Some(stale) = declared_panel_staleness(&path, model, footprint_dir)? else {
-            return Ok(Some(path)); // fresh — authoritative, use as-is
+            return Ok(Some(path)); // fresh â authoritative, use as-is
         };
         // Derive the substitute anyway. It is no longer what we build; it is the
         // worked example the error points at, so "adopt the derived panel" is a
@@ -1229,7 +1239,7 @@ impl std::fmt::Display for PanelStaleness {
 /// outcome this tool must never produce quietly: panel and PCB are ordered from
 /// different vendors weeks apart, so a board built to a width its panel does not
 /// have is money spent on two parts that cannot be assembled. `legion-of-bom-unc`
-/// is the whole story — an explicit `hp = 4` was accepted, refused, and replaced
+/// is the whole story â an explicit `hp = 4` was accepted, refused, and replaced
 /// with 6 behind a warning; the mismatch surfaced as "why is the panel/PCB
 /// mismatched?" only after both had been rendered and looked at.
 ///
@@ -1239,26 +1249,28 @@ fn panel_mismatch(path: &Path, stale: &PanelStaleness, substitute: Option<&Path>
     let mut lines = vec![
         format!("declared panel {file} does not fit the PCB: {stale}"),
         "  panel and board are manufactured separately, so a board that does not mate".into(),
-        "  its panel is not a warning — it is two parts that cannot be assembled.".into(),
+        "  its panel is not a warning â it is two parts that cannot be assembled.".into(),
         "  fix one of:".into(),
     ];
     match stale {
         PanelStaleness::TooNarrow { needed, .. } => {
             lines.push(format!(
-                "    • set hp = {needed} in that file, then re-check the cutout x positions"
+                "    â¢ set hp = {needed} in that file, then re-check the cutout x positions"
             ));
-            lines.push("    • shrink the circuit until it fits the width you declared".into());
+            lines.push("    â¢ shrink the circuit until it fits the width you declared".into());
         }
         PanelStaleness::Missing(refs) => {
             lines.push(format!(
-                "    • add a cutout for {} to that file",
+                "    â¢ add a cutout for {} to that file",
                 refs.join(", ")
             ));
-            lines.push("    • drop those controls from the circuit".into());
+            lines.push("    â¢ drop those controls from the circuit".into());
         }
     }
     if let Some(sub) = substitute {
-        lines.push("    • adopt the derived panel: drop `panel = …` from lob.toml, or pass".into());
+        lines.push(
+            "    â¢ adopt the derived panel: drop `panel = â¦` from lob.toml, or pass".into(),
+        );
         lines.push(format!("      --panel {}", sub.display()));
     }
     lines.push(format!("  ({file} was left untouched.)"));
@@ -1279,7 +1291,7 @@ fn write_auto_panel(
     let hp = minimum_hp(model, &facts);
     let panel = derive_panel(model, hp, &BuiltinCutouts);
     if panel.cutouts.is_empty() {
-        return Ok(None); // no controls — build a plain board, no panel
+        return Ok(None); // no controls â build a plain board, no panel
     }
     std::fs::create_dir_all(work_dir)?;
     let path = work_dir.join(format!("{stem}_auto_panel.toml"));
@@ -1288,7 +1300,7 @@ fn write_auto_panel(
         .map_err(|e| anyhow::anyhow!("serialising panel: {e}"))?;
     std::fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
     println!(
-        "  auto panel: {hp} HP, {} control(s) → {}",
+        "  auto panel: {hp} HP, {} control(s) â {}",
         panel.cutouts.len(),
         path.display()
     );
@@ -1299,7 +1311,7 @@ fn write_auto_panel(
 ///
 /// Stale two ways: missing a control the circuit now has (nothing for the board
 /// to mate), or declared narrower than the PCB fits in (parts will not lay out).
-/// An unreadable or unparseable spec is treated as fine and left entirely alone —
+/// An unreadable or unparseable spec is treated as fine and left entirely alone â
 /// guessing at a file we cannot read is how you destroy one.
 fn declared_panel_staleness(
     path: &Path,
@@ -1347,7 +1359,7 @@ fn declared_panel_staleness(
 /// exists and to the panel spec otherwise.
 ///
 /// A `<circuit>.placement.toml` wins over the panel's cutouts. Both produce the
-/// same thing — a refdes→point map in the board's frame — but only one of them
+/// same thing â a refdesâpoint map in the board's frame â but only one of them
 /// is a decision somebody made: the panel spec's positions come from
 /// `derive_panel`'s idealised column, and letting that override a layout you
 /// authored by hand would silently undo it.
@@ -1395,7 +1407,7 @@ fn placement_path(circuit: &Path, stem: &str) -> PathBuf {
         .join(format!("{stem}.placement.toml"))
 }
 
-/// Handle `lob init` — make a repo track inputs and ignore outputs.
+/// Handle `lob init` â make a repo track inputs and ignore outputs.
 ///
 /// Two jobs, both idempotent. It merges lob's generated-output patterns into
 /// `.gitignore`, leaving anything the author wrote untouched; and it reports
@@ -1438,7 +1450,7 @@ fn init_cmd(dry_run: bool) -> Result<()> {
         .filter(|l| legion_of_bom_core::is_generated(l))
         .collect();
     if stale.is_empty() {
-        println!("  no generated files are tracked — the repo tracks inputs only");
+        println!("  no generated files are tracked â the repo tracks inputs only");
         return Ok(());
     }
     println!(
@@ -1453,7 +1465,7 @@ fn init_cmd(dry_run: bool) -> Result<()> {
         }
     }
     if stale.len() > shown {
-        println!("    … and {} more", stale.len() - shown);
+        println!("    â¦ and {} more", stale.len() - shown);
     }
     println!("\n  Untracking is a change to your index, so lob will not do it for you:");
     println!("    git rm -r --cached <paths above> && git commit -m 'untrack generated outputs'");
@@ -1463,11 +1475,11 @@ fn init_cmd(dry_run: bool) -> Result<()> {
 
 /// Resolve a `lob panel` argument to the spec that should actually be built.
 ///
-/// An existing file is used as given — an ad-hoc spec has no circuit to check
+/// An existing file is used as given â an ad-hoc spec has no circuit to check
 /// against. Otherwise the argument is a circuit **name**: the manifest supplies
 /// its declared panel, and the *cached* netlist (no SKiDL run, no network) says
 /// whether that panel still matches the circuit. A stale one is reported and the
-/// derived substitute is built instead, exactly as the board build does — so the
+/// derived substitute is built instead, exactly as the board build does â so the
 /// panel and the board can no longer disagree about how wide the module is.
 fn resolve_panel_spec(arg: &Path) -> Result<PathBuf> {
     if arg.is_file() {
@@ -1476,7 +1488,7 @@ fn resolve_panel_spec(arg: &Path) -> Result<PathBuf> {
     let resolved = resolve_circuit(arg)?;
     let declared = resolved.panel.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "'{}' declares no panel — pass a spec file instead",
+            "'{}' declares no panel â pass a spec file instead",
             resolved.name
         )
     })?;
@@ -1487,7 +1499,7 @@ fn resolve_panel_spec(arg: &Path) -> Result<PathBuf> {
     let net = work_dir.join(format!("{stem}.net"));
     let Ok(model) = parse_netlist_file(&net) else {
         println!(
-            "  ⚠ no cached netlist for '{stem}' — plotting the declared panel unchecked\n    run `lob build {stem}` first to have it verified against the circuit"
+            "  â  no cached netlist for '{stem}' â plotting the declared panel unchecked\n    run `lob build {stem}` first to have it verified against the circuit"
         );
         return Ok(declared);
     };
@@ -1520,7 +1532,7 @@ struct Layout {
     conflicts: Vec<String>,
     /// Mechanical clearance problems (DESIGN 6.7). Empty on the one-shot path.
     collisions: Vec<String>,
-    /// Parts with no footprint at all — off-board hardware, absent from the board.
+    /// Parts with no footprint at all â off-board hardware, absent from the board.
     not_placed: Vec<String>,
 }
 
@@ -1532,11 +1544,11 @@ struct Layout {
 /// `generate_board_artifacts` directly, you want this instead.
 ///
 /// It did not do that job. `legion-of-bom-p6m`: for months this had exactly ONE
-/// caller — `guide_cmd` — while `board_cmd` and `fab_cmd` each inlined their own
+/// caller â `guide_cmd` â while `board_cmd` and `fab_cmd` each inlined their own
 /// copy of the match, and this copy hardcoded `LayoutLoop::default()` so it
 /// ignored `--mode` entirely. `lob fab --mode digital` and `lob guide` therefore
 /// laid out two different boards, and guide's is the one written to
-/// `out/<n>/<n>.kicad_pcb` — what the dashboard renders and what `lob panel
+/// `out/<n>/<n>.kicad_pcb` â what the dashboard renders and what `lob panel
 /// derive` reads back. Taking the whole `LayoutLoop` is what stops that: there is
 /// no longer a knob a caller can hold that this function ignores.
 fn build_layout(
@@ -1550,7 +1562,7 @@ fn build_layout(
         None => {
             let template = free_outline_template(model, &mut options)?;
             println!(
-                "  outline: {:.0} x {:.0} mm (no panel — sized to the parts)",
+                "  outline: {:.0} x {:.0} mm (no panel â sized to the parts)",
                 template.width_mm, template.height_mm
             );
             template
@@ -1598,7 +1610,7 @@ fn seeded_template(panel: &Option<PathBuf>) -> Result<Option<SeededPlacer>> {
     }
 }
 
-/// A human-readable board title from a file stem: `slew_limiter` → `Slew Limiter`.
+/// A human-readable board title from a file stem: `slew_limiter` â `Slew Limiter`.
 fn pretty_title(stem: &str) -> String {
     stem.split(['_', '-'])
         .filter(|w| !w.is_empty())
@@ -1615,7 +1627,7 @@ fn pretty_title(stem: &str) -> String {
 
 /// The silkscreen legend for a circuit, read from the repo's manifest when one
 /// is discoverable. A bare-path build outside a circuits repo simply gets no
-/// legend rather than an error — the board is still a board.
+/// legend rather than an error â the board is still a board.
 fn legend_for(stem: &str) -> SilkLegend {
     let Ok(cwd) = std::env::current_dir() else {
         return SilkLegend::default();
@@ -1674,13 +1686,13 @@ fn board_cmd(
 
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    // Default: the PCB drives the panel — auto-derive one at minimum HP.
+    // Default: the PCB drives the panel â auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
     let mut options =
         board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
     options.title = Some(pretty_title(stem));
-    // `lob board` takes a bare path, so there is no resolved manifest entry —
+    // `lob board` takes a bare path, so there is no resolved manifest entry â
     // look one up by stem when this repo has a lob.toml, else print no legend.
     options.legend = legend_for(stem);
     options.logo = load_logo(&logo)?;
@@ -1714,7 +1726,7 @@ fn board_cmd(
         std::fs::write(&model_path, &glb)
             .with_context(|| format!("writing {}", model_path.display()))?;
         println!(
-            "  wrote {} ({} part(s), {} bytes) — named/colored, for a model viewer, not a render",
+            "  wrote {} ({} part(s), {} bytes) â named/colored, for a model viewer, not a render",
             model_path.display(),
             parts.len(),
             glb.len()
@@ -1722,7 +1734,7 @@ fn board_cmd(
     }
     if !conflicts.is_empty() {
         eprintln!(
-            "  ⚠ {} connection(s) left unrouted (for manual/iterative routing):",
+            "  â  {} connection(s) left unrouted (for manual/iterative routing):",
             conflicts.len()
         );
         for c in &conflicts {
@@ -1731,7 +1743,7 @@ fn board_cmd(
     }
     if !collisions.is_empty() {
         eprintln!(
-            "  ⚠ {} mechanical clearance issue(s) under a stacked sub-board:",
+            "  â  {} mechanical clearance issue(s) under a stacked sub-board:",
             collisions.len()
         );
         for c in &collisions {
@@ -1740,7 +1752,7 @@ fn board_cmd(
     }
     if !not_placed.is_empty() {
         println!(
-            "  not placed (no footprint — off-board hardware, see BOM for MPN): {}",
+            "  not placed (no footprint â off-board hardware, see BOM for MPN): {}",
             not_placed.join(", ")
         );
     }
@@ -1749,7 +1761,7 @@ fn board_cmd(
     Ok(())
 }
 
-/// Handle `lob diagram <circuit> [--svg <path>] [--pdf <path>]` — a readable
+/// Handle `lob diagram <circuit> [--svg <path>] [--pdf <path>]` â a readable
 /// schematic diagram (symbols + routed nets), straight from the circuit model,
 /// no board/layout step involved. SVG is the fast, iterate-on-it format; PDF
 /// is a one-shot render of that same diagram for sharing.
@@ -1784,7 +1796,7 @@ fn diagram_cmd(circuit: PathBuf, svg_out: Option<PathBuf>, pdf_out: Option<PathB
 }
 
 /// `count` breakpoints of a `amplitude`-peak sine at `freq_hz`, sampled
-/// `points_per_cycle` times per cycle over `cycles` — dense enough that
+/// `points_per_cycle` times per cycle over `cycles` â dense enough that
 /// ngspice's PWL source reads as sinusoidal rather than faceted.
 fn sine_pwl(freq_hz: f64, amplitude: f64, cycles: u32, points_per_cycle: u32) -> Vec<(f64, f64)> {
     let period = 1.0 / freq_hz;
@@ -1811,7 +1823,7 @@ fn steady_state_pp(points: &[legion_of_bom_core::TranPoint], period_s: f64, stop
 }
 
 /// Fraction of steady-state samples whose slope is under `flat_frac` of this
-/// waveform's own peak slope — scale-invariant (unlike comparing raw
+/// waveform's own peak slope â scale-invariant (unlike comparing raw
 /// sample-to-sample deltas against peak-to-peak, which conflates "the
 /// timestep is fine" with "the signal is flat"). A clean sine's derivative
 /// is near-zero only for an instant at each peak; a clipped waveform's
@@ -1843,7 +1855,7 @@ fn flat_top_fraction(
     flat as f64 / slopes.len() as f64
 }
 
-/// Handle `lob scope-probe` — drive a sine sweep into a circuit's recognized
+/// Handle `lob scope-probe` â drive a sine sweep into a circuit's recognized
 /// input net and measure gain compression / flat-topping. Built for
 /// PCBBench's `Check::SpiceClips` (see legion-of-bom's own
 /// `crates/core/examples/scope_probe.rs`, this is that mechanism promoted to
@@ -1965,7 +1977,7 @@ fn scope_probe_cmd(
     Ok(())
 }
 
-/// Handle `lob drc <board>` — run DRC and report violations (the layout loop's
+/// Handle `lob drc <board>` â run DRC and report violations (the layout loop's
 /// check step). Exits non-zero if any error-severity violation remains.
 fn drc_cmd(board: PathBuf) -> Result<()> {
     let board = board
@@ -1984,19 +1996,19 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
         report.unconnected_count()
     );
     for v in report.errors() {
-        println!("  ✗ [{}] {}", v.kind, v.description);
+        println!("  â [{}] {}", v.kind, v.description);
         for it in &v.items {
             println!("      - {}", it.description);
         }
     }
     // Non-silk warnings; silkscreen collisions get their own section below.
     for v in report.warnings().filter(|v| !v.is_silkscreen_collision()) {
-        println!("  ⚠ [{}] {}", v.kind, v.description);
+        println!("  â  [{}] {}", v.kind, v.description);
     }
     // Silkscreen collisions (DESIGN 6.10): not electrical, but they garble the
-    // refdes/polarity legend a hand-assembler reads — surface them explicitly.
+    // refdes/polarity legend a hand-assembler reads â surface them explicitly.
     if silk > 0 {
-        println!("  silkscreen ({silk}): refdes/marks over pads or overlapping —");
+        println!("  silkscreen ({silk}): refdes/marks over pads or overlapping â");
         for v in report.silkscreen_collisions() {
             let loc = v
                 .items
@@ -2004,18 +2016,18 @@ fn drc_cmd(board: PathBuf) -> Result<()> {
                 .find_map(|it| it.pos)
                 .map(|p| format!(" @ ({:.1}, {:.1})", p.x, p.y))
                 .unwrap_or_default();
-            println!("      ▪ [{}] {}{}", v.kind, v.description, loc);
+            println!("      âª [{}] {}{}", v.kind, v.description, loc);
         }
     }
     if report.is_clean() {
-        println!("  ✓ no errors");
+        println!("  â no errors");
         Ok(())
     } else {
         anyhow::bail!("{} DRC error(s)", report.error_count());
     }
 }
 
-/// Handle `lob fab <circuit> [--out]` — generate a board, gate it on DRC, and
+/// Handle `lob fab <circuit> [--out]` â generate a board, gate it on DRC, and
 /// write the JLCPCB-ready manufacturing package (Gerbers + drill + CPL + BOM).
 fn fab_cmd(
     circuit: PathBuf,
@@ -2042,7 +2054,7 @@ fn fab_cmd(
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    // Default: the PCB drives the panel — auto-derive one at minimum HP.
+    // Default: the PCB drives the panel â auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
     let mut options =
@@ -2057,7 +2069,7 @@ fn fab_cmd(
     let kicad = kicad_cli_path().context("kicad-cli not found (install KiCad or set PATH)")?;
 
     // Iterative, connectivity-aware layout when a panel is given; else one-shot.
-    // The DRC gate below is the loop's final verification (§6.5), so the loop
+    // The DRC gate below is the loop's final verification (Â§6.5), so the loop
     // scores in-process unless `--drc-every-iter` is set.
     let cfg = LayoutLoop {
         mode: parse_mode(&mode)?,
@@ -2075,7 +2087,7 @@ fn fab_cmd(
     std::fs::write(&board_path, &board)
         .with_context(|| format!("writing {}", board_path.display()))?;
     if !conflicts.is_empty() {
-        eprintln!("  ⚠ {} connection(s) left unrouted:", conflicts.len());
+        eprintln!("  â  {} connection(s) left unrouted:", conflicts.len());
         for c in &conflicts {
             eprintln!("      - {c}");
         }
@@ -2091,7 +2103,7 @@ fn fab_cmd(
     // Physical-rule gate, ahead of DRC because KiCad cannot do this one.
     //
     // KiCad has no "footprint outside the board outline" rule. Measured: a part
-    // moved 15.8mm clear of the edge produces ZERO geometric DRC violations —
+    // moved 15.8mm clear of the edge produces ZERO geometric DRC violations â
     // the only errors are the unconnected nets it drags with it, and a part
     // with no connections (a mounting hole, an unpopulated position) drags
     // none. So a board with a component floating in space can be DRC-clean, and
@@ -2099,7 +2111,7 @@ fn fab_cmd(
     // coordinate off the board.
     //
     // `crate::rules` Tier::Physical does catch it, exactly and with the
-    // magnitude — it is what the placer's own overflow lane is measured against.
+    // magnitude â it is what the placer's own overflow lane is measured against.
     // It just was not consulted here. It is now.
     if let Ok(facts) = build_facts(&model, &footprint_dir) {
         let derived = rules::derive_in(
@@ -2118,16 +2130,16 @@ fn fab_cmd(
             .collect();
         if !physical.is_empty() {
             for v in &physical {
-                eprintln!("  ✗ [physical] {}", v.what);
+                eprintln!("  â [physical] {}", v.what);
             }
             anyhow::bail!(
-                "board breaks {} physical rule(s) KiCad DRC does not check — refusing to build a fab package",
+                "board breaks {} physical rule(s) KiCad DRC does not check â refusing to build a fab package",
                 physical.len()
             );
         }
     }
 
-    // DRC gate — do not ship a package for a board with errors.
+    // DRC gate â do not ship a package for a board with errors.
     let report = run_drc(&board_path, &kicad)?;
     println!(
         "DRC: {} error(s), {} warning(s)",
@@ -2136,10 +2148,10 @@ fn fab_cmd(
     );
     if !report.is_clean() {
         for v in report.errors() {
-            eprintln!("  ✗ [{}] {}", v.kind, v.description);
+            eprintln!("  â [{}] {}", v.kind, v.description);
         }
         anyhow::bail!(
-            "board has {} DRC error(s) — refusing to build a fab package",
+            "board has {} DRC error(s) â refusing to build a fab package",
             report.error_count()
         );
     }
@@ -2150,7 +2162,7 @@ fn fab_cmd(
     let zip_path = pkg.join(format!("{stem}-gerbers.zip"));
     let zipped = zip_dir(&gerber_dir, &zip_path)?;
     // Which parts the fab will NOT place, read off the BOARD's real pads rather
-    // than guessed from footprint names — a part is through-hole if it has a
+    // than guessed from footprint names â a part is through-hole if it has a
     // through-hole pad, and that is a fact about the geometry, not the string.
     //
     // Computed BEFORE the CPL, because both halves of the upload have to be
@@ -2158,7 +2170,7 @@ fn fab_cmd(
     // ever saw it (`legion-of-bom-g5a`).
     //
     // A parse failure here used to `unwrap_or_default()` into an EMPTY set,
-    // which silently puts every through-hole part back into the assembly BOM —
+    // which silently puts every through-hole part back into the assembly BOM â
     // the exact regression the kit-split exists to prevent, arriving quietly.
     // The board was just written and DRC'd, so failing to parse it is a real
     // fault and worth stopping for.
@@ -2195,7 +2207,7 @@ fn fab_cmd(
         println!("  PCB (upload this):   {}", zip_path.display());
     } else {
         println!(
-            "  gerbers + drill:     {}/  (zip it — system `zip` unavailable)",
+            "  gerbers + drill:     {}/  (zip it â system `zip` unavailable)",
             gerber_dir.display()
         );
     }
@@ -2206,21 +2218,23 @@ fn fab_cmd(
         bom_path.display()
     );
     // The PCB half of this package is orderable on its own. The ASSEMBLY half is
-    // not, unless every line the fab is asked to place carries a part number —
+    // not, unless every line the fab is asked to place carries a part number â
     // and saying "upload the CPL + BOM for assembly" over a BOM with none is how
     // a package that cannot be quoted looks finished (`legion-of-bom-g5a`).
     if assembly.unsourceable.is_empty() {
-        println!("  → JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly");
-    } else {
-        println!("  → JLCPCB: upload the gerber zip — the PCB is ready to order.");
         println!(
-            "  ⚠ NOT an assembly order yet: {} part(s) on the BOM have no LCSC number, so the\n    \
-             fab cannot source them — {}",
+            "  â JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly"
+        );
+    } else {
+        println!("  â JLCPCB: upload the gerber zip â the PCB is ready to order.");
+        println!(
+            "  â  NOT an assembly order yet: {} part(s) on the BOM have no LCSC number, so the\n    \
+             fab cannot source them â {}",
             assembly.unsourceable.len(),
             assembly.unsourceable.join(" ")
         );
         println!(
-            "    resolve them (`lob parts suggest {stem}` → `lob parts fetch` → `lob parts verify`)\n    \
+            "    resolve them (`lob parts suggest {stem}` â `lob parts fetch` â `lob parts verify`)\n    \
              or match them by hand in JLCPCB's BOM step."
         );
     }
@@ -2229,7 +2243,7 @@ fn fab_cmd(
 
 /// A circuit input resolved from either a direct file path or a manifest circuit.
 struct ResolvedCircuit {
-    /// Circuit id — the manifest name, or the source file stem for a path arg.
+    /// Circuit id â the manifest name, or the source file stem for a path arg.
     /// Drives the `out/<name>/` output tree.
     name: String,
     source: PathBuf,
@@ -2249,7 +2263,7 @@ struct ResolvedCircuit {
 /// Resolve a `lob <cmd> <arg>` circuit argument. An existing file is used
 /// directly (flags supply panel/kit as before). Otherwise `arg` is treated as a
 /// circuit **name** in the nearest `lob.toml` (walking up from the working dir),
-/// pulling its source/panel/kit/build + the repo brand — so `lob guide
+/// pulling its source/panel/kit/build + the repo brand â so `lob guide
 /// slew_limiter` works by name from inside a circuits repo.
 fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
     if arg.is_file() {
@@ -2292,7 +2306,7 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
     // Commands that build need a definition; an imported circuit has none.
     let source = entry.source_path(&root).ok_or_else(|| {
         anyhow::anyhow!(
-            "'{}' is an imported circuit (fab package only) — it has no source to build from",
+            "'{}' is an imported circuit (fab package only) â it has no source to build from",
             entry.name
         )
     })?;
@@ -2309,7 +2323,7 @@ fn resolve_circuit(arg: &Path) -> Result<ResolvedCircuit> {
     })
 }
 
-/// Handle `lob circuits` — list the circuits declared in the nearest `lob.toml`.
+/// Handle `lob circuits` â list the circuits declared in the nearest `lob.toml`.
 fn circuits_cmd() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let view = ProjectView::discover(&cwd)
@@ -2319,7 +2333,7 @@ fn circuits_cmd() -> Result<()> {
         .repo
         .brand
         .as_deref()
-        .map(|b| format!(" · {b}"))
+        .map(|b| format!(" Â· {b}"))
         .unwrap_or_default();
     println!("{repo}{brand}  [{}]", view.root.display());
     if view.circuits.is_empty() {
@@ -2330,10 +2344,10 @@ fn circuits_cmd() -> Result<()> {
         let panel = c
             .panel
             .as_deref()
-            .map(|p| format!(" · panel {p}"))
+            .map(|p| format!(" Â· panel {p}"))
             .unwrap_or_default();
         let copy = if c.has_build_copy {
-            " · build-copy"
+            " Â· build-copy"
         } else {
             ""
         };
@@ -2341,14 +2355,14 @@ fn circuits_cmd() -> Result<()> {
         let origin = match (&c.source, &c.import) {
             (Some(src), _) => src.clone(),
             (None, Some(pkg)) => format!("{pkg}  [imported]"),
-            _ => "—".to_string(),
+            _ => "â".to_string(),
         };
         println!("  {:<20} {origin}  ({kit}{panel}{copy})", c.name);
     }
     Ok(())
 }
 
-/// Handle `lob build [circuit]` — produce a circuit's full artifact set (guide +
+/// Handle `lob build [circuit]` â produce a circuit's full artifact set (guide +
 /// Visual BOM + fab package), or every circuit in the repo. Each artifact is
 /// independent, so one failing (e.g. a DRC-blocked fab) still leaves the others.
 /// Build the artifacts an imported board *can* have.
@@ -2425,9 +2439,9 @@ fn build_cmd(name: Option<String>) -> Result<()> {
     let root = _root;
     let mut failures: Vec<String> = Vec::new();
     for name in &targets {
-        println!("\n━━━━━━━━━━  build {name}  ━━━━━━━━━━");
+        println!("\nââââââââââ  build {name}  ââââââââââ");
 
-        // An imported board has no source, but it does have a fab package —
+        // An imported board has no source, but it does have a fab package â
         // enough for a guide and a Visual BOM, which is what a builder needs.
         if let Some(pkg) = manifest
             .circuit(name)
@@ -2440,9 +2454,9 @@ fn build_cmd(name: Option<String>) -> Result<()> {
                     .is_some_and(|c| c.effective_guide_smd(&manifest.defaults)),
             };
             match build_imported(&root, name, &pkg, opts) {
-                Ok(done) => println!("✓ {name}: {} (imported)", done.join(" + ")),
+                Ok(done) => println!("â {name}: {} (imported)", done.join(" + ")),
                 Err(e) => {
-                    eprintln!("  ✗ {e:#}");
+                    eprintln!("  â {e:#}");
                     failures.push(name.clone());
                 }
             }
@@ -2451,7 +2465,7 @@ fn build_cmd(name: Option<String>) -> Result<()> {
 
         let arg = || PathBuf::from(name);
         // ONE mode and ONE iteration count, passed to both. They agreed before
-        // only because three separately-chosen defaults happened to match —
+        // only because three separately-chosen defaults happened to match â
         // guide's hardcoded `LayoutLoop::default()`, fab's `"analog"` literal, and
         // `GUIDE_LAYOUT_ITERS` vs fab's `6`. Any one of them moving split the
         // guide's board from the one in the fab package (`legion-of-bom-p6m`).
@@ -2480,13 +2494,13 @@ fn build_cmd(name: Option<String>) -> Result<()> {
             match res {
                 Ok(()) => done.push(label),
                 Err(e) => {
-                    eprintln!("  ✗ {label}: {e:#}");
+                    eprintln!("  â {label}: {e:#}");
                     circuit_ok = false;
                 }
             }
         }
         if circuit_ok {
-            println!("✓ {name}: {}", done.join(" + "));
+            println!("â {name}: {}", done.join(" + "));
         } else {
             failures.push(name.clone());
         }
@@ -2503,9 +2517,9 @@ fn build_cmd(name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Handle `lob status` — per-circuit build freshness, no network. An artifact is
+/// Handle `lob status` â per-circuit build freshness, no network. An artifact is
 /// "stale" when the source (or panel, or the manifest) changed after it was
-/// written; "—" when it was never built. Reads the shared [`ProjectView`] model
+/// written; "â" when it was never built. Reads the shared [`ProjectView`] model
 /// so the dashboard reports identical state (DESIGN 2.2).
 fn status_cmd() -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -2524,9 +2538,9 @@ fn status_cmd() -> Result<()> {
             .iter()
             .map(|&kind| {
                 let mark = match c.artifact(kind).map(|a| a.status) {
-                    Some(ArtifactStatus::Fresh) => "✓",
+                    Some(ArtifactStatus::Fresh) => "â",
                     Some(ArtifactStatus::Stale) => "stale",
-                    _ => "—",
+                    _ => "â",
                 };
                 format!("{} {mark}", kind.label())
             })
@@ -2536,7 +2550,7 @@ fn status_cmd() -> Result<()> {
     Ok(())
 }
 
-/// Handle `lob serve [--bind]` — start the localhost dashboard backend over the
+/// Handle `lob serve [--bind]` â start the localhost dashboard backend over the
 /// nearest circuits repo. The third head (DESIGN 2.2), no auth (DESIGN 2.5).
 fn serve_cmd(bind: String) -> Result<()> {
     let addr: std::net::SocketAddr = bind
@@ -2550,7 +2564,7 @@ fn serve_cmd(bind: String) -> Result<()> {
     legion_of_bom_web::serve_blocking(root, addr)
 }
 
-/// Handle `lob guide <circuit> [--out]` — generate a board and render a
+/// Handle `lob guide <circuit> [--out]` â generate a board and render a
 /// step-by-step visual assembly guide (HTML).
 fn guide_cmd(
     circuit: PathBuf,
@@ -2589,12 +2603,12 @@ fn guide_cmd(
     let model = parse_netlist_file(&run.netlist_path)?;
     let footprint_dir = kicad_footprint_dir()
         .context("no KiCad footprint library found (set KICAD9_FOOTPRINT_DIR)")?;
-    // Default: the PCB drives the panel — auto-derive one at minimum HP.
+    // Default: the PCB drives the panel â auto-derive one at minimum HP.
     let panel = effective_panel(panel, &model, &footprint_dir, &work_dir, stem)?;
     let placement = placement_path(&circuit, stem);
     let options = board_options_with_panel_and_placement(footprint_dir, &panel, Some(&placement))?;
     // The SAME layout the fab package gets. This used to be a single one-shot
-    // `generate_board_report` — no iteration, no scoring, no best-of — so the
+    // `generate_board_report` â no iteration, no scoring, no best-of â so the
     // guide's board was a *different, worse* board than the one that ships:
     // measured on the slew limiter, the guide's had an IC hanging 9mm off the
     // edge and a through-hole cap colliding with an IC through the board, while
@@ -2647,7 +2661,7 @@ fn guide_cmd(
     }
 
     // Diagram: photorealistic UNPOPULATED board renders (bare pads a builder
-    // populates) when kicad-cli is available — top always, plus the bottom side
+    // populates) when kicad-cli is available â top always, plus the bottom side
     // when any part mounts on the back; fall back to the schematic top-down.
     std::fs::create_dir_all(&work_dir)?;
     let board_file = work_dir.join(format!("{stem}.kicad_pcb"));
@@ -2666,7 +2680,7 @@ fn guide_cmd(
     };
     match &top {
         Some((_, w, h)) => println!(
-            "  diagram: photoreal bare-board render ({w}×{h}){}",
+            "  diagram: photoreal bare-board render ({w}Ã{h}){}",
             if bottom.is_some() {
                 " + bottom side"
             } else {
@@ -2699,7 +2713,7 @@ fn guide_cmd(
     }
 
     // Native print-ready PDF, one step per page (self-contained, no browser).
-    // Embeds the same photoreal renders (PNG→JPEG for DCTDecode), else schematic.
+    // Embeds the same photoreal renders (PNGâJPEG for DCTDecode), else schematic.
     let top_jpeg = top.as_ref().and_then(|(png, _, _)| png_to_jpeg(png));
     let bottom_jpeg = bottom.as_ref().and_then(|(png, _, _)| png_to_jpeg(png));
     let pdf_path = path.with_extension("pdf");
@@ -2757,7 +2771,7 @@ fn bom_cmd(
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| "?".into());
                             eprintln!(
-                                "  priced {mpn} → {} @ ${unit:.4} ({stock} in stock)",
+                                "  priced {mpn} â {} @ ${unit:.4} ({stock} in stock)",
                                 pp.mpn
                             );
                         }
@@ -2782,7 +2796,7 @@ fn bom_cmd(
 
     if visual {
         // Hydrate line photos from the parts library first (curated/scripted
-        // per-MPN images — the durable source for boutique parts). Best-effort:
+        // per-MPN images â the durable source for boutique parts). Best-effort:
         // skip silently if the library isn't available.
         if let Ok(lib) = PartsLibrary::open(default_parts_dir()) {
             for line in &mut bom.lines {
@@ -2833,7 +2847,7 @@ fn bom_cmd(
 }
 
 /// The Visual BOM's photo for a line: the source [`photo_source`] chooses,
-/// embedded as a `data:` URI with any crop applied. `None` → the Visual BOM
+/// embedded as a `data:` URI with any crop applied. `None` â the Visual BOM
 /// falls back to a life-size swatch / package silhouette / blank.
 fn resolve_photo(line: &BomLine, cache: &Path) -> Option<String> {
     embed_source(&photo_source(line, cache)?, cache)
@@ -2848,7 +2862,7 @@ fn csv_cell(v: &str) -> String {
     }
 }
 
-/// The repo a path sits in — the nearest ancestor holding `lob.toml` or `.git`.
+/// The repo a path sits in â the nearest ancestor holding `lob.toml` or `.git`.
 fn find_repo_root(from: &std::path::Path) -> Option<PathBuf> {
     let mut dir = from.to_path_buf();
     loop {
@@ -2889,10 +2903,10 @@ fn eagle_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// Handle `lob parts …` against the global parts library.
+/// Handle `lob parts â¦` against the global parts library.
 fn parts_cmd(action: PartsCmd) -> Result<()> {
     // `suggest` is about parts NOT yet in the library (generic, no MPN), so it
-    // doesn't need the library open yet — handle it before opening it.
+    // doesn't need the library open yet â handle it before opening it.
     if let PartsCmd::Suggest { circuit, limit } = action {
         return suggest_cmd(circuit, limit);
     }
@@ -2900,7 +2914,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
         PartsLibrary::open(default_parts_dir()).with_context(|| "opening the parts library")?;
     match action {
         PartsCmd::Learn { packages, bom } => {
-            // A BOM states what was bought, keyed by refdes — the half an Eagle
+            // A BOM states what was bought, keyed by refdes â the half an Eagle
             // schematic never carries. Joining them recovers the part choice.
             let mut bought: std::collections::HashMap<String, (String, String)> =
                 Default::default();
@@ -2934,7 +2948,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                     .to_string();
 
                 // An Eagle schematic states what a board is built from but not
-                // what was bought — Mutable's carry `value` and `device` and no
+                // what was bought â Mutable's carry `value` and `device` and no
                 // part number at all. Those still tell us which parts we need an
                 // answer for, so they are recorded as demand, not as a choice.
                 if eagle_paths(path).is_empty() {
@@ -2943,7 +2957,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                     for part in &board.parts {
                         // A part-number column is authoritative. Only fall back
                         // to reading the comment when the board gives us no
-                        // column — a comment like `100nf50V0603` merely *looks*
+                        // column â a comment like `100nf50V0603` merely *looks*
                         // like a part number and must not outrank the real one.
                         let mpn = match &part.part_number {
                             Some(m) if !m.is_empty() => m.clone(),
@@ -2992,7 +3006,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                                 if !stated.is_empty() && !value.is_empty() && *stated != value {
                                     eprintln!(
                                         "  ! {} is {value} on the schematic but {stated} in the BOM \
-                                         — not learning {m}",
+                                         â not learning {m}",
                                         part.refdes.0
                                     );
                                     mismatched += 1;
@@ -3028,7 +3042,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             );
             if mismatched > 0 {
                 println!(
-                    "{mismatched} refdes disagreed between the BOM and the schematic — \
+                    "{mismatched} refdes disagreed between the BOM and the schematic â \
                      check the BOM is the one that built this revision"
                 );
             }
@@ -3040,15 +3054,15 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                     seen.entry((kind, value, pkg)).or_insert(board);
                 }
                 println!(
-                    "\n{} part(s) used but not in the library — these need sourcing:",
+                    "\n{} part(s) used but not in the library â these need sourcing:",
                     seen.len()
                 );
                 for ((kind, value, pkg), board) in seen.iter().take(20) {
-                    let v = if value.is_empty() { "—" } else { value };
+                    let v = if value.is_empty() { "â" } else { value };
                     println!("  {kind:<11} {v:<10} {pkg:<20} (on {board})");
                 }
                 if seen.len() > 20 {
-                    println!("  … and {} more", seen.len() - 20);
+                    println!("  â¦ and {} more", seen.len() - 20);
                 }
             }
         }
@@ -3076,12 +3090,16 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                 return Ok(());
             }
             if shown.is_empty() {
-                println!("nothing learned yet — try `lob parts learn <package>...`");
+                println!("nothing learned yet â try `lob parts learn <package>...`");
                 return Ok(());
             }
             for h in &shown {
-                let val = if h.value.is_empty() { "—" } else { &h.value };
-                let photo = if h.photo.is_some() { " 📷" } else { "" };
+                let val = if h.value.is_empty() {
+                    "â"
+                } else {
+                    &h.value
+                };
+                let photo = if h.photo.is_some() { " ð·" } else { "" };
                 println!(
                     "  {:<10} {:<10} {:<10} {:<22} x{}  ({}){photo}",
                     h.kind, val, h.package, h.mpn, h.uses, h.seen_on
@@ -3118,7 +3136,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             if lib.set_house_photo(&kind, &value, &package, &stored)? {
                 println!("photo set for {kind} {package}: {stored}");
             } else {
-                let val = if value.is_empty() { "—" } else { &value };
+                let val = if value.is_empty() { "â" } else { &value };
                 println!(
                     "no such part in the library: {kind} {val} {package}\n\
                      check `lob parts house --kind {kind}` for the exact key"
@@ -3195,7 +3213,7 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                 .collect();
             if blockers.is_empty() {
                 let n = resolutions.iter().filter(|r| r.mpn.is_some()).count();
-                println!("✓ verification gate passed — {n} MPN-bearing part(s), all verified");
+                println!("â verification gate passed â {n} MPN-bearing part(s), all verified");
             } else {
                 for b in &blockers {
                     let why = match b.status {
@@ -3204,13 +3222,13 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
                         _ => "",
                     };
                     println!(
-                        "  ✗ {:<6} {:<18} {why}",
+                        "  â {:<6} {:<18} {why}",
                         b.refdes,
                         b.mpn.as_deref().unwrap_or("-")
                     );
                 }
                 anyhow::bail!(
-                    "verification gate FAILED: {} part(s) not verified — layout / BOM ordering refuse to run",
+                    "verification gate FAILED: {} part(s) not verified â layout / BOM ordering refuse to run",
                     blockers.len()
                 );
             }
@@ -3235,14 +3253,14 @@ fn parts_cmd(action: PartsCmd) -> Result<()> {
             lib.upsert_part(&part)?;
             println!("fetched {mpn} from {source}:");
             print_part(&part);
-            println!("\n(unverified — run `lob parts verify {mpn}` after confirming)");
+            println!("\n(unverified â run `lob parts verify {mpn}` after confirming)");
         }
     }
     Ok(())
 }
 
 /// Handle `lob panel ...` commands.
-/// `lob import eagle` — read an Eagle design into a circuit, and write SKiDL.
+/// `lob import eagle` â read an Eagle design into a circuit, and write SKiDL.
 fn import_cmd(action: ImportCmd) -> Result<()> {
     match action {
         ImportCmd::Eagle {
@@ -3265,13 +3283,13 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
             );
             if !imp.symbols_skipped.is_empty() {
                 println!(
-                    "  {} schematic symbol(s) skipped (frames, GND/supply markers — not components)",
+                    "  {} schematic symbol(s) skipped (frames, GND/supply markers â not components)",
                     imp.symbols_skipped.len()
                 );
             }
             if !imp.unmapped_footprints.is_empty() {
                 println!(
-                    "  ⚠ {} package(s) have no KiCad footprint and are marked `eagle:` — \
+                    "  â  {} package(s) have no KiCad footprint and are marked `eagle:` â \
                      resolve before laying this out:",
                     imp.unmapped_footprints.len()
                 );
@@ -3279,7 +3297,7 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                     println!("      {p}");
                 }
                 if imp.unmapped_footprints.len() > 12 {
-                    println!("      … and {} more", imp.unmapped_footprints.len() - 12);
+                    println!("      â¦ and {} more", imp.unmapped_footprints.len() - 12);
                 }
             }
 
@@ -3289,7 +3307,7 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                 let places = legion_of_bom_core::parse_eagle_board(&btext);
                 let back = places.iter().filter(|p| p.back).count();
                 println!(
-                    "  board: {} placement(s), {back} on the back — the existing layout, reusable as-is",
+                    "  board: {} placement(s), {back} on the back â the existing layout, reusable as-is",
                     places.len()
                 );
             }
@@ -3299,7 +3317,7 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                 .with_context(|| format!("writing {}", out.display()))?;
             println!("  SKiDL: {}", out.display());
             println!(
-                "  NOTE: symbol libraries are inferred from each reference designator — \
+                "  NOTE: symbol libraries are inferred from each reference designator â \
                  review the Part(...) lines before running it."
             );
             Ok(())
@@ -3314,11 +3332,11 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                 .with_context(|| format!("reading {}", package.display()))?;
             let clients = search.then(SourcingClients::from_env).unwrap_or_default();
             if search && !clients.any() {
-                println!("(no distributor key found — set MOUSER_API_KEY to search)");
+                println!("(no distributor key found â set MOUSER_API_KEY to search)");
             }
 
             // The parts we already buy are the best answer available, and they
-            // cost nothing to consult — a jack or a pot we have shipped before
+            // cost nothing to consult â a jack or a pot we have shipped before
             // is known good, so it should never reach a distributor search.
             let lib = PartsLibrary::open(default_parts_dir()).ok();
 
@@ -3377,19 +3395,19 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
                     }
                     Repair::NotSourceable(what) => {
                         skip += 1;
-                        println!("  {refs:<24} — {what}");
+                        println!("  {refs:<24} â {what}");
                     }
                 }
             }
             println!(
-                "\n{have} already had a part number · {found} recovered from the comment · \
-                 {known} known from parts we use · {todo} need a search · \
+                "\n{have} already had a part number Â· {found} recovered from the comment Â· \
+                 {known} known from parts we use Â· {todo} need a search Â· \
                  {skip} not sourceable from this BOM"
             );
             if found > 0 {
                 println!(
                     "Recovered numbers come from what the author wrote, not from a \
-                     distributor — confirm them before ordering."
+                     distributor â confirm them before ordering."
                 );
             }
             Ok(())
@@ -3443,7 +3461,7 @@ fn import_cmd(action: ImportCmd) -> Result<()> {
             let with_mpn = bom.lines.iter().filter(|l| l.mpn.is_some()).count();
             if with_mpn < bom.lines.len() {
                 println!(
-                    "  NOTE: {}/{} BOM lines carry no part number — this package left the \
+                    "  NOTE: {}/{} BOM lines carry no part number â this package left the \
                      distributor column blank, so those cannot be priced or ordered directly. \
                      `lob parts suggest` can propose candidates from value + package.",
                     bom.lines.len() - with_mpn,
@@ -3471,7 +3489,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 .with_context(|| format!("writing {}", out_path.display()))?;
             println!("wrote {}", out_path.display());
             println!(
-                "  panel: {:.2} mm × {:.2} mm, {} hole(s), {} cutout(s)",
+                "  panel: {:.2} mm Ã {:.2} mm, {} hole(s), {} cutout(s)",
                 panel.width_mm(),
                 panel.height_mm(),
                 panel.mounting_holes().len(),
@@ -3499,7 +3517,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid panel spec: {e}"))?;
             let stem = spec.file_stem().and_then(|s| s.to_str()).unwrap_or("panel");
             // Drop a trailing "_panel"/"-panel" and prettify: "slew_limiter_panel"
-            // → "Slew Limiter".
+            // â "Slew Limiter".
             let title = pretty_title(stem.trim_end_matches("_panel").trim_end_matches("-panel"));
             let logo = load_logo(&logo)?;
             let pcb = panel_to_kicad_pcb(panel.as_ref(), &title, logo.as_ref());
@@ -3508,7 +3526,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 .with_context(|| format!("writing {}", out_path.display()))?;
             println!("wrote {}", out_path.display());
             println!(
-                "  panel PCB: {:.2} mm × {:.2} mm ({} HP), {} hole(s), {} cutout(s)",
+                "  panel PCB: {:.2} mm Ã {:.2} mm ({} HP), {} hole(s), {} cutout(s)",
                 panel.width_mm(),
                 panel.height_mm(),
                 (panel.width_mm() / 5.08).round() as i64,
@@ -3601,7 +3619,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             // positions are then evidence about a DIFFERENT panel, and using them
             // is the circular step in `legion-of-bom-unc`: the controls sit at
             // x=15.24 because the board is 6 HP, 15.24 + 7 overflows 4 HP, therefore
-            // "4 HP can't fit the control hardware" — the 6 HP board offered as
+            // "4 HP can't fit the control hardware" â the 6 HP board offered as
             // proof that 6 HP is needed. Worse, `panel_from_board` takes its HP from
             // the board outline, so the requested width was discarded and that
             // verdict printed without 4 HP ever being tried.
@@ -3611,7 +3629,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 .filter(|(want, have)| want != have);
             if let Some((want, have)) = width_clash {
                 println!(
-                    "  built board is {have} HP but you asked for {want} — laying out from \
+                    "  built board is {have} HP but you asked for {want} â laying out from \
                      scratch; positions from a board of another width prove nothing here"
                 );
             }
@@ -3619,18 +3637,18 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             let mut panel = match from_board {
                 Some(p) => {
                     println!(
-                        "  from the built board ({}) — {} cutout(s) at their real positions",
+                        "  from the built board ({}) â {} cutout(s) at their real positions",
                         board_path.display(),
                         p.cutouts.len()
                     );
                     p
                 }
                 None => {
-                    // Not when the board was deliberately set aside just above —
+                    // Not when the board was deliberately set aside just above â
                     // "no built board" would be a plain untruth.
                     if !idealised && width_clash.is_none() {
                         println!(
-                            "  no built board at {} — laying out from scratch; \
+                            "  no built board at {} â laying out from scratch; \
                              the board will follow this panel",
                             board_path.display()
                         );
@@ -3642,22 +3660,24 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             // so report what was emitted, not what was asked for.
             let hp = panel.hp.unwrap_or(hp);
             if hp > requested_hp {
-                println!("  widened to {hp} HP — {requested_hp} HP can't fit the control hardware");
+                println!(
+                    "  widened to {hp} HP â {requested_hp} HP can't fit the control hardware"
+                );
             }
             let out_path =
                 out.unwrap_or_else(|| circuit.with_file_name(format!("{stem}_panel.toml")));
             // The default output path IS the declared spec for any circuit that has
-            // one — comments, the control order somebody chose, edited labels. A
+            // one â comments, the control order somebody chose, edited labels. A
             // derived panel keeps none of that. `effective_panel` was carefully
             // taught never to write to a declared spec (`legion-of-bom-byh`); this
             // command still could, and did.
             if out_path.exists() && !force {
                 anyhow::bail!(
-                    "{} already exists — refusing to overwrite it\n  \
+                    "{} already exists â refusing to overwrite it\n  \
                      a derived spec keeps none of what a person put there: comments, the\n  \
                      control order they chose, labels they edited.\n  \
-                     • --out <path>  write it elsewhere and diff the two\n  \
-                     • --force       overwrite this one anyway",
+                     â¢ --out <path>  write it elsewhere and diff the two\n  \
+                     â¢ --force       overwrite this one anyway",
                     out_path.display()
                 );
             }
@@ -3719,7 +3739,7 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
                 model.parts().len()
             );
             // Fitting is not building. Route each width for real and gate it on
-            // KiCad DRC, because a board can fit and still be unroutable — the
+            // KiCad DRC, because a board can fit and still be unroutable â the
             // failure that shipped a 3 HP answer for a board that needed more.
             let cfg = LayoutLoop {
                 kicad_cli: kicad_cli_path(),
@@ -3728,32 +3748,32 @@ fn panel_cmd(action: PanelCmd) -> Result<()> {
             };
             let search = HpSearch::default();
             if cfg.kicad_cli.is_some() {
-                println!("  trialling widths (place → route → DRC), {floor} HP up…");
+                println!("  trialling widths (place â route â DRC), {floor} HP upâ¦");
             }
             let found = minimum_routable_hp(&model, floor, &search, &cfg, |hp| {
                 eurorack_trial_build(&model, &footprint_dir, hp)
             });
             for t in &found.tried {
                 match t.errors {
-                    None => println!("    {:>2} HP · could not be built", t.hp),
-                    Some(0) => println!("    {:>2} HP · DRC clean", t.hp),
+                    None => println!("    {:>2} HP Â· could not be built", t.hp),
+                    Some(0) => println!("    {:>2} HP Â· DRC clean", t.hp),
                     Some(n) => {
                         let why: Vec<String> =
-                            t.kinds.iter().map(|(k, c)| format!("{c}× {k}")).collect();
-                        println!("    {:>2} HP · {n} DRC error(s): {}", t.hp, why.join(", "));
+                            t.kinds.iter().map(|(k, c)| format!("{c}Ã {k}")).collect();
+                        println!("    {:>2} HP Â· {n} DRC error(s): {}", t.hp, why.join(", "));
                     }
                 }
             }
             match (found.unproven, found.hp) {
                 (true, _) => println!(
-                    "  routability unchecked (no kicad-cli) — {floor} HP is a floor, not a proven width"
+                    "  routability unchecked (no kicad-cli) â {floor} HP is a floor, not a proven width"
                 ),
                 (_, Some(hp)) => println!(
                     "minimum BUILDABLE width: {hp} HP ({:.1} mm)",
                     f64::from(hp) * 5.08
                 ),
                 (_, None) => println!(
-                    "  no width from {floor} to {} HP routed DRC-clean — this is a layout problem, not a width problem",
+                    "  no width from {floor} to {} HP routed DRC-clean â this is a layout problem, not a width problem",
                     floor + search.max_widths - 1
                 ),
             }
@@ -3815,7 +3835,7 @@ fn resolve_circuit_file(
     Ok(lib.resolve_circuit(&model)?)
 }
 
-/// Handle `lob parts suggest <circuit> [--limit N]` — run SKiDL → netlist → model,
+/// Handle `lob parts suggest <circuit> [--limit N]` â run SKiDL â netlist â model,
 /// then for each part with NO MPN, print ranked real-MPN candidates from the
 /// distributors we have access to. SUGGEST-ONLY: prints only; a human confirms one
 /// via `lob parts fetch`/`verify` (the okm gate stays intact). Degrades gracefully
@@ -3834,7 +3854,7 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
     let model = parse_netlist_file(&run.netlist_path)?;
 
     let clients = SourcingClients::from_env();
-    // Tell the user what's active — never panic on a missing key.
+    // Tell the user what's active â never panic on a missing key.
     let mut sources = Vec::new();
     if clients.mouser.is_some() {
         sources.push("Mouser");
@@ -3870,7 +3890,7 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
 
     if generics.is_empty() {
         println!(
-            "every part already declares an MPN ({resolved_count} part(s)) — nothing to suggest"
+            "every part already declares an MPN ({resolved_count} part(s)) â nothing to suggest"
         );
         return Ok(());
     }
@@ -3878,14 +3898,14 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
     for ((value, footprint), (part, mut refdes)) in generics {
         refdes.sort();
         let fp = footprint.as_deref().unwrap_or("(no footprint)");
-        println!("● {}  {value}  [{fp}]", refdes.join(", "));
+        println!("â {}  {value}  [{fp}]", refdes.join(", "));
         let query = legion_of_bom_core::build_query(&part);
         if let Some(q) = &query {
             println!("    query: \"{q}\"");
         }
         let candidates = suggest_mpns(&part, &clients, limit);
         if candidates.is_empty() {
-            println!("    (no candidates — try a more specific value/footprint, or add by hand)");
+            println!("    (no candidates â try a more specific value/footprint, or add by hand)");
         }
         for (i, c) in candidates.iter().enumerate() {
             let mfr = c.manufacturer.as_deref().unwrap_or("?");
@@ -3900,12 +3920,12 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
             let pkg = c
                 .package
                 .as_deref()
-                .map(|p| format!(" · {p}"))
+                .map(|p| format!(" Â· {p}"))
                 .unwrap_or_default();
             let lcsc = c
                 .lcsc_code
                 .as_deref()
-                .map(|l| format!(" · {l}"))
+                .map(|l| format!(" Â· {l}"))
                 .unwrap_or_default();
             println!(
                 "    {}. {:<22} {mfr:<16} {stock:<16} {price:<9}{pkg}{lcsc}  [{}]",
@@ -3917,7 +3937,7 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
                 println!("       datasheet: {ds}");
             }
         }
-        // The confirm path — never silent-assign (okm gate).
+        // The confirm path â never silent-assign (okm gate).
         if let Some(top) = candidates.first() {
             let fetch_hint = match top.lcsc_code.as_deref() {
                 Some(code) => format!("lob parts fetch {code} --source jlcpcb"),
@@ -3926,7 +3946,7 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
                 }),
             };
             println!(
-                "    → confirm: {fetch_hint}  then  lob parts verify {}",
+                "    â confirm: {fetch_hint}  then  lob parts verify {}",
                 top.mpn
             );
         }
@@ -3935,7 +3955,7 @@ fn suggest_cmd(circuit: PathBuf, limit: usize) -> Result<()> {
 
     println!(
         "{} generic part group(s) need an MPN; {resolved_count} part(s) already resolved.\n\
-         Suggestions are NOT auto-assigned — confirm one, then `lob parts verify` (okm gate).",
+         Suggestions are NOT auto-assigned â confirm one, then `lob parts verify` (okm gate).",
         // recompute count of groups printed
         model
             .parts()
@@ -4029,14 +4049,14 @@ fn print_part(part: &PartRecord) {
 fn print_resolutions(resolutions: &[PartResolution]) {
     let with_mpn: Vec<_> = resolutions.iter().filter(|r| r.mpn.is_some()).collect();
     if with_mpn.is_empty() {
-        println!("no parts declare an MPN (generic/ideal parts) — nothing to resolve");
+        println!("no parts declare an MPN (generic/ideal parts) â nothing to resolve");
         return;
     }
     for r in &with_mpn {
         let (mark, label) = match r.status {
-            ResolutionStatus::Verified => ("✓", "verified"),
-            ResolutionStatus::Unverified => ("⚠", "in library, unverified"),
-            ResolutionStatus::Unknown => ("✗", "not in library"),
+            ResolutionStatus::Verified => ("â", "verified"),
+            ResolutionStatus::Unverified => ("â ", "in library, unverified"),
+            ResolutionStatus::Unknown => ("â", "not in library"),
             ResolutionStatus::NoMpn => continue,
         };
         println!(
@@ -4060,7 +4080,7 @@ fn print_report(report: &PipelineReport) {
     for outcome in &report.outcomes {
         println!(
             "  {} {}",
-            if outcome.passed { "✓" } else { "✗" },
+            if outcome.passed { "â" } else { "â" },
             outcome.stage
         );
         for finding in &outcome.findings {
@@ -4074,11 +4094,11 @@ fn print_report(report: &PipelineReport) {
     }
     println!();
     if report.passed() {
-        println!("✓ pipeline passed ({} stages)", report.outcomes.len());
+        println!("â pipeline passed ({} stages)", report.outcomes.len());
     } else {
         let failed = report.outcomes.iter().filter(|o| !o.passed).count();
         println!(
-            "✗ pipeline failed ({failed} of {} stages)",
+            "â pipeline failed ({failed} of {} stages)",
             report.outcomes.len()
         );
     }
@@ -4111,13 +4131,13 @@ fn init_tracing(verbose: u8) {
 /// then a repo-local `.env` (a dev convenience, searched from the cwd upward),
 /// then the user-global `~/.lob/credentials`. `dotenvy` never overrides an
 /// already-set variable, so loading local before global gives local precedence
-/// while the global file supplies the keys from *any* working directory — so
+/// while the global file supplies the keys from *any* working directory â so
 /// `lob bom --price` and `lob serve` find `MOUSER_API_KEY` when run from inside
 /// a circuits repo, not only from this checkout.
 fn load_credentials() {
     // Repo-local .env (dev override).
     let _ = dotenvy::dotenv();
-    // User-global credentials — the durable home for API keys.
+    // User-global credentials â the durable home for API keys.
     if let Some(home) = std::env::var_os("HOME") {
         let global = Path::new(&home).join(".lob").join("credentials");
         let _ = dotenvy::from_path(&global);
@@ -4129,7 +4149,7 @@ mod tests {
     use super::*;
 
     /// A declared panel is the author's file. Checking whether it has gone stale
-    /// must never write to it — the whole of `legion-of-bom-byh` was that check
+    /// must never write to it â the whole of `legion-of-bom-byh` was that check
     /// regenerating the spec in place, destroying comments, a chosen HP and a
     /// hand-built layout.
     #[test]
@@ -4139,8 +4159,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hand_panel.toml");
         // A deliberately hand-shaped spec: a comment, and only one control
-        // declared while the circuit below has two — i.e. stale.
-        let original = "# HAND-AUTHORED — a comment a generator would drop.\n\
+        // declared while the circuit below has two â i.e. stale.
+        let original = "# HAND-AUTHORED â a comment a generator would drop.\n\
                         format = \"eurorack\"\n\
                         hp = 8\n\
                         thickness_mm = 1.6\n\n\
@@ -4181,7 +4201,7 @@ mod tests {
     /// `board`, `fab` and `guide` must lay out the same board by DEFAULT.
     ///
     /// `legion-of-bom-p6m`: they agreed only because three separately-chosen
-    /// defaults happened to match — `guide` hardcoded `LayoutLoop::default()`
+    /// defaults happened to match â `guide` hardcoded `LayoutLoop::default()`
     /// (mode Analog), `fab` and `board` each spelled `"analog"` as a literal, and
     /// `GUIDE_LAYOUT_ITERS` was a different constant from fab's `6`. Any one of
     /// them moving split the guide's board from the one in the fab package, and
@@ -4215,7 +4235,7 @@ mod tests {
 
     /// The refusal MESSAGE carries both numbers and a way out.
     ///
-    /// Pure formatter only — deliberately not the proof that anything refuses.
+    /// Pure formatter only â deliberately not the proof that anything refuses.
     /// See `a_panel_narrower_than_the_pcb_stops_the_build` for that; an earlier
     /// version of this file had only this test and called it the guard, which
     /// would have stayed green through the exact `legion-of-bom-unc` regression
@@ -4245,11 +4265,11 @@ mod tests {
     /// `legion-of-bom-unc`: `hp = 5` was accepted, rejected and silently rebuilt
     /// at 6, and the two were rendered and ordered as if they matched. The panel
     /// and the board come from different vendors, so nothing downstream ever gets
-    /// the chance to notice they disagree — this is the only place that can.
+    /// the chance to notice they disagree â this is the only place that can.
     ///
     /// So this drives the real thing: DETECTION (`declared_panel_staleness` must
     /// classify it `TooNarrow`) and REFUSAL (`effective_panel` must return `Err`).
-    /// Asserting on `panel_mismatch`'s wording proves neither — a build that
+    /// Asserting on `panel_mismatch`'s wording proves neither â a build that
     /// logged the error and carried on would satisfy it.
     #[test]
     fn a_panel_narrower_than_the_pcb_stops_the_build() {
@@ -4261,7 +4281,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("narrow_panel.toml");
         // 1 HP is narrower than any real circuit's PCB, so this does not depend on
-        // the packer's exact answer — only that it is more than one.
+        // the packer's exact answer â only that it is more than one.
         std::fs::write(
             &path,
             "format = \"eurorack\"\nhp = 1\nthickness_mm = 1.6\n\n\
@@ -4279,7 +4299,7 @@ mod tests {
                 .with_footprint("Package_SO:SOIC-14_3.9x8.7mm_P1.27mm"),
         ];
 
-        // DETECTION: narrower than the PCB, and classified as such — not as a
+        // DETECTION: narrower than the PCB, and classified as such â not as a
         // missing cutout, which takes a different branch and a different message.
         let stale = declared_panel_staleness(&path, &circuit, &fp_dir).unwrap();
         let Some(PanelStaleness::TooNarrow { declared, needed }) = stale else {
@@ -4288,7 +4308,7 @@ mod tests {
         assert_eq!(declared, 1);
         assert!(needed > 1, "the PCB needs more than 1 HP, got {needed}");
 
-        // REFUSAL: the build stops. This is the assertion `unc` was filed about —
+        // REFUSAL: the build stops. This is the assertion `unc` was filed about â
         // the old code returned Ok(Some(derived_substitute)) here and built on.
         let err = effective_panel(Some(path.clone()), &circuit, &fp_dir, &dir, "t")
             .expect_err("a panel narrower than the PCB must stop the build");
@@ -4309,7 +4329,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide_panel.toml");
-        // 42 HP for a single jack — absurd, and entirely the author's business.
+        // 42 HP for a single jack â absurd, and entirely the author's business.
         std::fs::write(
             &path,
             "format = \"eurorack\"\nhp = 42\nthickness_mm = 1.6\n\n\

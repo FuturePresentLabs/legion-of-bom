@@ -94,6 +94,16 @@ impl Spec {
         }
     }
 
+    /// Facts this design rests on that no machine can check and no person has
+    /// confirmed yet — a value read off a datasheet figure, a choice no pinned
+    /// source states. What stands between the design and a fab order.
+    pub fn unconfirmed_facts(&self) -> Vec<String> {
+        match self {
+            Spec::Stm32Codec(s) => crate::mcu_audio::unconfirmed_facts(s),
+            Spec::FuzzPedal(_) | Spec::FuzzChain(_) => Vec::new(),
+        }
+    }
+
     /// The panel the board is built against, when the family has one — also
     /// a pure function of the spec. `None` means the board has no panel and
     /// its outline is derived from the parts.
