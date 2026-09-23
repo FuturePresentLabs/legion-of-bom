@@ -16,6 +16,7 @@ pub mod board;
 pub mod bom;
 pub mod bom_repair;
 pub mod carrier;
+pub mod datasheet;
 pub mod decouple;
 pub mod distributor_lua;
 pub mod drc;
