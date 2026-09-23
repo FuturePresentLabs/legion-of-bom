@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 
 use crate::board::{first_overlap, place_point, PartFacts, Placement};
+use crate::model::is_supply_rail as is_power;
 use crate::source::CircuitSource;
 
 /// Clearance (mm) between the cap's pad edge and the pin's, once snapped. Small,
@@ -69,16 +70,22 @@ pub fn snap(
         }
     }
 
+    // How many caps each (IC, rail) has been given so far — the next one takes
+    // the next rail pin.
+    let mut given: HashMap<(String, String), usize> = HashMap::new();
     for (cap, ic) in crate::board::decoupling_pairs(circuit) {
         let Some(rail) = shared_rail(&pin_net, &cap, &ic) else {
             report.skipped.push(cap);
             continue;
         };
+        let nth = given.entry((ic.clone(), rail.to_string())).or_default();
+        let ic_pin = *nth;
+        *nth += 1;
         // The cap's pad on the rail, and the IC's pin on the same rail, both as
         // footprint-local offsets.
         let (Some(cap_local), Some(ic_local)) = (
-            pad_on_net(facts, &pin_net, &cap, rail),
-            pad_on_net(facts, &pin_net, &ic, rail),
+            pad_on_net(facts, &pin_net, &cap, rail, 0),
+            pad_on_net(facts, &pin_net, &ic, rail, ic_pin),
         ) else {
             report.skipped.push(cap);
             continue;
@@ -196,23 +203,33 @@ fn shared_rail<'a>(
         .find(|rail| pin_net.iter().any(|((r, _), n)| *r == ic && n == rail))
 }
 
-/// A part's pad carrying `net`, as a footprint-local offset.
+/// A part's `nth` pad carrying `net` (wrapping), as a footprint-local offset.
+///
+/// An MCU has a VDD pin per side and a cap belongs at each: the `nth` cap on a
+/// rail takes the `nth` rail pin, so four caps land at four pins instead of
+/// piling onto the first one. Pins are taken in natural order (2 before 10),
+/// so the same board is produced every run.
 fn pad_on_net(
     facts: &HashMap<String, PartFacts>,
     pin_net: &HashMap<(&str, &str), &str>,
     refdes: &str,
     net: &str,
+    nth: usize,
 ) -> Option<(f64, f64)> {
     let offsets = &facts.get(refdes)?.pin_offsets;
-    // Deterministic: lowest pin number wins when a part has several pins on the
-    // rail, so the same board is produced every run.
-    let mut pins: Vec<&str> = pin_net
-        .iter()
-        .filter(|((r, _), n)| *r == refdes && **n == net)
-        .map(|((_, p), _)| *p)
-        .collect();
-    pins.sort_unstable();
-    pins.into_iter().find_map(|p| offsets.get(p).copied())
+    let pins: Vec<(f64, f64)> = {
+        let mut named: Vec<&str> = pin_net
+            .iter()
+            .filter(|((r, _), n)| *r == refdes && **n == net)
+            .map(|((_, p), _)| *p)
+            .collect();
+        named.sort_unstable_by_key(|p| (p.parse::<u32>().unwrap_or(u32::MAX), *p));
+        named
+            .into_iter()
+            .filter_map(|p| offsets.get(p).copied())
+            .collect()
+    };
+    pins.get(nth % pins.len().max(1)).copied()
 }
 
 /// The IC's keep-out centre in board space — what "away from the body" is
@@ -263,15 +280,6 @@ const SNAP_STEP_MM: f64 = 0.4;
 /// outward normal is tried first at every radius, so a clear straight-out spot
 /// always wins over an angled nearer one.
 const SNAP_FAN_DEG: [f64; 5] = [0.0, 25.0, -25.0, 50.0, -50.0];
-
-fn is_power(net: &str) -> bool {
-    let u = net.trim().to_ascii_uppercase();
-    let gnd =
-        matches!(u.as_str(), "GND" | "GNDA" | "AGND" | "DGND" | "VSS" | "0") || u.ends_with("GND");
-    !gnd && (u.starts_with('+')
-        || u.starts_with('-')
-        || matches!(u.as_str(), "VCC" | "VDD" | "VEE" | "V+" | "V-"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -475,6 +483,59 @@ mod tests {
             Net::new("GND", vec![PinRef::new("C2", "2")]),
         ];
         c
+    }
+
+    /// An MCU has a supply pin per side and wants a cap at each. Two caps on a
+    /// two-pin rail must land one at each pin — the bug was both piling onto the
+    /// lowest-numbered pin, leaving the other undecoupled. The rail is named the
+    /// way an MCU board names it (`3V3`), which the rail classifier used not to
+    /// recognise at all, so neither cap was snapped.
+    #[test]
+    fn two_caps_on_a_two_pin_rail_take_one_pin_each() {
+        let mut facts = facts_for();
+        facts.insert("C3".to_string(), facts["C2"].clone());
+        let mut c = Circuit::new("mcu");
+        let mut u1 = Part::new("U1", "STM32");
+        u1.footprint = Some("Package_QFP:LQFP-48_7x7mm_P0.5mm".into());
+        let cap = |r: &str| {
+            let mut p = Part::new(r, "100nF");
+            p.footprint = Some("Capacitor_SMD:C_0603_1608Metric".into());
+            p
+        };
+        c.parts = vec![u1, cap("C2"), cap("C3")];
+        c.nets = vec![
+            Net::new(
+                "3V3",
+                vec![
+                    PinRef::new("U1", "6"),
+                    PinRef::new("U1", "11"),
+                    PinRef::new("C2", "1"),
+                    PinRef::new("C3", "1"),
+                ],
+            ),
+            Net::new("GND", vec![PinRef::new("C2", "2"), PinRef::new("C3", "2")]),
+        ];
+        let at = |x: f64, y: f64| Placement {
+            x_mm: x,
+            y_mm: y,
+            rotation_deg: 0.0,
+            back: false,
+        };
+        let mut p: HashMap<String, Placement> = [
+            ("U1".to_string(), at(50.0, 50.0)),
+            ("C2".to_string(), at(70.0, 50.0)),
+            ("C3".to_string(), at(80.0, 50.0)),
+        ]
+        .into();
+
+        let report = snap(&mut p, &c, &facts);
+        assert_eq!(report.snapped.len(), 2, "both caps snapped: {report:?}");
+        // Pin 6 is at the IC's +y end (y = 55), pin 11 at its -y end (y = 45).
+        let (y2, y3) = (p["C2"].y_mm, p["C3"].y_mm);
+        assert!(
+            (y2 > 50.0) != (y3 > 50.0),
+            "one cap per supply pin, one at each end: C2 at y={y2:.1}, C3 at y={y3:.1}"
+        );
     }
 
     /// The cap ends up beside the *pin*, not the package centre — and outside the

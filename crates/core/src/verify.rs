@@ -5,6 +5,7 @@
 //! compares that against the cutoff the ngspice AC sweep actually produced and
 //! passes only if they agree within tolerance.
 
+use crate::model::is_ground_net;
 use crate::source::CircuitSource;
 use crate::spice::AcResult;
 use crate::stage::{Finding, StageOutcome};
@@ -86,10 +87,6 @@ pub fn check_rc_cutoff(
 /// Output net + ground convention (matches [`SimConfig`](crate::spice::SimConfig)
 /// defaults) used to identify the feedback vs ground resistor topologically.
 const OUTPUT_NET: &str = "OUT";
-
-fn is_ground_net(name: &str) -> bool {
-    name.eq_ignore_ascii_case("GND") || name == "0"
-}
 
 /// Net names a given reference designator connects to.
 fn nets_of<'a>(circuit: &'a dyn CircuitSource, refdes: &str) -> Vec<&'a str> {

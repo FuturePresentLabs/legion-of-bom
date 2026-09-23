@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::model::{is_ground_net as is_ground, is_supply_rail as is_rail};
 use crate::source::CircuitSource;
 use crate::symbols::{read_symbol_graphics, SymFill, SymShape, SymbolGraphics};
 
@@ -276,21 +277,6 @@ impl Placed {
             ((x, self.y() + sheet::BOX_H), (0.0, 1.0))
         }
     }
-}
-
-/// True for a ground net.
-fn is_ground(name: &str) -> bool {
-    let u = name.trim().to_ascii_uppercase();
-    matches!(u.as_str(), "GND" | "GNDA" | "AGND" | "DGND" | "VSS" | "0") || u.ends_with("GND")
-}
-
-/// True for a supply rail (but not ground).
-fn is_rail(name: &str) -> bool {
-    let u = name.trim().to_ascii_uppercase();
-    !is_ground(name)
-        && (u.starts_with('+')
-            || u.starts_with('-')
-            || matches!(u.as_str(), "VCC" | "VDD" | "VEE" | "V+" | "V-"))
 }
 
 /// Power and ground are drawn as stubs, not routed wires.

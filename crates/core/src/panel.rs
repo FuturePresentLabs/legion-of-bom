@@ -1426,11 +1426,7 @@ fn control_label(circuit: &dyn CircuitSource, refdes: &str) -> Option<String> {
 
 /// Whether a net is a power rail / ground (so it isn't used as a control label).
 fn is_power_net(name: &str) -> bool {
-    let u = name.to_ascii_uppercase();
-    u == "GND"
-        || u.ends_with("GND")
-        || matches!(u.as_str(), "VCC" | "VEE" | "VDD" | "VSS")
-        || ((u.starts_with('+') || u.starts_with('-')) && u.contains('V'))
+    crate::model::is_ground_net(name) || crate::model::is_supply_rail(name)
 }
 
 /// Shorten a net name into a control label: drop a `SIG_` prefix / `_CV` suffix,

@@ -189,6 +189,45 @@ impl Net {
     }
 }
 
+/// Whether a net name is a **ground** — the one classifier every stage uses
+/// (a copy per module disagreed about `AGND` and `VSSA`).
+pub fn is_ground_net(name: &str) -> bool {
+    let u = name.trim().to_ascii_uppercase();
+    matches!(u.as_str(), "0" | "VSS" | "VSSA" | "VSSD")
+        || u.starts_with("GND")
+        || u.ends_with("GND")
+}
+
+/// Whether a net name is a **supply rail** (not ground): `+12V`/`-12V`, the
+/// bare `VCC`/`VDD`/`VEE`, and the names an MCU/codec board actually uses —
+/// `3V3`/`1V8`/`5V`, `VDDA`/`VDD_USB`/`AVDD`/`DVDD`/`IOVDD`, `VBUS`, `VBAT`,
+/// `VREF+`. (Not `VIN`: in an audio circuit that is as often a signal.) Everything downstream that treats a rail specially —
+/// decoupling a pin, drawing a stub instead of a wire, keeping a rail off a
+/// panel label — asks this, so an MCU board is not a board of signals.
+pub fn is_supply_rail(name: &str) -> bool {
+    let u = name.trim().to_ascii_uppercase();
+    if u.is_empty() || is_ground_net(&u) {
+        return false;
+    }
+    if u.starts_with('+') || u.starts_with('-') || matches!(u.as_str(), "V+" | "V-") {
+        return true;
+    }
+    const RAIL_PREFIXES: [&str; 10] = [
+        "VCC", "VDD", "VEE", "AVDD", "DVDD", "IOVDD", "PVDD", "VBUS", "VBAT", "VREF",
+    ];
+    if RAIL_PREFIXES.iter().any(|p| u.starts_with(p)) {
+        return true;
+    }
+    // A voltage as the name: 5V, 12V, 3V3, 1V8, 3.3V, optionally suffixed
+    // (3V3_A, 5V_USB).
+    let head = u.split(['_', '-']).next().unwrap_or("");
+    let Some((volts, frac)) = head.split_once('V') else {
+        return false;
+    };
+    let digits = |s: &str| s.chars().all(|c| c.is_ascii_digit() || c == '.');
+    !volts.is_empty() && digits(volts) && digits(frac)
+}
+
 /// A complete circuit: the parsed, DSL-agnostic representation every stage
 /// consumes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -214,6 +253,29 @@ impl Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rails_and_grounds_are_told_apart_including_mcu_names() {
+        for rail in [
+            "+12V", "-12V", "VCC", "VDD", "V+", "3V3", "1V8", "5V", "3.3V", "3V3_A", "VDDA",
+            "VDD_USB", "AVDD", "IOVDD", "VBUS", "VBAT", "VREF+",
+        ] {
+            assert!(is_supply_rail(rail), "{rail} is a rail");
+            assert!(!is_ground_net(rail), "{rail} is not ground");
+        }
+        for gnd in ["GND", "AGND", "DGND", "GNDA", "PGND", "VSS", "VSSA", "0"] {
+            assert!(is_ground_net(gnd), "{gnd} is ground");
+            assert!(!is_supply_rail(gnd), "{gnd} is not a rail");
+        }
+        for signal in [
+            "SIG_IN", "VIN", "VOUT", "CV1", "I2S_SCK", "OUT", "V", "USB_DP",
+        ] {
+            assert!(
+                !is_supply_rail(signal) && !is_ground_net(signal),
+                "{signal} is a signal"
+            );
+        }
+    }
 
     /// A minimal RC low-pass: one resistor, one capacitor, three nets.
     pub(crate) fn rc_lowpass() -> Circuit {

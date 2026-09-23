@@ -17,19 +17,20 @@ use legion_of_bom_core::{
     analytic_check, build_facts, build_guide_with, default_image_cache_dir,
     default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
     eurorack_trial_build, export_board_glb, export_cpl, export_gerbers, fetch_from_jlcpcb,
-    fetch_from_kicad, generate_board_artifacts, generate_bom, generate_fuzz_chain, guide,
-    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
-    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
-    render_board_png, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg,
-    simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
-    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
-    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer,
-    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
-    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
-    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
-    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis, TranDrive,
+    fetch_from_kicad, free_outline_template, generate_board_artifacts, generate_bom,
+    generate_fuzz_chain, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules,
+    kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key,
+    panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
+    photo_source, plan_repair, png_to_jpeg, render_board_png, render_spec_text, rules, run_drc,
+    run_layout_loop, schematic_to_svg, simulate_ac, simulate_tran, simulate_tran_drive,
+    suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key, zip_dir,
+    ArtifactKind, ArtifactStatus, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts,
+    CircuitSource, EnclosureSize, EurorackPlacer, Finding, FuzzConstraints, GuideOptions, HpSearch,
+    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
+    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -1515,12 +1516,23 @@ struct Layout {
 /// no longer a knob a caller can hold that this function ignores.
 fn build_layout(
     model: &legion_of_bom_core::Circuit,
-    options: BoardOptions,
+    mut options: BoardOptions,
     panel: &Option<PathBuf>,
     cfg: &LayoutLoop,
 ) -> Result<Layout> {
-    match (seeded_template(panel)?, cfg.max_iters) {
-        (Some(template), n) if n > 0 => {
+    let template = match seeded_template(panel)? {
+        Some(template) => template,
+        None => {
+            let template = free_outline_template(model, &mut options)?;
+            println!(
+                "  outline: {:.0} x {:.0} mm (no panel — sized to the parts)",
+                template.width_mm, template.height_mm
+            );
+            template
+        }
+    };
+    match cfg.max_iters {
+        n if n > 0 => {
             let report = run_layout_loop(model, options, template, cfg)?;
             println!(
                 "  seeded layout ({}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
@@ -1550,8 +1562,7 @@ fn build_layout(
 }
 
 /// The seeded-placer template for the iterative layout loop, when a panel is
-/// given. `None` (no panel) means there's nothing to anchor to, so the loop is
-/// skipped and one-shot placement stands.
+/// given; `None` without one ([`free_outline_template`] sizes that board).
 fn seeded_template(panel: &Option<PathBuf>) -> Result<Option<SeededPlacer>> {
     match panel {
         Some(spec_path) => {

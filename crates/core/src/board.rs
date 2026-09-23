@@ -649,17 +649,7 @@ fn decoupling_bonus(circuit: &dyn CircuitSource) -> Vec<(String, String, f64)> {
 /// the pull is a hint, the rule is the guarantee, and they must not be able to
 /// disagree about which cap belongs to which IC.
 pub fn decoupling_pairs(circuit: &dyn CircuitSource) -> Vec<(String, String)> {
-    let is_gnd = |n: &str| {
-        let u = n.trim().to_ascii_uppercase();
-        matches!(u.as_str(), "GND" | "GNDA" | "AGND" | "DGND" | "VSS" | "0") || u.ends_with("GND")
-    };
-    let is_power = |n: &str| {
-        let u = n.trim().to_ascii_uppercase();
-        !is_gnd(n)
-            && (u.starts_with('+')
-                || u.starts_with('-')
-                || matches!(u.as_str(), "VCC" | "VDD" | "VEE" | "V+" | "V-"))
-    };
+    use crate::model::{is_ground_net as is_gnd, is_supply_rail as is_power};
     let fp: HashMap<&str, &str> = circuit
         .parts()
         .iter()
@@ -1647,6 +1637,75 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
             .iter()
             .filter_map(|c| c.refdes.clone().map(|r| (r, (c.x_mm, h - c.y_mm))))
             .collect();
+        if fits_outline(circuit, facts, w, h, anchors) {
+            return hp;
+        }
+    }
+    MAX_HP
+}
+
+/// The smallest **free rectangular** board (`(width, height)` mm) a circuit's
+/// parts fit on — [`minimum_hp`]'s counterpart for a board with no panel, such
+/// as an MCU board (legion-of-bom-y17.3). Square, grown 1mm at a time from the
+/// parts' own total keep-out area (a 100%-packed lower bound) until the same
+/// placer the build uses fits everything legally.
+///
+/// Like [`minimum_hp`], a floor: it proves the parts fit, not that the router
+/// can connect them in what is left.
+pub fn minimum_free_outline(
+    circuit: &dyn CircuitSource,
+    facts: &HashMap<String, PartFacts>,
+) -> (f64, f64) {
+    const MAX_SIDE_MM: f64 = 300.0;
+    let area: f64 = circuit
+        .parts()
+        .iter()
+        .filter_map(|p| facts.get(&p.refdes.0))
+        .map(|f| f.extent.0 * f.extent.1)
+        .sum();
+    // No single part may be wider than the board, whatever the total area.
+    let widest = facts
+        .values()
+        .map(|f| f.extent.0.max(f.extent.1))
+        .fold(0.0, f64::max);
+    let mut side = area.sqrt().max(widest).ceil();
+    while side < MAX_SIDE_MM {
+        if fits_outline(circuit, facts, side, side, HashMap::new()) {
+            return (side, side);
+        }
+        side += 1.0;
+    }
+    (MAX_SIDE_MM, MAX_SIDE_MM)
+}
+
+/// Set a board with **no panel** (an MCU board, a regulator) up as a free
+/// rectangle sized to its parts — [`minimum_free_outline`] — laid out by the
+/// same seeded placer as a panel board, with nothing anchored. Sets the outline
+/// and placer on `options` (so a one-shot build uses them too) and returns the
+/// template for [`crate::layout::run_layout_loop`].
+pub fn free_outline_template(
+    circuit: &dyn CircuitSource,
+    options: &mut BoardOptions,
+) -> Result<SeededPlacer, BoardError> {
+    let facts = build_facts(circuit, &options.footprint_dir)?;
+    let (w, h) = minimum_free_outline(circuit, &facts);
+    let template = SeededPlacer::new(w, h, (0.0, 0.0), HashMap::new());
+    options.fixed_outline = Some((0.0, 0.0, w, h));
+    options.placer = Box::new(template.clone());
+    Ok(template)
+}
+
+/// Does everything fit on a `w × h` board, with `anchors` pinned — no part
+/// pushed into the placer's overflow lane, and no physical rule broken once
+/// legalized, exactly as the build would place it?
+fn fits_outline(
+    circuit: &dyn CircuitSource,
+    facts: &HashMap<String, PartFacts>,
+    w: f64,
+    h: f64,
+    anchors: HashMap<String, (f64, f64)>,
+) -> bool {
+    {
         // Measure with the SAME placer the build uses (SeededPlacer): it packs
         // back-side SMD *under* front-side THT controls, so the min HP reflects
         // the real, tight layout — not the looser side-unaware EurorackPlacer.
@@ -1685,11 +1744,8 @@ pub fn minimum_hp(circuit: &dyn CircuitSource, facts: &HashMap<String, PartFacts
         // copper_edge_clearance errors at 4 HP went from 5 to 0. Restored.
         crate::legalize::legalize_pinning(&mut placements, &rules, facts, &pinned);
         let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
-        if !overflowed && broken[0] <= 0.0 {
-            return hp;
-        }
+        !overflowed && broken[0] <= 0.0
     }
-    MAX_HP
 }
 
 /// Generate a `.kicad_pcb` for a circuit: footprints assigned + placed + net-wired,
