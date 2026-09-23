@@ -1939,21 +1939,7 @@ pub fn generate_board_artifacts(
                 h_mm: ph,
                 layer,
             };
-            // Resolve the pad's net by pad number, then (for a sub-board) by any of
-            // the pad's function names — so `AUDIO_OUT_L` wires to pad 18.
-            let net_name: Option<&str> = pin_net
-                .get(&(refdes.to_string(), pad.num.clone()))
-                .copied()
-                .or_else(|| {
-                    pin_labels
-                        .get(refdes)
-                        .and_then(|m| m.get(&pad.num))
-                        .and_then(|names| {
-                            names.iter().find_map(|n| {
-                                pin_net.get(&(refdes.to_string(), n.clone())).copied()
-                            })
-                        })
-                });
+            let net_name = resolve_pad_net(&pin_net, &pin_labels, refdes, &pad.num);
             match net_name.and_then(|name| net_index.get(name).map(|&idx| (idx, name))) {
                 Some((idx, name)) => net_pads
                     .entry(idx)
@@ -1988,6 +1974,7 @@ pub fn generate_board_artifacts(
             options.silk_values,
             placement,
             &pin_net,
+            &pin_labels,
             &net_index,
         ));
     }
@@ -2533,6 +2520,48 @@ fn load_footprint(dir: &Path, lib_part: &str) -> Result<Sexpr, BoardError> {
     })
 }
 
+/// Resolve a physical pad's net: by its own function name/aliases first,
+/// then its raw pad number — *unless* that raw number is itself claimed as
+/// an alias by some *other*, different pad on the same sub-board, in which
+/// case trusting it would silently steal a net actually meant for that
+/// other pad. (Seed2 DFM pad A1's own name is VIN, but "A1" is also pad
+/// C1's alias for "analog input 1" — a net wired to "A1" means C1, never
+/// A1's own VIN.) A synthesized sub-board like Daisy_Seed has no such
+/// collision (pad numbers are bare digits, names/aliases are
+/// letter-prefixed), so it keeps resolving by raw number exactly as an
+/// ordinary, non-sub-board part does.
+fn resolve_pad_net<'a>(
+    pin_net: &HashMap<(String, String), &'a str>,
+    pin_labels: &HashMap<String, HashMap<String, Vec<String>>>,
+    refdes: &str,
+    pad_num: &str,
+) -> Option<&'a str> {
+    match pin_labels.get(refdes) {
+        Some(names_by_pad) => names_by_pad
+            .get(pad_num)
+            .and_then(|names| {
+                names
+                    .iter()
+                    .find_map(|n| pin_net.get(&(refdes.to_string(), n.clone())).copied())
+            })
+            .or_else(|| {
+                let claimed_elsewhere = names_by_pad
+                    .iter()
+                    .any(|(other, names)| other != pad_num && names.iter().any(|n| n == pad_num));
+                if claimed_elsewhere {
+                    None
+                } else {
+                    pin_net
+                        .get(&(refdes.to_string(), pad_num.to_string()))
+                        .copied()
+                }
+            }),
+        None => pin_net
+            .get(&(refdes.to_string(), pad_num.to_string()))
+            .copied(),
+    }
+}
+
 /// Turn a library footprint into a placed, net-wired board footprint: set the
 /// `lib:name`, insert placement + uuid, set the reference designator, and inject
 /// each connected pad's net.
@@ -2545,6 +2574,7 @@ fn transform_footprint(
     silk_values: SilkValues,
     placement: Placement,
     pin_net: &HashMap<(String, String), &str>,
+    pin_labels: &HashMap<String, HashMap<String, Vec<String>>>,
     net_index: &HashMap<&str, usize>,
 ) -> Sexpr {
     let items = fp.as_list_mut().expect("a footprint is a list");
@@ -2638,7 +2668,7 @@ fn transform_footprint(
                 let pad_num = item.nth_atom(1).unwrap_or_default().to_string();
                 turn_pad_with_footprint(item, placement.rotation_deg);
                 if let Some(l) = item.as_list_mut() {
-                    if let Some(&name) = pin_net.get(&(refdes.to_string(), pad_num.clone())) {
+                    if let Some(name) = resolve_pad_net(pin_net, pin_labels, refdes, &pad_num) {
                         let idx = net_index.get(name).copied().unwrap_or(0);
                         let net = Sexpr::list(vec![
                             Sexpr::sym("net"),
@@ -3542,6 +3572,7 @@ mod tests {
                 },
                 &HashMap::new(),
                 &HashMap::new(),
+                &HashMap::new(),
             )
         };
         // Unrotated: the library angles stand.
@@ -4053,11 +4084,7 @@ mod tests {
             nets: vec![
                 Net::new(
                     "CONTROL",
-                    vec![
-                        PinRef::new("M1", "D16"),
-                        PinRef::new("M1", "A1"),
-                        PinRef::new("M1", "ADC1"),
-                    ],
+                    vec![PinRef::new("M1", "D16"), PinRef::new("M1", "ADC1")],
                 ),
                 Net::new(
                     "AUDIO_DIFF",
@@ -4080,9 +4107,55 @@ mod tests {
             art.pcb.contains("(segment"),
             "semantic Seed2 DFM names become routed copper"
         );
-        assert!(art.pcb.contains(r#"(pad "C1""#), "D16/A1/ADC1 maps to C1");
+        assert!(
+            pad_block(&art.pcb, "C1").contains(r#"(net 2 "CONTROL")"#),
+            "D16/ADC1 maps to C1, and C1 actually carries the CONTROL net"
+        );
         assert!(art.pcb.contains(r#"(pad "D5""#), "AUDIO_OUT_L+ maps to D5");
         assert_eq!(subboard_standoff("LobModule:DAISY_SEED2_DFM"), None);
+    }
+
+    /// The exact bug a live Blender/DRC pass once caught: Seed2 DFM pad A1's
+    /// real name is VIN, but "A1" is *also* pad C1's alias for "analog input
+    /// 1" (matching Daisy's own pin-naming convention, not the KiCad
+    /// footprint's row+column designator). A net wired to alias "A1" must
+    /// land on C1 — never silently steal onto the unrelated physical pad A1
+    /// and short it to VIN. 20 of Seed2 DFM's 50 pads have this exact kind
+    /// of alias/designator collision (subboard.rs's `SEED2_DFM_PINS`); C1/A1
+    /// is the representative case.
+    #[test]
+    fn seed2_dfm_alias_collision_does_not_short_the_real_pad_it_collides_with() {
+        let seed2 = Circuit {
+            name: "seed2-carrier".into(),
+            parts: vec![
+                Part::new("M1", "DAISY_SEED2_DFM").with_footprint("LobModule:DAISY_SEED2_DFM")
+            ],
+            nets: vec![Net::new("CV1_ADC", vec![PinRef::new("M1", "A1")])],
+        };
+        let art = generate_board_artifacts(&seed2, &BoardOptions::new("/nonexistent"))
+            .expect("Seed2 DFM carrier generates");
+
+        assert!(
+            pad_block(&art.pcb, "C1").contains(r#"(net 1 "CV1_ADC")"#),
+            "alias A1 (analog input 1) must resolve to physical pad C1 (D16/ADC1)"
+        );
+        assert!(
+            !pad_block(&art.pcb, "A1").contains("CV1_ADC"),
+            "physical pad A1 (VIN) must NOT be shorted onto a net meant for C1's alias"
+        );
+    }
+
+    /// The text of one `(pad "<num>" ...)` block, up to the next pad or the
+    /// end of the footprint — so a test can assert what a *specific* pad
+    /// carries, not just that the string appears somewhere in the board.
+    fn pad_block<'a>(pcb: &'a str, pad_num: &str) -> &'a str {
+        let needle = format!(r#"(pad "{pad_num}""#);
+        let start = pcb
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no pad {pad_num} in board"));
+        let rest = &pcb[start + needle.len()..];
+        let end = rest.find("(pad \"").unwrap_or(rest.len());
+        &rest[..end]
     }
 
     #[test]
@@ -4455,6 +4528,7 @@ mod tests {
             },
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .to_sexpr_string();
         assert!(out.contains(r#""Reference" "C7""#), "refdes set: {out}");
@@ -4490,6 +4564,7 @@ mod tests {
                     rotation_deg: 0.0,
                     back: false,
                 },
+                &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
             )
@@ -4567,6 +4642,7 @@ mod tests {
                 },
                 &HashMap::new(),
                 &HashMap::new(),
+                &HashMap::new(),
             )
             .to_sexpr_string()
         };
@@ -4614,6 +4690,7 @@ mod tests {
                 rotation_deg: 0.0,
                 back: true,
             },
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         )
