@@ -39,6 +39,7 @@ pub mod layout;
 pub mod legalize;
 pub mod logo;
 pub mod manifest;
+pub mod mcu_audio;
 pub mod model;
 pub mod module_port;
 pub mod mouser;

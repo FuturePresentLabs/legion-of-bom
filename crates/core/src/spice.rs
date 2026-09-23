@@ -329,7 +329,10 @@ fn netlist_body(
         // Connectors and mechanical parts (jacks, headers, mounting holes, test
         // points) carry no SPICE device — their pins are just net junctions. Skip
         // them rather than demanding a model.
-        if is_electrical_noop(part) {
+        // Parts the circuit declares out of simulation (`Sim.Enable = 0`) are
+        // skipped the same way; if one sat in the middle of an analog path its
+        // nodes float and SPICE says so, which is the right failure.
+        if is_electrical_noop(part) || part.sim_excluded {
             continue;
         }
 
@@ -418,6 +421,63 @@ fn netlist_body(
 /// mechanical part (jack, header, mounting hole, test point) that contributes no
 /// SPICE device, only net junctions. Recognised by the `J` reference prefix or a
 /// connector/mechanical footprint.
+/// Whether `from` reaches `to` through parts that are actually simulated — i.e.
+/// whether there is an **analog** signal path to run AC/transient analysis on.
+///
+/// `Err` lists the declared-out-of-simulation parts (`Sim.Enable = 0`) that the
+/// two nets *are* joined through, which is what a converter board looks like:
+/// line in reaches line out only by way of an ADC, a processor and a DAC, and
+/// "the passband gain of IN_L to OUT_L" is not a question SPICE can answer.
+/// Connectors and test points join nothing (their pins are separate nets).
+pub fn analog_path(circuit: &dyn CircuitSource, from: &str, to: &str) -> Result<(), Vec<String>> {
+    use std::collections::{HashSet, VecDeque};
+    let reach = |through_excluded: bool| {
+        let mut seen: HashSet<&str> = HashSet::from([from]);
+        let mut queue: VecDeque<&str> = VecDeque::from([from]);
+        let mut via: HashSet<&str> = HashSet::new();
+        while let Some(net) = queue.pop_front() {
+            for part in circuit.parts() {
+                if is_electrical_noop(part) || (part.sim_excluded && !through_excluded) {
+                    continue;
+                }
+                let r = part.refdes.0.as_str();
+                let on: Vec<&str> = circuit
+                    .nets()
+                    .iter()
+                    .filter(|n| n.pins.iter().any(|p| p.refdes.0 == r))
+                    .map(|n| n.name.as_str())
+                    .collect();
+                if !on.contains(&net) {
+                    continue;
+                }
+                if part.sim_excluded {
+                    via.insert(r);
+                }
+                // Rails and ground are AC ground, not signal: every part touches
+                // one, so walking them would join everything to everything.
+                for n in on {
+                    let rail = crate::model::is_ground_net(n) || crate::model::is_supply_rail(n);
+                    if !rail && seen.insert(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+        (seen.contains(to), via)
+    };
+    if reach(false).0 {
+        return Ok(());
+    }
+    let (joined, via) = reach(true);
+    let mut via: Vec<String> = if joined {
+        via.into_iter().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
+    via.sort();
+    Err(via)
+}
+
 fn is_electrical_noop(part: &crate::model::Part) -> bool {
     if part.refdes.0.starts_with('J') {
         return true;
@@ -969,6 +1029,52 @@ mod tests {
     use super::*;
     use crate::model::{Circuit, Net, Part, PinRef};
 
+    /// A line-in → ADC → DAC → line-out board has no analog path to simulate;
+    /// an RC filter does, and sharing a ground with the converters does not
+    /// join the two sides.
+    #[test]
+    fn an_analog_path_goes_through_simulated_parts_and_not_through_ground() {
+        let excluded = |r: &str| Part {
+            sim_excluded: true,
+            ..Part::new(r, "CODEC")
+        };
+        let net = |name: &str, pins: &[(&str, &str)]| {
+            Net::new(
+                name,
+                pins.iter().map(|(r, p)| PinRef::new(*r, *p)).collect(),
+            )
+        };
+        let converter = Circuit {
+            name: "converter".into(),
+            parts: vec![
+                Part::new("C1", "1u"),
+                excluded("U1"),
+                Part::new("R1", "470"),
+                Part::new("R2", "10k"),
+            ],
+            nets: vec![
+                net("IN_L", &[("C1", "1")]),
+                net("ADC_IN", &[("C1", "2"), ("U1", "1")]),
+                net("DAC_OUT", &[("U1", "2"), ("R1", "1")]),
+                net("OUT_L", &[("R1", "2"), ("R2", "1")]),
+                net("GND", &[("R2", "2"), ("U1", "3")]),
+            ],
+        };
+        assert_eq!(
+            analog_path(&converter, "IN_L", "OUT_L"),
+            Err(vec!["U1".to_string()])
+        );
+
+        let mut filter = converter.clone();
+        filter.parts[1].sim_excluded = false;
+        assert_eq!(
+            analog_path(&filter, "IN_L", "OUT_L"),
+            Ok(()),
+            "an un-excluded part — even one with no model yet — is a path, so a \
+             missing model still fails the simulation loudly"
+        );
+    }
+
     fn rc_lowpass() -> Circuit {
         Circuit {
             name: "rc_lowpass".into(),
@@ -1188,6 +1294,7 @@ mod tests {
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
                     mpn: None,
                     sim: None,
+                    sim_excluded: false,
                     side: None,
                 },
                 Part::new("R1", "9k"),

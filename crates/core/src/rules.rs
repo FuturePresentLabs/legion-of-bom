@@ -1092,6 +1092,7 @@ mod tests {
                 library_part: None,
                 mpn: None,
                 sim: None,
+                sim_excluded: false,
                 side: None,
             }],
             nets: vec![],

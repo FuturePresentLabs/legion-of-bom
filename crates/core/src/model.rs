@@ -80,6 +80,11 @@ pub struct Part {
     /// SPICE model carried by the part, if it declares one (`Sim.*` fields). A
     /// primitive (R/C/L) carries none. This is the seam the parts library fills.
     pub sim: Option<SimModel>,
+    /// Declared out of simulation (KiCad's `Sim.Enable = 0`): an MCU, a codec,
+    /// a crystal — parts that are not an analog circuit a SPICE netlist models.
+    /// The declaration is the author's, so a part merely *missing* a model is
+    /// still an error, not a silent exclusion.
+    pub sim_excluded: bool,
     /// The board side this part is declared to mount on (a `Side` field). `None`
     /// means the default, front.
     pub side: Option<Side>,
@@ -96,6 +101,7 @@ impl Part {
             library_part: None,
             mpn: None,
             sim: None,
+            sim_excluded: false,
             side: None,
         }
     }

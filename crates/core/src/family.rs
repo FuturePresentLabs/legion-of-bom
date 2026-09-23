@@ -13,6 +13,7 @@
 use ooda::{Client, Trace};
 use serde::{Deserialize, Serialize};
 
+use crate::mcu_audio::{generate_stm32_codec_spec, render_stm32_codec_skidl, Stm32CodecSpec};
 use crate::panel::PanelFile;
 use crate::pedal_panel::fuzz_pedal_panel_file;
 use crate::spec::{generate_fuzz_pedal_spec, render_skidl, FuzzPedalSpec, SpecError};
@@ -26,10 +27,12 @@ pub enum Spec {
     /// Written by `lob spec-chain`, which takes constraints `lob spec` does
     /// not; it is not reachable through [`generate`].
     FuzzChain(FuzzChain),
+    /// An STM32H7 audio board with one of three codec options.
+    Stm32Codec(Stm32CodecSpec),
 }
 
 /// The families [`generate`] decides — what `lob spec <family>` accepts.
-pub const FAMILIES: &[&str] = &["fuzz-pedal"];
+pub const FAMILIES: &[&str] = &["fuzz-pedal", "stm32-codec"];
 
 /// Unknown family, or a decision that failed.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +53,9 @@ pub fn generate(
 ) -> Result<Spec, FamilyError> {
     match family {
         "fuzz-pedal" => Ok(Spec::FuzzPedal(generate_fuzz_pedal_spec(
+            client, trace, brief,
+        )?)),
+        "stm32-codec" => Ok(Spec::Stm32Codec(generate_stm32_codec_spec(
             client, trace, brief,
         )?)),
         other => Err(FamilyError::Unknown(other.to_string())),
@@ -75,6 +81,7 @@ impl Spec {
         match self {
             Spec::FuzzPedal(_) => "fuzz-pedal",
             Spec::FuzzChain(_) => "fuzz-chain",
+            Spec::Stm32Codec(_) => "stm32-codec",
         }
     }
 
@@ -83,6 +90,7 @@ impl Spec {
         match self {
             Spec::FuzzPedal(s) => render_skidl(s),
             Spec::FuzzChain(c) => render_chain_skidl(c),
+            Spec::Stm32Codec(s) => render_stm32_codec_skidl(s),
         }
     }
 
@@ -93,6 +101,8 @@ impl Spec {
         let size = match self {
             Spec::FuzzPedal(s) => s.enclosure_size,
             Spec::FuzzChain(c) => c.enclosure_size,
+            // A board, not a front panel: its outline comes from its parts.
+            Spec::Stm32Codec(_) => return None,
         };
         Some(fuzz_pedal_panel_file(size, ("RV1", "RV2"), 1.6))
     }
@@ -119,6 +129,18 @@ mod tests {
             Spec::from_json(bare).unwrap(),
             Spec::FuzzPedal(fuzz_pedal_spec())
         );
+    }
+
+    #[test]
+    fn an_mcu_board_spec_round_trips_and_has_no_panel() {
+        let spec = Spec::Stm32Codec(Stm32CodecSpec {
+            codec: crate::mcu_audio::Codec::Es8388,
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["family"], "stm32-codec");
+        assert_eq!(json["codec"], "es8388");
+        assert_eq!(Spec::from_json(json).unwrap(), spec);
+        assert!(spec.panel().is_none(), "a board has no front panel");
     }
 
     #[test]

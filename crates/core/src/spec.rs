@@ -44,6 +44,9 @@ use ooda::{Answer, Client, Criteria, Question, Request, Trace};
 pub enum SpecError {
     #[error("decision failed: {0}")]
     Decision(#[from] ooda::Error),
+    /// A decision came back outside the options it was asked to choose from.
+    #[error("unexpected decision: {0}")]
+    Unexpected(String),
 }
 
 /// A question kind's lowercase tag, for display — [`ooda::Kind`] has no

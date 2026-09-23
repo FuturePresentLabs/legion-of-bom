@@ -598,6 +598,7 @@ mod tests {
             library_part: None,
             mpn: None,
             sim: None,
+            sim_excluded: false,
             side: None,
         };
         let node = |r: &str, p: &str| PinRef {

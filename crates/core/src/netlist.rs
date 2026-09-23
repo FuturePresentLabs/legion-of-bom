@@ -77,6 +77,7 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 library_part,
                 mpn,
                 sim,
+                sim_excluded: field_value(comp, "Sim.Enable").is_some_and(|v| v.trim() == "0"),
                 side,
             });
         }

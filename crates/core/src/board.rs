@@ -3537,6 +3537,7 @@ mod tests {
             library_part: None,
             mpn: None,
             sim: None,
+            sim_excluded: false,
             side: None,
         };
         let node = |r: &str, p: &str| PinRef {
@@ -3592,6 +3593,7 @@ mod tests {
                 library_part: None,
                 mpn: None,
                 sim: None,
+                sim_excluded: false,
                 side: None,
             }],
             nets: vec![],
@@ -3619,6 +3621,7 @@ mod tests {
             library_part: None,
             mpn: None,
             sim: None,
+            sim_excluded: false,
             side: None,
         };
         let c = Circuit {
@@ -3778,6 +3781,7 @@ mod tests {
                 library_part: None,
                 mpn: None,
                 sim: None,
+                sim_excluded: false,
                 side: None,
             }],
             nets: vec![],
@@ -5006,6 +5010,7 @@ mod tests {
             library_part: None,
             mpn: None,
             sim: None,
+            sim_excluded: false,
             // Declared front, exactly as SKiDL writes it — the house rule for a
             // Eurorack power header still has to win, or no board gets it right.
             side: Some(Side::Front),

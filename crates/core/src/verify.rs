@@ -354,6 +354,7 @@ mod tests {
                     library_part: Some("Simulation_SPICE:OPAMP".into()),
                     mpn: None,
                     sim: None,
+                    sim_excluded: false,
                     side: None,
                 },
                 Part::new("R1", rf), // feedback: OUT ↔ FB

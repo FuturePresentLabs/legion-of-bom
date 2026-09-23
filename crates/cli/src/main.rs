@@ -700,8 +700,23 @@ fn run(circuit: PathBuf) -> Result<()> {
     let sim_config = SimConfig::infer(&model);
     let net_names: std::collections::HashSet<&str> =
         model.nets().iter().map(|n| n.name.as_str()).collect();
-    let has_signal_path = net_names.contains(sim_config.input_net.as_str())
+    let has_io = net_names.contains(sim_config.input_net.as_str())
         && net_names.contains(sim_config.output_net.as_str());
+    // Input and output joined only through parts the circuit declares out of
+    // simulation (an ADC, a processor, a DAC) is a converter board, not an
+    // analog signal path: there is no passband gain to measure.
+    let converter_only = has_io
+        .then(|| {
+            legion_of_bom_core::spice::analog_path(
+                &model,
+                &sim_config.input_net,
+                &sim_config.output_net,
+            )
+            .err()
+            .filter(|via| !via.is_empty())
+        })
+        .flatten();
+    let has_signal_path = has_io && converter_only.is_none();
 
     let ac_result = if has_signal_path {
         let ac = simulate_ac(&model, &sim_config, &work_dir)
@@ -741,6 +756,16 @@ fn run(circuit: PathBuf) -> Result<()> {
         }
 
         Some(ac)
+    } else if let Some(via) = converter_only {
+        report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
+            "'{}' reaches '{}' only through {} (declared Sim.Enable = 0) — a \
+             converter path, not an analog one; AC/transient/crosstalk analysis \
+             doesn't apply",
+            sim_config.input_net,
+            sim_config.output_net,
+            via.join(", ")
+        ))));
+        None
     } else {
         report.push(StageOutcome::passed("simulate").with(Finding::info(format!(
             "no recognizable signal-path net ('{}'/'{}' not present — have: {}) — \

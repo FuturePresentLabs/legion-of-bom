@@ -186,7 +186,7 @@ pub fn generate_pierce_oscillator(
 /// [`crate::spec`]'s own `round_e12` convention for resistors — a computed
 /// value should land on something actually buyable, not a mathematically
 /// exact but unpurchasable number).
-fn round_e12_pf(pf: f64) -> f64 {
+pub(crate) fn round_e12_pf(pf: f64) -> f64 {
     const E12: [f64; 12] = [1.0, 1.2, 1.5, 1.8, 2.2, 2.7, 3.3, 3.9, 4.7, 5.6, 6.8, 8.2];
     if pf <= 0.0 {
         return 0.0;
@@ -296,7 +296,7 @@ if __name__ == "__main__":
 
 /// A picofarad value as SKiDL-style text (`"33p"`, matching the existing
 /// `"2.2u"`/`"150k"` convention elsewhere in this crate's generated code).
-fn fmt_pf(pf: f64) -> String {
+pub(crate) fn fmt_pf(pf: f64) -> String {
     if (pf - pf.round()).abs() < 1e-6 {
         format!("{}p", pf.round() as i64)
     } else {

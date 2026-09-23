@@ -41,6 +41,55 @@ pub struct Citation {
     pub quote: &'static str,
 }
 
+/// What a design fact rests on.
+///
+/// Some facts cannot be checked by machine: WM8731's supply decoupling exists
+/// only in a schematic figure (p.60, no text layer) and OCR misreads it
+/// (0.1uF comes back as "0.4uF"). Those are a [`Evidence::Reading`] — what a
+/// reader saw on that page — and count only once a person has confirmed it,
+/// the same human-verification gate the parts library applies to pinouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// Verbatim text on a page: checked mechanically by [`verify`].
+    Quote(Citation),
+    /// A value read off a figure, or a fact the pinned sources do not state.
+    /// `source`/`page` say where to look; `None` means no pinned document
+    /// states it at all.
+    Reading {
+        source: Option<&'static Datasheet>,
+        page: usize,
+        what: &'static str,
+        /// Who confirmed the reading against the source (a person, by name).
+        confirmed_by: Option<&'static str>,
+    },
+}
+
+impl Evidence {
+    /// The mechanically checkable citation, if this is one.
+    pub fn quote(&self) -> Option<&Citation> {
+        match self {
+            Evidence::Quote(c) => Some(c),
+            Evidence::Reading { .. } => None,
+        }
+    }
+
+    /// A reading no person has confirmed yet — what the human gate reports.
+    pub fn unconfirmed(&self) -> Option<String> {
+        match self {
+            Evidence::Reading {
+                source,
+                page,
+                what,
+                confirmed_by: None,
+            } => Some(match source {
+                Some(ds) => format!("{} p.{page}: {what}", ds.part),
+                None => format!("unsourced: {what}"),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// The shared datasheet cache (override with `LOB_DATASHEET_CACHE`), keyed by
 /// hash so a revised upstream PDF can never overwrite a pinned one.
 pub fn default_cache_dir() -> PathBuf {
