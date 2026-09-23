@@ -1,17 +1,57 @@
+<div align="center">
+
 # legion-of-bom
+
+### Prompt to PCB.
+
+*One sentence in. A placed, routed, DRC-checked board out — and every value on it has a receipt.*
+
+[![license](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](#license)
+[![rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg?logo=rust)](https://www.rust-lang.org)
+[![kicad](https://img.shields.io/badge/KiCad-9-314cb0.svg)](https://www.kicad.org)
+[![tests](https://img.shields.io/badge/tests-572%20passing-brightgreen.svg)](#dev-loop)
+[![families](https://img.shields.io/badge/curated%20families-2-8a2be2.svg)](#the-pipeline)
+[![datasheets](https://img.shields.io/badge/pinned%20datasheets-7-orange.svg)](#the-pipeline)
+[![benchmarked](https://img.shields.io/badge/benchmarked%20by-PCBBench-black.svg)](https://github.com/FuturePresentLabs/pcbbench)
 
 *SKiDLs are better with friends.*
 
-**legion-of-bom** turns circuit-as-code into manufacturing-ready outputs — placed
-and routed boards, panels, Gerbers, a JLCPCB assembly package, build guides and a
-priced BOM — in one pipeline instead of KiCad + spreadsheets + manual ordering
-scattered across tools. It started with [Puget Audio](https://pugetaudio.com)
-Eurorack modules and now designs small digital boards too.
+</div>
 
-Status: **in use.** The Puget Audio slew limiter builds from source to a
-DRC-clean fab package, and the first microcontroller family (an STM32H743 audio
-board) runs the design pipeline end to end. See [`DESIGN.md`](./DESIGN.md) for
-the full design and [marbles](#issue-tracking) for the live task graph.
+```bash
+lob spec stm32-codec --brief "stereo line in and out, no I2C setup" --out design
+lob schematic design.json --out board.py
+lob board board.py && lob drc out/board/board.kicad_pcb
+```
+
+That's a design brief becoming an STM32H743 audio board: a codec **decided**
+from what you asked for, pins wired by the names in the official KiCad symbols,
+every capacitor and strap **cited** to a page of a pinned datasheet, then placed,
+routed and checked by KiCad's own DRC. No schematic drawn by hand, no pinout
+typed from memory, no value you can't trace.
+
+**legion-of-bom** turns circuit-as-code into manufacturing-ready outputs —
+placed and routed boards, panels, Gerbers, a JLCPCB assembly package, build
+guides and a priced BOM — in one pipeline instead of KiCad + spreadsheets +
+manual ordering scattered across tools. It started with
+[Puget Audio](https://pugetaudio.com) Eurorack modules and now designs
+microcontroller boards too.
+
+- 🎛️ **Ships real hardware.** The Puget Audio slew limiter builds from source to a
+  DRC-clean, 0-unconnected fab package.
+- 🧠 **Decides, doesn't hallucinate.** Every design choice is a bounded, typed
+  decision — a choice, a probability, a rubric score — never free text. The
+  rest is a pure function of those answers.
+- 🧾 **Cites everything.** 0.5 mm pins escape through a router that measures
+  clearance in exact geometry; decoupling values come with a verbatim datasheet
+  quote a machine checks; anything it can't check waits for a human to sign.
+- 📏 **Keeps score.** [PCBBench](https://github.com/FuturePresentLabs/pcbbench)
+  runs brief → board → DRC against a rubric, so "does it work" has a number.
+
+*(Badge numbers are generated — run `scripts/update-badges.sh` after tests,
+families or datasheets change; don't hand-edit them.)* See
+[`DESIGN.md`](./DESIGN.md) for the full design and [marbles](#issue-tracking)
+for the live task graph.
 
 ## The pipeline
 
