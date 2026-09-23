@@ -1,0 +1,42 @@
+[
+  {
+    "key": "line_in",
+    "question": "Does the board need a stereo line-level audio input?",
+    "role": "i2s-adc",
+    "interface": "audio-line-in",
+    "port": "stereo-audio",
+    "net": "LINE_IN"
+  },
+  {
+    "key": "line_out",
+    "question": "Does the board need a stereo line-level audio output?",
+    "role": "i2s-dac",
+    "interface": "audio-line-out",
+    "port": "stereo-audio",
+    "net": "LINE_OUT"
+  },
+  {
+    "key": "mic_in",
+    "question": "Does the board need a microphone input?",
+    "role": "mic-in",
+    "interface": "audio-mic-in",
+    "port": "mono-audio",
+    "net": "MIC_IN"
+  },
+  {
+    "key": "headphone_out",
+    "question": "Does the board need to drive headphones directly?",
+    "role": "headphone-out",
+    "interface": "headphone-out",
+    "port": "stereo-audio",
+    "net": "HEADPHONE"
+  },
+  {
+    "key": "subghz_radio",
+    "question": "Does the board need a sub-GHz radio (LoRa or an ISM band such as 433, 868 or 915 MHz)?",
+    "role": "radio-subghz",
+    "interface": "rf",
+    "port": "rf",
+    "net": "RF"
+  }
+]

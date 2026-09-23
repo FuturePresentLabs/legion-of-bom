@@ -65,7 +65,11 @@ pub fn generate(
         )?)),
         "board" => {
             let catalog = Catalog::load(&default_catalog_dir())?;
-            Ok(Spec::Board(synth::design(client, trace, brief, &catalog)?))
+            let symbols = crate::skidl::kicad_symbol_dir();
+            let symbol_dir = symbols.as_ref().map(|s| s.path());
+            Ok(Spec::Board(synth::design(
+                client, trace, brief, &catalog, symbol_dir,
+            )?))
         }
         other => Err(FamilyError::Unknown(other.to_string())),
     }

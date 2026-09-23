@@ -124,7 +124,7 @@ pub enum Signal {
 pub struct Support {
     /// `pin:NAME`, `net:NAME` or `node:NAME`.
     pub between: [String; 2],
-    /// `tie` (a direct connection), `C`, `CP` (polarised), or `R`.
+    /// `tie` (a direct connection), `C`, `CP` (polarised), `L`, or `R`.
     pub part: String,
     #[serde(default)]
     pub value: Option<String>,
@@ -183,6 +183,27 @@ impl Endpoint {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
     pub parts: Vec<CatalogPart>,
+    /// The requirement vocabulary (`features.json` beside the parts
+    /// directory): what a brief can ask for, and the role, interface and
+    /// connector port that meet it.
+    pub features: Vec<Feature>,
+}
+
+/// One requirement a brief can ask of a board.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Feature {
+    pub key: String,
+    /// The yes/no question put to the decider.
+    pub question: String,
+    /// The role a catalog part must provide to meet it.
+    pub role: String,
+    /// That part's interface which carries it out to the world.
+    pub interface: String,
+    /// The connector port kind it lands on.
+    pub port: String,
+    /// Board net prefix for its signals.
+    pub net: String,
 }
 
 /// A catalog that could not be loaded.
@@ -249,7 +270,20 @@ impl Catalog {
             }
             parts.push(part);
         }
-        Ok(Catalog { parts })
+        // The vocabulary sits beside the parts; a parts-only directory has none.
+        let features_path = dir.parent().map(|p| p.join("features.json"));
+        let features = match features_path.filter(|p| p.is_file()) {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path).map_err(|source| CatalogError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                serde_json::from_str(&text)
+                    .map_err(|source| CatalogError::Parse { path, source })?
+            }
+            None => Vec::new(),
+        };
+        Ok(Catalog { parts, features })
     }
 
     /// A hash of every part's content, in part order: what a design spec
@@ -266,6 +300,11 @@ impl Catalog {
             );
             h.update([0]);
         }
+        h.update(
+            serde_json::to_string(&self.features)
+                .expect("features serialize")
+                .as_bytes(),
+        );
         h.finalize()[..8]
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -297,8 +336,11 @@ impl CatalogPart {
                     out.push(m);
                 }
             }
-            if !matches!(s.part.as_str(), "tie" | "C" | "CP" | "R") {
-                out.push(format!("support part {:?} is not tie, C, CP or R", s.part));
+            if !matches!(s.part.as_str(), "tie" | "C" | "CP" | "L" | "R") {
+                out.push(format!(
+                    "support part {:?} is not tie, C, CP, L or R",
+                    s.part
+                ));
             }
             if s.part != "tie" && s.value.is_none() {
                 out.push(format!("{} between {:?} has no value", s.part, s.between));
@@ -499,9 +541,9 @@ mod tests {
             (r#"["AVDD", "net:GND"]"#, "tie", "", "not pin:/net:/node:"),
             (
                 r#"["pin:AVDD", "net:GND"]"#,
-                "L",
+                "D",
                 r#", "value": "1u""#,
-                "not tie, C, CP or R",
+                "not tie, C, CP, L or R",
             ),
             (r#"["pin:AVDD", "net:GND"]"#, "C", "", "has no value"),
         ];

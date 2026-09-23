@@ -1,19 +1,23 @@
 //! Synthesis: a brief becomes a circuit by typed decisions over the catalog
 //! (legion-of-bom-uvdm).
 //!
-//! Nothing here knows any board. The steps:
+//! Nothing here knows any board, or any domain: what a brief can ask for is
+//! the catalog's feature vocabulary (`catalog/features.json`), and what can
+//! meet it is the catalog's parts. The steps:
 //!
-//! 1. **Requirements** — a fixed vocabulary ([`FEATURES`]), each a yes/no
-//!    typed decision answered from the brief.
-//! 2. **Parts** — every slot (the audio parts, the MCU, the regulator, the
-//!    crystal, each connector) is filled by [`pick`] from the catalog parts
-//!    that can fill it: one candidate is *derived*, several are a typed
-//!    **choice**. The audio slot's candidates are the *minimal* sets of
-//!    catalog parts that cover the required roles.
-//! 3. **Bindings** — each bus between the MCU and a peripheral is bound to one
-//!    of the MCU's peripheral instances that can carry every signal the bus
-//!    needs (a choice again); pins within the instance follow from the KiCad
-//!    symbol's alternates, lowest-numbered free pin first.
+//! 1. **Requirements** — each feature a yes/no typed decision from the brief.
+//! 2. **Parts** — every slot is filled by [`pick`] from the catalog parts that
+//!    can fill it: one candidate is *derived*, several are a typed **choice**.
+//!    The `function` slot's candidates are the minimal sets of parts covering
+//!    the required roles; then the MCU (one with a master for every bus those
+//!    parts are slaves on), whatever any chosen part `needs` (a crystal),
+//!    the rail regulators, and a connector per port.
+//! 3. **Bindings** — each bus is bound to one of the MCU's peripheral
+//!    instances that can carry every signal it needs (a choice); each option
+//!    tells the decider which pins it would use and on which side of the
+//!    package they sit. Pins follow the KiCad symbol's alternates, lowest-
+//!    numbered free pin first; control lines (`gpio`, a missing `cs`) take
+//!    free port pins.
 //!
 //! The [`DesignSpec`] records every outcome plus the catalog's fingerprint, so
 //! [`circuit`] — spec to SKiDL — is a pure function of it, and refuses a
@@ -31,55 +35,6 @@ use crate::skidl_emit::{Circuit, EmitPart, PinRef, SymbolSrc};
 use crate::spec::{expect_choice, expect_noul, SpecError};
 use crate::stage::StageError;
 
-/// One requirement the brief can ask of the board, and what it takes.
-pub struct Feature {
-    pub key: &'static str,
-    pub question: &'static str,
-    /// The catalog role a part must provide to meet it.
-    pub role: &'static str,
-    /// The audio part's interface that carries it out to the world.
-    pub interface: &'static str,
-    /// The connector port kind it lands on, and the board net prefix.
-    pub port: &'static str,
-    pub net: &'static str,
-}
-
-/// The requirement vocabulary.
-pub const FEATURES: [Feature; 4] = [
-    Feature {
-        key: "line_in",
-        question: "Does the board need a stereo line-level audio input?",
-        role: "i2s-adc",
-        interface: "audio-line-in",
-        port: "stereo-audio",
-        net: "LINE_IN",
-    },
-    Feature {
-        key: "line_out",
-        question: "Does the board need a stereo line-level audio output?",
-        role: "i2s-dac",
-        interface: "audio-line-out",
-        port: "stereo-audio",
-        net: "LINE_OUT",
-    },
-    Feature {
-        key: "mic_in",
-        question: "Does the board need a microphone input?",
-        role: "mic-in",
-        interface: "audio-mic-in",
-        port: "mono-audio",
-        net: "MIC_IN",
-    },
-    Feature {
-        key: "headphone_out",
-        question: "Does the board need to drive headphones directly?",
-        role: "headphone-out",
-        interface: "headphone-out",
-        port: "stereo-audio",
-        net: "HEADPHONE",
-    },
-];
-
 /// How one slot came to be filled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
@@ -93,7 +48,7 @@ pub struct Selection {
 pub struct DesignSpec {
     pub brief: String,
     pub requirements: BTreeMap<String, bool>,
-    /// Slot → parts: `audio`, `mcu`, `crystal`, `rail:+3V3`, `port:line_out`, …
+    /// Slot → parts: `function`, `mcu`, `needs:hse`, `rail:+3V3`, `port:line_out`, …
     pub parts: BTreeMap<String, Selection>,
     /// Bus kind → MCU peripheral instance: `i2s` → `SAI1`.
     pub bindings: BTreeMap<String, Selection>,
@@ -116,6 +71,9 @@ pub enum SynthError {
     Invalid(String),
 }
 
+/// The board's supply input net.
+const SUPPLY_NET: &str = "+5V";
+
 /// Fill a slot: one candidate is derived, several are a typed choice.
 fn pick(
     client: &impl Client,
@@ -124,10 +82,13 @@ fn pick(
     key: &str,
     question: &str,
     options: Vec<(String, String)>,
-) -> Result<(String, String), SynthError> {
+) -> Result<Selection, SynthError> {
     match options.len() {
         0 => Err(SynthError::Unfilled(key.to_string())),
-        1 => Ok((options[0].0.clone(), "derived".into())),
+        1 => Ok(Selection {
+            chosen: split(&options[0].0),
+            how: "derived".into(),
+        }),
         _ => {
             let criteria: Criteria = options
                 .iter()
@@ -142,14 +103,20 @@ fn pick(
                     SpecError::Unexpected(format!("{key}: {chosen:?} is not an option")).into(),
                 );
             }
-            Ok((chosen, "decided".into()))
+            Ok(Selection {
+                chosen: split(&chosen),
+                how: "decided".into(),
+            })
         }
     }
 }
 
-/// The smallest sets of parts that between them provide every role in
-/// `roles`: no set with a part it could drop. Each set is sorted by MPN, and
-/// the list is in a stable order.
+fn split(key: &str) -> Vec<String> {
+    key.split('+').map(str::to_string).collect()
+}
+
+/// The smallest sets of parts (of one or two) that between them provide every
+/// role in `roles`: no set with a part it could drop. Sorted, stable.
 pub fn minimal_covers<'a>(
     catalog: &'a Catalog,
     roles: &BTreeSet<&str>,
@@ -168,8 +135,6 @@ pub fn minimal_covers<'a>(
             .all(|r| set.iter().any(|p| p.provides.iter().any(|x| x == r)))
     };
     let mut out: Vec<Vec<&CatalogPart>> = Vec::new();
-    // Sets of one, then two: an audio board is not a four-chip puzzle, and a
-    // cover needing more is reported as unfillable rather than searched for.
     for (i, a) in useful.iter().enumerate() {
         if covers(&[a]) {
             out.push(vec![a]);
@@ -188,62 +153,186 @@ pub fn minimal_covers<'a>(
     out
 }
 
-/// The signals a set of slave interfaces needs from the master, in the
-/// master's terms (a slave's `din` is the master's `dout`).
-fn master_signals<'a>(slaves: impl Iterator<Item = &'a Interface>) -> BTreeSet<String> {
-    slaves
-        .flat_map(|i| i.signals.keys())
-        .map(|s| match s.as_str() {
-            "din" => "dout".to_string(),
-            "dout" => "din".to_string(),
-            other => other.to_string(),
+/// A slave's signal in its master's terms: an I2S slave's `din` is the
+/// master's `dout`. SPI's MOSI/MISO and everything else are named for the bus.
+fn master_signal(kind: &str, sig: &str) -> String {
+    match (kind, sig) {
+        ("i2s", "din") => "dout".into(),
+        ("i2s", "dout") => "din".into(),
+        _ => sig.into(),
+    }
+}
+
+/// A signal the master need not carry as a peripheral function: a chip select
+/// is any free port pin.
+fn gpio_ok(sig: &str) -> bool {
+    sig == "cs"
+}
+
+fn interfaces<'a>(
+    p: &'a CatalogPart,
+    kind: &'a str,
+    role: &'a str,
+) -> impl Iterator<Item = &'a Interface> {
+    p.interfaces
+        .iter()
+        .filter(move |i| i.kind == kind && i.role == role)
+}
+
+/// The buses a set of parts are slaves on (control lines excepted).
+fn buses(parts: &[&CatalogPart]) -> BTreeSet<String> {
+    parts
+        .iter()
+        .flat_map(|p| &p.interfaces)
+        .filter(|i| i.role == "slave" && i.kind != "gpio")
+        .map(|i| i.kind.clone())
+        .collect()
+}
+
+/// A part's pins and alternates, and where each pin sits on the package.
+struct Pinout {
+    pins: Vec<(String, String)>,
+    alternates: Vec<(String, String)>,
+    quad: bool,
+}
+
+impl Pinout {
+    fn of(p: &CatalogPart, symbol_dir: &Path) -> Result<Pinout, SynthError> {
+        let (pins, alternates) = p.pins(symbol_dir)?;
+        let quad = ["QFP", "QFN", "DFN"]
+            .iter()
+            .any(|k| p.footprint.contains(k));
+        Ok(Pinout {
+            pins,
+            alternates,
+            quad,
+        })
+    }
+
+    fn name_of(&self, number: &str) -> Option<&String> {
+        self.pins
+            .iter()
+            .find(|(n, _)| n == number)
+            .map(|(_, name)| name)
+    }
+
+    fn number_of(&self, name: &str) -> Option<&String> {
+        self.pins
+            .iter()
+            .find(|(_, n)| n == name)
+            .map(|(num, _)| num)
+    }
+
+    /// Which side of a quad package a pin sits on, counting from pin 1 at the
+    /// top of the left side, counter-clockwise (the IPC numbering).
+    fn side(&self, number: &str) -> Option<&'static str> {
+        let n: usize = number.parse().ok()?;
+        let count = self
+            .pins
+            .iter()
+            .filter(|(num, _)| num.parse::<usize>().is_ok())
+            .count();
+        let per = count / 4;
+        (self.quad && per > 0 && n >= 1 && n <= per * 4)
+            .then(|| ["left", "bottom", "right", "top"][(n - 1) / per])
+    }
+
+    /// The lowest-numbered pin carrying `alt` that nothing has taken.
+    fn free_pin_for(&self, alt: &str, taken: &BTreeSet<String>) -> Option<String> {
+        let mut numbers: Vec<&String> = self
+            .alternates
+            .iter()
+            .filter(|(_, a)| a == alt)
+            .map(|(n, _)| n)
+            .collect();
+        numbers.sort_by_key(|n| (n.parse::<u32>().unwrap_or(u32::MAX), n.to_string()));
+        numbers
+            .into_iter()
+            .filter_map(|n| self.name_of(n))
+            .find(|name| !taken.contains(*name))
+            .cloned()
+    }
+
+    /// The lowest-numbered general-purpose port pin (`PA0`, `PB12`, …) that
+    /// nothing has taken — where a chip select or a control line goes.
+    fn free_gpio(&self, taken: &BTreeSet<String>) -> Option<String> {
+        let port_pin = |name: &str| {
+            let b = name.as_bytes();
+            b.len() >= 3
+                && b[0] == b'P'
+                && b[1].is_ascii_uppercase()
+                && name[2..].chars().all(|c| c.is_ascii_digit())
+        };
+        let mut pins: Vec<&(String, String)> = self
+            .pins
+            .iter()
+            .filter(|(_, n)| port_pin(n) && !taken.contains(n))
+            .collect();
+        pins.sort_by_key(|(num, _)| num.parse::<u32>().unwrap_or(u32::MAX));
+        pins.first().map(|(_, n)| n.clone())
+    }
+}
+
+/// Pin names a part's own support (and its fixed interfaces) already use: not
+/// free for a bus or a control line.
+fn support_pins(p: &CatalogPart) -> BTreeSet<String> {
+    let fixed = p
+        .interfaces
+        .iter()
+        .filter(|i| i.kind == "swd" || i.kind == "hse")
+        .flat_map(|i| i.signals.values())
+        .filter_map(|s| match s {
+            Signal::At(a) => Some(a),
+            Signal::Alt { .. } => None,
+        });
+    p.support
+        .iter()
+        .flat_map(|s| &s.between)
+        .chain(fixed)
+        .filter_map(|e| match Endpoint::parse(e) {
+            Ok(Endpoint::Pin(n)) => Some(n),
+            _ => None,
         })
         .collect()
 }
 
-/// Decide a design for `brief` from `catalog`.
+/// Decide a design for `brief` from `catalog`. With `symbol_dir`, each
+/// binding option is described by the pins it would use and where they sit.
 pub fn design(
     client: &impl Client,
     trace: &mut Trace,
     brief: &str,
     catalog: &Catalog,
+    symbol_dir: Option<&Path>,
 ) -> Result<DesignSpec, SynthError> {
     // 1. Requirements.
     let mut request = Request::new(serde_json::json!({ "brief": brief }));
-    for f in &FEATURES {
-        request = request.with(f.key, Question::noul(f.question));
+    for f in &catalog.features {
+        request = request.with(&f.key, Question::noul(&f.question));
     }
     let outcome = client.decide(&request).map_err(SpecError::from)?;
     let mut requirements = BTreeMap::new();
-    for f in &FEATURES {
-        requirements.insert(
-            f.key.to_string(),
-            expect_noul(&outcome, trace, f.key)? >= 0.5,
-        );
+    for f in &catalog.features {
+        requirements.insert(f.key.clone(), expect_noul(&outcome, trace, &f.key)? >= 0.5);
     }
-    let wanted: Vec<&Feature> = FEATURES.iter().filter(|f| requirements[f.key]).collect();
+    let wanted: Vec<_> = catalog
+        .features
+        .iter()
+        .filter(|f| requirements[&f.key])
+        .collect();
 
-    let mut parts = BTreeMap::new();
-    let fill = |parts: &mut BTreeMap<String, Selection>,
-                slot: &str,
-                question: &str,
-                options: Vec<(String, String)>,
-                trace: &mut Trace| {
-        let (chosen, how) = pick(client, trace, brief, slot, question, options)?;
-        parts.insert(
-            slot.to_string(),
-            Selection {
-                chosen: chosen.split('+').map(str::to_string).collect(),
-                how,
-            },
-        );
-        Ok::<_, SynthError>(())
+    let mut parts: BTreeMap<String, Selection> = BTreeMap::new();
+    let describe = |p: &CatalogPart| (p.mpn.clone(), p.summary.clone());
+    let chosen = |parts: &BTreeMap<String, Selection>, slot: &str| -> Vec<&CatalogPart> {
+        parts
+            .get(slot)
+            .map(|s| s.chosen.iter().filter_map(|m| catalog.part(m)).collect())
+            .unwrap_or_default()
     };
 
-    // 2. Parts: the audio set, then everything it needs.
-    let roles: BTreeSet<&str> = wanted.iter().map(|f| f.role).collect();
-    let covers = minimal_covers(catalog, &roles);
-    let options = covers
+    // 2a. The function parts: minimal covers of the required roles.
+    let roles: BTreeSet<&str> = wanted.iter().map(|f| f.role.as_str()).collect();
+    let options = minimal_covers(catalog, &roles)
         .iter()
         .map(|set| {
             (
@@ -258,76 +347,72 @@ pub fn design(
             )
         })
         .collect();
-    fill(
-        &mut parts,
-        "audio",
-        "Which audio parts should the board use?",
-        options,
+    let function = pick(
+        client,
         trace,
+        brief,
+        "function",
+        "Which parts should the board be built around?",
+        options,
     )?;
-    let audio: Vec<&CatalogPart> = parts["audio"]
-        .chosen
-        .iter()
-        .filter_map(|m| catalog.part(m))
-        .collect();
+    parts.insert("function".into(), function);
+    let function_parts = chosen(&parts, "function");
 
-    let needs_bus = |kind: &str| {
-        audio.iter().any(|p| {
-            p.interfaces
-                .iter()
-                .any(|i| i.kind == kind && i.role == "slave")
-        })
-    };
-    let buses: Vec<&str> = ["i2s", "i2c"]
-        .into_iter()
-        .filter(|k| needs_bus(k))
-        .collect();
-    let mcu_ok = |p: &&CatalogPart| {
-        buses.iter().all(|k| {
-            p.interfaces
-                .iter()
-                .any(|i| i.kind == *k && i.role == "master")
-        })
-    };
+    // 2b. The MCU: a master for every bus the function parts are slaves on.
+    let bus_kinds = buses(&function_parts);
     let options = catalog
         .providing("mcu")
-        .filter(mcu_ok)
-        .map(|p| (p.mpn.clone(), p.summary.clone()))
+        .filter(|m| {
+            bus_kinds
+                .iter()
+                .all(|k| interfaces(m, k, "master").next().is_some())
+        })
+        .map(describe)
         .collect();
-    fill(
-        &mut parts,
+    let mcu_sel = pick(
+        client,
+        trace,
+        brief,
         "mcu",
         "Which microcontroller should the board use?",
         options,
-        trace,
     )?;
-    let mcu = catalog
-        .part(&parts["mcu"].chosen[0])
-        .expect("picked from the catalog");
+    parts.insert("mcu".into(), mcu_sel);
+    let mcu = chosen(&parts, "mcu")[0];
 
-    if mcu
-        .interfaces
+    // 2c. Whatever a chosen part needs from outside it (the MCU's crystal).
+    let needs: BTreeSet<String> = function_parts
         .iter()
-        .any(|i| i.kind == "hse" && i.role == "needs")
-    {
+        .copied()
+        .chain([mcu])
+        .flat_map(|p| &p.interfaces)
+        .filter(|i| i.role == "needs")
+        .map(|i| i.kind.clone())
+        .collect();
+    for kind in &needs {
         let options = catalog
-            .providing("crystal")
-            .map(|p| (p.mpn.clone(), p.summary.clone()))
+            .parts
+            .iter()
+            .filter(|p| interfaces(p, kind, "source").next().is_some())
+            .map(describe)
             .collect();
-        fill(
-            &mut parts,
-            "crystal",
-            "Which crystal should clock the MCU?",
-            options,
+        let slot = format!("needs:{kind}");
+        let sel = pick(
+            client,
             trace,
+            brief,
+            &slot,
+            &format!("Which part should supply {kind}?"),
+            options,
         )?;
+        parts.insert(slot, sel);
     }
 
-    // Rails the chosen parts tie to, other than ground and the supply input.
+    // 2d. Rails every chosen part ties to, other than ground and the input.
     let mut rails: BTreeSet<String> = BTreeSet::new();
-    for p in audio.iter().copied().chain([mcu]) {
-        for s in &p.support {
-            for e in &s.between {
+    for slot in parts.keys().cloned().collect::<Vec<_>>() {
+        for p in chosen(&parts, &slot) {
+            for e in p.support.iter().flat_map(|s| &s.between) {
                 if let Ok(Endpoint::Net(n)) = Endpoint::parse(e) {
                     if crate::model::is_supply_rail(&n) && n != SUPPLY_NET {
                         rails.insert(n);
@@ -338,103 +423,130 @@ pub fn design(
     }
     for rail in &rails {
         let role = format!("rail:{rail}");
-        let options = catalog
-            .providing(&role)
-            .map(|p| (p.mpn.clone(), p.summary.clone()))
-            .collect();
-        fill(
-            &mut parts,
+        let options = catalog.providing(&role).map(describe).collect();
+        let sel = pick(
+            client,
+            trace,
+            brief,
             &role,
             &format!("Which part should supply {rail}?"),
             options,
-            trace,
         )?;
+        parts.insert(role, sel);
     }
 
-    // Connectors: one per wanted feature, the supply, and the debug port.
-    let port_options = |kind: &str| -> Vec<(String, String)> {
+    // 2e. Connectors: one per wanted feature, the supply, and the debug port.
+    let ports = |kind: &str, role: &str| -> Vec<(String, String)> {
         catalog
             .parts
             .iter()
             .filter(|p| {
                 p.interfaces
                     .iter()
-                    .any(|i| i.kind == kind && i.role == "port")
+                    .any(|i| i.kind == kind && i.role == role)
             })
-            .map(|p| (p.mpn.clone(), p.summary.clone()))
+            .map(describe)
             .collect()
     };
     for f in &wanted {
-        fill(
-            &mut parts,
-            &format!("port:{}", f.key),
-            &format!("Which connector carries {}?", f.key),
-            port_options(f.port),
-            trace,
-        )?;
+        let slot = format!("port:{}", f.key);
+        let q = format!("Which connector carries {}?", f.key);
+        let sel = pick(client, trace, brief, &slot, &q, ports(&f.port, "port"))?;
+        parts.insert(slot, sel);
     }
-    fill(
-        &mut parts,
+    let supply = pick(
+        client,
+        trace,
+        brief,
         "port:supply",
         "Which connector brings in the 5 V supply?",
-        port_options("power-in"),
-        trace,
+        ports("power-in", "port"),
     )?;
-    let debug: Vec<(String, String)> = catalog
-        .parts
-        .iter()
-        .filter(|p| {
-            p.interfaces
-                .iter()
-                .any(|i| i.kind == "swd" && i.role == "debugger")
-        })
-        .map(|p| (p.mpn.clone(), p.summary.clone()))
-        .collect();
-    if mcu.interfaces.iter().any(|i| i.kind == "swd") {
-        fill(
-            &mut parts,
+    parts.insert("port:supply".into(), supply);
+    if interfaces(mcu, "swd", "target").next().is_some() {
+        let swd = pick(
+            client,
+            trace,
+            brief,
             "port:swd",
             "Which footprint lands the SWD programmer?",
-            debug,
-            trace,
+            ports("swd", "debugger"),
         )?;
+        parts.insert("port:swd".into(), swd);
     }
 
-    // 3. Bindings: which MCU peripheral instance carries each bus.
+    // 3. Bindings, each option described by the pins it would take.
+    let pinout = symbol_dir.map(|d| Pinout::of(mcu, d)).transpose()?;
+    let mut taken = support_pins(mcu);
     let mut bindings = BTreeMap::new();
-    for kind in &buses {
-        let need = master_signals(
-            audio
-                .iter()
-                .flat_map(|p| &p.interfaces)
-                .filter(|i| i.kind == *kind && i.role == "slave"),
-        );
-        let options = mcu
-            .interfaces
+    for kind in &bus_kinds {
+        let need: BTreeSet<String> = function_parts
             .iter()
-            .filter(|i| i.kind == *kind && i.role == "master")
+            .flat_map(|p| interfaces(p, kind, "slave"))
+            .flat_map(|i| i.signals.keys())
+            .map(|s| master_signal(kind, s))
+            .filter(|s| !gpio_ok(s))
+            .collect();
+        let describe_pins = |i: &Interface| -> Vec<String> {
+            let Some(po) = &pinout else {
+                return Vec::new();
+            };
+            need.iter()
+                .filter_map(|s| match &i.signals[s] {
+                    Signal::Alt { alt } => po.free_pin_for(alt, &taken).map(|pin| {
+                        let num = po.number_of(&pin).cloned().unwrap_or_default();
+                        match po.side(&num) {
+                            Some(side) => {
+                                format!("{} on {pin} (pin {num}, {side} side)", s.to_uppercase())
+                            }
+                            None => format!("{} on {pin} (pin {num})", s.to_uppercase()),
+                        }
+                    }),
+                    Signal::At(_) => None,
+                })
+                .collect()
+        };
+        let options: Vec<(String, String)> = interfaces(mcu, kind, "master")
             .filter(|i| need.iter().all(|s| i.signals.contains_key(s)))
             .filter_map(|i| {
-                i.instance
-                    .clone()
-                    .map(|n| (n.clone(), format!("{kind} on {n}")))
+                let name = i.instance.clone()?;
+                let pins = describe_pins(i);
+                let desc = if pins.is_empty() {
+                    format!("{kind} on {name}")
+                } else {
+                    format!("{kind} on {name}: {}", pins.join(", "))
+                };
+                Some((name, desc))
             })
             .collect();
-        let (chosen, how) = pick(
+        let question = format!(
+            "Which {} peripheral should carry the {kind} bus? Prefer one whose pins sit \
+             together on one side of the package.",
+            mcu.mpn
+        );
+        let sel = pick(
             client,
             trace,
             brief,
             &format!("bind_{kind}"),
-            &format!("Which {} peripheral should carry the {kind} bus?", mcu.mpn),
+            &question,
             options,
         )?;
-        bindings.insert(
-            kind.to_string(),
-            Selection {
-                chosen: vec![chosen],
-                how,
-            },
-        );
+        // What this binding takes is not free for the next one.
+        if let (Some(po), Some(inst)) = (&pinout, sel.chosen.first()) {
+            if let Some(i) = interfaces(mcu, kind, "master")
+                .find(|i| i.instance.as_deref() == Some(inst.as_str()))
+            {
+                for s in &need {
+                    if let Signal::Alt { alt } = &i.signals[s] {
+                        if let Some(pin) = po.free_pin_for(alt, &taken) {
+                            taken.insert(pin);
+                        }
+                    }
+                }
+            }
+        }
+        bindings.insert(kind.clone(), sel);
     }
 
     Ok(DesignSpec {
@@ -445,9 +557,6 @@ pub fn design(
         catalog: catalog.fingerprint(),
     })
 }
-
-/// The board's supply input net.
-const SUPPLY_NET: &str = "+5V";
 
 /// Union-find over connection keys, so ties merge nets and a tie that would
 /// join two named nets is caught instead of emitted.
@@ -486,9 +595,54 @@ impl Nets {
 /// A part placed on the board.
 struct Placed<'a> {
     reference: String,
+    slot: String,
     part: &'a CatalogPart,
-    pins: Vec<(String, String)>,
-    alternates: Vec<(String, String)>,
+    pinout: Pinout,
+}
+
+fn pin_key(r: &str, n: &str) -> String {
+    format!("{r}.pin.{n}")
+}
+
+fn endpoint_key(r: &str, e: &str) -> Result<String, SynthError> {
+    Ok(match Endpoint::parse(e).map_err(SynthError::Invalid)? {
+        Endpoint::Pin(n) => pin_key(r, &n),
+        Endpoint::Net(n) => format!("net:{n}"),
+        Endpoint::Node(n) => format!("{r}.node.{n}"),
+    })
+}
+
+type Taken = BTreeMap<String, BTreeSet<String>>;
+
+/// A signal's key on its part: a named pin or node, or — on an MCU — the
+/// lowest-numbered free pin carrying the alternate.
+fn resolve(pl: &Placed, s: &Signal, taken: &mut Taken) -> Result<String, SynthError> {
+    match s {
+        Signal::At(at) => endpoint_key(&pl.reference, at),
+        Signal::Alt { alt } => {
+            let t = taken.entry(pl.reference.clone()).or_default();
+            let pin = pl.pinout.free_pin_for(alt, t).ok_or_else(|| {
+                SynthError::Invalid(format!("{}: no free pin carries {alt}", pl.part.mpn))
+            })?;
+            t.insert(pin.clone());
+            Ok(pin_key(&pl.reference, &pin))
+        }
+    }
+}
+
+/// A free MCU port pin, for a chip select or a control line.
+fn free_gpio(pl: &Placed, taken: &mut Taken) -> Result<String, SynthError> {
+    let t = taken.entry(pl.reference.clone()).or_default();
+    let pin = pl
+        .pinout
+        .free_gpio(t)
+        .ok_or_else(|| SynthError::Invalid(format!("{}: no free port pin left", pl.part.mpn)))?;
+    t.insert(pin.clone());
+    Ok(pin_key(&pl.reference, &pin))
+}
+
+fn first_iface(pl: &Placed, kind: &str, role: &str) -> Option<Interface> {
+    interfaces(pl.part, kind, role).next().cloned()
 }
 
 /// Build the circuit a spec describes — a pure function of the spec, the
@@ -504,239 +658,219 @@ pub fn circuit(
             now: catalog.fingerprint(),
         });
     }
-    let part = |mpn: &str| {
-        catalog.part(mpn).ok_or_else(|| {
-            SynthError::Invalid(format!("spec names {mpn}, which the catalog lacks"))
-        })
-    };
 
     // Place every chosen part, in a fixed order so designators are stable.
     let mut next: BTreeMap<char, usize> = BTreeMap::new();
-    let mut designate = |p: &CatalogPart| {
-        let prefix = if p.provides.iter().any(|r| r == "crystal") {
-            'Y'
-        } else if p.provides.iter().any(|r| r == "connector") {
-            'J'
-        } else {
-            'U'
-        };
-        let n = next.entry(prefix).or_insert(0);
-        *n += 1;
-        format!("{prefix}{n}")
-    };
     let mut placed: Vec<Placed> = Vec::new();
-    let mut slots: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let order = ["mcu", "audio", "crystal"];
-    let mut slot_names: Vec<&String> = spec.parts.keys().collect();
-    slot_names.sort_by_key(|s| {
-        (
-            order.iter().position(|o| o == s).unwrap_or(order.len()),
-            s.to_string(),
-        )
-    });
-    for slot in slot_names {
+    let rank = |s: &str| match s {
+        "mcu" => 0,
+        "function" => 1,
+        s if s.starts_with("needs:") => 2,
+        s if s.starts_with("rail:") => 3,
+        _ => 4,
+    };
+    let mut slots: Vec<&String> = spec.parts.keys().collect();
+    slots.sort_by_key(|s| (rank(s), s.to_string()));
+    for slot in slots {
         for mpn in &spec.parts[slot].chosen {
-            let p = part(mpn)?;
-            let (pins, alternates) = p.pins(symbol_dir)?;
-            slots.entry(slot.clone()).or_default().push(placed.len());
+            let part = catalog.part(mpn).ok_or_else(|| {
+                SynthError::Invalid(format!("spec names {mpn}, which the catalog lacks"))
+            })?;
+            let prefix = if part.provides.iter().any(|r| r == "crystal") {
+                'Y'
+            } else if part.provides.iter().any(|r| r == "connector") {
+                'J'
+            } else {
+                'U'
+            };
+            let n = next.entry(prefix).or_insert(0);
+            *n += 1;
             placed.push(Placed {
-                reference: designate(p),
-                part: p,
-                pins,
-                alternates,
+                reference: format!("{prefix}{n}"),
+                slot: slot.clone(),
+                part,
+                pinout: Pinout::of(part, symbol_dir)?,
             });
         }
     }
-    let one = |slot: &str| slots.get(slot).and_then(|v| v.first().copied());
+    let in_slot = |slot: &str| -> Vec<usize> {
+        (0..placed.len())
+            .filter(|&i| placed[i].slot == slot)
+            .collect()
+    };
+    let mcu = *in_slot("mcu")
+        .first()
+        .ok_or_else(|| SynthError::Unfilled("mcu".into()))?;
 
     let mut nets = Nets::default();
-    // `(key, reference, pin)` — which key each physical pin connection hangs off.
-    let mut pin_links: Vec<(String, String, PinRef)> = Vec::new();
     let mut passives: Vec<(&'static str, String, String, String, String)> = Vec::new();
-    let pin_key = |r: &str, n: &str| format!("{r}.pin.{n}");
-    let node_key = |r: &str, n: &str| format!("{r}.node.{n}");
-    let endpoint_key = |r: &str, e: &str| -> Result<String, SynthError> {
-        Ok(match Endpoint::parse(e).map_err(SynthError::Invalid)? {
-            Endpoint::Pin(n) => pin_key(r, &n),
-            Endpoint::Net(n) => format!("net:{n}"),
-            Endpoint::Node(n) => node_key(r, &n),
-        })
-    };
-    // An interface signal's key on the part; an MCU alternate resolves to the
-    // lowest-numbered pin carrying it that nothing else has taken.
-    let mut taken: BTreeSet<(String, String)> = BTreeSet::new();
-    let signal_key = |pl: &Placed,
-                      s: &Signal,
-                      taken: &mut BTreeSet<(String, String)>|
-     -> Result<String, SynthError> {
-        match s {
-            Signal::At(at) => endpoint_key(&pl.reference, at),
-            Signal::Alt { alt } => {
-                let mut numbers: Vec<&String> = pl
-                    .alternates
-                    .iter()
-                    .filter(|(_, a)| a == alt)
-                    .map(|(n, _)| n)
-                    .collect();
-                numbers.sort_by_key(|n| (n.parse::<u32>().unwrap_or(u32::MAX), n.to_string()));
-                let name = numbers
-                    .iter()
-                    .filter_map(|n| {
-                        pl.pins
-                            .iter()
-                            .find(|(num, _)| num == *n)
-                            .map(|(_, name)| name)
-                    })
-                    .find(|name| !taken.contains(&(pl.reference.clone(), (*name).clone())))
-                    .ok_or_else(|| {
-                        SynthError::Invalid(format!("{}: no free pin carries {alt}", pl.part.mpn))
-                    })?;
-                taken.insert((pl.reference.clone(), name.clone()));
-                Ok(pin_key(&pl.reference, name))
-            }
-        }
-    };
-    let iface =
-        |pl: &Placed, kind: &str, role: &str, instance: Option<&str>| -> Option<Interface> {
-            pl.part
-                .interfaces
-                .iter()
-                .find(|i| {
-                    i.kind == kind
-                        && i.role == role
-                        && (instance.is_none() || i.instance.as_deref() == instance)
-                })
-                .cloned()
-        };
+    let mut taken: Taken = placed
+        .iter()
+        .map(|pl| (pl.reference.clone(), support_pins(pl.part)))
+        .collect();
 
-    // Pins the MCU's own support uses are not free for a bus.
-    if let Some(m) = one("mcu") {
-        for s in &placed[m].part.support {
-            for e in &s.between {
-                if let Ok(Endpoint::Pin(n)) = Endpoint::parse(e) {
-                    taken.insert((placed[m].reference.clone(), n));
+    // Buses: the bound MCU instance to every slave on it, signal by signal.
+    for (kind, sel) in &spec.bindings {
+        let instance = &sel.chosen[0];
+        let master = interfaces(placed[mcu].part, kind, "master")
+            .find(|i| i.instance.as_deref() == Some(instance.as_str()))
+            .cloned()
+            .ok_or_else(|| {
+                SynthError::Invalid(format!("{} has no {kind} {instance}", placed[mcu].part.mpn))
+            })?;
+        for s in 0..placed.len() {
+            if s == mcu {
+                continue;
+            }
+            let Some(slave) = first_iface(&placed[s], kind, "slave") else {
+                continue;
+            };
+            for (sig, at) in &slave.signals {
+                let msig = master_signal(kind, sig);
+                // A chip select is per slave; every other bus line is shared.
+                let bus_net = if gpio_ok(&msig) {
+                    format!(
+                        "net:{}_{}_{}",
+                        kind.to_uppercase(),
+                        msig.to_uppercase(),
+                        placed[s].reference
+                    )
+                } else {
+                    format!("net:{}_{}", kind.to_uppercase(), msig.to_uppercase())
+                };
+                if !nets.parent.contains_key(&bus_net) {
+                    let mk = match master.signals.get(&msig) {
+                        Some(m) => resolve(&placed[mcu], m, &mut taken)?,
+                        None if gpio_ok(&msig) => free_gpio(&placed[mcu], &mut taken)?,
+                        None => {
+                            return Err(SynthError::Invalid(format!(
+                                "{instance} cannot carry {kind} {msig}"
+                            )))
+                        }
+                    };
+                    nets.union(&bus_net, &mk);
                 }
+                let sk = resolve(&placed[s], at, &mut taken)?;
+                nets.union(&bus_net, &sk);
             }
         }
     }
 
-    // Buses: the bound MCU instance to every slave on it, signal by signal.
-    let mcu_idx = one("mcu").ok_or_else(|| SynthError::Unfilled("mcu".into()))?;
-    for (kind, sel) in &spec.bindings {
-        let instance = &sel.chosen[0];
-        let master = iface(&placed[mcu_idx], kind, "master", Some(instance)).ok_or_else(|| {
-            SynthError::Invalid(format!(
-                "{} has no {kind} {instance}",
-                placed[mcu_idx].part.mpn
-            ))
-        })?;
-        for &a in slots.get("audio").map(Vec::as_slice).unwrap_or(&[]) {
-            let Some(slave) = iface(&placed[a], kind, "slave", None) else {
-                continue;
-            };
-            for (sig, at) in &slave.signals {
-                let msig = match sig.as_str() {
-                    "din" => "dout",
-                    "dout" => "din",
-                    other => other,
-                };
-                let bus_net = format!("net:{}_{}", kind.to_uppercase(), msig.to_uppercase());
-                let m_sig = master.signals.get(msig).ok_or_else(|| {
-                    SynthError::Invalid(format!("{instance} cannot carry {kind} {msig}"))
-                })?;
-                let mk = match nets.parent.contains_key(&bus_net) {
-                    true => None,
-                    false => Some(signal_key(&placed[mcu_idx], m_sig, &mut taken)?),
-                };
-                if let Some(mk) = mk {
-                    nets.union(&bus_net, &mk);
-                }
-                nets.union(&bus_net, &signal_key(&placed[a], at, &mut taken)?);
+    // Control lines: each to a free MCU port pin.
+    for s in 0..placed.len() {
+        if s == mcu {
+            continue;
+        }
+        let gpios: Vec<Interface> = interfaces(placed[s].part, "gpio", "slave")
+            .cloned()
+            .collect();
+        for gpio in gpios {
+            for (sig, at) in &gpio.signals {
+                let net = format!("net:{}_{}", placed[s].reference, sig.to_uppercase());
+                let mk = free_gpio(&placed[mcu], &mut taken)?;
+                nets.union(&net, &mk);
+                let sk = resolve(&placed[s], at, &mut taken)?;
+                nets.union(&net, &sk);
             }
         }
     }
 
     // SWD: the MCU's debug interface to the programming footprint.
-    if let (Some(dbg), Some(target)) = (
-        one("port:swd"),
-        iface(&placed[mcu_idx], "swd", "target", None),
+    if let (Some(&dbg), Some(target)) = (
+        in_slot("port:swd").first(),
+        first_iface(&placed[mcu], "swd", "target"),
     ) {
-        let debugger = iface(&placed[dbg], "swd", "debugger", None).ok_or_else(|| {
+        let debugger = first_iface(&placed[dbg], "swd", "debugger").ok_or_else(|| {
             SynthError::Invalid("the SWD footprint has no debugger interface".into())
         })?;
         for (sig, at) in &target.signals {
             let net = format!("net:{}", sig.to_uppercase());
-            nets.union(&net, &signal_key(&placed[mcu_idx], at, &mut taken)?);
+            let mk = resolve(&placed[mcu], at, &mut taken)?;
+            nets.union(&net, &mk);
             if let Some(d) = debugger.signals.get(sig) {
-                nets.union(&net, &signal_key(&placed[dbg], d, &mut taken)?);
+                let dk = resolve(&placed[dbg], d, &mut taken)?;
+                nets.union(&net, &dk);
             }
         }
     }
 
-    // Crystal: the MCU's HSE pins to the crystal, with load caps computed from
-    // the crystal's own load capacitance.
-    if let (Some(y), Some(needs)) = (
-        one("crystal"),
-        iface(&placed[mcu_idx], "hse", "needs", None),
-    ) {
-        let source = iface(&placed[y], "hse", "source", None)
-            .ok_or_else(|| SynthError::Invalid("the crystal has no hse interface".into()))?;
-        let cl = placed[y]
+    // Needs: each part's need to the part filling it; a crystal's load caps
+    // are computed from its own load capacitance.
+    for n in 0..placed.len() {
+        let needs: Vec<Interface> = placed[n]
             .part
-            .params
-            .get("cl_pf")
-            .ok_or_else(|| SynthError::Invalid(format!("{} has no cl_pf", placed[y].part.mpn)))?
-            .value;
-        let cap = fmt_pf(round_e12_pf(load_cap_pf(cl)));
-        for (sig, at) in &needs.signals {
-            let net = format!("net:HSE_{}", sig.to_uppercase());
-            nets.union(&net, &signal_key(&placed[mcu_idx], at, &mut taken)?);
-            if let Some(s) = source.signals.get(sig) {
-                nets.union(&net, &signal_key(&placed[y], s, &mut taken)?);
+            .interfaces
+            .iter()
+            .filter(|i| i.role == "needs")
+            .cloned()
+            .collect();
+        for need in needs {
+            let Some(&src) = in_slot(&format!("needs:{}", need.kind)).first() else {
+                continue;
+            };
+            let source = first_iface(&placed[src], &need.kind, "source").ok_or_else(|| {
+                SynthError::Invalid(format!(
+                    "{} has no {} source",
+                    placed[src].part.mpn, need.kind
+                ))
+            })?;
+            let load = placed[src]
+                .part
+                .params
+                .get("cl_pf")
+                .map(|p| fmt_pf(round_e12_pf(load_cap_pf(p.value))));
+            for (sig, at) in &need.signals {
+                let net = format!("net:{}_{}", need.kind.to_uppercase(), sig.to_uppercase());
+                let nk = resolve(&placed[n], at, &mut taken)?;
+                nets.union(&net, &nk);
+                if let Some(s) = source.signals.get(sig) {
+                    let sk = resolve(&placed[src], s, &mut taken)?;
+                    nets.union(&net, &sk);
+                }
+                if let Some(cap) = &load {
+                    passives.push(("C", cap.clone(), String::new(), net, "net:GND".into()));
+                }
             }
-            passives.push(("C", cap.clone(), String::new(), net, "net:GND".into()));
         }
     }
 
-    // Ports: each wanted feature's audio interface to its connector.
-    for f in &FEATURES {
-        let Some(j) = one(&format!("port:{}", f.key)) else {
+    // Ports: each wanted feature's interface to its connector.
+    for f in &catalog.features {
+        let Some(&j) = in_slot(&format!("port:{}", f.key)).first() else {
             continue;
         };
-        let (src, src_iface) = slots
-            .get("audio")
+        let (src, iface) = in_slot("function")
             .into_iter()
-            .flatten()
-            .find_map(|&a| {
+            .find_map(|a| {
                 placed[a]
                     .part
                     .interfaces
                     .iter()
-                    .find(|i| i.kind == f.interface)
+                    .find(|i| i.kind == f.interface && i.role != "port")
                     .map(|i| (a, i.clone()))
             })
-            .ok_or_else(|| SynthError::Invalid(format!("no audio part has {}", f.interface)))?;
-        let port = iface(&placed[j], f.port, "port", None)
+            .ok_or_else(|| SynthError::Invalid(format!("no function part has {}", f.interface)))?;
+        let port = first_iface(&placed[j], &f.port, "port")
             .ok_or_else(|| SynthError::Invalid(format!("connector has no {} port", f.port)))?;
-        let port_sigs: Vec<(&String, &Signal)> = port.signals.iter().collect();
-        for (k, (sig, at)) in src_iface.signals.iter().enumerate() {
+        let port_sigs: Vec<&Signal> = port.signals.values().collect();
+        for (k, (sig, at)) in iface.signals.iter().enumerate() {
             let net = format!("net:{}_{}", f.net, sig.to_uppercase());
-            nets.union(&net, &signal_key(&placed[src], at, &mut taken)?);
-            let (_, p) = port_sigs.get(k).ok_or_else(|| {
+            let sk = resolve(&placed[src], at, &mut taken)?;
+            nets.union(&net, &sk);
+            let p = port_sigs.get(k).ok_or_else(|| {
                 SynthError::Invalid(format!("{} port too narrow for {}", f.port, f.key))
             })?;
-            nets.union(&net, &signal_key(&placed[j], p, &mut taken)?);
+            let pk = resolve(&placed[j], p, &mut taken)?;
+            nets.union(&net, &pk);
         }
     }
-    if let Some(j) = one("port:supply") {
-        let port = iface(&placed[j], "power-in", "port", None).ok_or_else(|| {
+    if let Some(&j) = in_slot("port:supply").first() {
+        let port = first_iface(&placed[j], "power-in", "port").ok_or_else(|| {
             SynthError::Invalid("the supply connector has no power-in port".into())
         })?;
         for at in port.signals.values() {
-            nets.union(
-                &format!("net:{SUPPLY_NET}"),
-                &signal_key(&placed[j], at, &mut taken)?,
-            );
+            let pk = resolve(&placed[j], at, &mut taken)?;
+            nets.union(&format!("net:{SUPPLY_NET}"), &pk);
         }
     }
 
@@ -762,6 +896,7 @@ pub fn circuit(
             let kind: &'static str = match s.part.as_str() {
                 "R" => "R",
                 "CP" => "CP",
+                "L" => "L",
                 _ => "C",
             };
             let repeat = s.between.iter().find_map(|e| match Endpoint::parse(e) {
@@ -770,14 +905,14 @@ pub fn circuit(
             });
             match repeat {
                 Some(pin) => {
-                    let count = pl.pins.iter().filter(|(_, n)| *n == pin).count();
+                    let count = pl.pinout.pins.iter().filter(|(_, n)| *n == pin).count();
+                    let other = s
+                        .between
+                        .iter()
+                        .find(|e| **e != format!("pin:{pin}"))
+                        .expect("two ends");
                     for k in 0..count {
                         let key = format!("{}#{k}", pin_key(&pl.reference, &pin));
-                        let other = s
-                            .between
-                            .iter()
-                            .find(|e| **e != format!("pin:{pin}"))
-                            .expect("two ends");
                         passives.push((
                             kind,
                             value.clone(),
@@ -797,6 +932,14 @@ pub fn circuit(
             }
         }
     }
+    // Interface pins count as named too, so a repeated one joins its siblings.
+    for k in nets.parent.keys() {
+        if let Some((r, rest)) = k.split_once(".pin.") {
+            if !rest.contains('#') {
+                name_used.insert((r.to_string(), rest.to_string()));
+            }
+        }
+    }
 
     // Physical pins: every key naming a pin becomes a connection.
     let mut keyed_pins: BTreeSet<String> = nets
@@ -812,6 +955,7 @@ pub fn circuit(
             }
         }
     }
+    let mut pin_links: Vec<(String, String, PinRef)> = Vec::new();
     for k in &keyed_pins {
         let (reference, rest) = k.split_once(".pin.").expect("a pin key");
         match rest.split_once('#') {
@@ -820,6 +964,11 @@ pub fn circuit(
             Some((name, idx)) => {
                 if name_used.contains(&(reference.to_string(), name.to_string())) {
                     nets.union(k, &pin_key(reference, name));
+                    pin_links.push((
+                        pin_key(reference, name),
+                        reference.into(),
+                        PinRef::Name(name.into()),
+                    ));
                 } else {
                     let idx: usize = idx.parse().expect("an index");
                     pin_links.push((
@@ -832,16 +981,14 @@ pub fn circuit(
             None => pin_links.push((k.clone(), reference.into(), PinRef::Name(rest.into()))),
         }
     }
+    pin_links.sort();
+    pin_links.dedup();
 
-    // Assemble, naming each net after its named member or its first key.
-    let mut c = Circuit {
-        title: format!("{} — synthesized by legion-of-bom", spec.brief),
-        ..Circuit::default()
-    };
+    // Name each net after its named member, or its root key; two named nets
+    // in one group is a short.
     let mut roots_named: BTreeMap<String, String> = BTreeMap::new();
-    let all_keys: Vec<String> = nets.parent.keys().cloned().collect();
-    for k in &all_keys {
-        let root = nets.find(k);
+    for k in nets.parent.keys().cloned().collect::<Vec<_>>() {
+        let root = nets.find(&k);
         if let Some(name) = k.strip_prefix("net:") {
             if let Some(prev) = roots_named.insert(root.clone(), name.to_string()) {
                 if prev != name {
@@ -859,6 +1006,11 @@ pub fn circuit(
                 .replace(".node.", "_")
                 .replace('#', "_")
         })
+    };
+
+    let mut c = Circuit {
+        title: format!("{} — synthesized by legion-of-bom", spec.brief),
+        ..Circuit::default()
     };
     for pl in &placed {
         let mut fields = BTreeMap::from([("MPN".to_string(), pl.part.mpn.clone())]);
@@ -890,27 +1042,27 @@ pub fn circuit(
         let net = net_name(&mut nets, &key);
         c.connect(&net, &reference, pin);
     }
-    let (mut nc, mut nr) = (0usize, 0usize);
+    let (mut nc, mut nr, mut nl) = (0usize, 0usize, 0usize);
     for (kind, value, fp, a, b) in passives {
-        let (prefix, n) = if kind == "R" {
-            ("R", &mut nr)
-        } else {
-            ("C", &mut nc)
+        let (prefix, n) = match kind {
+            "R" => ("R", &mut nr),
+            "L" => ("L", &mut nl),
+            _ => ("C", &mut nc),
         };
         *n += 1;
         let reference = format!("{prefix}{n}");
-        let (lib, sym, default_fp) = match kind {
-            "R" => ("Device", "R", "Resistor_SMD:R_0603_1608Metric"),
+        let (sym, default_fp) = match kind {
+            "R" => ("R", "Resistor_SMD:R_0603_1608Metric"),
+            "L" => ("L", "Inductor_SMD:L_0603_1608Metric"),
             "CP" => (
-                "Device",
                 "C_Polarized",
                 "Capacitor_Tantalum_SMD:CP_EIA-3528-21_Kemet-B",
             ),
-            _ => ("Device", "C", "Capacitor_SMD:C_0603_1608Metric"),
+            _ => ("C", "Capacitor_SMD:C_0603_1608Metric"),
         };
         c.parts.push(EmitPart {
             reference: reference.clone(),
-            symbol: SymbolSrc::Kicad(lib.into(), sym.into()),
+            symbol: SymbolSrc::Kicad("Device".into(), sym.into()),
             value,
             footprint: if fp.is_empty() { default_fp.into() } else { fp },
             fields: BTreeMap::new(),
@@ -957,32 +1109,64 @@ mod tests {
         )
     }
 
-    /// Line in + line out, pins-only codec pair, SAI2 — every answer scripted.
+    /// A decider that answers whatever it is asked, by rule: yes to the listed
+    /// features, the preferred option where a test cares, the first option
+    /// otherwise. The answers go through ooda's own wire format, so a test
+    /// holds however many decisions a growing catalog turns into choices.
+    struct Decider {
+        yes: &'static [&'static str],
+        prefer: &'static [(&'static str, &'static str)],
+    }
+
+    impl ooda::Client for Decider {
+        fn decide(&self, request: &Request) -> Result<ooda::Outcome, ooda::Error> {
+            let answers: Vec<String> = request
+                .questions
+                .iter()
+                .map(|(k, q)| {
+                    let a = match q {
+                        Question::Choice { criteria, .. } => {
+                            let first = criteria.keys().next().unwrap_or_default().to_string();
+                            let c = self
+                                .prefer
+                                .iter()
+                                .find(|(key, _)| key == k)
+                                .map(|(_, c)| c.to_string())
+                                .unwrap_or(first);
+                            choice(&c)
+                        }
+                        _ => noul(if self.yes.contains(&k.as_str()) {
+                            0.9
+                        } else {
+                            0.1
+                        }),
+                    };
+                    format!(r#""{k}": {a}"#)
+                })
+                .collect();
+            ooda::ScriptedClient::new([format!(r#"{{"answers": {{{}}}}}"#, answers.join(", "))])
+                .decide(request)
+        }
+    }
+
+    /// Line in + line out on the H7, the pins-only converter pair, SAI2.
     fn line_io_design() -> DesignSpec {
-        let client = ooda::ScriptedClient::new([
-            format!(
-                r#"{{"answers": {{"line_in": {}, "line_out": {}, "mic_in": {}, "headphone_out": {}}}}}"#,
-                noul(0.9),
-                noul(0.9),
-                noul(0.1),
-                noul(0.1)
-            ),
-            format!(
-                r#"{{"answers": {{"audio": {}}}}}"#,
-                choice("PCM1808PWR+PCM5102APWR")
-            ),
-            format!(r#"{{"answers": {{"bind_i2s": {}}}}}"#, choice("SAI2")),
-        ]);
-        let mut trace = Trace::new();
-        let spec = design(
-            &client,
-            &mut trace,
+        let decider = Decider {
+            yes: &["line_in", "line_out"],
+            prefer: &[
+                ("function", "PCM1808PWR+PCM5102APWR"),
+                ("mcu", "STM32H743VIT6"),
+                ("bind_i2s", "SAI2"),
+            ],
+        };
+        design(
+            &decider,
+            &mut Trace::new(),
             "stereo line in and out, no I2C setup",
             &catalog(),
+            None,
         )
-        .expect("designs");
-        assert_eq!(trace.records().len(), 6, "4 requirements + audio + binding");
-        spec
+        .expect("designs")
     }
 
     #[test]
@@ -998,33 +1182,30 @@ mod tests {
                     .join("+")
             })
             .collect();
-        assert_eq!(covers, ["ES8388", "PCM1808PWR+PCM5102APWR", "WM8731SEDS"]);
-        let with_mic: BTreeSet<&str> = ["i2s-adc", "i2s-dac", "mic-in"].into();
-        let covers = minimal_covers(&cat, &with_mic);
-        assert_eq!(covers.len(), 1, "only the WM8731 has a mic input");
+        assert!(
+            covers.contains(&"PCM1808PWR+PCM5102APWR".to_string()),
+            "{covers:?}"
+        );
+        assert!(covers.contains(&"WM8731SEDS".to_string()), "{covers:?}");
+        assert!(
+            covers.iter().all(|c| !c.starts_with("WM8731SEDS+")),
+            "no redundant pairs: {covers:?}"
+        );
     }
 
     #[test]
     fn a_brief_becomes_decisions_and_derivations_over_the_catalog() {
         let spec = line_io_design();
-        assert_eq!(spec.parts["audio"].chosen, ["PCM1808PWR", "PCM5102APWR"]);
-        assert_eq!(spec.parts["audio"].how, "decided");
-        // One MCU, one crystal, one 3V3 supply in the catalog: derived, not asked.
-        for slot in [
-            "mcu",
-            "crystal",
-            "rail:+3V3",
-            "port:line_in",
-            "port:line_out",
-            "port:supply",
-            "port:swd",
-        ] {
-            assert_eq!(spec.parts[slot].how, "derived", "{slot}");
-        }
+        assert_eq!(spec.parts["function"].chosen, ["PCM1808PWR", "PCM5102APWR"]);
+        assert_eq!(spec.parts["function"].how, "decided");
         assert_eq!(spec.bindings["i2s"].chosen, ["SAI2"]);
         assert!(
             !spec.bindings.contains_key("i2c"),
             "pin-strapped parts need no control bus"
+        );
+        assert!(
+            spec.parts.contains_key("needs:hse"),
+            "the MCU's crystal is a need, filled"
         );
     }
 
@@ -1036,6 +1217,21 @@ mod tests {
         assert!(matches!(err, SynthError::StaleCatalog { .. }), "{err}");
     }
 
+    #[test]
+    fn pins_on_a_quad_package_have_sides() {
+        let po = Pinout {
+            pins: (1..=100)
+                .map(|n| (n.to_string(), format!("P{n}")))
+                .collect(),
+            alternates: Vec::new(),
+            quad: true,
+        };
+        assert_eq!(po.side("1"), Some("left"));
+        assert_eq!(po.side("26"), Some("bottom"));
+        assert_eq!(po.side("75"), Some("right"));
+        assert_eq!(po.side("100"), Some("top"));
+    }
+
     /// Needs the installed KiCad symbol library (pin names and alternates).
     #[test]
     #[ignore = "needs KiCad symbols"]
@@ -1043,21 +1239,34 @@ mod tests {
         let dir = crate::skidl::kicad_symbol_dir().expect("KiCad symbol library");
         let c = circuit(&line_io_design(), &catalog(), dir.path()).unwrap();
         let py = c.to_skidl();
-        // SAI2's block-A clock lands on whichever pin carries SAI2_SCK_A.
         let bck = &c.nets["I2S_BCK"];
         assert_eq!(
             bck.len(),
             3,
             "MCU, DAC and ADC share the bit clock: {bck:?}"
         );
-        // Five VDD pins, five 100 nF — counted from the symbol, not written.
         let vdd_caps = c.parts.iter().filter(|p| p.value == "100nF").count();
         assert!(vdd_caps >= 5, "{vdd_caps}");
-        // Each VCAP pin its own cap, never tied together.
         assert!(
             py.contains(r#"pins(u1, "VCAP")[0]"#) && py.contains(r#"pins(u1, "VCAP")[1]"#),
             "{py}"
         );
         assert!(c.nets.contains_key("LINE_OUT_L") && c.nets.contains_key("LINE_IN_R"));
+    }
+
+    /// Binding options carry the pins they would take, and where.
+    #[test]
+    #[ignore = "needs KiCad symbols"]
+    fn binding_options_say_which_pins_and_which_side() {
+        let dir = crate::skidl::kicad_symbol_dir().expect("KiCad symbol library");
+        let cat = catalog();
+        let po = Pinout::of(cat.part("STM32H743VIT6").unwrap(), dir.path()).unwrap();
+        let pin = po.free_pin_for("SAI1_SCK_A", &BTreeSet::new()).unwrap();
+        assert_eq!(pin, "PE5");
+        assert_eq!(
+            po.side(po.number_of(&pin).unwrap()),
+            Some("left"),
+            "PE5 is pin 4"
+        );
     }
 }
