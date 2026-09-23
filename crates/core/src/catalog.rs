@@ -252,6 +252,26 @@ impl Catalog {
         Ok(Catalog { parts })
     }
 
+    /// A hash of every part's content, in part order: what a design spec
+    /// records so a spec decided against one catalog is not silently rendered
+    /// against another.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for p in &self.parts {
+            h.update(
+                serde_json::to_string(p)
+                    .expect("a part serializes")
+                    .as_bytes(),
+            );
+            h.update([0]);
+        }
+        h.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     pub fn part(&self, mpn: &str) -> Option<&CatalogPart> {
         self.parts.iter().find(|p| p.mpn == mpn)
     }

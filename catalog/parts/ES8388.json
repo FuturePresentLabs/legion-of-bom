@@ -430,6 +430,30 @@
         "reading": "47uF series on LOUT2/ROUT2 used as headphone output",
         "page": 7
       }
+    },
+    {
+      "between": [
+        "pin:CCLK",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "10K pull-ups on the I2C control lines in the typical application circuit",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:CDATA",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "10K pull-ups on the I2C control lines in the typical application circuit",
+        "page": 7
+      }
     }
   ]
 }

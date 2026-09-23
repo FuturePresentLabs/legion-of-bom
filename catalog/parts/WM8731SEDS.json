@@ -533,6 +533,28 @@
         "reading": "Figure 57 gain-dependent Rmic between C2 and MICIN omitted (0 Ω): mic gain set in the codec registers",
         "page": 60
       }
+    },
+    {
+      "between": [
+        "pin:SCLK",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "I2C pull-ups: the datasheet text names none; 10k to 3.3 V as on the ES8388 typical application circuit"
+      }
+    },
+    {
+      "between": [
+        "pin:SDIN",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "I2C pull-ups: the datasheet text names none; 10k to 3.3 V as on the ES8388 typical application circuit"
+      }
     }
   ]
 }

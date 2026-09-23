@@ -13,10 +13,12 @@
 use ooda::{Client, Trace};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::{default_catalog_dir, Catalog, CatalogError};
 use crate::mcu_audio::{generate_stm32_codec_spec, render_stm32_codec_skidl, Stm32CodecSpec};
 use crate::panel::PanelFile;
 use crate::pedal_panel::fuzz_pedal_panel_file;
 use crate::spec::{generate_fuzz_pedal_spec, render_skidl, FuzzPedalSpec, SpecError};
+use crate::synth::{self, DesignSpec, SynthError};
 use crate::topology::{render_chain_skidl, FuzzChain};
 
 /// A decided spec, of any curated family.
@@ -29,10 +31,13 @@ pub enum Spec {
     FuzzChain(FuzzChain),
     /// An STM32H7 audio board with one of three codec options.
     Stm32Codec(Stm32CodecSpec),
+    /// A board synthesized from the brief by typed decisions over the parts
+    /// catalog ([`crate::synth`]).
+    Board(DesignSpec),
 }
 
 /// The families [`generate`] decides — what `lob spec <family>` accepts.
-pub const FAMILIES: &[&str] = &["fuzz-pedal", "stm32-codec"];
+pub const FAMILIES: &[&str] = &["board", "fuzz-pedal", "stm32-codec"];
 
 /// Unknown family, or a decision that failed.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +46,12 @@ pub enum FamilyError {
     Unknown(String),
     #[error(transparent)]
     Spec(#[from] SpecError),
+    #[error(transparent)]
+    Synth(#[from] SynthError),
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")]
+    NoSymbols,
 }
 
 /// Decide a spec for `family` from `brief`, recording every decision to
@@ -58,6 +69,10 @@ pub fn generate(
         "stm32-codec" => Ok(Spec::Stm32Codec(generate_stm32_codec_spec(
             client, trace, brief,
         )?)),
+        "board" => {
+            let catalog = Catalog::load(&default_catalog_dir())?;
+            Ok(Spec::Board(synth::design(client, trace, brief, &catalog)?))
+        }
         other => Err(FamilyError::Unknown(other.to_string())),
     }
 }
@@ -82,16 +97,23 @@ impl Spec {
             Spec::FuzzPedal(_) => "fuzz-pedal",
             Spec::FuzzChain(_) => "fuzz-chain",
             Spec::Stm32Codec(_) => "stm32-codec",
+            Spec::Board(_) => "board",
         }
     }
 
-    /// The SKiDL circuit — a pure function of the spec.
-    pub fn render_skidl(&self) -> String {
-        match self {
+    /// The SKiDL circuit — a pure function of the spec (and, for a synthesized
+    /// board, of the catalog it was decided against and the KiCad symbols).
+    pub fn render_skidl(&self) -> Result<String, FamilyError> {
+        Ok(match self {
             Spec::FuzzPedal(s) => render_skidl(s),
             Spec::FuzzChain(c) => render_chain_skidl(c),
             Spec::Stm32Codec(s) => render_stm32_codec_skidl(s),
-        }
+            Spec::Board(d) => {
+                let catalog = Catalog::load(&default_catalog_dir())?;
+                let symbols = crate::skidl::kicad_symbol_dir().ok_or(FamilyError::NoSymbols)?;
+                synth::circuit(d, &catalog, symbols.path())?.to_skidl()
+            }
+        })
     }
 
     /// Facts this design rests on that no machine can check and no person has
@@ -100,6 +122,9 @@ impl Spec {
     pub fn unconfirmed_facts(&self) -> Vec<String> {
         match self {
             Spec::Stm32Codec(s) => crate::mcu_audio::unconfirmed_facts(s),
+            Spec::Board(d) => Catalog::load(&default_catalog_dir())
+                .map(|c| synth::unconfirmed(d, &c))
+                .unwrap_or_else(|e| vec![format!("catalog did not load: {e}")]),
             Spec::FuzzPedal(_) | Spec::FuzzChain(_) => Vec::new(),
         }
     }
@@ -112,7 +137,7 @@ impl Spec {
             Spec::FuzzPedal(s) => s.enclosure_size,
             Spec::FuzzChain(c) => c.enclosure_size,
             // A board, not a front panel: its outline comes from its parts.
-            Spec::Stm32Codec(_) => return None,
+            Spec::Stm32Codec(_) | Spec::Board(_) => return None,
         };
         Some(fuzz_pedal_panel_file(size, ("RV1", "RV2"), 1.6))
     }

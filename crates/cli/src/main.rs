@@ -857,6 +857,30 @@ fn spec_cmd(
 
     let text = match &spec {
         family::Spec::FuzzPedal(s) => render_spec_text(&brief, s, trace.records()),
+        family::Spec::Board(d) => {
+            let mut t = format!("Brief: {brief}\n\nRequirements (typed decisions):\n");
+            for (k, v) in &d.requirements {
+                t.push_str(&format!("  {k:<14} {}\n", if *v { "yes" } else { "no" }));
+            }
+            t.push_str("\nParts (from the catalog):\n");
+            for (slot, sel) in &d.parts {
+                t.push_str(&format!(
+                    "  {slot:<16} {:<28} {}\n",
+                    sel.chosen.join(" + "),
+                    sel.how
+                ));
+            }
+            t.push_str("\nBindings:\n");
+            for (bus, sel) in &d.bindings {
+                t.push_str(&format!(
+                    "  {bus:<16} {:<28} {}\n",
+                    sel.chosen.join(" + "),
+                    sel.how
+                ));
+            }
+            t.push_str(&format!("\nCatalog: {}\n", d.catalog));
+            t
+        }
         other => anyhow::bail!("`lob spec` does not decide {} specs", other.family()),
     };
     std::fs::write(&text_path, text).with_context(|| format!("writing {}", text_path.display()))?;
@@ -1002,7 +1026,7 @@ fn schematic_cmd(spec_path: PathBuf, out: PathBuf, panel: Option<PathBuf>) -> Re
 
     let spec = family::Spec::from_json(value)
         .with_context(|| format!("parsing spec {}", spec_path.display()))?;
-    std::fs::write(&out, spec.render_skidl())
+    std::fs::write(&out, spec.render_skidl()?)
         .with_context(|| format!("writing {}", out.display()))?;
 
     println!(
