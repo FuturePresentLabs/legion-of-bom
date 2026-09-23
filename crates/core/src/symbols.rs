@@ -191,6 +191,11 @@ fn build_subckt_model(
 pub struct SymbolData {
     /// `(pin_number, pin_name)`, sorted by pin number.
     pub pins: Vec<(String, String)>,
+    /// `(pin_number, alternate_name)` — a pin's other functions, as the
+    /// library lists them (an STM32 port pin's `SAI1_SCK_A`, `SPI4_SCK`, …).
+    /// KiCad's STM32 symbols are generated from ST's own pin data, so this is
+    /// the cited source for a pin-mux choice.
+    pub alternates: Vec<(String, String)>,
     pub datasheet: Option<String>,
     pub description: Option<String>,
 }
@@ -229,11 +234,12 @@ pub fn read_symbol(
         .map_err(|e| StageError::Other(format!("reading {}: {e}", path.display())))?;
     let root = Sexpr::parse(&text)
         .map_err(|e| StageError::Other(format!("parsing {}: {e}", path.display())))?;
-    let Some(sym) = root
-        .get_all("symbol")
-        .into_iter()
-        .find(|s| s.nth_atom(1) == Some(part))
-    else {
+    let find = |name: &str| {
+        root.get_all("symbol")
+            .into_iter()
+            .find(|s| s.nth_atom(1) == Some(name))
+    };
+    let Some(sym) = find(part) else {
         return Ok(None);
     };
 
@@ -246,9 +252,31 @@ pub fn read_symbol(
             .filter(|s| !s.is_empty())
     };
 
+    // A derived symbol (`(extends "PCM5100")` — how KiCad draws one package
+    // for a family) carries its own properties but its parent's pins. Walk
+    // the chain to the symbol that actually has them; a cycle or a missing
+    // parent is a broken library, reported rather than read as "no pins".
+    let mut body = sym;
+    let mut chain = vec![part.to_string()];
+    while let Some(parent) = body.get("extends").and_then(|e| e.nth_atom(1)) {
+        if chain.iter().any(|c| c == parent) {
+            return Err(StageError::Other(format!(
+                "symbol '{part}' in {lib} extends itself: {}",
+                chain.join(" -> ")
+            )));
+        }
+        chain.push(parent.to_string());
+        body = find(parent).ok_or_else(|| {
+            StageError::Other(format!(
+                "symbol '{part}' in {lib} extends '{parent}', which {lib} does not define"
+            ))
+        })?;
+    }
+
     let mut pins: Vec<(String, String)> = Vec::new();
+    let mut alternates: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
-    for unit in sym.get_all("symbol") {
+    for unit in body.get_all("symbol") {
         for pin in unit.get_all("pin") {
             let number = pin
                 .get("number")
@@ -262,12 +290,19 @@ pub fn read_symbol(
                 .and_then(|n| n.nth_atom(1))
                 .unwrap_or_default();
             pins.push((number.to_string(), name.to_string()));
+            for alt in pin.get_all("alternate") {
+                if let Some(a) = alt.nth_atom(1) {
+                    alternates.push((number.to_string(), a.to_string()));
+                }
+            }
         }
     }
     pins.sort_by_key(|p| pin_sort_key(&p.0));
+    alternates.sort_by_key(|p| (pin_sort_key(&p.0), p.1.clone()));
 
     Ok(Some(SymbolData {
         pins,
+        alternates,
         datasheet: prop("Datasheet"),
         description: prop("Description"),
     }))
@@ -740,6 +775,51 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("T.kicad_sym"), body).unwrap();
         TempLib(dir)
+    }
+
+    /// A derived symbol reads its parent's pins (PCM5102A is drawn as
+    /// `(extends "PCM5100")`, and read naively has none), and a port pin's
+    /// alternate functions come back with it — the cited source for an STM32
+    /// pin-mux choice.
+    #[test]
+    fn a_derived_symbol_has_its_parents_pins_and_their_alternates() {
+        let lib = temp_lib(
+            "extends",
+            r#"(kicad_symbol_lib
+                 (symbol "BASE"
+                   (property "Datasheet" "https://example.com/base.pdf")
+                   (symbol "BASE_1_1"
+                     (pin bidirectional line (at 0 0 0) (length 2.54)
+                       (name "PE5") (number "4")
+                       (alternate "SAI1_SCK_A" bidirectional line)
+                       (alternate "SPI4_MISO" bidirectional line))
+                     (pin power_in line (at 0 2.54 0) (length 2.54)
+                       (name "VDD") (number "10"))))
+                 (symbol "DERIVED" (extends "BASE")
+                   (property "Datasheet" "https://example.com/derived.pdf"))
+                 (symbol "LOOP" (extends "LOOP")))"#,
+        );
+        let d = read_symbol(&lib.0, "T", "DERIVED").unwrap().expect("found");
+        assert_eq!(
+            d.pins,
+            vec![("4".into(), "PE5".into()), ("10".into(), "VDD".into())]
+        );
+        assert_eq!(
+            d.alternates,
+            vec![
+                ("4".into(), "SAI1_SCK_A".into()),
+                ("4".into(), "SPI4_MISO".into())
+            ]
+        );
+        assert_eq!(
+            d.datasheet.as_deref(),
+            Some("https://example.com/derived.pdf"),
+            "the derived symbol's own properties win"
+        );
+        assert!(
+            read_symbol(&lib.0, "T", "LOOP").is_err(),
+            "a cycle is a broken library, not a part with no pins"
+        );
     }
 
     /// KiCad has three fill modes and they are not interchangeable: `outline` is
