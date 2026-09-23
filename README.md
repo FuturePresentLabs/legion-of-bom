@@ -19,7 +19,7 @@
 </div>
 
 ```bash
-lob spec stm32-codec --brief "stereo line in and out, no I2C setup" --out design
+lob spec board --brief "stereo line in and out, no I2C setup" --out design
 lob schematic design.json --out board.py
 lob board board.py && lob drc out/board/board.kicad_pcb
 ```
@@ -71,11 +71,14 @@ brief ─(lob spec)─► spec ─(lob schematic)─► SKiDL circuit
   never free text) of a System One–compatible endpoint through the shared
   [`ooda`](https://github.com/FuturePresentLabs/ooda) client, and writes a spec. `lob schematic` renders
   the circuit as a pure function of that spec. Families today: `fuzz-pedal`
-  (plus `lob spec-chain` for chained gain stages) and `stm32-codec` (an
-  STM32H743 with a PCM5102A + PCM1808, WM8731 or ES8388 codec).
-- **Cited, not remembered.** A family's pinouts come from the official KiCad
-  symbols, connected by pin name and checked against the symbol file (including
-  pin-mux alternates). Every component value carries a verbatim quote from a
+  (plus `lob spec-chain` for chained gain stages) and `board`, which
+  synthesizes the circuit: requirements, parts and bus bindings are each typed
+  decisions whose options come from the [parts catalog](catalog/README.md), and
+  the tool writes the SKiDL.
+- **Cited, not remembered.** The catalog is hand-curated JSON, one file per
+  part. Pinouts come from the official KiCad symbols, connected by pin name and
+  checked against the symbol file (including pin-mux alternates). Every
+  component value carries a verbatim quote from a
   page of a pinned datasheet — distributor copy, URL + SHA-256 — that is checked
   mechanically with `pdftotext`. Values read off a figure, or not stated in any
   pinned source, are recorded as readings; `lob schematic` lists every one no
@@ -123,7 +126,7 @@ fails with a clear error, never a panic, when its tool is missing:
 ```bash
 cargo run -p legion-of-bom-cli -- run examples/rc_lowpass.py        # simulate a textbook filter
 
-lob spec stm32-codec --brief "stereo line in/out, no I2C setup" --out design
+lob spec board --brief "stereo line in/out, no I2C setup" --out design
 lob schematic design.json --out board.py                            # + unconfirmed readings
 lob run board.py && lob board board.py && lob drc out/board/board.kicad_pcb
 ```

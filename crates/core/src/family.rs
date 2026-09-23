@@ -14,7 +14,6 @@ use ooda::{Client, Trace};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{default_catalog_dir, Catalog, CatalogError};
-use crate::mcu_audio::{generate_stm32_codec_spec, render_stm32_codec_skidl, Stm32CodecSpec};
 use crate::panel::PanelFile;
 use crate::pedal_panel::fuzz_pedal_panel_file;
 use crate::spec::{generate_fuzz_pedal_spec, render_skidl, FuzzPedalSpec, SpecError};
@@ -29,15 +28,13 @@ pub enum Spec {
     /// Written by `lob spec-chain`, which takes constraints `lob spec` does
     /// not; it is not reachable through [`generate`].
     FuzzChain(FuzzChain),
-    /// An STM32H7 audio board with one of three codec options.
-    Stm32Codec(Stm32CodecSpec),
     /// A board synthesized from the brief by typed decisions over the parts
     /// catalog ([`crate::synth`]).
     Board(DesignSpec),
 }
 
 /// The families [`generate`] decides — what `lob spec <family>` accepts.
-pub const FAMILIES: &[&str] = &["board", "fuzz-pedal", "stm32-codec"];
+pub const FAMILIES: &[&str] = &["board", "fuzz-pedal"];
 
 /// Unknown family, or a decision that failed.
 #[derive(Debug, thiserror::Error)]
@@ -64,9 +61,6 @@ pub fn generate(
 ) -> Result<Spec, FamilyError> {
     match family {
         "fuzz-pedal" => Ok(Spec::FuzzPedal(generate_fuzz_pedal_spec(
-            client, trace, brief,
-        )?)),
-        "stm32-codec" => Ok(Spec::Stm32Codec(generate_stm32_codec_spec(
             client, trace, brief,
         )?)),
         "board" => {
@@ -96,7 +90,6 @@ impl Spec {
         match self {
             Spec::FuzzPedal(_) => "fuzz-pedal",
             Spec::FuzzChain(_) => "fuzz-chain",
-            Spec::Stm32Codec(_) => "stm32-codec",
             Spec::Board(_) => "board",
         }
     }
@@ -107,7 +100,6 @@ impl Spec {
         Ok(match self {
             Spec::FuzzPedal(s) => render_skidl(s),
             Spec::FuzzChain(c) => render_chain_skidl(c),
-            Spec::Stm32Codec(s) => render_stm32_codec_skidl(s),
             Spec::Board(d) => {
                 let catalog = Catalog::load(&default_catalog_dir())?;
                 let symbols = crate::skidl::kicad_symbol_dir().ok_or(FamilyError::NoSymbols)?;
@@ -121,7 +113,6 @@ impl Spec {
     /// source states. What stands between the design and a fab order.
     pub fn unconfirmed_facts(&self) -> Vec<String> {
         match self {
-            Spec::Stm32Codec(s) => crate::mcu_audio::unconfirmed_facts(s),
             Spec::Board(d) => Catalog::load(&default_catalog_dir())
                 .map(|c| synth::unconfirmed(d, &c))
                 .unwrap_or_else(|e| vec![format!("catalog did not load: {e}")]),
@@ -137,7 +128,7 @@ impl Spec {
             Spec::FuzzPedal(s) => s.enclosure_size,
             Spec::FuzzChain(c) => c.enclosure_size,
             // A board, not a front panel: its outline comes from its parts.
-            Spec::Stm32Codec(_) | Spec::Board(_) => return None,
+            Spec::Board(_) => return None,
         };
         Some(fuzz_pedal_panel_file(size, ("RV1", "RV2"), 1.6))
     }
@@ -167,13 +158,23 @@ mod tests {
     }
 
     #[test]
-    fn an_mcu_board_spec_round_trips_and_has_no_panel() {
-        let spec = Spec::Stm32Codec(Stm32CodecSpec {
-            codec: crate::mcu_audio::Codec::Es8388,
+    fn a_synthesized_board_spec_round_trips_and_has_no_panel() {
+        let spec = Spec::Board(DesignSpec {
+            brief: "b".into(),
+            requirements: [("line_out".to_string(), true)].into(),
+            parts: [(
+                "audio".to_string(),
+                synth::Selection {
+                    chosen: vec!["PCM5102APWR".into()],
+                    how: "derived".into(),
+                },
+            )]
+            .into(),
+            bindings: Default::default(),
+            catalog: "0123456789abcdef".into(),
         });
         let json = serde_json::to_value(&spec).unwrap();
-        assert_eq!(json["family"], "stm32-codec");
-        assert_eq!(json["codec"], "es8388");
+        assert_eq!(json["family"], "board");
         assert_eq!(Spec::from_json(json).unwrap(), spec);
         assert!(spec.panel().is_none(), "a board has no front panel");
     }

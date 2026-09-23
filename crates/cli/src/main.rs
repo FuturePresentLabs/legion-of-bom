@@ -250,8 +250,8 @@ enum Command {
     /// for a local dev endpoint) -- see .env.example. Follow with
     /// `lob schematic` to render the circuit from the written spec.
     Spec {
-        /// Circuit family from the curated library: "fuzz-pedal" or
-        /// "stm32-codec".
+        /// Circuit family from the curated library: "board" (synthesized from
+        /// the parts catalog) or "fuzz-pedal".
         family: String,
         /// Free-text design brief, carried as decision context (not parsed for
         /// control flow -- the decisions, not the brief, choose the circuit).
@@ -4192,6 +4192,46 @@ fn load_credentials() {
     }
 }
 
+/// Handle `lob catalog`.
+fn catalog_cmd(action: CatalogCmd) -> Result<()> {
+    use legion_of_bom_core::catalog::{self, Catalog};
+    let dir_or_default = |d: Option<PathBuf>| d.unwrap_or_else(catalog::default_catalog_dir);
+    match action {
+        CatalogCmd::List { dir } => {
+            let cat = Catalog::load(&dir_or_default(dir))?;
+            for p in &cat.parts {
+                println!("{:<28} {}", p.mpn, p.provides.join(", "));
+            }
+        }
+        CatalogCmd::Check { dir } => {
+            let dir = dir_or_default(dir);
+            let cat = Catalog::load(&dir)?;
+            let symbols = kicad_symbol_dir()
+                .context("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")?;
+            let mut problems = catalog::check_symbols(&cat, symbols.path())?;
+            problems.extend(catalog::check_quotes(
+                &cat,
+                &legion_of_bom_core::datasheet::default_cache_dir(),
+            )?);
+            let unconfirmed: usize = cat.parts.iter().map(|p| p.unconfirmed().len()).sum();
+            for p in &problems {
+                println!("  ✗ {p}");
+            }
+            println!(
+                "{} part(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
+                cat.parts.len(),
+                cat.parts.iter().map(|p| p.quotes().len()).sum::<usize>(),
+                unconfirmed,
+                problems.len()
+            );
+            if !problems.is_empty() {
+                anyhow::bail!("catalog check failed");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4402,44 +4442,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// Handle `lob catalog`.
-fn catalog_cmd(action: CatalogCmd) -> Result<()> {
-    use legion_of_bom_core::catalog::{self, Catalog};
-    let dir_or_default = |d: Option<PathBuf>| d.unwrap_or_else(catalog::default_catalog_dir);
-    match action {
-        CatalogCmd::List { dir } => {
-            let cat = Catalog::load(&dir_or_default(dir))?;
-            for p in &cat.parts {
-                println!("{:<28} {}", p.mpn, p.provides.join(", "));
-            }
-        }
-        CatalogCmd::Check { dir } => {
-            let dir = dir_or_default(dir);
-            let cat = Catalog::load(&dir)?;
-            let symbols = kicad_symbol_dir()
-                .context("no KiCad symbol library found (set KICAD9_SYMBOL_DIR)")?;
-            let mut problems = catalog::check_symbols(&cat, symbols.path())?;
-            problems.extend(catalog::check_quotes(
-                &cat,
-                &legion_of_bom_core::datasheet::default_cache_dir(),
-            )?);
-            let unconfirmed: usize = cat.parts.iter().map(|p| p.unconfirmed().len()).sum();
-            for p in &problems {
-                println!("  ✗ {p}");
-            }
-            println!(
-                "{} part(s), {} quote(s) checked, {} reading(s) awaiting confirmation, {} problem(s)",
-                cat.parts.len(),
-                cat.parts.iter().map(|p| p.quotes().len()).sum::<usize>(),
-                unconfirmed,
-                problems.len()
-            );
-            if !problems.is_empty() {
-                anyhow::bail!("catalog check failed");
-            }
-        }
-    }
-    Ok(())
 }
