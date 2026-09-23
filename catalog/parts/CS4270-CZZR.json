@@ -1,0 +1,526 @@
+{
+  "mpn": "CS4270-CZZR",
+  "manufacturer": "Cirrus Logic",
+  "lcsc": "C1323229",
+  "summary": "Stereo 24-bit 192 kHz audio codec (ADC + DAC), single-ended analog in/out, I2S or left-justified serial audio; wired here in Software (I2C) Mode as an I2S slave at 7-bit address 0x48 (1001 + AD2..AD0 = 000). NEEDS A 5 V ANALOG SUPPLY: VA 4.75-5.25 V; VD 3.14-5.25 V and VLC 1.71-5.25 V run from +3V3. Channel A = left, B = right. Line in via a 2k/2k divider (2 Vrms to the 1 Vrms full scale) and 10 uF; line out via 3.3 uF, 10k and a 470 ohm / C filter; MUTEA/MUTEB (optional external mute) left open",
+  "symbol": {
+    "kicad": "Audio:CS4270"
+  },
+  "footprint": "Package_SO:TSSOP-24_4.4x7.8mm_P0.65mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/770b55756ad4187c2607d924824cc1da.pdf",
+    "sha256": "44e2eabc1e6b70a26cc8e8d20522505cd16c7c64e3d3b5b08c8878987f2f5c1c"
+  },
+  "provides": [
+    "i2s-dac",
+    "i2s-adc"
+  ],
+  "sim_excluded": true,
+  "params": {
+    "i2c_addr": {
+      "value": 72,
+      "cite": {
+        "page": 28,
+        "quote": "upper 4 bits of the 7-bit address field are fixed at 1001."
+      }
+    },
+    "va_min_v": {
+      "value": 4.75,
+      "cite": {
+        "page": 8,
+        "quote": "DC Power Supplies: Analog VA 4.75 5.0 5.25 V"
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "i2s",
+      "role": "slave",
+      "signals": {
+        "mclk": "pin:MCLK",
+        "bck": "pin:SCLK",
+        "lrck": "pin:LRCLK",
+        "din": "pin:SDIN",
+        "dout": "pin:SDOUT"
+      },
+      "cite": {
+        "page": 22,
+        "quote": "In Serial Control Port Mode, the CS4270 defaults to Slave Mode."
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "slave",
+      "signals": {
+        "scl": "pin:SCL/CCLK/M0",
+        "sda": "pin:SDA/CDOUT/M1"
+      },
+      "cite": {
+        "page": 28,
+        "quote": "Software Mode supports the I²C interface, with the CS4270 acting as a"
+      }
+    },
+    {
+      "kind": "gpio",
+      "role": "slave",
+      "signals": {
+        "reset": "pin:~{RST}"
+      },
+      "cite": {
+        "page": 21,
+        "quote": "After RST is released, the device is put into Serial Control Port Mode by setting the power down bit"
+      }
+    },
+    {
+      "kind": "audio-line-in",
+      "role": "sink",
+      "signals": {
+        "l": "node:in_l",
+        "r": "node:in_r"
+      },
+      "cite": {
+        "page": 25,
+        "quote": "will attenuate a typical line level voltage, 2 Vrms, to the full-scale input of the ADC, 0.56*VA (1 Vrms) when"
+      }
+    },
+    {
+      "kind": "audio-line-out",
+      "role": "source",
+      "signals": {
+        "l": "node:out_l",
+        "r": "node:out_r"
+      },
+      "cite": {
+        "page": 27,
+        "quote": "The recommended external analog"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VA",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 8,
+        "quote": "DC Power Supplies: Analog VA 4.75 5.0 5.25 V"
+      }
+    },
+    {
+      "between": [
+        "pin:VD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 8,
+        "quote": "Digital VD 3.14 3.3 5.25 V"
+      }
+    },
+    {
+      "between": [
+        "pin:VLC",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 8,
+        "quote": "Serial Control Port VLC 1.71 3.3 5.25 V"
+      }
+    },
+    {
+      "between": [
+        "pin:AGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 5,
+        "quote": "AGND 20 Analog Ground (Input) - Ground reference for the analog section."
+      }
+    },
+    {
+      "between": [
+        "pin:DGND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 5,
+        "quote": "DGND 6 Digital Ground (Input) - Ground reference for the digital section."
+      }
+    },
+    {
+      "between": [
+        "pin:VA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 0.1 uF + 1 uF on VA",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 0.1 uF + 1 uF on VA",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 0.1 uF + 1 uF on VD",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 0.1 uF + 1 uF on VD",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VLC",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 0.1 uF on VLC",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:FIL+",
+        "net:GND"
+      ],
+      "part": "CP",
+      "value": "47uF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 47 uF + 0.1 uF from FILT+ to AGND",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:FIL+",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 47 uF + 0.1 uF from FILT+ to AGND",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VQ",
+        "net:GND"
+      ],
+      "part": "CP",
+      "value": "10uF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 10 uF + 0.1 uF from VQ to AGND",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:VQ",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 10 uF + 0.1 uF from VQ to AGND",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:SCL/CCLK/M0",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "2k",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 2 kohm pull-ups from SCL and SDA to VLC (note 3: pull-ups in Software Mode)",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:SDA/CDOUT/M1",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "2k",
+      "cite": {
+        "reading": "Figure 1 Typical Connection Diagram: 2 kohm pull-ups from SCL and SDA to VLC (note 3: pull-ups in Software Mode)",
+        "page": 7
+      }
+    },
+    {
+      "between": [
+        "pin:SDOUT",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "47k",
+      "cite": {
+        "page": 19,
+        "quote": "In Stand-Alone Mode, the CS4270 enters Slave Mode when SDOUT (M/S) is pulled low through a 47 k"
+      }
+    },
+    {
+      "between": [
+        "pin:AD0/~{CS}/I2S/~{LJ}",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "p.28: AD0 should be connected through a resistor to VL or GND; the datasheet gives no value, 10k is a design choice",
+        "page": 28
+      }
+    },
+    {
+      "between": [
+        "pin:AD1/CDIN/MDIV1",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 28,
+        "quote": "field, which is the first byte sent to the CS4270, should match 1001 followed by the settings of AD2, AD1,"
+      }
+    },
+    {
+      "between": [
+        "pin:AD2/MDIV2",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 28,
+        "quote": "field, which is the first byte sent to the CS4270, should match 1001 followed by the settings of AD2, AD1,"
+      }
+    },
+    {
+      "between": [
+        "node:in_l",
+        "node:ain_l"
+      ],
+      "part": "R",
+      "value": "2k",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: R1 2 kohm series from the analog input",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "node:ain_l",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "2k",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: R2 2 kohm to ground",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "pin:AINA",
+        "node:ain_l"
+      ],
+      "part": "CP",
+      "value": "10uF",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: 10 uF coupling, + side at AINx",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "pin:AINA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "220pF",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: 220 pF from AINx to ground",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "node:in_r",
+        "node:ain_r"
+      ],
+      "part": "R",
+      "value": "2k",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: R1 2 kohm series from the analog input",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "node:ain_r",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "2k",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: R2 2 kohm to ground",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "pin:AINB",
+        "node:ain_r"
+      ],
+      "part": "CP",
+      "value": "10uF",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: 10 uF coupling, + side at AINx",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "pin:AINB",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "220pF",
+      "cite": {
+        "reading": "Figure 15 Example Analog Input Network: 220 pF from AINx to ground",
+        "page": 26
+      }
+    },
+    {
+      "between": [
+        "pin:OUTA",
+        "node:aout_l"
+      ],
+      "part": "CP",
+      "value": "3.3uF",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: 3.3 uF coupling, + side at AOUTx",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "node:aout_l",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: 10 kohm to ground after the coupling cap",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "node:aout_l",
+        "node:out_l"
+      ],
+      "part": "R",
+      "value": "470",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: 470 ohm series",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "node:out_l",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "3.9nF",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: C = (Rext + 470) / (4 pi Fs (Rext * 470)); 3.9 nF is the nearest E12 value to 3.69 nF for an assumed Rext = 10 kohm and Fs = 48 kHz - recompute for the real load and rate",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "pin:OUTB",
+        "node:aout_r"
+      ],
+      "part": "CP",
+      "value": "3.3uF",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: 3.3 uF coupling, + side at AOUTx",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "node:aout_r",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: 10 kohm to ground after the coupling cap",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "node:aout_r",
+        "node:out_r"
+      ],
+      "part": "R",
+      "value": "470",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: 470 ohm series",
+        "page": 27
+      }
+    },
+    {
+      "between": [
+        "node:out_r",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "3.9nF",
+      "cite": {
+        "reading": "Figure 18 Recommended Analog Output Filter: C = (Rext + 470) / (4 pi Fs (Rext * 470)); 3.9 nF is the nearest E12 value to 3.69 nF for an assumed Rext = 10 kohm and Fs = 48 kHz - recompute for the real load and rate",
+        "page": 27
+      }
+    }
+  ]
+}

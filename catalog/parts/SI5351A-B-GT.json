@@ -1,0 +1,37 @@
+{
+  "mpn": "SI5351A-B-GT",
+  "manufacturer": "Silicon Labs (Skyworks)",
+  "lcsc": "C529366",
+  "summary": "I2C-programmable CMOS clock generator, 3 outputs (CLK0-CLK2) from 2.5 kHz to 200 MHz, 10-MSOP; runs from a 25 or 27 MHz crystal using internal 6/8/10 pF load caps; I2C slave at fixed address 0x60 (no A0 pin on this package); core VDD 2.5 or 3.3 V, output bank VDDO 1.8/2.5/3.3 V",
+  "symbol": {"kicad": "Oscillator:Si5351A-B-GT"},
+  "footprint": "Package_SO:MSOP-10_3x3mm_P0.5mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/9d1e3309ddd1eb04cc3a10020cbc51b5.pdf",
+    "sha256": "0e0873d925956618b4e39b4f9e03c743481447a32c1cedefba7a70c0d269b31d"
+  },
+  "provides": ["clock-gen"],
+  "sim_excluded": true,
+  "params": {
+    "xtal_freq_hz": {"value": 25000000, "cite": {"page": 11, "quote": "Crystal Frequency fXTAL 25 — 27 MHz"}},
+    "xtal_cl_pf": {"value": 10, "cite": {"page": 11, "quote": "Crystals which require load capacitances of 6, 8, or 10 pF should use the device"}},
+    "i2c_addr": {"value": 96, "cite": {"page": 18, "quote": "If a part does not have the A0 pin, the default address is 0x60 with the A0 bit set to 0."}},
+    "fout_max_hz": {"value": 200000000, "cite": {"page": 1, "quote": "200 MHz"}}
+  },
+  "interfaces": [
+    {"kind": "i2c", "role": "slave", "signals": {"scl": "pin:SCL", "sda": "pin:SDA"},
+     "cite": {"page": 18, "quote": "The I2C interface operates in slave mode with 7-bit addressing and can operate in Standard-Mode (100 kbps) or"}},
+    {"kind": "hse", "role": "needs", "signals": {"in": "pin:XA", "out": "pin:XB"},
+     "cite": {"page": 15, "quote": "Internal load capacitors are provided to eliminate the need for external components when connecting a crystal to"}},
+    {"kind": "clk-out", "role": "source", "signals": {"clk0": "pin:CLK0", "clk1": "pin:CLK1", "clk2": "pin:CLK2"},
+     "cite": {"page": 33, "quote": "CLK0 10 O Output clock 0."}}
+  ],
+  "support": [
+    {"between": ["pin:VDD", "net:+3V3"], "part": "tie", "cite": {"page": 1, "quote": "Core VDD: 2.5 or 3.3 V"}},
+    {"between": ["pin:VDDO", "net:+3V3"], "part": "tie", "cite": {"page": 1, "quote": "Output VDDO: 1.8, 2.5, or 3.3 V"}},
+    {"between": ["pin:GND", "net:GND"], "part": "tie", "cite": {"page": 33, "quote": "GND 8 P Ground."}},
+    {"between": ["pin:VDD", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 25, "quote": "All that is recommended is one 0.1 to 1.0 µF decoupling capacitor per power supply pin."}},
+    {"between": ["pin:VDDO", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 25, "quote": "All that is recommended is one 0.1 to 1.0 µF decoupling capacitor per power supply pin."}},
+    {"between": ["pin:SCL", "net:+3V3"], "part": "R", "value": "10k", "cite": {"reading": "p.33 requires an SCL pull-up of at least 1k and p.11 limits the pull-up voltage to 2.25-3.63 V; 10k is a design choice matching the other catalog I2C parts, not a datasheet value", "page": 33}},
+    {"between": ["pin:SDA", "net:+3V3"], "part": "R", "value": "10k", "cite": {"reading": "p.33 requires an SDA pull-up of at least 1k and p.11 limits the pull-up voltage to 2.25-3.63 V; 10k is a design choice matching the other catalog I2C parts, not a datasheet value", "page": 33}}
+  ]
+}

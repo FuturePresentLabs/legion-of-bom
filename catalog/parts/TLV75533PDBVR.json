@@ -1,0 +1,90 @@
+{
+  "mpn": "TLV75533PDBVR",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C404027",
+  "summary": "Fixed 3.3 V LDO, 500 mA, with enable and active output discharge, from a 5 V rail (SOT-23-5); input max 5.5 V",
+  "symbol": {
+    "kicad": "Regulator_Linear:TLV75533PDBV"
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-23-5",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/107eeb995f1c91f292b91a59221db472.pdf",
+    "sha256": "44ac688d7e51f85259134abcffeed6cd1ae61234dfd2b6dea2b0607d8ad0d015"
+  },
+  "provides": [
+    "rail:+3V3"
+  ],
+  "sim_excluded": true,
+  "support": [
+    {
+      "between": [
+        "pin:IN",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 4,
+        "quote": "VIN Input voltage 1.45 5.5 V"
+      }
+    },
+    {
+      "between": [
+        "pin:EN",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 12,
+        "quote": "If shutdown capability is not required, connect EN to IN."
+      }
+    },
+    {
+      "between": [
+        "pin:OUT",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 22,
+        "quote": "xx(x) is the nominal output voltage. For output voltages with a resolution of 100 mV, two digits are used"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 3,
+        "quote": "GND 2 2 3 — Ground pin."
+      }
+    },
+    {
+      "between": [
+        "pin:IN",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 15,
+        "quote": "Place a 1 µF or greater capacitor on the input pin of the LDO."
+      }
+    },
+    {
+      "between": [
+        "pin:OUT",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 3,
+        "quote": "Regulated output voltage pin. A capacitor with a value of 1 µF or larger"
+      }
+    }
+  ]
+}

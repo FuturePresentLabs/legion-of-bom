@@ -1,0 +1,61 @@
+{
+  "mpn": "ECS-160-20-33-TR",
+  "manufacturer": "ECS Inc.",
+  "lcsc": "C2441333",
+  "summary": "16 MHz fundamental crystal, 20 pF load, 3.2x2.5 mm 4-pad SMD (ECX-32); pads 1/3 crystal, 2/4 ground",
+  "symbol": {
+    "kicad": "Device:Crystal_GND24"
+  },
+  "footprint": "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/4dd822b1861c1f4bac77725a3ad062b8.pdf",
+    "sha256": "7f56a768dd3d45948b254a36510ee2158a57ecbdf1b3cdcaaff2c6d49b0e6ee3"
+  },
+  "provides": [
+    "crystal"
+  ],
+  "sim_excluded": true,
+  "params": {
+    "freq_hz": {
+      "value": 16000000,
+      "cite": {
+        "page": 2,
+        "quote": "160 16.000"
+      }
+    },
+    "cl_pf": {
+      "value": 20,
+      "cite": {
+        "page": 1,
+        "quote": "20 = 20 pF"
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "hse",
+      "role": "source",
+      "signals": {
+        "in": "pin:1",
+        "out": "pin:3"
+      },
+      "cite": {
+        "page": 1,
+        "quote": "Crystal is symmetrical, pad 1 & 3 are interchangeable."
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:G",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "1 In/Out 2 Gnd"
+      }
+    }
+  ]
+}

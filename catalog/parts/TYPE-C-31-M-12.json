@@ -1,0 +1,89 @@
+{
+  "mpn": "TYPE-C-31-M-12",
+  "manufacturer": "Korean Hroparts Elec",
+  "lcsc": "C165948",
+  "summary": "USB Type-C 16-pin SMD receptacle: 5 V power input on VBUS plus a USB 2.0 D+/D- port; needs 5.1k CC pull-downs to act as a sink",
+  "symbol": {
+    "kicad": "Connector:USB_C_Receptacle_USB2.0_16P"
+  },
+  "footprint": "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/9e56b777c022540fcce7c7f67825f55e.pdf",
+    "sha256": "6ae33d50ac47820114661138dc4e4659f40fdc5d4f485b46685dfec338da1a9e"
+  },
+  "provides": [
+    "connector"
+  ],
+  "interfaces": [
+    {
+      "kind": "power-in",
+      "role": "port",
+      "signals": {
+        "v": "pin:VBUS"
+      },
+      "cite": {
+        "reading": "pin table on the drawing: A4, A9, B4, B9 = VBUS; electrical performance 'CURRENT RATING:5A' (drawing has no text layer)",
+        "page": 1
+      }
+    },
+    {
+      "kind": "usb",
+      "role": "port",
+      "signals": {
+        "dp": "pin:D+",
+        "dm": "pin:D-"
+      },
+      "cite": {
+        "reading": "pin table on the drawing: A6 DP1, B6 DP2, A7 DN1, B7 DN2 (drawing has no text layer); both D+ pins and both D- pins share a net by name",
+        "page": 1
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "pin table on the drawing: A1, A12, B1, B12 = GND (drawing has no text layer)",
+        "page": 1
+      }
+    },
+    {
+      "between": [
+        "pin:SHIELD",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "shell tied straight to board ground: a common design choice, not stated on the connector drawing; an RC or ferrite shell termination is an alternative"
+      }
+    },
+    {
+      "between": [
+        "pin:CC1",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "5.1k",
+      "footprint": "Resistor_SMD:R_0402_1005Metric",
+      "cite": {
+        "reading": "Rd = 5.1 kΩ pull-down on CC1 marks a USB Type-C sink (USB Type-C specification, not the connector datasheet)"
+      }
+    },
+    {
+      "between": [
+        "pin:CC2",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "5.1k",
+      "footprint": "Resistor_SMD:R_0402_1005Metric",
+      "cite": {
+        "reading": "Rd = 5.1 kΩ pull-down on CC2 marks a USB Type-C sink (USB Type-C specification, not the connector datasheet)"
+      }
+    }
+  ]
+}

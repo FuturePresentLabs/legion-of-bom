@@ -1,0 +1,55 @@
+{
+  "mpn": "USBLC6-2SC6",
+  "manufacturer": "STMicroelectronics",
+  "lcsc": "C7519",
+  "summary": "Two-line low-capacitance ESD protection for a USB 2.0 D+/D- pair plus VBUS (SOT-23-6); the data lines pass through I/O1 (pins 1/6) and I/O2 (pins 3/4)",
+  "symbol": {
+    "kicad": "Power_Protection:USBLC6-2SC6"
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-23-6",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/0d3a2ab954b34651a0695e7ccf534db0.pdf",
+    "sha256": "8ba7ab4ec1781b7f6052f5999a2304bd611c0ed2b5e8f36ffa5092552932a42e"
+  },
+  "provides": [
+    "esd-usb"
+  ],
+  "sim_excluded": true,
+  "support": [
+    {
+      "between": [
+        "pin:VBUS",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "Protects VBUS"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "GND 2 5 VBUS"
+      }
+    },
+    {
+      "between": [
+        "pin:VBUS",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "cite": {
+        "page": 9,
+        "quote": "CBUS = 100nF"
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "mpn": "132289",
+  "manufacturer": "Amphenol RF",
+  "lcsc": "C3172723",
+  "summary": "SMA female end-launch (edge-mount) bulkhead jack for a 1.57 mm (0.062 in) board, 50 ohm, DC-18 GHz: an off-board RF/antenna port",
+  "symbol": {
+    "kicad": "Connector:Conn_Coaxial"
+  },
+  "footprint": "Connector_Coaxial:SMA_Amphenol_132289_EdgeMount",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/aecd7a13550ce04adaae36681a1a5d95.pdf",
+    "sha256": "3456bf4b332f2d98bcfc067d6ee9ba5cce049419ee66606831fd38340101ae07"
+  },
+  "provides": [
+    "connector"
+  ],
+  "interfaces": [
+    {
+      "kind": "rf",
+      "role": "port",
+      "signals": {
+        "rf": "pin:In"
+      },
+      "cite": {
+        "reading": "drawing notes '1. IMPEDANCE: 50 OHM' and '2. FREQUENCY RANGE: DC 0-18 GHZ' (drawing has no text layer)",
+        "page": 1
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:Ext",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "body legs straddle the board edge on the outer pads of the recommended PCB layout; body is ground (drawing has no text layer)",
+        "page": 1
+      }
+    }
+  ]
+}

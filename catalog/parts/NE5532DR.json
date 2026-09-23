@@ -1,0 +1,21 @@
+{
+  "mpn": "NE5532DR",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C7426",
+  "summary": "Dual low-noise bipolar audio op-amp (5 nV/rtHz, 10 MHz GBW, drives 600 ohm), SOIC-8; a split-supply part (recommended VCC+ 5 to 15 V, VCC- -5 to -15 V), not a single +3V3 rail part. Supply ties are the circuit's choice: this entry gives only the per-pin bypass caps",
+  "symbol": {"kicad": "Amplifier_Operational:NE5532"},
+  "footprint": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/b87bff46a57243bf94b623c52737c5cd.pdf",
+    "sha256": "29b59482944aa6f6fc88e1b3c26799b1edf840ecc256caeadaf7a435535c401d"
+  },
+  "provides": ["opamp"],
+  "params": {
+    "vcc_pos_min_v": {"value": 5, "cite": {"page": 3, "quote": "VCC+ Supply voltage 5 15 V"}},
+    "vcc_pos_max_v": {"value": 15, "cite": {"page": 3, "quote": "VCC+ Supply voltage 5 15 V"}}
+  },
+  "support": [
+    {"between": ["pin:V+", "net:GND"], "part": "C", "value": "100nF", "cite": {"reading": "SLOS075I gives no bypass guidance; 100nF per supply pin is the conventional value (TI's newer TL07x sheet SLOS080M p.17 says 0.1 uF) - confirm for this part"}},
+    {"between": ["pin:V-", "net:GND"], "part": "C", "value": "100nF", "cite": {"reading": "SLOS075I gives no bypass guidance; 100nF per supply pin is the conventional value (TI's newer TL07x sheet SLOS080M p.17 says 0.1 uF) - confirm for this part"}}
+  ]
+}

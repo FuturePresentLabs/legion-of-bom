@@ -1,0 +1,106 @@
+{
+  "mpn": "W25Q128JVSIQ",
+  "manufacturer": "Winbond",
+  "lcsc": "C113767",
+  "summary": "128 Mbit (16 MB) SPI NOR flash, standard/dual/quad SPI up to 133 MHz, 2.7-3.6 V, SOIC-8 208 mil",
+  "symbol": {
+    "kicad": "Memory_Flash:W25Q128JVS"
+  },
+  "footprint": "Package_SO:SOIC-8_5.3x5.3mm_P1.27mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/deb5ae36ee5d4406b73283cbc91e149f.pdf",
+    "sha256": "cee5c3a5e3367c21261d5fa6730807fe4294539888297882cdcfa6e0eb91b72d"
+  },
+  "provides": [
+    "flash-spi"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "spi",
+      "role": "slave",
+      "signals": {
+        "sck": "pin:CLK",
+        "mosi": "pin:DI/IO_{0}",
+        "miso": "pin:DO/IO_{1}",
+        "cs": "pin:~{CS}"
+      },
+      "cite": {
+        "page": 10,
+        "quote": "Standard SPI instructions use the unidirectional DI (input) pin to serially write instructions, addresses or data to the device on the rising edge of the Serial Clock (CLK) input pin. Standard SPI also uses the unidirectional DO (output) to read data or status from the device"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VCC",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 5,
+        "quote": "Single 2.7 to 3.6V supply"
+      }
+    },
+    {
+      "between": [
+        "pin:VCC",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "the datasheet gives no decoupling recommendation; one 100 nF at VCC is standard practice",
+        "page": 6
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 6,
+        "quote": "4 GND Ground"
+      }
+    },
+    {
+      "between": [
+        "pin:~{CS}",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "pull-up so /CS tracks VCC at power-up; the datasheet says a pull-up can be used but gives no value, 10k assumed",
+        "page": 10
+      }
+    },
+    {
+      "between": [
+        "pin:~{WP}/IO_{2}",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "/WP is active low and must be held high for writes to the status register in standard SPI use; 10k pull-up assumed (value not in datasheet)",
+        "page": 10
+      }
+    },
+    {
+      "between": [
+        "pin:~{HOLD}/~{RESET}/IO_{3}",
+        "net:+3V3"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "/HOLD is active low and must be held high in standard SPI use or the device pauses; 10k pull-up assumed (value not in datasheet)",
+        "page": 10
+      }
+    }
+  ]
+}

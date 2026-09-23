@@ -1,0 +1,197 @@
+{
+  "mpn": "STM32G0B1KEU6",
+  "manufacturer": "STMicroelectronics",
+  "lcsc": "C3225630",
+  "summary": "Arm Cortex-M0+ MCU at 64 MHz, 512 KB flash, 144 KB RAM, UFQFPN-32; three SPI, three I2C, crystal-less USB FS, FDCAN; no HSE crystal pins on this package (internal HSI16/HSI48 only)",
+  "symbol": {
+    "kicad": "MCU_ST_STM32G0:STM32G0B1KEUx"
+  },
+  "footprint": "Package_DFN_QFN:QFN-32-1EP_5x5mm_P0.5mm_EP3.45x3.45mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/3d64feb4cdc2a68a0c23eb6ae93b103c.pdf",
+    "sha256": "19ad77934ee0849dbf613999149675086b13912adbafca09b8c37b8bfa76b053"
+  },
+  "provides": [
+    "mcu"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI1",
+      "signals": {
+        "sck": {
+          "alt": "SPI1_SCK"
+        },
+        "mosi": {
+          "alt": "SPI1_MOSI"
+        },
+        "miso": {
+          "alt": "SPI1_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI2",
+      "signals": {
+        "sck": {
+          "alt": "SPI2_SCK"
+        },
+        "mosi": {
+          "alt": "SPI2_MOSI"
+        },
+        "miso": {
+          "alt": "SPI2_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI3",
+      "signals": {
+        "sck": {
+          "alt": "SPI3_SCK"
+        },
+        "mosi": {
+          "alt": "SPI3_MOSI"
+        },
+        "miso": {
+          "alt": "SPI3_MISO"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C1",
+      "signals": {
+        "scl": {
+          "alt": "I2C1_SCL"
+        },
+        "sda": {
+          "alt": "I2C1_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C2",
+      "signals": {
+        "scl": {
+          "alt": "I2C2_SCL"
+        },
+        "sda": {
+          "alt": "I2C2_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C3",
+      "signals": {
+        "scl": {
+          "alt": "I2C3_SCL"
+        },
+        "sda": {
+          "alt": "I2C3_SDA"
+        }
+      }
+    },
+    {
+      "kind": "usb",
+      "role": "device",
+      "signals": {
+        "dp": {
+          "alt": "USB_DP (PA12)"
+        },
+        "dm": {
+          "alt": "USB_DM (PA11)"
+        }
+      },
+      "cite": {
+        "reading": "USB DP/DM sit on the shared PA12[PA10]/PA11[PA9] pads of UFQFPN32; PA11/PA12 must be selected by the SYSCFG pin remap, and with no HSE crystal on this package USB runs from HSI48 trimmed by CRS (RM0444; not pinned)"
+      }
+    },
+    {
+      "kind": "swd",
+      "role": "target",
+      "signals": {
+        "swdio": {
+          "alt": "SYS_SWDIO"
+        },
+        "swclk": {
+          "alt": "SYS_SWCLK"
+        },
+        "nrst": "pin:PF2"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 65,
+        "quote": "1 x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "page": 65,
+        "quote": "1 x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 65,
+        "quote": "+ 1 x 4.7 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VSS",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 65,
+        "quote": "Power supply pin pair (VDD/VDDA/VDDIO2 and VSS/VSSA) must be decoupled"
+      }
+    },
+    {
+      "between": [
+        "pin:PF2",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 100,
+        "quote": "0.1 μF"
+      }
+    }
+  ]
+}

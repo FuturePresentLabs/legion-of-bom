@@ -1,0 +1,90 @@
+{
+  "mpn": "ME6211C33M5G-N",
+  "manufacturer": "Nanjing Micro One Electronics",
+  "lcsc": "C82942",
+  "summary": "Fixed 3.3 V CMOS LDO, 500 mA, with CE enable, from a 5 V rail (SOT-23-5); high PSRR, low noise, ceramic-cap stable",
+  "symbol": {
+    "kicad": "Regulator_Linear:ME6211C33M5"
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-23-5",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/d15331d096a848ac81a26b001a32d4e3.pdf",
+    "sha256": "7e33d6651f019782b16169a5b26b7cad43e9d462b5e25dc54815b458f88fd59b"
+  },
+  "provides": [
+    "rail:+3V3"
+  ],
+  "sim_excluded": true,
+  "support": [
+    {
+      "between": [
+        "pin:V_{IN}",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 1,
+        "quote": "Operating Voltage Range: 2V～6.0V"
+      }
+    },
+    {
+      "between": [
+        "pin:CE",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 8,
+        "quote": "ME6211C33 (VIN= VOUT+1V，VCE = VIN，CIN=CL=1uF，Ta=25OC, unless otherwise noted)"
+      }
+    },
+    {
+      "between": [
+        "pin:V_{OUT}",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 3,
+        "quote": "ME6211C33M5G Enable can be set 3.3V SOT23-5"
+      }
+    },
+    {
+      "between": [
+        "pin:V_{SS}",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 4,
+        "quote": "2 2 VSS Ground"
+      }
+    },
+    {
+      "between": [
+        "pin:V_{IN}",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 8,
+        "quote": "ME6211C33 (VIN= VOUT+1V，VCE = VIN，CIN=CL=1uF，Ta=25OC, unless otherwise noted)"
+      }
+    },
+    {
+      "between": [
+        "pin:V_{OUT}",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 8,
+        "quote": "ME6211C33 (VIN= VOUT+1V，VCE = VIN，CIN=CL=1uF，Ta=25OC, unless otherwise noted)"
+      }
+    }
+  ]
+}

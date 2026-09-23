@@ -1,0 +1,384 @@
+{
+  "mpn": "CC1101RGPR",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C29953",
+  "summary": "Sub-1 GHz (315/433/868/915 MHz bands) FSK/GFSK/ASK/OOK/MSK transceiver, up to +12 dBm; 4-wire SPI slave plus GDO0/GDO2 general outputs (IRQ/FIFO status); 26-27 MHz crystal with external load caps; 1.8-3.6 V; no reset pin (reset by SRES strobe). Differential RF_P/RF_N need a band-specific balun and LC filter (inductors) that this entry does NOT model, so node:rf is not fab-ready until that network is added",
+  "symbol": {
+    "pins": [
+      {
+        "number": "1",
+        "name": "SCLK",
+        "io": "I",
+        "cite": {
+          "page": 21,
+          "quote": "1 SCLK Digital Input Serial configuration interface, clock input"
+        }
+      },
+      {
+        "number": "2",
+        "name": "SO",
+        "io": "O",
+        "cite": {
+          "page": 21,
+          "quote": "2 SO (GDO1) Digital Output Serial configuration interface, data output"
+        }
+      },
+      {
+        "number": "3",
+        "name": "GDO2",
+        "io": "O",
+        "cite": {
+          "page": 21,
+          "quote": "3 GDO2 Digital Output Digital output pin for general use:"
+        }
+      },
+      {
+        "number": "4",
+        "name": "DVDD",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "4 DVDD Power (Digital) 1.8 - 3.6 V digital power supply for digital I/O"
+        }
+      },
+      {
+        "number": "5",
+        "name": "DCOUPL",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "5 DCOUPL Power (Digital) 1.6 - 2.0 V digital power supply output for decoupling"
+        }
+      },
+      {
+        "number": "6",
+        "name": "GDO0",
+        "io": "I/O",
+        "cite": {
+          "page": 21,
+          "quote": "6 GDO0 Digital I/O Digital output pin for general use:"
+        }
+      },
+      {
+        "number": "7",
+        "name": "CSn",
+        "io": "I",
+        "cite": {
+          "page": 21,
+          "quote": "7 CSn Digital Input Serial configuration interface, chip select"
+        }
+      },
+      {
+        "number": "8",
+        "name": "XOSC_Q1",
+        "io": "passive",
+        "cite": {
+          "page": 21,
+          "quote": "8 XOSC_Q1 Analog I/O Crystal oscillator pin 1, or external clock input"
+        }
+      },
+      {
+        "number": "9",
+        "name": "AVDD",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "9 AVDD Power (Analog) 1.8 - 3.6 V analog power supply connection"
+        }
+      },
+      {
+        "number": "10",
+        "name": "XOSC_Q2",
+        "io": "passive",
+        "cite": {
+          "page": 21,
+          "quote": "10 XOSC_Q2 Analog I/O Crystal oscillator pin 2"
+        }
+      },
+      {
+        "number": "11",
+        "name": "AVDD",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "11 AVDD Power (Analog) 1.8 - 3.6 V analog power supply connection"
+        }
+      },
+      {
+        "number": "12",
+        "name": "RF_P",
+        "io": "I/O",
+        "cite": {
+          "page": 21,
+          "quote": "12 RF_P RF I/O Positive RF input signal to LNA in receive mode"
+        }
+      },
+      {
+        "number": "13",
+        "name": "RF_N",
+        "io": "I/O",
+        "cite": {
+          "page": 21,
+          "quote": "13 RF_N RF I/O Negative RF input signal to LNA in receive mode"
+        }
+      },
+      {
+        "number": "14",
+        "name": "AVDD",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "14 AVDD Power (Analog) 1.8 - 3.6 V analog power supply connection"
+        }
+      },
+      {
+        "number": "15",
+        "name": "AVDD",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "15 AVDD Power (Analog) 1.8 - 3.6 V analog power supply connection"
+        }
+      },
+      {
+        "number": "16",
+        "name": "GND",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "16 GND Ground (Analog) Analog ground connection"
+        }
+      },
+      {
+        "number": "17",
+        "name": "RBIAS",
+        "io": "passive",
+        "cite": {
+          "page": 21,
+          "quote": "17 RBIAS Analog I/O External bias resistor for reference current"
+        }
+      },
+      {
+        "number": "18",
+        "name": "DGUARD",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "18 DGUARD Power (Digital) Power supply connection for digital noise isolation"
+        }
+      },
+      {
+        "number": "19",
+        "name": "GND",
+        "io": "power",
+        "cite": {
+          "page": 21,
+          "quote": "19 GND Ground (Digital) Ground connection for digital noise isolation"
+        }
+      },
+      {
+        "number": "20",
+        "name": "SI",
+        "io": "I",
+        "cite": {
+          "page": 21,
+          "quote": "20 SI Digital Input Serial configuration interface, data input"
+        }
+      },
+      {
+        "number": "21",
+        "name": "GND",
+        "io": "power",
+        "cite": {
+          "page": 20,
+          "quote": "The exposed die attach pad must be connected to a solid ground plane as this is the main"
+        }
+      }
+    ]
+  },
+  "footprint": "Package_DFN_QFN:Texas_RGP0020H_VQFN-20-1EP_4x4mm_P0.5mm_EP2.4x2.4mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/908c0e816bb7416e91986500fa54e78e.pdf",
+    "sha256": "41dd22c5dcc55f94fd85442f003bf10d2636e0d95f9bb7c3f4cb34ca60a6b1cd"
+  },
+  "provides": [
+    "radio-subghz"
+  ],
+  "sim_excluded": true,
+  "params": {
+    "xtal_freq_hz": {
+      "value": 26000000,
+      "cite": {
+        "page": 26,
+        "quote": "26.0 MHz surface mount crystal"
+      }
+    },
+    "xtal_parasitic_pf": {
+      "value": 2.5,
+      "cite": {
+        "page": 23,
+        "quote": "Total parasitic capacitance is typically 2.5 pF."
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "spi",
+      "role": "slave",
+      "signals": {
+        "sck": "pin:SCLK",
+        "mosi": "pin:SI",
+        "miso": "pin:SO",
+        "cs": "pin:CSn"
+      },
+      "cite": {
+        "page": 22,
+        "quote": "A 4-wire SPI serial interface is used for"
+      }
+    },
+    {
+      "kind": "gpio",
+      "role": "slave",
+      "signals": {
+        "irq": "pin:GDO0",
+        "gdo2": "pin:GDO2"
+      },
+      "cite": {
+        "page": 21,
+        "quote": "6 GDO0 Digital I/O Digital output pin for general use:"
+      }
+    },
+    {
+      "kind": "hse",
+      "role": "needs",
+      "signals": {
+        "in": "pin:XOSC_Q1",
+        "out": "pin:XOSC_Q2"
+      },
+      "cite": {
+        "page": 23,
+        "quote": "A crystal in the frequency range 26-27 MHz"
+      }
+    },
+    {
+      "kind": "rf",
+      "role": "port",
+      "signals": {
+        "rf": "node:rf"
+      },
+      "cite": {
+        "reading": "node:rf is the 50 ohm antenna point of Figure 10 (315/433 MHz) / Figure 11 (868/915 MHz) on p.25: RF_P/RF_N reach it through a band-specific balun and LC filter (C121-C126, C131, L121-L125, L131-L132) whose values are in Table 21 on p.26. Not expressible in this schema today (no inductor support part); p.23 says to follow the CC1101EM reference designs [1] swrr046 / [2] swrr045, which confirm layout and values",
+        "page": 25
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:DVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 21,
+        "quote": "4 DVDD Power (Digital) 1.8 - 3.6 V digital power supply for digital I/O"
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 21,
+        "quote": "9 AVDD Power (Analog) 1.8 - 3.6 V analog power supply connection"
+      }
+    },
+    {
+      "between": [
+        "pin:DGUARD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 21,
+        "quote": "18 DGUARD Power (Digital) Power supply connection for digital noise isolation"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 20,
+        "quote": "The exposed die attach pad must be connected to a solid ground plane as this is the main"
+      }
+    },
+    {
+      "between": [
+        "pin:DCOUPL",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 26,
+        "quote": "C51 100 nF ± 10%, 0402 X5R"
+      }
+    },
+    {
+      "between": [
+        "pin:RBIAS",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "56k",
+      "cite": {
+        "page": 26,
+        "quote": "R171 56 kΩ ± 1%, 0402 Koa RK73 series"
+      }
+    },
+    {
+      "between": [
+        "pin:DVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Supply decoupling values are not in SWRS061I: p.24 says the application circuit excludes them and to follow the CC1101EM reference designs [1] swrr046 / [2] swrr045. 100nF per supply pin is a placeholder, not from any TI document; confirm against the CC1101EM schematic",
+        "page": 24
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "reading": "Supply decoupling values are not in SWRS061I: p.24 says the application circuit excludes them and to follow the CC1101EM reference designs [1] swrr046 / [2] swrr045. 100nF per supply pin is a placeholder, not from any TI document; confirm against the CC1101EM schematic",
+        "page": 24
+      }
+    },
+    {
+      "between": [
+        "pin:DGUARD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Supply decoupling values are not in SWRS061I: p.24 says the application circuit excludes them and to follow the CC1101EM reference designs [1] swrr046 / [2] swrr045. 100nF per supply pin is a placeholder, not from any TI document; confirm against the CC1101EM schematic",
+        "page": 24
+      }
+    }
+  ]
+}

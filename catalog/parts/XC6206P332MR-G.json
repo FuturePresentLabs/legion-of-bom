@@ -1,0 +1,79 @@
+{
+  "mpn": "XC6206P332MR-G",
+  "manufacturer": "Torex Semiconductor",
+  "lcsc": "C5446",
+  "summary": "Fixed 3.3 V CMOS LDO, 200 mA class, no enable, from a 5 V rail (SOT-23-3); low quiescent current, ceramic-cap stable",
+  "symbol": {
+    "kicad": "Regulator_Linear:XC6206PxxxMR"
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-23-3",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/221c990eb3a74b8a8233f22168ce0d59.pdf",
+    "sha256": "8fda1e40ea3e7c17178353aceba9c9a9794e56a1960d02b105c576429ce418ed"
+  },
+  "provides": [
+    "rail:+3V3"
+  ],
+  "sim_excluded": true,
+  "support": [
+    {
+      "between": [
+        "pin:VI",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 4,
+        "quote": "Input Voltage VIN - 1.8 - 6.0 V"
+      }
+    },
+    {
+      "between": [
+        "pin:VO",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 5,
+        "quote": "3.3 3.234 3.366 3.267 3.333"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 2,
+        "quote": "1 1 2 1 VSS Ground"
+      }
+    },
+    {
+      "between": [
+        "pin:VI",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "CIN 1.0µF (ceramic) from VIN to ground in the typical application circuit figure (no text layer)",
+        "page": 1
+      }
+    },
+    {
+      "between": [
+        "pin:VO",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "reading": "CL 1.0µF (ceramic) from VOUT to ground in the typical application circuit figure (no text layer)",
+        "page": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,660 @@
+{
+  "mpn": "AT86RF215-ZU",
+  "manufacturer": "Microchip (Atmel)",
+  "lcsc": "C1526155",
+  "summary": "Dual-band IEEE 802.15.4g/SUN transceiver: sub-1GHz (389.5-510 / 779-1020 MHz) and 2.4 GHz radios with MR-FSK/MR-OFDM/MR-O-QPSK basebands, plus an LVDS I/Q interface; SPI slave with IRQ and RSTN; 26 MHz crystal (CL 8 pF) or TCXO; 1.8-3.6 V with internal 1.8 V regulators needing 100 nF each. Both RF ports are 50 ohm DIFFERENTIAL (RFP/RFN): the baluns/matching to a single-ended antenna are NOT in the datasheet or this entry, so node:rf09 / node:rf24 are not fab-ready. Bench stock at LCSC is low",
+  "symbol": {
+    "pins": [
+      {
+        "number": "1",
+        "name": "FEA24",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "1 FEA24 Output RF frontend control; digital output for the 2.4GHz transceiver"
+        }
+      },
+      {
+        "number": "2",
+        "name": "FEB24",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "2 FEB24 Output RF frontend control; digital output for the 2.4GHz transceiver"
+        }
+      },
+      {
+        "number": "3",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "3 AVSS In/Out Analog ground (RF)"
+        }
+      },
+      {
+        "number": "4",
+        "name": "RFP24",
+        "io": "I/O",
+        "cite": {
+          "page": 8,
+          "quote": "4 RFP24 In/Out Differential RF input/output 2.4GHz (positive)"
+        }
+      },
+      {
+        "number": "5",
+        "name": "RFN24",
+        "io": "I/O",
+        "cite": {
+          "page": 8,
+          "quote": "5 RFN24 In/Out Differential RF input/output 2.4GHz (negative)"
+        }
+      },
+      {
+        "number": "6",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "6 AVSS In/Out Analog ground (RF)"
+        }
+      },
+      {
+        "number": "7",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "7 AVSS In/Out Analog ground (RF)"
+        }
+      },
+      {
+        "number": "8",
+        "name": "RFP09",
+        "io": "I/O",
+        "cite": {
+          "page": 8,
+          "quote": "8 RFP09 In/Out Differential RF input/output for sub-1GHz transceiver (positive)"
+        }
+      },
+      {
+        "number": "9",
+        "name": "RFN09",
+        "io": "I/O",
+        "cite": {
+          "page": 8,
+          "quote": "9 RFN09 In/Out Differential RF input/output for sub-1GHz transceiver (negative)"
+        }
+      },
+      {
+        "number": "10",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "10 AVSS In/Out Analog ground (RF)"
+        }
+      },
+      {
+        "number": "11",
+        "name": "FEA09",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "11 FEA09 Output RF frontend control; digital output for the sub-1GHz transceiver"
+        }
+      },
+      {
+        "number": "12",
+        "name": "FEB09",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "12 FEB09 Output RF frontend control; digital output for the sub-1GHz transceiver"
+        }
+      },
+      {
+        "number": "13",
+        "name": "RSTN",
+        "io": "I",
+        "cite": {
+          "page": 8,
+          "quote": "13 RSTN Input Reset input (active low)"
+        }
+      },
+      {
+        "number": "14",
+        "name": "AVDD0",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "14 AVDD0 In/Out Internal regulated analog 1.8V supply output voltage (internally generated) for"
+        }
+      },
+      {
+        "number": "15",
+        "name": "EVDD",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "15 EVDD Input External analog supply voltage (VDD); 3.0V typical"
+        }
+      },
+      {
+        "number": "16",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "16 AVSS In/out Analog ground"
+        }
+      },
+      {
+        "number": "17",
+        "name": "TCXO",
+        "io": "passive",
+        "cite": {
+          "page": 8,
+          "quote": "17 TCXO Input TCXO or crystal oscillator (26MHz) input"
+        }
+      },
+      {
+        "number": "18",
+        "name": "XTAL2",
+        "io": "passive",
+        "cite": {
+          "page": 8,
+          "quote": "18 XTAL2 Output Crystal oscillator"
+        }
+      },
+      {
+        "number": "19",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "19 AVSS In/Out Analog ground"
+        }
+      },
+      {
+        "number": "20",
+        "name": "DVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "20 DVSS In/Out Digital ground"
+        }
+      },
+      {
+        "number": "21",
+        "name": "DEVDD",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "21 DEVDD Input External digital supply voltage (VDD); 3.0V typical"
+        }
+      },
+      {
+        "number": "22",
+        "name": "CLKO",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "22 CLKO Output Clock output"
+        }
+      },
+      {
+        "number": "23",
+        "name": "DVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "23 DVSS In/Out Digital ground"
+        }
+      },
+      {
+        "number": "24",
+        "name": "DVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "24 DVSS In/Out Digital ground"
+        }
+      },
+      {
+        "number": "25",
+        "name": "TXCLKN",
+        "io": "I",
+        "cite": {
+          "page": 8,
+          "quote": "25 TXCLKN Input Differential TX I/Q clock interface input (negative)"
+        }
+      },
+      {
+        "number": "26",
+        "name": "TXCLKP",
+        "io": "I",
+        "cite": {
+          "page": 8,
+          "quote": "26 TXCLKP Input Differential TX I/Q clock interface input (positive)"
+        }
+      },
+      {
+        "number": "27",
+        "name": "TXDN",
+        "io": "I",
+        "cite": {
+          "page": 8,
+          "quote": "27 TXDN Input Differential TX I/Q data interface input (negative)"
+        }
+      },
+      {
+        "number": "28",
+        "name": "TXDP",
+        "io": "I",
+        "cite": {
+          "page": 8,
+          "quote": "28 TXDP Input Differential TX I/Q data interface input (positive)"
+        }
+      },
+      {
+        "number": "29",
+        "name": "DEVDD",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "29 DEVDD Input External digital supply voltage (VDD); 3.0V typical"
+        }
+      },
+      {
+        "number": "30",
+        "name": "RXDN09",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "30 RXDN09 Output Differential RX I/Q data interface output sub-1GHz transceiver (negative)"
+        }
+      },
+      {
+        "number": "31",
+        "name": "RXDP09",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "31 RXDP09 Output Differential RX I/Q data interface output sub-1GHz transceiver (positive)"
+        }
+      },
+      {
+        "number": "32",
+        "name": "DVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "32 DVSS In/Out Digital ground"
+        }
+      },
+      {
+        "number": "33",
+        "name": "RXCLKN",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "33 RXCLKN Output Differential RX I/Q clock interface output (negative)"
+        }
+      },
+      {
+        "number": "34",
+        "name": "RXCLKP",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "34 RXCLKP Output Differential RX I/Q clock interface output (positive)"
+        }
+      },
+      {
+        "number": "35",
+        "name": "RXDN24",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "35 RXDN24 Output Differential RX I/Q data interface output 2.4GHz transceiver (negative)"
+        }
+      },
+      {
+        "number": "36",
+        "name": "RXDP24",
+        "io": "O",
+        "cite": {
+          "page": 8,
+          "quote": "36 RXDP24 Output Differential RX I/Q data interface output 2.4GHz transceiver (positive)"
+        }
+      },
+      {
+        "number": "37",
+        "name": "DVDD",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "37 DVDD In/Out Internal regulated supply output voltage (internally generated) for digital circuitry"
+        }
+      },
+      {
+        "number": "38",
+        "name": "DVSS",
+        "io": "power",
+        "cite": {
+          "page": 8,
+          "quote": "38 DVSS In/Out Digital ground"
+        }
+      },
+      {
+        "number": "39",
+        "name": "DEVDD",
+        "io": "power",
+        "cite": {
+          "page": 9,
+          "quote": "39 DEVDD Output External digital supply voltage (VDD); 3.0V typical"
+        }
+      },
+      {
+        "number": "40",
+        "name": "IRQ",
+        "io": "O",
+        "cite": {
+          "page": 9,
+          "quote": "40 IRQ Output Interrupt output"
+        }
+      },
+      {
+        "number": "41",
+        "name": "SCLK",
+        "io": "I",
+        "cite": {
+          "page": 9,
+          "quote": "41 SCLK Input SPI interface clock input"
+        }
+      },
+      {
+        "number": "42",
+        "name": "SELN",
+        "io": "I",
+        "cite": {
+          "page": 9,
+          "quote": "42 SELN Input SPI select input (active low)"
+        }
+      },
+      {
+        "number": "43",
+        "name": "MOSI",
+        "io": "I",
+        "cite": {
+          "page": 9,
+          "quote": "43 MOSI Input SPI data input"
+        }
+      },
+      {
+        "number": "44",
+        "name": "MISO",
+        "io": "O",
+        "cite": {
+          "page": 9,
+          "quote": "44 MISO Output SPI data output"
+        }
+      },
+      {
+        "number": "45",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 9,
+          "quote": "45 AVSS In/Out Analog ground"
+        }
+      },
+      {
+        "number": "46",
+        "name": "EVDD",
+        "io": "power",
+        "cite": {
+          "page": 9,
+          "quote": "46 EVDD Input External analog supply voltage (VDD); 3.0V typical"
+        }
+      },
+      {
+        "number": "47",
+        "name": "AVDD1",
+        "io": "power",
+        "cite": {
+          "page": 9,
+          "quote": "47 AVDD1 In/Out Internal regulated analog 1.8V supply output voltage (internally generated) for"
+        }
+      },
+      {
+        "number": "48",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "page": 9,
+          "quote": "48 AVSS In/Out Analog ground"
+        }
+      },
+      {
+        "number": "49",
+        "name": "AVSS",
+        "io": "power",
+        "cite": {
+          "reading": "Exposed paddle is AVSS: Figure 2-1 pin-out labels it PADDLE (AVSS); pad number 49 is the KiCad footprint convention",
+          "page": 7
+        }
+      }
+    ]
+  },
+  "footprint": "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm_EP5.6x5.6mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/715755a0db3afff20b49dc32050a5115.pdf",
+    "sha256": "448b3fabd31336fed900ad1d75a1528c02de0ae87e7fb4c0872975b0603b8531"
+  },
+  "provides": [
+    "radio-subghz",
+    "radio-2g4"
+  ],
+  "sim_excluded": true,
+  "params": {
+    "xtal_freq_hz": {
+      "value": 26000000,
+      "cite": {
+        "page": 188,
+        "quote": "fCRYSTAL Crystal frequency requirement 26 MHz"
+      }
+    },
+    "xtal_cl_pf": {
+      "value": 8,
+      "cite": {
+        "page": 188,
+        "quote": "CLOAD_ Load capacitances of the crystal 8 pF"
+      }
+    },
+    "xtal_lead_pf": {
+      "value": 5,
+      "cite": {
+        "page": 188,
+        "quote": "CLEAD_ Lead capacitance of the AT86RF215 5 pF"
+      }
+    }
+  },
+  "interfaces": [
+    {
+      "kind": "spi",
+      "role": "slave",
+      "signals": {
+        "sck": "pin:SCLK",
+        "mosi": "pin:MOSI",
+        "miso": "pin:MISO",
+        "cs": "pin:SELN"
+      },
+      "cite": {
+        "page": 16,
+        "quote": "The control interface comprises an SPI slave and provides access to registers and frame buffers of the AT86RF215."
+      }
+    },
+    {
+      "kind": "gpio",
+      "role": "slave",
+      "signals": {
+        "irq": "pin:IRQ",
+        "reset": "pin:RSTN"
+      },
+      "cite": {
+        "page": 10,
+        "quote": "Pin IRQ is the interrupt pin from the transceiver to the microcontroller and is controlled by both radios and basebands."
+      }
+    },
+    {
+      "kind": "hse",
+      "role": "needs",
+      "signals": {
+        "in": "pin:TCXO",
+        "out": "pin:XTAL2"
+      },
+      "cite": {
+        "page": 10,
+        "quote": "Alternatively, the device can be operated with a 26MHz Crystal (XTAL) which must be connected between pin TCXO"
+      }
+    },
+    {
+      "kind": "rf",
+      "role": "port",
+      "instance": "RF09",
+      "signals": {
+        "rf": "node:rf09"
+      },
+      "cite": {
+        "reading": "node:rf09 is the single-ended 50 ohm antenna side of a sub-1GHz balun/match on RFP09/RFN09. p.9 states only that the pins want a 50 ohm differential load and need AC coupling if the load has a DC path to supply or ground; Figure 3-1 (p.11) draws a bare Sub-1GHz Front-end block. Balun part, match topology and values: confirm against Microchip ATREB215-XPRO(-A) reference design / AT86RF215 hardware design guidelines. Not expressible in this schema today (no inductor or balun support part)",
+        "page": 9
+      }
+    },
+    {
+      "kind": "rf",
+      "role": "port",
+      "instance": "RF24",
+      "signals": {
+        "rf": "node:rf24"
+      },
+      "cite": {
+        "reading": "node:rf24 is the single-ended 50 ohm antenna side of a 2.4 GHz balun/match on RFP24/RFN24; same constraints and same confirming documents as node:rf09 (ATREB215-XPRO reference design). Not expressible in this schema today",
+        "page": 9
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:EVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 11,
+        "quote": "EVDD and DEVDD must be shorted at PCB level and should always have the same potential"
+      }
+    },
+    {
+      "between": [
+        "pin:DEVDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 11,
+        "quote": "EVDD and DEVDD must be shorted at PCB level and should always have the same potential"
+      }
+    },
+    {
+      "between": [
+        "pin:AVSS",
+        "net:GND"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 8,
+        "quote": "3 AVSS In/Out Analog ground (RF)"
+      }
+    },
+    {
+      "between": [
+        "pin:DVSS",
+        "net:GND"
+      ],
+      "part": "tie",
+      "each_pin": true,
+      "cite": {
+        "page": 8,
+        "quote": "20 DVSS In/Out Digital ground"
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD0",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 75,
+        "quote": "A recommended value is Cdec= 100nF"
+      }
+    },
+    {
+      "between": [
+        "pin:AVDD1",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 75,
+        "quote": "A recommended value is Cdec= 100nF"
+      }
+    },
+    {
+      "between": [
+        "pin:DVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 75,
+        "quote": "A recommended value is Cdec= 100nF"
+      }
+    },
+    {
+      "between": [
+        "pin:EVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "reading": "Figure 3-1 draws a Cdec on every EVDD/DEVDD pin, the same symbol p.75 and Table 10-4 give as 100nF for the regulator outputs; the text states no value for the external supplies",
+        "page": 11
+      }
+    },
+    {
+      "between": [
+        "pin:DEVDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "reading": "Figure 3-1 draws a Cdec on every EVDD/DEVDD pin, the same symbol p.75 and Table 10-4 give as 100nF for the regulator outputs; the text states no value for the external supplies",
+        "page": 11
+      }
+    }
+  ]
+}

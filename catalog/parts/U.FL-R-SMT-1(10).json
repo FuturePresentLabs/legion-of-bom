@@ -1,0 +1,43 @@
+{
+  "mpn": "U.FL-R-SMT-1(10)",
+  "manufacturer": "Hirose Electric",
+  "lcsc": "C88373",
+  "summary": "U.FL (IPEX MHF1) ultra-small SMD coaxial receptacle, 50 ohm: an on-board antenna/pigtail RF port",
+  "symbol": {
+    "kicad": "Connector:Conn_Coaxial"
+  },
+  "footprint": "Connector_Coaxial:U.FL_Hirose_U.FL-R-SMT-1_Vertical",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/ed724b9ee28536c28fee4171a29923cc.pdf",
+    "sha256": "6949727d3bc42a67f6115848d3e5bc7dd4c41db28de7a4b6f0c2f2f5731dcdd2"
+  },
+  "provides": [
+    "connector"
+  ],
+  "interfaces": [
+    {
+      "kind": "rf",
+      "role": "port",
+      "signals": {
+        "rf": "pin:In"
+      },
+      "cite": {
+        "page": 2,
+        "quote": "Nominal characteristic impedance 50 ohms"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:Ext",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "the two side pads are GND and the centre pad SIG in the recommended PCB mounting pattern figure",
+        "page": 3
+      }
+    }
+  ]
+}

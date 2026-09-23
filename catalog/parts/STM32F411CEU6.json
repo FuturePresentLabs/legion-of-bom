@@ -1,0 +1,370 @@
+{
+  "mpn": "STM32F411CEU6",
+  "manufacturer": "STMicroelectronics",
+  "lcsc": "C60420",
+  "summary": "Arm Cortex-M4F MCU at 100 MHz, 512 KB flash, 128 KB RAM, UFQFPN-48; five SPI, three I2C, two full-duplex I2S with MCLK, USB OTG FS; 4-26 MHz crystal for USB and audio clocks",
+  "symbol": {
+    "kicad": "MCU_ST_STM32F4:STM32F411CEUx"
+  },
+  "footprint": "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm_EP5.6x5.6mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/b486a29054384794bffe11b8e5b84fab.pdf",
+    "sha256": "284b85ff62b026900343f3c5e12556c8dfb62f980f7891d69b1be8ae40f4c6da"
+  },
+  "provides": [
+    "mcu"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI1",
+      "signals": {
+        "sck": {
+          "alt": "SPI1_SCK"
+        },
+        "mosi": {
+          "alt": "SPI1_MOSI"
+        },
+        "miso": {
+          "alt": "SPI1_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI2",
+      "signals": {
+        "sck": {
+          "alt": "SPI2_SCK"
+        },
+        "mosi": {
+          "alt": "SPI2_MOSI"
+        },
+        "miso": {
+          "alt": "SPI2_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI3",
+      "signals": {
+        "sck": {
+          "alt": "SPI3_SCK"
+        },
+        "mosi": {
+          "alt": "SPI3_MOSI"
+        },
+        "miso": {
+          "alt": "SPI3_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI4",
+      "signals": {
+        "sck": {
+          "alt": "SPI4_SCK"
+        },
+        "mosi": {
+          "alt": "SPI4_MOSI"
+        },
+        "miso": {
+          "alt": "SPI4_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI5",
+      "signals": {
+        "sck": {
+          "alt": "SPI5_SCK"
+        },
+        "mosi": {
+          "alt": "SPI5_MOSI"
+        },
+        "miso": {
+          "alt": "SPI5_MISO"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C1",
+      "signals": {
+        "scl": {
+          "alt": "I2C1_SCL"
+        },
+        "sda": {
+          "alt": "I2C1_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C2",
+      "signals": {
+        "scl": {
+          "alt": "I2C2_SCL"
+        },
+        "sda": {
+          "alt": "I2C2_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C3",
+      "signals": {
+        "scl": {
+          "alt": "I2C3_SCL"
+        },
+        "sda": {
+          "alt": "I2C3_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "I2S2",
+      "signals": {
+        "mclk": {
+          "alt": "I2S2_MCK"
+        },
+        "bck": {
+          "alt": "I2S2_CK"
+        },
+        "lrck": {
+          "alt": "I2S2_WS"
+        },
+        "dout": {
+          "alt": "I2S2_SD"
+        },
+        "din": {
+          "alt": "I2S2_ext_SD"
+        }
+      },
+      "cite": {
+        "reading": "SPI/I2S peripheral in full-duplex I2S master mode, I2Sx_SD transmitting and the I2Sx_ext_SD extension receiving (RM0383; not pinned)"
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "I2S3",
+      "signals": {
+        "mclk": {
+          "alt": "I2S3_MCK"
+        },
+        "bck": {
+          "alt": "I2S3_CK"
+        },
+        "lrck": {
+          "alt": "I2S3_WS"
+        },
+        "dout": {
+          "alt": "I2S3_SD"
+        },
+        "din": {
+          "alt": "I2S3_ext_SD"
+        }
+      },
+      "cite": {
+        "reading": "SPI/I2S peripheral in full-duplex I2S master mode, I2Sx_SD transmitting and the I2Sx_ext_SD extension receiving (RM0383; not pinned)"
+      }
+    },
+    {
+      "kind": "usb",
+      "role": "device",
+      "signals": {
+        "dp": {
+          "alt": "USB_OTG_FS_DP"
+        },
+        "dm": {
+          "alt": "USB_OTG_FS_DM"
+        }
+      }
+    },
+    {
+      "kind": "swd",
+      "role": "target",
+      "signals": {
+        "swdio": {
+          "alt": "SYS_JTMS-SWDIO"
+        },
+        "swclk": {
+          "alt": "SYS_JTCK-SWCLK"
+        },
+        "nrst": "pin:NRST"
+      }
+    },
+    {
+      "kind": "hse",
+      "role": "needs",
+      "signals": {
+        "in": "pin:PH0",
+        "out": "pin:PH1"
+      },
+      "cite": {
+        "page": 1,
+        "quote": "4-to-26 MHz crystal oscillator"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 20,
+        "quote": "provided externally through VDD pins"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "reading": "Figure 17 (power supply scheme) draws N x 100 nF, one per VDD pin; the figure text is font-encoded and not extractable, so the value is read off the drawing",
+        "page": 59
+      }
+    },
+    {
+      "between": [
+        "net:+3V3",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 59,
+        "quote": "The 4.7 µF ceramic capacitor must be connected to one of the VDD pin."
+      }
+    },
+    {
+      "between": [
+        "pin:VSS",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 59,
+        "quote": "Each power supply pair (for example VDD/VSS, VDDA/VSSA) must be decoupled"
+      }
+    },
+    {
+      "between": [
+        "pin:VCAP1",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 64,
+        "quote": "Capacitance of external capacitor with a single VCAP CEXT 4.7 µF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 20,
+        "quote": "VDDA and VSSA must be connected to VDD and VSS, respectively"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "10nF",
+      "cite": {
+        "page": 115,
+        "quote": "1 µF // 10 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 115,
+        "quote": "1 µF // 10 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VSSA",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 20,
+        "quote": "VDDA and VSSA must be connected to VDD and VSS, respectively"
+      }
+    },
+    {
+      "between": [
+        "pin:VBAT",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 26,
+        "quote": "or from VDD when no external battery and an external super-capacitor are present"
+      }
+    },
+    {
+      "between": [
+        "pin:NRST",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "reading": "Figure 32 (recommended NRST pin protection) draws a capacitor from NRST to ground but its value is font-encoded and not extractable; 100 nF assumed, matching the same figure in the G4/G0 datasheets",
+        "page": 101
+      }
+    },
+    {
+      "between": [
+        "pin:BOOT0",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "BOOT0 held low through 10k so the part boots from user flash (boot modes, AN2606 / RM0383; not pinned)",
+        "page": 20
+      }
+    }
+  ]
+}

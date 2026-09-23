@@ -1,0 +1,289 @@
+{
+  "mpn": "STM32G431KBU6",
+  "manufacturer": "STMicroelectronics",
+  "lcsc": "C529358",
+  "summary": "Arm Cortex-M4F MCU at 170 MHz, 128 KB flash, 32 KB SRAM, UFQFPN-32; three SPI, three I2C, one SAI (audio), USB FS device, rich analog; 4-48 MHz crystal oscillator",
+  "symbol": {
+    "kicad": "MCU_ST_STM32G4:STM32G431KBUx"
+  },
+  "footprint": "Package_DFN_QFN:QFN-32-1EP_5x5mm_P0.5mm_EP3.45x3.45mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/3f23d741047d660d2a0e8aabbc953854.pdf",
+    "sha256": "cabefb21b47dc4c12494b3d9283e3ed1b83925036a65194580b8ebe68adeb71e"
+  },
+  "provides": [
+    "mcu"
+  ],
+  "sim_excluded": true,
+  "interfaces": [
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI1",
+      "signals": {
+        "sck": {
+          "alt": "SPI1_SCK"
+        },
+        "mosi": {
+          "alt": "SPI1_MOSI"
+        },
+        "miso": {
+          "alt": "SPI1_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI2",
+      "signals": {
+        "sck": {
+          "alt": "SPI2_SCK"
+        },
+        "mosi": {
+          "alt": "SPI2_MOSI"
+        },
+        "miso": {
+          "alt": "SPI2_MISO"
+        }
+      }
+    },
+    {
+      "kind": "spi",
+      "role": "master",
+      "instance": "SPI3",
+      "signals": {
+        "sck": {
+          "alt": "SPI3_SCK"
+        },
+        "mosi": {
+          "alt": "SPI3_MOSI"
+        },
+        "miso": {
+          "alt": "SPI3_MISO"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C1",
+      "signals": {
+        "scl": {
+          "alt": "I2C1_SCL"
+        },
+        "sda": {
+          "alt": "I2C1_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C2",
+      "signals": {
+        "scl": {
+          "alt": "I2C2_SCL"
+        },
+        "sda": {
+          "alt": "I2C2_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2c",
+      "role": "master",
+      "instance": "I2C3",
+      "signals": {
+        "scl": {
+          "alt": "I2C3_SCL"
+        },
+        "sda": {
+          "alt": "I2C3_SDA"
+        }
+      }
+    },
+    {
+      "kind": "i2s",
+      "role": "master",
+      "instance": "SAI1",
+      "signals": {
+        "mclk": {
+          "alt": "SAI1_MCLK_A"
+        },
+        "bck": {
+          "alt": "SAI1_SCK_A"
+        },
+        "lrck": {
+          "alt": "SAI1_FS_A"
+        },
+        "dout": {
+          "alt": "SAI1_SD_A"
+        },
+        "din": {
+          "alt": "SAI1_SD_B"
+        }
+      },
+      "cite": {
+        "reading": "SAI block A as clock master driving the DAC data, block B synchronous to it receiving the ADC data (RM0440 SAI synchronous mode; not pinned)"
+      }
+    },
+    {
+      "kind": "usb",
+      "role": "device",
+      "signals": {
+        "dp": {
+          "alt": "USB_DP"
+        },
+        "dm": {
+          "alt": "USB_DM"
+        }
+      }
+    },
+    {
+      "kind": "swd",
+      "role": "target",
+      "signals": {
+        "swdio": {
+          "alt": "SYS_JTMS-SWDIO"
+        },
+        "swclk": {
+          "alt": "SYS_JTCK-SWCLK"
+        },
+        "nrst": "pin:PG10"
+      }
+    },
+    {
+      "kind": "hse",
+      "role": "needs",
+      "signals": {
+        "in": "pin:PF0",
+        "out": "pin:PF1"
+      },
+      "cite": {
+        "page": 104,
+        "quote": "4 to 48 MHz crystal/ceramic"
+      }
+    }
+  ],
+  "support": [
+    {
+      "between": [
+        "pin:VDD",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 68,
+        "quote": "n x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDD",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "each_pin": true,
+      "cite": {
+        "page": 68,
+        "quote": "n x 100 nF"
+      }
+    },
+    {
+      "between": [
+        "net:+3V3",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 68,
+        "quote": "+1 x 4.7 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VSS",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 68,
+        "quote": "Each power supply pair (VDD/VSS, VDDA/VSSA etc.) must be decoupled"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "reading": "VDDA/VREF+ (one pin on UFQFPN32) tied to the 3.3 V VDD rail; the datasheet allows a separate 1.62-3.6 V analog supply",
+        "page": 21
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 68,
+        "quote": "100 nF +1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VDDA",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "cite": {
+        "page": 68,
+        "quote": "100 nF +1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:VSSA",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 68,
+        "quote": "Each power supply pair (VDD/VSS, VDDA/VSSA etc.) must be decoupled"
+      }
+    },
+    {
+      "between": [
+        "pin:PG10",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "100nF",
+      "cite": {
+        "page": 121,
+        "quote": "0.1 μF"
+      }
+    },
+    {
+      "between": [
+        "pin:PB8",
+        "net:GND"
+      ],
+      "part": "R",
+      "value": "10k",
+      "cite": {
+        "reading": "PB8-BOOT0 held low through 10k so the part boots from user flash with default option bytes (nSWBOOT0=1); a pin assignment that also uses PB8 (I2C1_SCL, SAI1_MCLK_A) conflicts with this strap (RM0440; not pinned)",
+        "page": 19
+      }
+    }
+  ]
+}

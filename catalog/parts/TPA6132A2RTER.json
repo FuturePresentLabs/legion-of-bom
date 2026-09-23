@@ -1,0 +1,42 @@
+{
+  "mpn": "TPA6132A2RTER",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C69901",
+  "summary": "25 mW DirectPath stereo headphone amplifier: ground-centred outputs from an internal charge pump (no output DC-block caps), 2.3-5.5 V supply, pin-selected gain (-6/0/3/6 dB via G0/G1), EN shutdown. Wired here for single-ended line inputs and -6 dB gain (G0, G1 low). CAUTION: EN, G0 and G1 are rated to HPVDD + 0.3 V absolute maximum (HPVDD is internal, 1.9 V max), so a 3.3 V GPIO must not drive EN directly",
+  "symbol": {"kicad": "Amplifier_Audio:TPA6132A2RTE"},
+  "footprint": "Package_DFN_QFN:WQFN-16-1EP_3x3mm_P0.5mm_EP1.6x1.6mm_ThermalVias",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/3634de5e5702453599a1961ad2702ea2.pdf",
+    "sha256": "9c704fdf305cc1fb988a316026b840794e74b9b496e5dadf85ee94c58d66e315"
+  },
+  "provides": ["headphone-out"],
+  "sim_excluded": true,
+  "params": {
+    "logic_in_max_above_hpvdd_v": {"value": 0.3, "cite": {"page": 4, "quote": "EN, G0, G1 –0.3 HPVDD + V"}},
+    "hpvdd_abs_max_v": {"value": 1.9, "cite": {"page": 4, "quote": "HPVDD (do not connect to external supply) –0.3 1.9 V"}}
+  },
+  "interfaces": [
+    {"kind": "headphone-out", "role": "source", "signals": {"l": "pin:OUTL", "r": "pin:OUTR"},
+     "cite": {"page": 3, "quote": "Left headphone amplifier output. Connect to left terminal of headphone jack"}},
+    {"kind": "audio-line-in", "role": "sink", "signals": {"l": "node:in_l", "r": "node:in_r"},
+     "cite": {"page": 16, "quote": "Figure 27 shows a typical application circuit for the TPA6132A2 with a stereo headphone jack output and single-"}},
+    {"kind": "gpio", "role": "slave", "signals": {"enable": "pin:EN"},
+     "cite": {"page": 3, "quote": "Amplifier enable. Connect to logic low to shutdown; connect to logic high to activate"}}
+  ],
+  "support": [
+    {"between": ["pin:VDD", "net:+3V3"], "part": "tie", "cite": {"page": 4, "quote": "Supply voltage, VDD 2.3 5.5 V"}},
+    {"between": ["pin:VDD", "net:GND"], "part": "C", "value": "2.2uF", "cite": {"page": 17, "quote": "Place a 2.2 μF capacitor within"}},
+    {"between": ["pin:HPVDD", "net:GND"], "part": "C", "value": "2.2uF", "cite": {"page": 17, "quote": "Connect a 2.2 μF capacitor between HPVDD and ground."}},
+    {"between": ["pin:HPVSS", "net:GND"], "part": "C", "value": "1uF", "cite": {"page": 3, "quote": "Charge pump output and negative power supply for output amplifiers; connect 1μF"}},
+    {"between": ["pin:CPP", "pin:CPN"], "part": "C", "value": "1uF", "cite": {"page": 3, "quote": "Charge pump positive flying cap. Connect to positive side of 1μF capacitor between CPP"}},
+    {"between": ["pin:PGND", "net:GND"], "part": "tie", "cite": {"page": 3, "quote": "PGND 10 P Ground"}},
+    {"between": ["pin:SGND", "net:GND"], "part": "tie", "cite": {"page": 3, "quote": "Amplifier reference voltage. Connect to ground terminal of headphone jack"}},
+    {"between": ["pin:EP", "net:GND"], "part": "tie", "cite": {"page": 18, "quote": "If the pad is grounded, it must be connected to the same ground as the PGND pin (10)."}},
+    {"between": ["pin:G0", "net:GND"], "part": "tie", "cite": {"page": 13, "quote": "≤ 0.5 V ≤ 0.5 V –6 dB"}},
+    {"between": ["pin:G1", "net:GND"], "part": "tie", "cite": {"page": 13, "quote": "≤ 0.5 V ≤ 0.5 V –6 dB"}},
+    {"between": ["pin:INL+", "net:GND"], "part": "tie", "cite": {"page": 3, "quote": "Non-inverting left input for differential signals. Connect to ground for single-ended input"}},
+    {"between": ["pin:INR+", "net:GND"], "part": "tie", "cite": {"page": 3, "quote": "Non-inverting right input for differential signals. Connect to ground for single-ended input"}},
+    {"between": ["node:in_l", "pin:INL-"], "part": "C", "value": "1uF", "cite": {"reading": "Figure 27: LEFT IN through a 1 uF series cap to INL- (p.15 gives 0.68 uF minimum-standard for a 20 Hz corner at +6 dB)", "page": 16}},
+    {"between": ["node:in_r", "pin:INR-"], "part": "C", "value": "1uF", "cite": {"reading": "Figure 27: RIGHT IN through a 1 uF series cap to INR- (p.15 gives 0.68 uF minimum-standard for a 20 Hz corner at +6 dB)", "page": 16}}
+  ]
+}

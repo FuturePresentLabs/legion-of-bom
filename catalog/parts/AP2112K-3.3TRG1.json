@@ -1,0 +1,90 @@
+{
+  "mpn": "AP2112K-3.3TRG1",
+  "manufacturer": "Diodes Incorporated",
+  "lcsc": "C51118",
+  "summary": "Fixed 3.3 V CMOS LDO, 600 mA, with enable, from a 5 V rail (SOT-23-5); stable with 1 uF ceramic caps",
+  "symbol": {
+    "kicad": "Regulator_Linear:AP2112K-3.3"
+  },
+  "footprint": "Package_TO_SOT_SMD:SOT-23-5",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/5b29baebdc4332b382a530ff21092301.pdf",
+    "sha256": "ef8d376f2ec356e29172eb9e053819a0ebdcc576dba7fc9ab0505c568427920f"
+  },
+  "provides": [
+    "rail:+3V3"
+  ],
+  "sim_excluded": true,
+  "support": [
+    {
+      "between": [
+        "pin:VIN",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 3,
+        "quote": "VIN Supply Voltage 2.5 6.0 V"
+      }
+    },
+    {
+      "between": [
+        "pin:EN",
+        "net:+5V"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 2,
+        "quote": "Chip Enable, H – normal work, L – shutdown output"
+      }
+    },
+    {
+      "between": [
+        "pin:VOUT",
+        "net:+3V3"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 8,
+        "quote": "AP2112-3.3 Electrical Characteristics (@VIN = 4.3V, CIN = 1.0µF (Ceramic), COUT = 1.0µF (Ceramic)"
+      }
+    },
+    {
+      "between": [
+        "pin:GND",
+        "net:GND"
+      ],
+      "part": "tie",
+      "cite": {
+        "page": 2,
+        "quote": "6, 7 GND GND"
+      }
+    },
+    {
+      "between": [
+        "pin:VIN",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 2,
+        "quote": "It is recommended to use X7R or X5R dielectric capacitor if 1.0µF ceramic capacitor is selected as input/output capacitors."
+      }
+    },
+    {
+      "between": [
+        "pin:VOUT",
+        "net:GND"
+      ],
+      "part": "C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "cite": {
+        "page": 2,
+        "quote": "It is recommended to use X7R or X5R dielectric capacitor if 1.0µF ceramic capacitor is selected as input/output capacitors."
+      }
+    }
+  ]
+}

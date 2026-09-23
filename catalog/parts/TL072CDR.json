@@ -1,0 +1,22 @@
+{
+  "mpn": "TL072CDR",
+  "manufacturer": "Texas Instruments",
+  "lcsc": "C67473",
+  "summary": "Dual low-noise JFET-input op-amp, SOIC-8; a split-supply part (recommended VCC+ 5 to 15 V, VCC- -5 to -15 V; 36 V max total) whose input common-mode range stops 4 V short of each rail, so it does not suit a single +3V3 or +5V rail. Supply ties are the circuit's choice: this entry gives only the per-pin bypass caps",
+  "symbol": {"kicad": "Amplifier_Operational:TL072"},
+  "footprint": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/datasheet/pdf/6ac0eed968314f7e81ddf42a42645994.pdf",
+    "sha256": "b7161f771fff8702a78cedf8fdacf25d015ccbed0b8642939cef9c243cc66448"
+  },
+  "provides": ["opamp"],
+  "params": {
+    "vcc_pos_min_v": {"value": 5, "cite": {"page": 5, "quote": "VCC+ Supply voltage 5 15 V"}},
+    "vcc_pos_max_v": {"value": 15, "cite": {"page": 5, "quote": "VCC+ Supply voltage 5 15 V"}},
+    "vcm_headroom_v": {"value": 4, "cite": {"page": 5, "quote": "VCM Common-mode voltage VCC– + 4 VCC+ – 4 V"}}
+  },
+  "support": [
+    {"between": ["pin:V+", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 17, "quote": "Place 0.1-μF bypass capacitors close to the power-supply pins"}},
+    {"between": ["pin:V-", "net:GND"], "part": "C", "value": "100nF", "cite": {"page": 17, "quote": "Place 0.1-μF bypass capacitors close to the power-supply pins"}}
+  ]
+}
