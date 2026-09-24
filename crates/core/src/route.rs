@@ -1887,10 +1887,11 @@ pub fn unroutable_by_placement(nets: &[RouteNet], opts: &RouteOptions) -> Vec<St
     let surface = build_surface(nets, &routable, opts);
     let free = Congestion::neutral();
     let mut out = Vec::new();
+    let mut budget = RoutingBudget::new(opts);
     for (ni, net) in routable.iter().enumerate() {
         // p_fac = 0 and no history: nothing costs more than its own length, and
         // no other net is on the board at all.
-        let rt = route_net_soft(&surface, net, ni, &free, 0);
+        let rt = route_net_soft(&surface, net, ni, &free, 0, &mut budget);
         for &k in &rt.unreached {
             out.push(format!(
                 "net {} ({}): pad {}.{} unreachable even with the board to itself",

@@ -59,6 +59,7 @@ pub mod photo;
 pub mod placement;
 pub mod placement_edit;
 pub mod project;
+pub mod readiness;
 pub mod resistor;
 pub mod route;
 pub mod rules;
@@ -194,6 +195,7 @@ pub use placement_edit::{
     PlacementEditError, PlacementEditResult, PlacementOp,
 };
 pub use project::{ArtifactKind, ArtifactStatus, ArtifactView, CircuitView, ProjectView, RepoView};
+pub use readiness::FabReadiness;
 pub use resistor::{color_code, parse_ohms, Band, ColorCode};
 pub use route::{
     unroutable_by_placement, GridRouter, MstRouter, PadLayer, PadPoint, PathfinderRouter, RouteNet,

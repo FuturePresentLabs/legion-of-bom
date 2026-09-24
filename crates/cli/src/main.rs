@@ -5,6 +5,7 @@
 //! and reports per-stage pass/fail, exiting non-zero on any failure.
 
 mod doctor;
+mod layout_cache;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,10 +27,10 @@ use legion_of_bom_core::{
     simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
     svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
     BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer,
-    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
-    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
-    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
-    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
+    FabReadiness, Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType,
+    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders,
+    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
+    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
     SourcingClients, StageOutcome, TranAnalysis, TranDrive,
 };
 
@@ -1819,6 +1820,18 @@ fn build_layout(
     };
     match cfg.max_iters {
         n if n > 0 => {
+            let cache = layout_cache::cache();
+            let cache_key = layout_cache::key(model, &options, &template, cfg)?;
+            if let Some(hit) = layout_cache::read(&cache, &cache_key)? {
+                println!("  layout cache: hit {cache_key}");
+                return Ok(Layout {
+                    board: hit.board,
+                    conflicts: hit.conflicts,
+                    collisions: hit.collisions,
+                    not_placed: hit.not_placed,
+                    routing: hit.routing,
+                });
+            }
             let report = run_layout_loop(model, options, template, cfg)?;
             println!(
                 "  seeded layout ({}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
@@ -1828,13 +1841,32 @@ fn build_layout(
                 report.metrics.critical_hpwl_mm,
                 report.metrics.via_count,
             );
-            Ok(Layout {
+            let cacheable = report.unresolved.is_empty()
+                && report.collisions.is_empty()
+                && report.metrics.violations.is_empty()
+                && report.drc.as_ref().is_none_or(|drc| drc.is_clean());
+            let layout = Layout {
                 board: report.board,
                 conflicts: report.unresolved,
                 collisions: report.collisions,
                 not_placed: report.not_placed,
                 routing: report.routing,
-            })
+            };
+            if cacheable {
+                layout_cache::write(
+                    &cache,
+                    &cache_key,
+                    &layout_cache::CachedLayout {
+                        board: layout.board.clone(),
+                        conflicts: layout.conflicts.clone(),
+                        collisions: layout.collisions.clone(),
+                        not_placed: layout.not_placed.clone(),
+                        routing: layout.routing.clone(),
+                    },
+                )?;
+                println!("  layout cache: stored {cache_key}");
+            }
+            Ok(layout)
         }
         _ => {
             let art = generate_board_artifacts(model, &options)?;
@@ -2438,17 +2470,8 @@ fn fab_cmd(
         for v in report.errors() {
             eprintln!("  â [{}] {}", v.kind, v.description);
         }
-        anyhow::bail!(
-            "board has {} DRC error(s) â refusing to build a fab package",
-            report.error_count()
-        );
     }
 
-    // Manufacturing outputs.
-    let gerber_dir = pkg.join("gerbers");
-    export_gerbers(&board_path, &gerber_dir, &kicad)?;
-    let zip_path = pkg.join(format!("{stem}-gerbers.zip"));
-    let zipped = zip_dir(&gerber_dir, &zip_path)?;
     // Which parts the fab will NOT place, read off the BOARD's real pads rather
     // than guessed from footprint names â a part is through-hole if it has a
     // through-hole pad, and that is a fact about the geometry, not the string.
@@ -2473,10 +2496,7 @@ fn fab_cmd(
         .map_err(|e| {
             anyhow::anyhow!("reading placements back from the board we just wrote: {e}")
         })?;
-    let cpl_path = pkg.join(format!("{stem}-cpl.csv"));
-    let placed = export_cpl(&board_path, &cpl_path, &kicad, &hand_soldered)?;
     let bom = generate_bom(&model);
-    let bom_path = pkg.join(format!("{stem}-bom.csv"));
     if !hand_soldered.is_empty() {
         let mut hs: Vec<&String> = hand_soldered.iter().collect();
         hs.sort();
@@ -2487,13 +2507,36 @@ fn fab_cmd(
         );
     }
     let assembly = jlc_assembly_bom(&bom, &hand_soldered);
-    if !assembly.unsourceable.is_empty() {
+
+    // One explicit readiness contract gates *all* manufacturing outputs.  The
+    // board and rule file above are diagnostic inputs; Gerbers/CPL/BOM are only
+    // emitted after routing, KiCad DRC, and exact procurement identities pass.
+    let readiness = FabReadiness::assess(
+        conflicts,
+        report.error_count(),
+        report.unconnected_count(),
+        assembly.unsourceable.clone(),
+    );
+    let readiness_path = pkg.join("fab-readiness.json");
+    std::fs::write(&readiness_path, serde_json::to_string_pretty(&readiness)?)
+        .with_context(|| format!("writing {}", readiness_path.display()))?;
+    if !readiness.ready {
         anyhow::bail!(
-            "refusing fabrication package: {} machine-placed component(s) lack an exact LCSC C-code: {}. Resolve each part before fabrication; manufacturer MPNs are not valid substitutes in JLCPCB's LCSC column",
-            assembly.unsourceable.len(),
-            assembly.unsourceable.join(" ")
+            "refusing fabrication package: {} (evidence: {})",
+            readiness.blockers.join(", "),
+            readiness_path.display()
         );
     }
+
+    // Manufacturing outputs. This point is unreachable for an unrouted,
+    // DRC-failing, or inexact-BOM board.
+    let gerber_dir = pkg.join("gerbers");
+    export_gerbers(&board_path, &gerber_dir, &kicad)?;
+    let zip_path = pkg.join(format!("{stem}-gerbers.zip"));
+    let zipped = zip_dir(&gerber_dir, &zip_path)?;
+    let cpl_path = pkg.join(format!("{stem}-cpl.csv"));
+    let placed = export_cpl(&board_path, &cpl_path, &kicad, &hand_soldered)?;
+    let bom_path = pkg.join(format!("{stem}-bom.csv"));
     std::fs::write(&bom_path, &assembly.csv)
         .with_context(|| format!("writing {}", bom_path.display()))?;
 
