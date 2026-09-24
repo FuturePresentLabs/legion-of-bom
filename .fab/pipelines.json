@@ -1,0 +1,23 @@
+{
+  "pipelines": [
+    {
+      "id": "edgerunner-image",
+      "watchPaths": ["Cargo.toml", "Cargo.lock", "crates/", "edgerunner-runner/", "requirements.txt"],
+      "pipeline": {
+        "type": "oci_image",
+        "registry": "registry.fpl.dev",
+        "image": "lob-edgerunner",
+        "context": ".",
+        "dockerfile": "edgerunner-runner/Dockerfile",
+        "tags": ["latest"],
+        "buildArgs": {
+          "EDGERUNNER_BASE_IMAGE": "registry.fpl.dev/edgerunner-design-runner-base:latest"
+        },
+        "push": true,
+        "tlsVerify": true,
+        "rootfsPublish": true,
+        "rootfsName": "fpl/lob-edgerunner"
+      }
+    }
+  ]
+}
