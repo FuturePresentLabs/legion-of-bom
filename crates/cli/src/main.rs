@@ -925,6 +925,7 @@ fn standards_cmd(
                 legion_of_bom_core::standards::Verdict::Passed => "PASS",
                 legion_of_bom_core::standards::Verdict::Failed => "FAIL",
                 legion_of_bom_core::standards::Verdict::NeedsTest => "TEST",
+                legion_of_bom_core::standards::Verdict::NeedsReview => "REVIEW",
             };
             println!("  [{mark}] {} — {}", result.aspect, result.detail);
         }

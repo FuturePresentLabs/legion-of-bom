@@ -66,6 +66,30 @@ pub const CATALOG: &[Standard] = &[
         public: true,
     },
     Standard {
+        id: "mil-std-3001-1a-schematic",
+        designation: "MIL-STD-3001-1A, Change 2 (2021), clauses B.5.5.9 and B.5.5.13",
+        title: "DoD technical-manual schematic presentation subset",
+        brief_example: "schematic presentation checked against the MIL-STD-3001-1A signal-flow and callout subset",
+        requirements: &[
+            Requirement {
+                aspect: "significant circuit features identified by reference designator and nomenclature",
+                verifiable: Artifact,
+            },
+            Requirement {
+                aspect: "major signal flow proceeds left to right where identifiable",
+                verifiable: Artifact,
+            },
+            Requirement {
+                aspect: "generated-page congestion and narrative separation",
+                verifiable: Proxy,
+            },
+        ],
+        status: Status::Implemented {
+            module: "legion_of_bom_core::standards::verify_mil_std_3001_schematic",
+        },
+        public: true,
+    },
+    Standard {
         id: "ipc-2221c",
         designation: "IPC-2221C",
         title: "Generic Standard on Printed Board Design",
@@ -112,6 +136,7 @@ pub enum Verdict {
     Passed,
     Failed,
     NeedsTest,
+    NeedsReview,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,9 +164,9 @@ impl StandardReport {
 
     #[must_use]
     pub fn needs_physical_test(&self) -> bool {
-        self.results
-            .iter()
-            .any(|result| result.verdict == Verdict::NeedsTest)
+        self.results.iter().any(|result| {
+            result.verdict == Verdict::NeedsTest && result.verifiable == Verifiable::TestOnly
+        })
     }
 }
 
@@ -169,9 +194,131 @@ pub fn verify(
                 id: "usb-type-c-2.0-sink",
                 ..
             }) => Ok(verify_usb_type_c_sink(circuit)),
+            Some(Standard {
+                id: "mil-std-3001-1a-schematic",
+                ..
+            }) => Ok(verify_mil_std_3001_schematic(circuit)),
             Some(_) => Err(StandardsError::NotImplemented(id.clone())),
         })
         .collect()
+}
+
+/// Verify the artifact-visible subset of MIL-STD-3001-1A's schematic rules.
+///
+/// This profile is intentionally narrow.  MIL-STD-3001-1A governs technical
+/// manuals for the covered DoD systems; passing this function is not a claim
+/// that a board, drawing set, or publication conforms to the whole standard.
+/// The congestion limits are named as Puget proxies in the report because the
+/// source requires understandable diagrams but does not specify these numbers.
+///
+/// @derives-from url:https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=280652 MIL-STD-3001-1A §§B.5.5.9, B.5.5.13 -- artifact-checkable schematic subset, not whole-standard conformity
+fn verify_mil_std_3001_schematic(circuit: &dyn CircuitSource) -> StandardReport {
+    use std::collections::HashSet;
+
+    let mut callout_failures = Vec::new();
+    let mut seen = HashSet::new();
+    for part in circuit.parts() {
+        if part.refdes.0.trim().is_empty() {
+            callout_failures.push("a part has no reference designator".to_string());
+        } else if !seen.insert(part.refdes.0.to_ascii_uppercase()) {
+            callout_failures.push(format!("duplicate reference designator {}", part.refdes));
+        }
+        if part.value.trim().is_empty() {
+            callout_failures.push(format!("{} has no value/nomenclature", part.refdes));
+        }
+    }
+    let callouts = CheckResult {
+        aspect: "significant circuit features identified by reference designator and nomenclature"
+            .into(),
+        verifiable: Artifact,
+        verdict: if callout_failures.is_empty() {
+            Verdict::Passed
+        } else {
+            Verdict::Failed
+        },
+        detail: if callout_failures.is_empty() {
+            format!(
+                "all {} parts have unique reference designators and displayed nomenclature",
+                circuit.parts().len()
+            )
+        } else {
+            callout_failures.join("; ")
+        },
+    };
+
+    let readability = crate::schematic::analyze_readability(circuit);
+    let flow = if !readability.flow_is_identifiable {
+        CheckResult {
+            aspect: "major signal flow proceeds left to right where identifiable".into(),
+            verifiable: Artifact,
+            verdict: Verdict::NeedsReview,
+            detail: "no recognized input/output net pair; a person must identify the major flow before this clause can be evaluated".into(),
+        }
+    } else if readability.major_signal_flow_is_left_to_right {
+        CheckResult {
+            aspect: "major signal flow proceeds left to right where identifiable".into(),
+            verifiable: Artifact,
+            verdict: Verdict::Passed,
+            detail:
+                "recognized input-to-output flow is ordered left to right in the generated layout"
+                    .into(),
+        }
+    } else {
+        CheckResult {
+            aspect: "major signal flow proceeds left to right where identifiable".into(),
+            verifiable: Artifact,
+            verdict: Verdict::Failed,
+            detail: "recognized output appears left of an input in the generated layout".into(),
+        }
+    };
+
+    const MAX_PARTS_PER_COLUMN: usize = 8;
+    const MAX_TRUNKS_PER_CHANNEL: usize = 8;
+    let mut proxy_failures = Vec::new();
+    if readability.max_parts_in_column > MAX_PARTS_PER_COLUMN {
+        proxy_failures.push(format!(
+            "{} parts share one column (Puget limit {MAX_PARTS_PER_COLUMN})",
+            readability.max_parts_in_column
+        ));
+    }
+    if readability.max_signal_trunks_in_channel > MAX_TRUNKS_PER_CHANNEL {
+        proxy_failures.push(format!(
+            "{} signal trunks share one channel (Puget limit {MAX_TRUNKS_PER_CHANNEL})",
+            readability.max_signal_trunks_in_channel
+        ));
+    }
+    if !readability.disconnected_parts.is_empty() {
+        proxy_failures.push(format!(
+            "electrically disconnected parts enter the schematic narrative: {}",
+            readability.disconnected_parts.join(", ")
+        ));
+    }
+    let congestion = CheckResult {
+        aspect: "generated-page congestion and narrative separation".into(),
+        verifiable: Proxy,
+        verdict: if proxy_failures.is_empty() {
+            Verdict::Passed
+        } else {
+            Verdict::Failed
+        },
+        detail: if proxy_failures.is_empty() {
+            format!(
+                "Puget proxy passes: at most {} parts/column and {} signal trunks/channel; no disconnected parts",
+                readability.max_parts_in_column, readability.max_signal_trunks_in_channel
+            )
+        } else {
+            format!(
+                "Puget readability proxy, not a MIL-STD numeric limit: {}",
+                proxy_failures.join("; ")
+            )
+        },
+    };
+
+    StandardReport {
+        standard: "mil-std-3001-1a-schematic".into(),
+        designation: "MIL-STD-3001-1A, Change 2 (2021), clauses B.5.5.9 and B.5.5.13".into(),
+        results: vec![callouts, flow, congestion],
+    }
 }
 
 /// Verify the topology-visible portion of a USB Type-C sink receptacle.
@@ -321,5 +468,66 @@ mod tests {
             verify(&sink(false, "5.1k"), &["ipc-2221c".into()]),
             Err(StandardsError::NotImplemented(_))
         ));
+    }
+
+    fn readable_signal_chain() -> Circuit {
+        let mut circuit = Circuit::new("readable chain");
+        circuit.parts = vec![
+            Part::new("J1", "INPUT"),
+            Part::new("R1", "1k"),
+            Part::new("U1", "BUFFER"),
+            Part::new("J2", "OUTPUT"),
+        ];
+        circuit.nets = vec![
+            Net::new("IN", vec![PinRef::new("J1", "1"), PinRef::new("R1", "1")]),
+            Net::new("MID", vec![PinRef::new("R1", "2"), PinRef::new("U1", "1")]),
+            Net::new("OUT", vec![PinRef::new("U1", "2"), PinRef::new("J2", "1")]),
+        ];
+        circuit
+    }
+
+    #[test]
+    fn schematic_profile_checks_callouts_and_left_to_right_flow() {
+        let reports = verify(
+            &readable_signal_chain(),
+            &["mil-std-3001-1a-schematic".into()],
+        )
+        .unwrap();
+        assert!(reports[0].design_passes());
+        assert_eq!(reports[0].results[0].verdict, Verdict::Passed);
+        assert_eq!(reports[0].results[1].verdict, Verdict::Passed);
+        assert_eq!(reports[0].results[2].verdict, Verdict::Passed);
+        assert!(!reports[0].needs_physical_test());
+    }
+
+    #[test]
+    fn schematic_profile_labels_unassessable_flow_as_review_not_pass() {
+        let mut circuit = Circuit::new("unnamed flow");
+        circuit.parts = vec![Part::new("R1", "1k"), Part::new("R2", "2k")];
+        circuit.nets = vec![Net::new(
+            "N$1",
+            vec![PinRef::new("R1", "2"), PinRef::new("R2", "1")],
+        )];
+        let reports = verify(&circuit, &["mil-std-3001-1a-schematic".into()]).unwrap();
+        assert_eq!(reports[0].results[1].verdict, Verdict::NeedsReview);
+        assert!(!reports[0].results[1].detail.contains("pass"));
+    }
+
+    #[test]
+    fn schematic_profile_fails_local_congestion_proxy_without_calling_it_military() {
+        let mut circuit = readable_signal_chain();
+        for index in 1..=9 {
+            circuit.parts.push(Part::new(format!("C{index}"), "100n"));
+            circuit.nets.push(Net::new(
+                format!("PWR{index}"),
+                vec![PinRef::new(format!("C{index}"), "1")],
+            ));
+        }
+        let reports = verify(&circuit, &["mil-std-3001-1a-schematic".into()]).unwrap();
+        let proxy = &reports[0].results[2];
+        assert_eq!(proxy.verifiable, Proxy);
+        assert_eq!(proxy.verdict, Verdict::Failed);
+        assert!(proxy.detail.contains("Puget readability proxy"));
+        assert!(!reports[0].design_passes());
     }
 }

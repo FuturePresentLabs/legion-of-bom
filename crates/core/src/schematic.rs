@@ -18,6 +18,35 @@ use crate::model::{is_ground_net as is_ground, is_supply_rail as is_rail};
 use crate::source::CircuitSource;
 use crate::symbols::{read_symbol_graphics, SymFill, SymShape, SymbolGraphics};
 
+/// Deterministic measurements of the generated schematic's readability.
+///
+/// These are deliberately described as layout proxies rather than standards
+/// compliance.  They let an engineering profile fail a visibly overloaded
+/// drawing without pretending that a density threshold came from a military
+/// or IEC publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadabilityAnalysis {
+    /// Whether named input and output nets let us evaluate major signal flow.
+    pub flow_is_identifiable: bool,
+    /// Whether every identified output is at or to the right of the inputs.
+    pub major_signal_flow_is_left_to_right: bool,
+    /// Largest number of parts stacked into one generated column.
+    pub max_parts_in_column: usize,
+    /// Largest number of signal-net trunks sharing one inter-column channel.
+    pub max_signal_trunks_in_channel: usize,
+    /// Parts with no electrical connection that still enter the narrative.
+    pub disconnected_parts: Vec<String>,
+}
+
+const INPUT_NET_NAMES: &[&str] = &["IN", "SIG_IN", "INPUT", "AUDIO_IN", "IN_L"];
+const OUTPUT_NET_NAMES: &[&str] = &["OUT", "SIG_OUT", "OUTPUT", "AUDIO_OUT", "OUT_L"];
+
+fn is_named_like(name: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 /// The sheet colour — also what a `background`-filled symbol shape paints with.
 const SHEET_BG: &str = "#fbfbf7";
 
@@ -312,11 +341,10 @@ fn rank_parts(circuit: &dyn CircuitSource) -> HashMap<String, usize> {
 
     // Seed from whatever looks like the input; else the alphabetically first part,
     // so the layout is deterministic either way.
-    let input_like = ["IN", "SIG_IN", "INPUT", "AUDIO_IN", "IN_L"];
     let mut seeds: Vec<&str> = circuit
         .nets()
         .iter()
-        .filter(|n| input_like.iter().any(|c| n.name.eq_ignore_ascii_case(c)))
+        .filter(|n| is_named_like(&n.name, INPUT_NET_NAMES))
         .flat_map(|n| n.pins.iter().map(|p| p.refdes.0.as_str()))
         .collect();
     seeds.sort_unstable();
@@ -354,6 +382,73 @@ fn rank_parts(circuit: &dyn CircuitSource) -> HashMap<String, usize> {
         rank.entry(p.refdes.0.clone()).or_insert(max + 1);
     }
     rank
+}
+
+/// Measure properties of the exact column/trunk layout used by
+/// [`schematic_to_svg`].
+///
+/// Signal direction follows the public MIL-STD rule; the numeric congestion
+/// values are local proxies and their policy thresholds live in the standards
+/// profile rather than being presented as clauses of that document.
+///
+/// @derives-from url:https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=280652 MIL-STD-3001-1A §B.5.5.9 -- only the left-to-right major-signal-flow direction; congestion metrics are Puget heuristics
+#[must_use]
+pub fn analyze_readability(circuit: &dyn CircuitSource) -> ReadabilityAnalysis {
+    let rank = rank_parts(circuit);
+    let ranks_for = |names: &[&str]| -> Vec<usize> {
+        circuit
+            .nets()
+            .iter()
+            .filter(|net| is_named_like(&net.name, names))
+            .flat_map(|net| net.pins.iter())
+            .filter_map(|pin| rank.get(pin.refdes.0.as_str()).copied())
+            .collect()
+    };
+    let inputs = ranks_for(INPUT_NET_NAMES);
+    let outputs = ranks_for(OUTPUT_NET_NAMES);
+    let flow_is_identifiable = !inputs.is_empty() && !outputs.is_empty();
+    let major_signal_flow_is_left_to_right = flow_is_identifiable
+        && outputs.iter().min().copied().unwrap_or(0) >= inputs.iter().max().copied().unwrap_or(0);
+
+    let mut parts_per_column: HashMap<usize, usize> = HashMap::new();
+    for column in rank.values() {
+        *parts_per_column.entry(*column).or_default() += 1;
+    }
+
+    let mut trunks_per_channel: HashMap<usize, usize> = HashMap::new();
+    for net in circuit.nets().iter().filter(|net| !is_power(&net.name)) {
+        let mut columns: Vec<usize> = net
+            .pins
+            .iter()
+            .filter_map(|pin| rank.get(pin.refdes.0.as_str()).copied())
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        if columns.len() >= 2 {
+            *trunks_per_channel.entry(columns[0]).or_default() += 1;
+        }
+    }
+
+    let connected: std::collections::HashSet<&str> = circuit
+        .nets()
+        .iter()
+        .flat_map(|net| net.pins.iter().map(|pin| pin.refdes.0.as_str()))
+        .collect();
+    let mut disconnected_parts: Vec<String> = circuit
+        .parts()
+        .iter()
+        .filter(|part| !connected.contains(part.refdes.0.as_str()))
+        .map(|part| part.refdes.0.clone())
+        .collect();
+    disconnected_parts.sort();
+
+    ReadabilityAnalysis {
+        flow_is_identifiable,
+        major_signal_flow_is_left_to_right,
+        max_parts_in_column: parts_per_column.values().copied().max().unwrap_or(0),
+        max_signal_trunks_in_channel: trunks_per_channel.values().copied().max().unwrap_or(0),
+        disconnected_parts,
+    }
 }
 
 /// Lay parts out in columns by rank, stacked in refdes order within a column.
@@ -1387,6 +1482,25 @@ mod tests {
             .map(|p| r[p.refdes.0.as_str()])
             .collect::<std::collections::HashSet<_>>();
         assert!(cols.len() >= 3, "expected several columns, got {cols:?}");
+    }
+
+    #[test]
+    fn readability_analysis_measures_the_layout_that_is_rendered() {
+        let c = demo();
+        let analysis = analyze_readability(&c);
+        assert!(analysis.flow_is_identifiable);
+        assert!(analysis.major_signal_flow_is_left_to_right);
+        assert!(analysis.max_parts_in_column > 0);
+        assert!(analysis.max_signal_trunks_in_channel > 0);
+        assert!(analysis.disconnected_parts.is_empty());
+    }
+
+    #[test]
+    fn readability_analysis_reports_disconnected_mechanical_items() {
+        let mut c = demo();
+        c.parts.push(Part::new("H1", "MountingHole_3.2mm"));
+        let analysis = analyze_readability(&c);
+        assert_eq!(analysis.disconnected_parts, ["H1"]);
     }
 
     #[test]
