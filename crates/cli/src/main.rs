@@ -129,6 +129,10 @@ enum Command {
         /// image. See `legion_of_bom_core::export_board_glb`.
         #[arg(long)]
         model: Option<PathBuf>,
+        /// Emit placed footprints, outline and pours without routing. For visual
+        /// previews only; this is never a substitute for a routed board + DRC.
+        #[arg(long)]
+        placement_only: bool,
     },
     /// Render a readable schematic diagram (symbols + routed nets) from a
     /// circuit â SVG for viewing/iterating, PDF for a shareable final export.
@@ -601,7 +605,19 @@ fn main() -> ExitCode {
             iterations,
             logo,
             model: model_glb,
-        } => board_cmd(circuit, out, panel, mode, iterations, logo, model_glb),
+            placement_only,
+        } => board_cmd(
+            circuit,
+            out,
+            panel,
+            mode,
+            iterations,
+            BoardOutputOptions {
+                logo,
+                model_glb,
+                placement_only,
+            },
+        ),
         Command::Diagram { circuit, svg, pdf } => diagram_cmd(circuit, svg, pdf),
         Command::ScopeProbe {
             circuit,
@@ -1774,15 +1790,25 @@ fn parse_mode(mode: &str) -> Result<LayoutMode> {
         .ok_or_else(|| anyhow::anyhow!("unknown --mode '{mode}' (analog | digital | mixed)"))
 }
 
+struct BoardOutputOptions {
+    logo: Option<PathBuf>,
+    model_glb: Option<PathBuf>,
+    placement_only: bool,
+}
+
 fn board_cmd(
     circuit: PathBuf,
     out: Option<PathBuf>,
     panel: Option<PathBuf>,
     mode: String,
     iterations: usize,
-    logo: Option<PathBuf>,
-    model_glb: Option<PathBuf>,
+    output: BoardOutputOptions,
 ) -> Result<()> {
+    let BoardOutputOptions {
+        logo,
+        model_glb,
+        placement_only,
+    } = output;
     let circuit = circuit
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", circuit.display()))?;
@@ -1804,6 +1830,9 @@ fn board_cmd(
     let frame = read_frame(&circuit, stem)?;
     let mut options =
         board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
+    if placement_only {
+        options.router = None;
+    }
     options.title = Some(pretty_title(stem));
     // `lob board` takes a bare path, so there is no resolved manifest entry â
     // look one up by stem when this repo has a lob.toml, else print no legend.
@@ -1830,7 +1859,11 @@ fn board_cmd(
     let tracks = board.matches("(segment").count();
     let vias = board.matches("(via").count();
     println!("wrote {}", path.display());
-    println!("  placed + routed: {tracks} tracks, {vias} vias, outline + GND pour");
+    if placement_only {
+        println!("  placement preview: unrouted, outline + GND pour");
+    } else {
+        println!("  placed + routed: {tracks} tracks, {vias} vias, outline + GND pour");
+    }
     if let Some(model_path) = model_glb {
         let parts = guide::parse_board(&board).map_err(|e| anyhow::anyhow!(e))?;
         let outline = guide::board_outline(&board)
