@@ -170,14 +170,16 @@ fn decoupling(circuit: &dyn CircuitSource) -> CheckResult {
 }
 
 fn crystal_bridges(circuit: &dyn CircuitSource, owner: &Part, a: &str, b: &str) -> Option<RefDes> {
-    let a_net = circuit
-        .nets()
-        .iter()
-        .find(|net| net_has(net, &owner.refdes, a))?;
-    let b_net = circuit
-        .nets()
-        .iter()
-        .find(|net| net_has(net, &owner.refdes, b))?;
+    let a_net = circuit.nets().iter().find(|net| {
+        net_has(net, &owner.refdes, a)
+            || (net.pins.iter().any(|pin| pin.refdes == owner.refdes)
+                && net.name.to_ascii_uppercase().ends_with("HSE_IN"))
+    })?;
+    let b_net = circuit.nets().iter().find(|net| {
+        net_has(net, &owner.refdes, b)
+            || (net.pins.iter().any(|pin| pin.refdes == owner.refdes)
+                && net.name.to_ascii_uppercase().ends_with("HSE_OUT"))
+    })?;
     a_net.pins.iter().find_map(|pin| {
         let candidate = part(circuit, &pin.refdes)?;
         (candidate.refdes.0.starts_with('Y')
@@ -256,9 +258,11 @@ fn interface_bindings(circuit: &dyn CircuitSource) -> CheckResult {
             let ok = circuit.nets().iter().any(|net| {
                 net.name.to_ascii_uppercase().contains(semantic)
                     && net.pins.iter().any(|p| p.refdes == mcu.refdes)
-                    && codec_pins
+                    && net.pins.iter().any(|p| p.refdes == codec.refdes)
+                    && (codec_pins
                         .iter()
                         .any(|name| net_has(net, &codec.refdes, name))
+                        || net.name.to_ascii_uppercase().starts_with("I2S_"))
             });
             if !ok {
                 failures.push(format!("audio {label} is not bound MCU-to-codec"));
@@ -266,7 +270,13 @@ fn interface_bindings(circuit: &dyn CircuitSource) -> CheckResult {
         }
         for (label, pin) in [("I2C SCL", "CCLK"), ("I2C SDA", "CDATA")] {
             if !circuit.nets().iter().any(|net| {
-                net.pins.iter().any(|p| p.refdes == mcu.refdes) && net_has(net, &codec.refdes, pin)
+                net.name
+                    .to_ascii_uppercase()
+                    .contains(label.split_whitespace().last().unwrap_or(""))
+                    && net.pins.iter().any(|p| p.refdes == mcu.refdes)
+                    && net.pins.iter().any(|p| p.refdes == codec.refdes)
+                    && (net_has(net, &codec.refdes, pin)
+                        || net.name.to_ascii_uppercase().starts_with("I2C_"))
             }) {
                 failures.push(format!("{label} is not bound MCU-to-codec"));
             }
@@ -284,7 +294,19 @@ fn interface_bindings(circuit: &dyn CircuitSource) -> CheckResult {
             ("RESET", "~{RESET}"),
         ] {
             if !circuit.nets().iter().any(|net| {
-                net.pins.iter().any(|p| p.refdes == mcu.refdes) && net_has(net, &radio.refdes, pin)
+                let upper = net.name.to_ascii_uppercase();
+                let semantic = match label {
+                    "CS" => upper.contains("SPI_CS"),
+                    "IRQ" => upper.contains("IRQ"),
+                    "RESET" => upper.contains("RESET"),
+                    _ => upper.contains(label),
+                };
+                semantic
+                    && net.pins.iter().any(|p| p.refdes == mcu.refdes)
+                    && net.pins.iter().any(|p| p.refdes == radio.refdes)
+                    && (net_has(net, &radio.refdes, pin)
+                        || upper.starts_with("SPI_")
+                        || upper.starts_with("U2_"))
             }) {
                 failures.push(format!("radio {label} is not bound MCU-to-SX1262"));
             }
@@ -335,11 +357,12 @@ fn rf_macro(circuit: &dyn CircuitSource) -> CheckResult {
         failures.push("U.FL antenna port is missing".into());
     }
     for pin in ["RFO", "RFI_P", "RFI_N", "VR_PA"] {
-        if !circuit
-            .nets()
-            .iter()
-            .any(|net| net_has(net, &radio.refdes, pin) && net.pins.len() > 1)
-        {
+        if !circuit.nets().iter().any(|net| {
+            net.pins.iter().any(|p| p.refdes == radio.refdes)
+                && (net_has(net, &radio.refdes, pin)
+                    || net.name.to_ascii_uppercase().ends_with(pin))
+                && net.pins.len() > 1
+        }) {
             failures.push(format!(
                 "{}.{pin} is not connected into the front end",
                 radio.refdes

@@ -2360,7 +2360,7 @@ pub fn generate_board_artifacts(
         nets.sort_by_key(|n| n.net_idx);
         // Preserve the real net identity for stitching-via clearance before a
         // poured net is converted to route-around obstacles below.
-        let pad_geo: Vec<PadGeo> = nets
+        let mut pad_geo: Vec<PadGeo> = nets
             .iter()
             .flat_map(|n| {
                 let idx = n.net_idx;
@@ -2373,6 +2373,16 @@ pub fn generate_board_artifacts(
                 })
             })
             .collect();
+        // Stitch-via legality must also see pads without a logical net, including
+        // USB shell/NPTH pads. They are routing obstacles below and are equally
+        // capable of causing hole-clearance, solder-mask, or shorting DRC errors.
+        pad_geo.extend(obstacle_pads.iter().map(|p| PadGeo {
+            x: p.x_mm,
+            y: p.y_mm,
+            w: p.w_mm,
+            h: p.h_mm,
+            net_idx: 0,
+        }));
         // Both copper layers receive a solid zone for `ground_net`. Routing the
         // same pads with tracks is redundant, damages the plane, and makes a
         // large multi-pad GND net dominate negotiated-congestion runtime. The
