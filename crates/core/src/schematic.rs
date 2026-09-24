@@ -58,7 +58,7 @@ mod sheet {
     /// constant deliberately: it is the "small fixed clearance" term next to
     /// two *computed* half-extents (see [`super::Placed::content_size`]), not
     /// a stand-in for either column's own size the way the old `COL_W` was.
-    pub const COL_CHANNEL: f64 = 92.0;
+    pub const COL_CHANNEL: f64 = 180.0;
     /// Extra width budgeted for a column when its part's refdes/value caption
     /// prints *beside* the body rather than below it (every pin runs
     /// vertically — a resistor, a cap). Sized for a short refdes plus an
@@ -86,6 +86,11 @@ mod sheet {
     pub const MARGIN: f64 = 62.0;
     /// Extra room on the right for a trunk + net label hanging off the last column.
     pub const GUTTER: f64 = 70.0;
+    /// A generated sheet should remain readable at normal page aspect ratios.
+    /// Power-only parts are deliberately excluded from signal-flow ranking, so
+    /// they otherwise all collect in one final, several-thousand-pixel column.
+    /// Wrap any overloaded rank into deterministic continuation columns.
+    pub const MAX_PARTS_PER_COLUMN: usize = 8;
     /// Preferred symbol scale, and the slot a symbol is fitted into.
     pub const SYM_PX_PER_MM: f64 = 6.5;
     pub const SYM_MAX_W: f64 = 104.0;
@@ -96,8 +101,8 @@ mod sheet {
     pub const RAIL_STUB: f64 = 13.0;
     /// Sheet frame inset, and the title block that sits in its bottom-right corner.
     pub const FRAME: f64 = 12.0;
-    pub const TITLE_W: f64 = 300.0;
-    pub const TITLE_H: f64 = 64.0;
+    pub const TITLE_W: f64 = 420.0;
+    pub const TITLE_H: f64 = 88.0;
 }
 
 /// A part awaiting placement: refdes, value, its resolved symbol, the pins the
@@ -586,68 +591,78 @@ fn layout(circuit: &dyn CircuitSource) -> Vec<Placed> {
     // that column's own widest part. A column of resistors no longer costs
     // the same width as a column holding a switch.
     let mut col_left = sheet::MARGIN;
-    for (ci, c) in cols.iter().enumerate() {
+    let mut visual_col = 0usize;
+    for c in &cols {
         let mut parts = by_col.remove(c).unwrap_or_default();
         parts.sort_by(|a, b| a.0.cmp(b.0));
 
-        let mut column: Vec<Placed> = parts
-            .into_iter()
-            .enumerate()
-            .map(
-                |(ri, (refdes, value, sym, box_pins, pin_names, (rot90, flip)))| Placed {
-                    refdes: refdes.to_string(),
-                    value: value.to_string(),
-                    col: ci,
-                    row: ri,
-                    sym,
-                    box_pins,
-                    pin_names,
-                    rot90,
-                    flip,
-                    sheet_x: 0.0,
-                    sheet_y: 0.0,
-                    col_w: 0.0,
-                },
-            )
-            .collect();
+        // A rank is a signal-flow concept, not a demand that every member be
+        // stacked in one physical column.  In particular, decouplers have only
+        // power connections and intentionally share the final rank.  Continue an
+        // overloaded rank in adjacent columns so the drawing stays page-shaped.
+        for chunk in parts.chunks(sheet::MAX_PARTS_PER_COLUMN) {
+            let mut column: Vec<Placed> = chunk
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(
+                    |(ri, (refdes, value, sym, box_pins, pin_names, (rot90, flip)))| Placed {
+                        refdes: refdes.to_string(),
+                        value: value.to_string(),
+                        col: visual_col,
+                        row: ri,
+                        sym,
+                        box_pins,
+                        pin_names,
+                        rot90,
+                        flip,
+                        sheet_x: 0.0,
+                        sheet_y: 0.0,
+                        col_w: 0.0,
+                    },
+                )
+                .collect();
 
-        // `content_size`/`pins_sideways` need only `sym`/`rot90`/`flip`, not a
-        // resolved position, so every part's real footprint can be measured
-        // before any position in this column is finalised.
-        let footprint_w = |p: &Placed| {
-            let (w, _) = p.content_size();
-            if p.sym.is_some() && !p.pins_sideways() {
-                // The caption prints beside the body for this part; budget
-                // for it here so shrinking the column to its symbol's real
-                // width doesn't push that caption into the next column's
-                // territory — the label-collision trap transmog's naive fix
-                // fell into.
-                w + sheet::CAPTION_SIDE_W
-            } else {
-                w
+            // `content_size`/`pins_sideways` need only `sym`/`rot90`/`flip`, not a
+            // resolved position, so every part's real footprint can be measured
+            // before any position in this column is finalised.
+            let footprint_w = |p: &Placed| {
+                let (w, _) = p.content_size();
+                if p.sym.is_some() && !p.pins_sideways() {
+                    // The caption prints beside the body for this part; budget
+                    // for it here so shrinking the column to its symbol's real
+                    // width doesn't push that caption into the next column's
+                    // territory — the label-collision trap transmog's naive fix
+                    // fell into.
+                    w + sheet::CAPTION_SIDE_W
+                } else {
+                    w
+                }
+            };
+            let col_w = column
+                .iter()
+                .map(footprint_w)
+                .fold(0.0_f64, f64::max)
+                .max(sheet::MIN_CONTENT);
+
+            let mut row_top = sheet::MARGIN;
+            for p in &mut column {
+                let (_, h) = p.content_size();
+                p.sheet_x = col_left;
+                p.sheet_y = row_top;
+                p.col_w = col_w;
+                // The label budgets above/below are fixed regardless of the
+                // body's real height — shrinking them along with a short body is
+                // exactly the mistake that put a stage name on top of the next
+                // part's rail in transmog's first attempt.
+                row_top +=
+                    sheet::ROW_TOP_BUDGET + h.max(sheet::MIN_CONTENT) + sheet::ROW_BOTTOM_BUDGET;
             }
-        };
-        let col_w = column
-            .iter()
-            .map(footprint_w)
-            .fold(0.0_f64, f64::max)
-            .max(sheet::MIN_CONTENT);
 
-        let mut row_top = sheet::MARGIN;
-        for p in &mut column {
-            let (_, h) = p.content_size();
-            p.sheet_x = col_left;
-            p.sheet_y = row_top;
-            p.col_w = col_w;
-            // The label budgets above/below are fixed regardless of the
-            // body's real height — shrinking them along with a short body is
-            // exactly the mistake that put a stage name on top of the next
-            // part's rail in transmog's first attempt.
-            row_top += sheet::ROW_TOP_BUDGET + h.max(sheet::MIN_CONTENT) + sheet::ROW_BOTTOM_BUDGET;
+            out.extend(column);
+            col_left += col_w + sheet::COL_CHANNEL;
+            visual_col += 1;
         }
-
-        out.extend(column);
-        col_left += col_w + sheet::COL_CHANNEL;
     }
     out
 }
@@ -773,22 +788,18 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
                 ));
             }
         }
-        // Net label at the top of the trunk, on a small backing so it stays legible
-        // where it crosses a wire.
+        // Put the net name vertically alongside its trunk. Dense MCU buses can
+        // have twenty or more lanes in one channel: horizontal labels above those
+        // lanes inevitably pile on top of one another, while a vertical label
+        // remains associated with exactly one lane and reads cleanly at any fanout.
         let label = ellipsize(name, 14);
-        let lw = label.chars().count() as f64 * 6.0 + 6.0;
-        // Stagger by lane as well as by x: two nets leaving the same column at the
-        // same height would otherwise print their labels on top of each other.
-        // Never let the stagger push a label off the top of the sheet.
-        let ly = (y0 - 6.0 - lane as f64 * 12.0).max(14.0);
+        let ly = (y0 + y1) / 2.0;
         s.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{lw:.1}\" height=\"12\" fill=\"{SHEET_BG}\"/>\
-             <text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
-             font-size=\"10\" fill=\"#6b7280\" text-anchor=\"middle\">{}</text>",
-            trunk - lw / 2.0,
-            ly - 10.0,
-            trunk,
-            ly,
+            "<text x=\"{:.1}\" y=\"{ly:.1}\" font-family=\"ui-monospace,monospace\" \
+             font-size=\"9\" fill=\"#6b7280\" text-anchor=\"middle\" \
+             transform=\"rotate(-90 {:.1} {ly:.1})\">{}</text>",
+            trunk + 3.5,
+            trunk + 3.5,
             xml_escape(&label)
         ));
     }
@@ -984,10 +995,14 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
     s
 }
 
-/// The sheet frame plus a KiCad-style title block in its bottom-right corner.
-/// Deliberately carries only what the model actually knows — the circuit name, the
-/// part count, and the tool — rather than inventing a date or a revision, which on
-/// a drawing people may print and file would be worse than leaving blank.
+/// The sheet frame plus a compact engineering title/provenance table.
+///
+/// Its field structure follows the same ISO 7200-inspired pattern as Transmog's
+/// manufacturing drawings, while deliberately carrying only what this model
+/// actually knows.  Missing authorship, approval, revision, and release state are
+/// not invented: generated schematics remain explicitly marked for verification.
+///
+/// @derives-from url:https://www.iso.org/standard/35446.html ISO 7200:2004 — title-block field organization; no claim of whole-standard conformity
 fn frame_and_title_svg(
     w: f64,
     h: f64,
@@ -1009,35 +1024,83 @@ fn frame_and_title_svg(
         sheet::TITLE_W,
         sheet::TITLE_H
     ));
-    // Divider under the title line.
-    s.push_str(&format!(
-        "<path d=\"M{tx:.1} {:.1} L{:.1} {:.1}\" stroke=\"{ink}\" stroke-width=\"1.0\"/>",
-        ty + 30.0,
-        tx + sheet::TITLE_W,
-        ty + 30.0
-    ));
-    s.push_str(&format!(
-        "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
-         font-size=\"15\" font-weight=\"600\" fill=\"{ink}\">{}</text>",
-        tx + 10.0,
-        ty + 21.0,
-        xml_escape(circuit.name())
-    ));
     let symbols = placed.iter().filter(|p| p.sym.is_some()).count();
-    for (i, line) in [
-        format!("{} parts · {} nets", placed.len(), circuit.nets().len()),
-        format!("{symbols} drawn from KiCad symbols"),
-        "legion-of-bom · schematic view".to_string(),
-    ]
-    .iter()
-    .enumerate()
-    {
+    let fields = [
+        (
+            "TITLE",
+            xml_escape(circuit.name()),
+            0.0,
+            0.0,
+            250.0,
+            34.0,
+            15,
+        ),
+        (
+            "DOCUMENT TYPE",
+            "SCHEMATIC".into(),
+            250.0,
+            0.0,
+            100.0,
+            34.0,
+            11,
+        ),
+        ("SHEET", "1 / 1".into(), 350.0, 0.0, 70.0, 34.0, 11),
+        (
+            "SOURCE",
+            "PARSED CIRCUIT MODEL".into(),
+            0.0,
+            34.0,
+            160.0,
+            27.0,
+            10,
+        ),
+        (
+            "GENERATED BY",
+            "LEGION-OF-BOM".into(),
+            160.0,
+            34.0,
+            130.0,
+            27.0,
+            10,
+        ),
+        (
+            "STATUS",
+            "VERIFY BEFORE RELEASE".into(),
+            290.0,
+            34.0,
+            130.0,
+            27.0,
+            9,
+        ),
+        (
+            "CONTENTS",
+            format!(
+                "{} PARTS / {} NETS / {symbols} KICAD SYMBOLS",
+                placed.len(),
+                circuit.nets().len()
+            ),
+            0.0,
+            61.0,
+            420.0,
+            27.0,
+            10,
+        ),
+    ];
+    for (label, value, dx, dy, cw, ch, value_size) in fields {
+        let cx = tx + dx;
+        let cy = ty + dy;
         s.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"ui-monospace,monospace\" \
-             font-size=\"9\" fill=\"#6b7280\">{}</text>",
-            tx + 10.0,
-            ty + 42.0 + i as f64 * 10.0,
-            xml_escape(line)
+            "<rect class=\"title-block-cell\" x=\"{cx:.1}\" y=\"{cy:.1}\" width=\"{cw:.1}\" \
+             height=\"{ch:.1}\" fill=\"{SHEET_BG}\" stroke=\"{ink}\" stroke-width=\"0.8\"/>\
+             <text class=\"title-block-label\" x=\"{:.1}\" y=\"{:.1}\" \
+             font-family=\"ui-monospace,monospace\" font-size=\"8\" fill=\"#6b7280\">{label}</text>\
+             <text class=\"title-block-value\" x=\"{:.1}\" y=\"{:.1}\" \
+             font-family=\"ui-monospace,monospace\" font-size=\"{value_size}\" \
+             font-weight=\"600\" fill=\"{ink}\">{value}</text>",
+            cx + 7.0,
+            cy + 10.0,
+            cx + 7.0,
+            cy + ch - 7.0,
         ));
     }
     s
@@ -1504,6 +1567,33 @@ mod tests {
     }
 
     #[test]
+    fn overloaded_signal_rank_wraps_into_readable_columns() {
+        let mut c = Circuit::new("decoupling bank");
+        for i in 1..=19 {
+            c.parts.push(Part::new(format!("C{i}"), "100nF"));
+        }
+        // Put every part in exactly the same rank. The visual layout may wrap a
+        // rank; it must not require the ranker to distort circuit topology.
+        c.nets.push(Net::new(
+            "IN",
+            (1..=19)
+                .map(|i| PinRef::new(format!("C{i}"), "1"))
+                .collect(),
+        ));
+        let placed = layout(&c);
+        let columns: std::collections::HashSet<usize> =
+            placed.iter().map(|part| part.col).collect();
+        assert_eq!(columns.len(), 3, "19 parts should wrap 8 / 8 / 3");
+        assert!(
+            columns
+                .iter()
+                .all(|col| placed.iter().filter(|part| part.col == *col).count()
+                    <= sheet::MAX_PARTS_PER_COLUMN),
+            "no visual column exceeds the page-oriented row limit"
+        );
+    }
+
+    #[test]
     fn svg_is_well_formed_and_labels_every_part() {
         let c = demo();
         let svg = schematic_to_svg(&c);
@@ -1517,6 +1607,9 @@ mod tests {
         }
         // Rails are drawn as stubs, not routed as trunk wires.
         assert!(svg.contains("+12V") && svg.contains("GND"));
+        assert!(svg.contains("class=\"title-block-cell\""));
+        assert!(svg.contains(">PARSED CIRCUIT MODEL<"));
+        assert!(svg.contains(">VERIFY BEFORE RELEASE<"));
     }
 
     #[test]
