@@ -19,10 +19,15 @@
 </div>
 
 ```bash
-lob spec board --brief "stereo line in and out, no I2C setup" --out design
+lob spec board --brief "stereo line in and out, no I2C setup" \
+  --model fpl/decide --out design
 lob schematic design.json --out board.py
 lob board board.py && lob drc out/board/board.kicad_pcb
 ```
+
+`--model` is an opaque gateway model slug: it may select a conventional LLM
+or an RLCD/System-One model. It overrides `OODA_MODEL` for that invocation,
+which lets PCBBench compare models without mutating process-wide configuration.
 
 Engineering profiles are explicit constraints, never claims inferred from a
 brief. `--require-standard` puts an implemented profile into every RLCD request

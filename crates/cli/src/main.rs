@@ -281,6 +281,10 @@ enum Command {
         /// here, for eval scoring (e.g. PCBBench).
         #[arg(long)]
         trace: Option<PathBuf>,
+        /// Decision model slug. May name a conventional LLM or an RLCD model.
+        /// Overrides OODA_MODEL for this invocation.
+        #[arg(long)]
+        model: Option<String>,
         /// Force an implemented engineering profile into the spec and its
         /// decision context; repeat for multiple requirements.
         #[arg(long = "require-standard")]
@@ -311,6 +315,10 @@ enum Command {
         /// Also write the full decision trace (JSON) here.
         #[arg(long)]
         trace: Option<PathBuf>,
+        /// Decision model slug. May name a conventional LLM or an RLCD model.
+        /// Overrides OODA_MODEL for this invocation.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Spec -> design: render a SKiDL schematic from a spec file written by
     /// `lob spec`. A pure function of the spec -- no decision calls, no
@@ -676,8 +684,9 @@ fn main() -> ExitCode {
             brief,
             out,
             trace,
+            model,
             required_standards,
-        } => spec_cmd(family, brief, out, trace, required_standards),
+        } => spec_cmd(family, brief, out, trace, model, required_standards),
         Command::Standards {
             circuit,
             required,
@@ -689,7 +698,8 @@ fn main() -> ExitCode {
             enclosure,
             out,
             trace,
-        } => spec_chain_cmd(brief, vcc, enclosure, out, trace),
+            model,
+        } => spec_chain_cmd(brief, vcc, enclosure, out, trace, model),
         Command::Schematic { spec, out, panel } => schematic_cmd(spec, out, panel),
     };
 
@@ -947,6 +957,7 @@ fn spec_cmd(
     brief: String,
     out: PathBuf,
     trace_path: Option<PathBuf>,
+    model: Option<String>,
     required_standards: Vec<String>,
 ) -> Result<()> {
     // Fail on an unknown family before asking for credentials: the typo is
@@ -955,10 +966,14 @@ fn spec_cmd(
         return Err(family::FamilyError::Unknown(family).into());
     }
 
-    let client = ooda::CapturingClient::new(
-        ooda::HttpClient::from_env().with_context(|| {
+    let mut http = ooda::HttpClient::from_env().with_context(|| {
             "OODA_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint"
-        })?,
+        })?;
+    if let Some(model) = model {
+        http = http.with_model(model);
+    }
+    let client = ooda::CapturingClient::new(
+        http,
         ooda::Capture::for_current_binary().context("opening the decision capture log")?,
     );
     let mut trace = ooda::Trace::new();
@@ -1062,12 +1077,17 @@ fn spec_chain_cmd(
     enclosure: String,
     out: PathBuf,
     trace_path: Option<PathBuf>,
+    model: Option<String>,
 ) -> Result<()> {
     let enclosure_size = parse_enclosure(&enclosure)?;
-    let client = ooda::CapturingClient::new(
-        ooda::HttpClient::from_env().with_context(|| {
+    let mut http = ooda::HttpClient::from_env().with_context(|| {
             "OODA_API_KEY not set (see .env.example) -- lob spec-chain needs a Jev/System One-compatible endpoint"
-        })?,
+        })?;
+    if let Some(model) = model {
+        http = http.with_model(model);
+    }
+    let client = ooda::CapturingClient::new(
+        http,
         ooda::Capture::for_current_binary().context("opening the decision capture log")?,
     );
     let mut trace = ooda::Trace::new();
@@ -4564,6 +4584,29 @@ mod tests {
             parse_mode(&board).is_ok(),
             "the shared default mode {board:?} does not parse"
         );
+    }
+
+    #[test]
+    fn spec_model_slug_is_an_opaque_cli_value() {
+        use clap::Parser;
+
+        let cli = Cli::parse_from([
+            "lob",
+            "spec",
+            "board",
+            "--brief",
+            "test",
+            "--out",
+            "design",
+            "--model",
+            "provider/model:variant",
+        ]);
+        match cli.command {
+            Command::Spec { model, .. } => {
+                assert_eq!(model.as_deref(), Some("provider/model:variant"));
+            }
+            _ => panic!("expected spec command"),
+        }
     }
 
     /// The refusal MESSAGE carries both numbers and a way out.
