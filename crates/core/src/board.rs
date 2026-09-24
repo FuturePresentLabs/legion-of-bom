@@ -2211,6 +2211,32 @@ pub fn generate_board_artifacts(
         // already deterministic (`GridRouter::route` sorts by net index); the
         // obstacle painting that happens before it was not (`legion-of-bom-gns`).
         nets.sort_by_key(|n| n.net_idx);
+        // Preserve the real net identity for stitching-via clearance before a
+        // poured net is converted to route-around obstacles below.
+        let pad_geo: Vec<PadGeo> = nets
+            .iter()
+            .flat_map(|n| {
+                let idx = n.net_idx;
+                n.pads.iter().map(move |p| PadGeo {
+                    x: p.x_mm,
+                    y: p.y_mm,
+                    w: p.w_mm,
+                    h: p.h_mm,
+                    net_idx: idx,
+                    tht: matches!(p.layer, PadLayer::Both),
+                })
+            })
+            .collect();
+        // Both copper layers receive a solid zone for `ground_net`. Routing the
+        // same pads with tracks is redundant, damages the plane, and makes a
+        // large multi-pad GND net dominate negotiated-congestion runtime. The
+        // pads must still block signal copper, so feed them back as independent
+        // no-net obstacles instead.
+        if let Some(gnd) = &options.ground_net {
+            if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
+                poured_net_as_obstacles(&mut nets, &mut obstacle_pads, net_index[name.as_str()]);
+            }
+        }
         // Each no-net pad as its own single-pad net: painted as an obstacle (with
         // clearance halo) so traces route around it, but never itself routed
         // (the router only connects nets with ≥2 pads).
@@ -2245,20 +2271,6 @@ pub fn generate_board_artifacts(
         if let (Some(rect), Some(gnd)) = (outline, &options.ground_net) {
             if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
                 let gnd_idx = net_index[name.as_str()];
-                let pad_geo: Vec<PadGeo> = nets
-                    .iter()
-                    .flat_map(|n| {
-                        let idx = n.net_idx;
-                        n.pads.iter().map(move |p| PadGeo {
-                            x: p.x_mm,
-                            y: p.y_mm,
-                            w: p.w_mm,
-                            h: p.h_mm,
-                            net_idx: idx,
-                            tht: matches!(p.layer, PadLayer::Both),
-                        })
-                    })
-                    .collect();
                 for via in ground_stitching_vias(
                     rect,
                     gnd_idx,
@@ -2284,6 +2296,18 @@ pub fn generate_board_artifacts(
         collisions,
         not_placed,
     })
+}
+
+/// Remove a net that is already connected by copper pours from maze routing,
+/// while retaining every one of its pads as a signal-routing obstacle.
+fn poured_net_as_obstacles(
+    nets: &mut Vec<RouteNet>,
+    obstacle_pads: &mut Vec<PadPoint>,
+    poured_net_idx: usize,
+) {
+    if let Some(pos) = nets.iter().position(|n| n.net_idx == poured_net_idx) {
+        obstacle_pads.extend(nets.remove(pos).pads);
+    }
 }
 
 /// A footprint pad's local geometry, for routing.
@@ -3391,6 +3415,43 @@ pub(crate) fn det_uuid(seed: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{Circuit, Net, Part, PinRef};
+
+    fn route_pad(refdes: &str, pad: &str) -> PadPoint {
+        PadPoint {
+            refdes: refdes.into(),
+            pad: pad.into(),
+            x_mm: 0.0,
+            y_mm: 0.0,
+            w_mm: 1.0,
+            h_mm: 1.0,
+            layer: PadLayer::Both,
+        }
+    }
+
+    #[test]
+    fn a_poured_ground_net_is_not_also_routed_as_tracks() {
+        let mut nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "GND".into(),
+                pads: vec![route_pad("U1", "1"), route_pad("U2", "1")],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG".into(),
+                pads: vec![route_pad("U1", "2"), route_pad("U2", "2")],
+            },
+        ];
+        let mut obstacles = vec![route_pad("H1", "")];
+
+        poured_net_as_obstacles(&mut nets, &mut obstacles, 1);
+
+        assert_eq!(nets.len(), 1);
+        assert_eq!(nets[0].name, "SIG");
+        assert_eq!(obstacles.len(), 3);
+        assert!(obstacles.iter().any(|p| p.refdes == "U1" && p.pad == "1"));
+        assert!(obstacles.iter().any(|p| p.refdes == "U2" && p.pad == "1"));
+    }
 
     /// A 2-part signal chain deliberately named so alphabetical refdes order
     /// (A1, Z1) *disagrees* with real signal-flow order (Z1 is one hop from
