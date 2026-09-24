@@ -100,7 +100,7 @@ pub use board::{
     build_facts, decoupling_pairs, framed_template, free_outline_template, generate_board,
     generate_board_artifacts, generate_board_report, minimum_framed_outline, minimum_free_outline,
     minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
-    Placement, Placer, SeededPlacer, SilkLegend, SilkValues,
+    Placement, PlacementSidePolicy, Placer, SeededPlacer, SilkLegend, SilkValues,
 };
 pub use bom::{generate_bom, Bom, BomLine, LineKind};
 pub use bom_repair::{
