@@ -9,7 +9,7 @@
 [![license](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](#license)
 [![rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg?logo=rust)](https://www.rust-lang.org)
 [![kicad](https://img.shields.io/badge/KiCad-9-314cb0.svg)](https://www.kicad.org)
-[![tests](https://img.shields.io/badge/tests-593%20passing-brightgreen.svg)](#dev-loop)
+[![tests](https://img.shields.io/badge/tests-594%20passing-brightgreen.svg)](#dev-loop)
 [![families](https://img.shields.io/badge/curated%20families-2-8a2be2.svg)](#the-pipeline)
 [![datasheets](https://img.shields.io/badge/pinned%20datasheets-1-orange.svg)](#the-pipeline)
 [![benchmarked](https://img.shields.io/badge/benchmarked%20by-PCBBench-black.svg)](https://github.com/FuturePresentLabs/pcbbench)

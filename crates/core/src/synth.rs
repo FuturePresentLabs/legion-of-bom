@@ -107,7 +107,7 @@ fn pick(
                 .collect();
             let request = Request::new(serde_json::json!({
                 "brief": brief,
-                "required_standards": required_standards,
+                "required_standards": standards_context(required_standards),
             }))
             .with(key, Question::choice(question, criteria));
             let outcome = client.decide(&request).map_err(SpecError::from)?;
@@ -123,6 +123,19 @@ fn pick(
             })
         }
     }
+}
+
+fn standards_context(ids: &[String]) -> Vec<serde_json::Value> {
+    ids.iter()
+        .filter_map(|id| crate::standards::find(id))
+        .map(|standard| {
+            serde_json::json!({
+                "id": standard.id,
+                "designation": standard.designation,
+                "requirements": standard.requirements,
+            })
+        })
+        .collect()
 }
 
 fn split(key: &str) -> Vec<String> {
@@ -405,7 +418,7 @@ pub fn design_with_standards(
     // 1. Requirements.
     let mut request = Request::new(serde_json::json!({
         "brief": brief,
-        "required_standards": required_standards,
+        "required_standards": standards_context(required_standards),
     }));
     for f in &catalog.features {
         request = request.with(&f.key, Question::noul(&f.question));
@@ -1457,6 +1470,22 @@ pub fn unconfirmed(spec: &DesignSpec, catalog: &Catalog) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_context_names_the_obligation_not_just_the_profile_id() {
+        let context = standards_context(&["usb-type-c-2.0-sink".into()]);
+        assert_eq!(
+            context[0]["designation"],
+            "USB Type-C Cable and Connector Specification, Release 2.0 (2019)"
+        );
+        assert!(context[0]["requirements"]
+            .as_array()
+            .is_some_and(|requirements| requirements.iter().any(|requirement| {
+                requirement["aspect"]
+                    .as_str()
+                    .is_some_and(|aspect| aspect.contains("CC1 and CC2"))
+            })));
+    }
     use crate::catalog::default_catalog_dir;
 
     fn catalog() -> Catalog {
