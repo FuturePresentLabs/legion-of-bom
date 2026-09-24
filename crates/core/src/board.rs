@@ -2229,7 +2229,6 @@ pub fn generate_board_artifacts(
                     w: p.w_mm,
                     h: p.h_mm,
                     net_idx: idx,
-                    tht: matches!(p.layer, PadLayer::Both),
                 })
             })
             .collect();
@@ -2271,9 +2270,9 @@ pub fn generate_board_artifacts(
                 &options.route_options.back,
             ));
         }
-        // GND stitching vias tie the two-sided pour together next to each
-        // through-hole ground pad, so a pour island fenced off by a dense THT grid
-        // (a sub-board header) reconnects — fixes starved_thermal (25z.2).
+        // GND stitching vias tie the two-sided pour together next to every GND
+        // pad. This reconnects islands fenced off by dense THT grids and gives
+        // SMD IC ground pads a nearby path into the opposite plane.
         if let (Some(rect), Some(gnd)) = (outline, &options.ground_net) {
             if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
                 let gnd_idx = net_index[name.as_str()];
@@ -3267,9 +3266,6 @@ struct PadGeo {
     w: f64,
     h: f64,
     net_idx: usize,
-    /// Through-hole (both layers) — the pads that punch a hole in *both* ground
-    /// pours and so can strand a pour island.
-    tht: bool,
 }
 
 /// Distance from point `p` to segment `a`–`b`.
@@ -3284,10 +3280,10 @@ fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
 }
 
-/// GND **stitching vias**: one beside each through-hole ground pad, tying the
-/// F.Cu and B.Cu pours together there. The two-sided pour (DESIGN 6.2) relies on
-/// through-hole GND pads to bridge its layers; where a GND pad is alone in a
-/// region a dense THT grid (a sub-board header) fenced off, its pour becomes an
+/// GND **stitching vias**: one beside each ground pad, tying the F.Cu and B.Cu
+/// pours together there. The two-sided pour (DESIGN 6.2) relies on
+/// nearby stitches to bridge its layers; where a GND pad is alone in a region a
+/// dense THT grid (a sub-board header) fenced off, its pour becomes an
 /// isolated island (KiCad `starved_thermal`). A via just off the pad reconnects
 /// that island to the intact pour on the other layer. Each via is kept inside the
 /// board edge and clear of all *other-net* copper (pads, tracks, vias); a pad
@@ -3337,7 +3333,7 @@ fn ground_stitching_vias(
     };
 
     let mut vias: Vec<Via> = Vec::new();
-    for p in pads.iter().filter(|p| p.net_idx == gnd_idx && p.tht) {
+    for p in pads.iter().filter(|p| p.net_idx == gnd_idx) {
         let off = p.w.max(p.h) / 2.0 + via_r + clr + 0.2;
         for k in 0..8 {
             let ang = k as f64 * std::f64::consts::FRAC_PI_4;
@@ -4583,7 +4579,6 @@ mod tests {
                 w: 1.7,
                 h: 1.7,
                 net_idx: gnd,
-                tht: true,
             },
             // An unrelated SMD pad, far away.
             PadGeo {
@@ -4592,7 +4587,6 @@ mod tests {
                 w: 1.0,
                 h: 1.0,
                 net_idx: 2,
-                tht: false,
             },
         ];
         let vias = ground_stitching_vias(outline, gnd, &pads, &[], &[], &opts);
@@ -4603,20 +4597,25 @@ mod tests {
     }
 
     #[test]
-    fn stitching_skips_smd_pads_and_boxed_in_pads() {
+    fn stitching_connects_smd_pads_and_skips_boxed_in_pads() {
         let opts = RouteOptions::default();
         let gnd = 5;
         let outline = (0.0, 0.0, 40.0, 40.0);
-        // An SMD (single-layer) GND pad doesn't bridge the pours → no stitch.
+        // An SMD (single-layer) GND pad gets a nearby path to the other pour.
         let smd = vec![PadGeo {
             x: 20.0,
             y: 20.0,
             w: 1.0,
             h: 1.0,
             net_idx: gnd,
-            tht: false,
         }];
-        assert!(ground_stitching_vias(outline, gnd, &smd, &[], &[], &opts).is_empty());
+        let vias = ground_stitching_vias(outline, gnd, &smd, &[], &[], &opts);
+        assert_eq!(vias.len(), 1, "one stitch for the SMD GND pad");
+        let d = (vias[0].at.0 - 20.0).hypot(vias[0].at.1 - 20.0);
+        assert!(
+            d > 0.5 && d < 3.0,
+            "stitch sits just off the SMD pad (d={d})"
+        );
         // A THT GND pad fenced in on every side by other-net copper is skipped,
         // never forced into a clearance violation.
         let wall = |x: f64, y: f64, w: f64, h: f64| PadGeo {
@@ -4625,7 +4624,6 @@ mod tests {
             w,
             h,
             net_idx: 2,
-            tht: false,
         };
         let boxed = vec![
             PadGeo {
@@ -4634,7 +4632,6 @@ mod tests {
                 w: 1.7,
                 h: 1.7,
                 net_idx: gnd,
-                tht: true,
             },
             wall(17.5, 20.0, 2.0, 10.0),
             wall(22.5, 20.0, 2.0, 10.0),

@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::board::{det_uuid, mm};
+use crate::model::is_supply_rail;
 use crate::sexpr::Sexpr;
 
 /// Which copper a pad is on. SMD pads sit on one side; through-hole pads (`*.Cu`)
@@ -379,6 +380,23 @@ enum Cell {
 #[derive(Debug, Clone, Default)]
 pub struct GridRouter;
 
+/// Stable initial ordering for global routing. Board-wide supply trees have
+/// little freedom after signal copper divides the board into corridors, so they
+/// go first; other high-fanout nets follow, with net index as the final stable
+/// tie-break. Ground is normally removed because its zones own connectivity.
+fn initial_route_order(routable: &[&RouteNet]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..routable.len()).collect();
+    order.sort_by_key(|&i| {
+        let net = routable[i];
+        (
+            Reverse(is_supply_rail(&net.name)),
+            Reverse(net.pads.len()),
+            net.net_idx,
+        )
+    });
+    order
+}
+
 /// Max rip-up-and-reroute iterations. Each adds an ordering constraint (a boxed-in
 /// net must route before whatever boxed it in), so the constraint set only grows —
 /// convergence is bounded and a handful resolves the common mutual-conflict cases.
@@ -406,9 +424,7 @@ impl Router for GridRouter {
         if routable.is_empty() {
             return RouteOutput::default();
         }
-        // Base order: deterministic by net index.
-        let mut base: Vec<usize> = (0..routable.len()).collect();
-        base.sort_by_key(|&i| routable[i].net_idx);
+        let base = initial_route_order(&routable);
         let neutral = Congestion::neutral();
         let mut budget = RoutingBudget::new(opts);
         let mut out = search_orderings(nets, &routable, base, opts, &neutral, &mut budget);
@@ -1595,11 +1611,9 @@ impl Router for PathfinderRouter {
         if routable.is_empty() {
             return RouteOutput::default();
         }
-        // Deterministic net order. Unlike GridRouter this is *not* load-bearing —
-        // it only decides who moves first within a round — but it must be stable
-        // so the same board comes out twice.
-        let mut order: Vec<usize> = (0..routable.len()).collect();
-        order.sort_by_key(|&i| routable[i].net_idx);
+        // Give constrained board-wide power fanout a clean surface before short
+        // point-to-point signals. The stable tie-break preserves reproducibility.
+        let order = initial_route_order(&routable);
 
         let surface = build_surface(nets, &routable, opts);
         let (minx, miny, res) = (surface.minx, surface.miny, surface.res);
@@ -3191,5 +3205,28 @@ mod tests {
         assert_eq!(a.tracks, b.tracks);
         assert_eq!(a.vias, b.vias);
         assert!(a.conflicts.is_empty());
+    }
+
+    #[test]
+    fn initial_order_prioritizes_supply_then_fanout_stably() {
+        let mk = |idx: usize, name: &str, pads: usize| RouteNet {
+            net_idx: idx,
+            name: name.into(),
+            pads: (0..pads)
+                .map(|i| pad("U1", &i.to_string(), i as f64, idx as f64))
+                .collect(),
+        };
+        let nets = [
+            mk(1, "SIG", 8),
+            mk(9, "+3V3", 3),
+            mk(2, "BUS", 5),
+            mk(3, "AUX", 5),
+        ];
+        let routable: Vec<&RouteNet> = nets.iter().collect();
+
+        let order = initial_route_order(&routable);
+        let names: Vec<&str> = order.iter().map(|&i| routable[i].name.as_str()).collect();
+
+        assert_eq!(names, ["+3V3", "SIG", "BUS", "AUX"]);
     }
 }
