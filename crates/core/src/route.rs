@@ -226,6 +226,7 @@ struct RoutingBudget {
     deadline: Option<Instant>,
     expansions: u64,
     exhausted: Option<RoutingStopReason>,
+    search_limit: Option<u64>,
 }
 
 impl RoutingBudget {
@@ -239,11 +240,26 @@ impl RoutingBudget {
                 .map(|ms| started + Duration::from_millis(ms)),
             expansions: 0,
             exhausted: None,
+            search_limit: None,
         }
+    }
+
+    /// Bound one A* invocation by a multiple of the finite routing state space.
+    /// Duplicate heap entries may otherwise let one impossible connection spend
+    /// the complete board budget before any other net is attempted.
+    fn begin_search(&mut self, states: usize) {
+        let allowance = u64::try_from(states).unwrap_or(u64::MAX).saturating_mul(2);
+        self.search_limit = Some(self.expansions.saturating_add(allowance));
     }
 
     fn expand(&mut self) -> bool {
         if self.exhausted.is_some() {
+            return false;
+        }
+        if self
+            .search_limit
+            .is_some_and(|limit| self.expansions >= limit)
+        {
             return false;
         }
         if self
@@ -607,7 +623,7 @@ struct Surface {
     pad_cells: Vec<Vec<((usize, usize), PadLayer)>>,
     /// Routable pads whose own centre cell lies inside another net's pad
     /// keep-out at this resolution: pads the router could never leave.
-    buried_pads: usize,
+    buried_pads: Vec<(String, String)>,
     costs: Costs,
 }
 
@@ -750,11 +766,34 @@ impl ViaTable {
 /// coarse grid; a 0.5mm-pitch QFP drops it to where the pin axis is on a cell.
 fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions) -> Surface {
     let mut res = opts.grid_mm.max(0.01);
+    let mut previous: Option<Surface> = None;
     loop {
         let surface = paint_surface(nets, routable, opts, res);
-        if surface.buried_pads == 0 || res / 2.0 < MIN_GRID_MM - 1e-9 {
+        if std::env::var_os("LOB_PF_TRACE").is_some() {
+            eprintln!(
+                "  routing surface: {:.4}mm, {}x{}, {} buried pad(s)",
+                res,
+                surface.cols,
+                surface.rows,
+                surface.buried_pads.len()
+            );
+            if !surface.buried_pads.is_empty() {
+                eprintln!("    buried: {:?}", surface.buried_pads);
+            }
+        }
+        if surface.buried_pads.is_empty() || res / 2.0 < MIN_GRID_MM - 1e-9 {
             return surface;
         }
+        if previous
+            .as_ref()
+            .is_some_and(|coarser| coarser.buried_pads == surface.buried_pads)
+        {
+            // Finer sampling did not free a single pad: this is a geometric
+            // conflict, not a resolution problem. Keep the coarser surface so
+            // the rest of the board can route and report these pads honestly.
+            return previous.expect("checked above");
+        }
+        previous = Some(surface);
         res /= 2.0;
     }
 }
@@ -867,7 +906,7 @@ fn paint_surface(
     // connection point on every layer it touches — so a through-hole pad is
     // reachable on both, letting the router meet it without a via.
     let mut pad_cells: Vec<Vec<((usize, usize), PadLayer)>> = Vec::new();
-    let mut buried_pads = 0;
+    let mut buried_pads = Vec::new();
     for net in routable {
         let mut cells = Vec::new();
         for pad in &net.pads {
@@ -877,7 +916,7 @@ fn paint_surface(
                 .iter()
                 .any(|&l| grid.get(c, r, l) != Cell::Owner(net.net_idx))
             {
-                buried_pads += 1;
+                buried_pads.push((pad.refdes.clone(), pad.pad.clone()));
             }
             for &layer in layers {
                 grid.set(c, r, layer, Cell::Owner(net.net_idx));
@@ -972,6 +1011,7 @@ fn route_pass(
             // Reach the pad on any layer it touches (cheapest wins).
             let targets: Vec<(usize, usize, usize)> =
                 tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
+            budget.begin_search(cols.saturating_mul(rows).saturating_mul(2));
             match grid.route_one_soft(
                 net.net_idx,
                 &connected,
@@ -1643,9 +1683,13 @@ impl Router for PathfinderRouter {
                 rt.claim(&surface);
                 cong.add(&rt);
                 routes[ni] = rt;
-                if budget.exhausted.is_some() {
-                    break;
-                }
+                // Keep visiting the remaining nets after the budget fires.
+                // `route_one_soft` then returns immediately, while
+                // `route_net_soft` records every one of those connections as
+                // unreached. Breaking here left untouched `NetRoute::default()`
+                // values behind, which looked complete to the settled-output
+                // path and let whole signal nets disappear from both copper and
+                // the routing evidence.
             }
             let over = (0..cong.core.len()).filter(|&i| cong.overused(i)).count();
             let unreached: usize = routes.iter().map(|r| r.unreached.len()).sum();
@@ -1838,10 +1882,13 @@ fn partial_output(
     let mut out = RouteOutput::default();
     let Some((_, _, routes, contested)) = best else {
         for &ni in order {
-            out.conflicts.push(format!(
-                "net {} ({}): routing budget exhausted before a legal route was found",
-                routable[ni].net_idx, routable[ni].name
-            ));
+            let net = routable[ni];
+            for pad in net.pads.iter().skip(1) {
+                out.conflicts.push(format!(
+                    "net {} ({}): routing budget exhausted before routing to pad {}.{}",
+                    net.net_idx, net.name, pad.refdes, pad.pad
+                ));
+            }
         }
         return out;
     };
@@ -1852,10 +1899,17 @@ fn partial_output(
                 emit_path(path, net.net_idx, opts, mm_of, &mut out);
             }
         } else {
-            out.conflicts.push(format!(
-                "net {} ({}): unresolved when routing budget was exhausted",
-                net.net_idx, net.name
-            ));
+            // Conflicts are connection-level evidence, not net-level summaries.
+            // The layout scorer and routing report both consume this count, so a
+            // 30-pad rail is 29 missing connections, not one vague "bad net".
+            // Only wholly legal nets are emitted from a negotiated partial; all
+            // of this net's tree edges therefore remain unresolved here.
+            for pad in net.pads.iter().skip(1) {
+                out.conflicts.push(format!(
+                    "net {} ({}): unresolved to pad {}.{} when routing budget was exhausted",
+                    net.net_idx, net.name, pad.refdes, pad.pad
+                ));
+            }
         }
     }
     out
@@ -1942,6 +1996,7 @@ fn route_net_soft(
         let ((tc, tr), tlayer) = s.pad_cells[ni][k];
         let targets: Vec<(usize, usize, usize)> =
             tlayer.layers().iter().map(|&l| (tc, tr, l)).collect();
+        budget.begin_search(s.cells());
         match s.grid.route_one_soft(
             net.net_idx,
             &connected,
@@ -3182,6 +3237,43 @@ mod tests {
         assert!(!out.conflicts.is_empty());
         assert!(!report.progress.is_empty());
         assert_eq!(report.progress.last().unwrap().unresolved_connections, 1);
+    }
+
+    #[test]
+    fn pathfinder_budget_evidence_counts_every_unrouted_connection() {
+        let nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "RAIL".into(),
+                pads: vec![
+                    pad("J1", "1", 0.0, 0.0),
+                    pad("U1", "1", 10.0, 0.0),
+                    pad("U2", "1", 20.0, 0.0),
+                ],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG".into(),
+                pads: vec![pad("U1", "2", 0.0, 10.0), pad("U2", "2", 20.0, 10.0)],
+            },
+        ];
+        let opts = RouteOptions {
+            bounds: Some((-1.0, -1.0, 21.0, 11.0)),
+            max_expansions: Some(1),
+            max_wall_time_ms: None,
+            ..RouteOptions::default()
+        };
+        let out = PathfinderRouter::default().route(&nets, &opts);
+        assert_eq!(out.conflicts.len(), 3, "conflicts: {:#?}", out.conflicts);
+        assert_eq!(
+            out.report
+                .unwrap()
+                .progress
+                .last()
+                .unwrap()
+                .unresolved_connections,
+            3
+        );
     }
 
     #[test]
