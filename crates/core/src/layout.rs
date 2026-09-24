@@ -15,6 +15,7 @@
 //! board, as a final gate (`kicad_cli`), with an opt-in (`drc_every_iter`) to
 //! fold it into every iteration when the caller accepts the cost.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -228,6 +229,55 @@ pub struct LayoutLoop {
     pub drc_every_iter: bool,
 }
 
+/// One deterministic point in the bounded layout/router policy sweep.
+///
+/// The values are multipliers over the caller's board options, not another
+/// configuration surface. This keeps manufacturing geometry authoritative while
+/// still trying a small, reproducible set of router trade-offs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutPolicy {
+    pub name: &'static str,
+    pub grid_scale: f64,
+    pub via_cost_scale: f64,
+    pub back_penalty_scale: f64,
+    /// Only applies to automatically-sized outlines. Fixed/panel outlines are
+    /// never silently enlarged.
+    pub outline_margin_delta_mm: f64,
+}
+
+/// The stable policy ladder. Iterations beyond the ladder repeat it while the
+/// placement repair sequence continues to explore new arrangements.
+pub const LAYOUT_POLICIES: [LayoutPolicy; 4] = [
+    LayoutPolicy {
+        name: "balanced",
+        grid_scale: 1.0,
+        via_cost_scale: 1.0,
+        back_penalty_scale: 1.0,
+        outline_margin_delta_mm: 0.0,
+    },
+    LayoutPolicy {
+        name: "fine_grid",
+        grid_scale: 0.75,
+        via_cost_scale: 1.0,
+        back_penalty_scale: 1.0,
+        outline_margin_delta_mm: 0.0,
+    },
+    LayoutPolicy {
+        name: "via_friendly",
+        grid_scale: 1.0,
+        via_cost_scale: 0.7,
+        back_penalty_scale: 0.5,
+        outline_margin_delta_mm: 0.0,
+    },
+    LayoutPolicy {
+        name: "roomy_coarse",
+        grid_scale: 1.25,
+        via_cost_scale: 1.2,
+        back_penalty_scale: 1.0,
+        outline_margin_delta_mm: 1.0,
+    },
+];
+
 impl Default for LayoutLoop {
     fn default() -> Self {
         LayoutLoop {
@@ -266,6 +316,48 @@ pub struct LayoutReport {
     pub findings: Vec<Finding>,
     /// Bounded repair strategies selected during this run, in attempt order.
     pub repair_actions: Vec<RepairAction>,
+    /// Policy which produced the winning candidate.
+    pub policy: LayoutPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateRank {
+    unrouted: usize,
+    drc_errors: usize,
+    broken: [f64; 3],
+    area_mm2: f64,
+    /// Deterministic router work proxy. Wall time remains report evidence, but
+    /// cannot select a winner because scheduler noise would change the board.
+    runtime_work: u64,
+    preference: f64,
+    policy_index: usize,
+}
+
+impl CandidateRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.unrouted
+            .cmp(&other.unrouted)
+            .then_with(|| self.drc_errors.cmp(&other.drc_errors))
+            .then_with(|| cmp_f64_array(self.broken, other.broken))
+            .then_with(|| self.area_mm2.total_cmp(&other.area_mm2))
+            .then_with(|| self.runtime_work.cmp(&other.runtime_work))
+            .then_with(|| self.preference.total_cmp(&other.preference))
+            .then_with(|| self.policy_index.cmp(&other.policy_index))
+    }
+}
+
+fn cmp_f64_array(left: [f64; 3], right: [f64; 3]) -> Ordering {
+    left[0]
+        .total_cmp(&right[0])
+        .then_with(|| left[1].total_cmp(&right[1]))
+        .then_with(|| left[2].total_cmp(&right[2]))
+}
+
+fn budget_share(total: Option<u64>, candidates: usize, index: usize) -> Option<u64> {
+    total.map(|total| {
+        let candidates = candidates.max(1) as u64;
+        total / candidates + u64::from((index as u64) < total % candidates)
+    })
 }
 
 /// Optional RLCD seam for repair strategy selection. The caller owns the
@@ -302,9 +394,6 @@ pub fn run_layout_loop_with_decider(
         broken: [f64; 3],
         /// Connections the router could not make. Ranks above every preference.
         unrouted: usize,
-        /// Preference cost with the rule penalty removed, so the tiers above are
-        /// not counted twice.
-        preference: f64,
         score: f64,
         board: String,
         metrics: PlacementMetrics,
@@ -313,6 +402,8 @@ pub fn run_layout_loop_with_decider(
         collisions: Vec<String>,
         not_placed: Vec<String>,
         drc: Option<DrcReport>,
+        rank: CandidateRank,
+        policy: LayoutPolicy,
     }
 
     let weights = cfg.mode.weights();
@@ -327,6 +418,12 @@ pub fn run_layout_loop_with_decider(
         },
     );
     let iters = cfg.max_iters.max(1);
+    let base_grid_mm = options.route_options.grid_mm;
+    let base_via_cost_mm = options.route_options.via_cost_mm;
+    let base_back_penalty_mm = options.route_options.back_penalty_mm;
+    let base_outline_margin_mm = options.outline_margin_mm;
+    let total_expansions = options.route_options.max_expansions;
+    let total_wall_time_ms = options.route_options.max_wall_time_ms;
 
     // Free parts (everything not anchored), sorted — the repair perturbation set.
     let mut free: Vec<String> = circuit
@@ -346,6 +443,20 @@ pub fn run_layout_loop_with_decider(
 
     for i in 0..iters {
         ran += 1;
+        let policy_index = i % LAYOUT_POLICIES.len();
+        let policy = LAYOUT_POLICIES[policy_index];
+        options.route_options.grid_mm = base_grid_mm * policy.grid_scale;
+        options.route_options.via_cost_mm = base_via_cost_mm * policy.via_cost_scale;
+        options.route_options.back_penalty_mm = base_back_penalty_mm * policy.back_penalty_scale;
+        options.outline_margin_mm = if options.fixed_outline.is_none() {
+            base_outline_margin_mm + policy.outline_margin_delta_mm
+        } else {
+            base_outline_margin_mm
+        };
+        // The CLI budgets the complete layout search, not every candidate. A
+        // hard board therefore cannot multiply its allowance by `max_iters`.
+        options.route_options.max_expansions = budget_share(total_expansions, iters, i);
+        options.route_options.max_wall_time_ms = budget_share(total_wall_time_ms, iters, i);
         let mut placer = template.clone();
         placer.nudges = nudges.clone();
         options.placer = Box::new(placer);
@@ -397,20 +508,32 @@ pub fn run_layout_loop_with_decider(
         let (unrouted, penalty) = (metrics.unrouted, metrics.rule_penalty);
         let broken = crate::rules::by_tier(&metrics.violations);
         let preference = sc - penalty;
-        // Ordered relaxation: physical damage decides first, then electrical,
-        // then whether the board is even connected, and only when those tie does
-        // the preference cost break it. An attempt is never allowed to buy
-        // wirelength with a rule, or with a net.
-        let key = relax_key(broken, unrouted, preference);
-        let improved = best
-            .as_ref()
-            .is_none_or(|b| key < relax_key(b.broken, b.unrouted, b.preference));
+        // Fabrication ordering: connectivity and actual DRC decide first. When
+        // DRC is unavailable or tied, the black-book rule tiers prevent a
+        // candidate buying compactness with a known physical/electrical defect.
+        let drc_errors = drc.as_ref().map_or(0, DrcReport::error_count);
+        let area_mm2 = options.fixed_outline.map_or_else(
+            || {
+                (template.width_mm + 2.0 * options.outline_margin_mm)
+                    * (template.height_mm + 2.0 * options.outline_margin_mm)
+            },
+            |(x0, y0, x1, y1)| (x1 - x0).abs() * (y1 - y0).abs(),
+        );
+        let rank = CandidateRank {
+            unrouted,
+            drc_errors,
+            broken,
+            area_mm2,
+            runtime_work: art.route.report.as_ref().map_or(0, |r| r.expansions),
+            preference,
+            policy_index,
+        };
+        let improved = best.as_ref().is_none_or(|b| rank.cmp(&b.rank).is_lt());
         stale = if improved { 0 } else { stale + 1 };
         if improved {
             best = Some(Attempt {
                 broken,
                 unrouted,
-                preference,
                 score: sc,
                 board: art.pcb,
                 metrics,
@@ -419,6 +542,8 @@ pub fn run_layout_loop_with_decider(
                 collisions: art.collisions.clone(),
                 not_placed: art.not_placed,
                 drc,
+                rank,
+                policy,
             });
         }
 
@@ -477,7 +602,6 @@ pub fn run_layout_loop_with_decider(
     let Attempt {
         broken: _,
         unrouted: _,
-        preference: _,
         score,
         board,
         metrics,
@@ -486,6 +610,8 @@ pub fn run_layout_loop_with_decider(
         collisions,
         not_placed,
         mut drc,
+        rank: _,
+        policy,
     } = best.expect("loop runs at least once");
 
     // Final DRC gate on the winning board, if not already done per-iteration.
@@ -569,34 +695,13 @@ pub fn run_layout_loop_with_decider(
         drc,
         findings,
         repair_actions,
+        policy,
     })
 }
 
 /// Deterministic repair perturbation: nudge each free part by a golden-angle
 /// offset that varies with the attempt, so successive attempts explore different
 /// arrangements without any RNG. Magnitude grows with the attempt number.
-/// The ordering key for one attempt: millimetres broken per tier, worst tier
-/// first, then connections the router could not make, then the preference cost.
-/// Lower is better, compared lexicographically.
-///
-/// This is what "relax the lowest tier first" means mechanically. A lower tier
-/// is only ever traded once every higher tier ties, so no amount of wirelength
-/// can buy back an electrical rule and nothing can buy back a physical one —
-/// exactly, rather than the [`crate::rules::penalty`] weights' approximation.
-///
-/// `unrouted` sits above the preference cost for the same reason, and used not
-/// to. [`CostWeights::unrouted`] prices a missing connection at 50, which reads
-/// like a lot until an attempt is 327 mm of wirelength tighter — then two
-/// unconnected nets are a bargain, and the loop took that trade on
-/// `daisy_panel_demo` and returned the broken board (`legion-of-bom-7a7`). A net
-/// the router could not finish is not a preference: `lob fab` refuses the board,
-/// so it is not a board. The module docs already claimed "unrouted dominates so
-/// a routable board always beats a tighter-but-broken one" — this is what makes
-/// that true.
-fn relax_key(broken: [f64; 3], unrouted: usize, preference: f64) -> (f64, f64, f64, f64, f64) {
-    (broken[0], broken[1], broken[2], unrouted as f64, preference)
-}
-
 /// A part a rule violation names (`Violation.repair`, already computed by
 /// `rules::assess` — see e.g. `Rule::Proximity`'s "move the cap to its IC"
 /// hint) steps partway toward that real, targeted destination instead of
@@ -1030,45 +1135,62 @@ mod tests {
         assert!(dist < 20.0, "C1 should seed near U1, got {dist}mm");
     }
 
-    /// Ordered relaxation: break the cheapest thing that lets the board fit,
-    /// and never buy a higher tier with a lower one.
-    #[test]
-    fn a_lower_tier_is_only_traded_once_the_higher_ones_tie() {
-        // An attempt that breaks a physical rule loses to one that breaks a much
-        // larger electrical one, however good its wirelength.
-        let physical = relax_key([0.1, 0.0, 0.0], 0, 0.0);
-        let electrical = relax_key([0.0, 50.0, 0.0], 0, 9_999.0);
-        assert!(electrical < physical);
-
-        // Likewise electrical over preference…
-        let elec = relax_key([0.0, 0.1, 0.0], 0, 0.0);
-        let pref = relax_key([0.0, 0.0, 50.0], 0, 9_999.0);
-        assert!(pref < elec);
-
-        // …and only when every tier ties does wirelength decide.
-        let tidy = relax_key([0.0, 2.0, 0.0], 0, 100.0);
-        let untidy = relax_key([0.0, 2.0, 0.0], 0, 200.0);
-        assert!(tidy < untidy);
+    fn candidate(
+        unrouted: usize,
+        drc_errors: usize,
+        area_mm2: f64,
+        runtime_work: u64,
+        preference: f64,
+    ) -> CandidateRank {
+        CandidateRank {
+            unrouted,
+            drc_errors,
+            broken: [0.0; 3],
+            area_mm2,
+            runtime_work,
+            preference,
+            policy_index: 0,
+        }
     }
 
-    /// legion-of-bom-7a7: the loop returned a board with two unconnected nets
-    /// because it was 327mm of wirelength tighter than the routable one, which
-    /// at 50 per unrouted net was a trade the score was happy to make. A board
-    /// `lob fab` refuses is not a board, so no wirelength can buy a net.
     #[test]
-    fn no_amount_of_wirelength_buys_an_unrouted_net() {
-        let broken_but_tight = relax_key([0.0, 0.0, 0.0], 2, 412.4);
-        let routed_but_loose = relax_key([0.0, 0.0, 0.0], 0, 739.6);
-        assert!(routed_but_loose < broken_but_tight);
+    fn candidate_order_is_connectivity_then_drc_then_area_work_preference() {
+        let routed = candidate(0, 99, 10_000.0, 99_000, 99_000.0);
+        let unrouted = candidate(1, 0, 1.0, 1, 1.0);
+        assert!(routed.cmp(&unrouted).is_lt());
 
-        // Fewer unrouted still wins, and among equally-routable attempts the
-        // preference cost decides as before.
-        assert!(relax_key([0.0; 3], 1, 9_999.0) < relax_key([0.0; 3], 2, 0.0));
-        assert!(relax_key([0.0; 3], 0, 100.0) < relax_key([0.0; 3], 0, 200.0));
+        let drc_clean = candidate(0, 0, 10_000.0, 99_000, 99_000.0);
+        let drc_broken = candidate(0, 1, 1.0, 1, 1.0);
+        assert!(drc_clean.cmp(&drc_broken).is_lt());
 
-        // But a physical rule still outranks routability: a board that does not
-        // fit its own outline is not rescued by connecting every net.
-        assert!(relax_key([0.0; 3], 3, 0.0) < relax_key([0.5, 0.0, 0.0], 0, 0.0));
+        let rules_clean = candidate(0, 0, 10_000.0, 99_000, 99_000.0);
+        let mut rules_broken = candidate(0, 0, 1.0, 1, 1.0);
+        rules_broken.broken[0] = 0.1;
+        assert!(rules_clean.cmp(&rules_broken).is_lt());
+
+        assert!(candidate(0, 0, 99.0, 999, 999.0)
+            .cmp(&candidate(0, 0, 100.0, 1, 1.0))
+            .is_lt());
+        assert!(candidate(0, 0, 100.0, 9, 999.0)
+            .cmp(&candidate(0, 0, 100.0, 10, 1.0))
+            .is_lt());
+        assert!(candidate(0, 0, 100.0, 10, 1.0)
+            .cmp(&candidate(0, 0, 100.0, 10, 2.0))
+            .is_lt());
+    }
+
+    #[test]
+    fn policy_ladder_and_budget_split_are_deterministic_and_bounded() {
+        assert_eq!(
+            LAYOUT_POLICIES.map(|policy| policy.name),
+            ["balanced", "fine_grid", "via_friendly", "roomy_coarse"]
+        );
+        let shares: Vec<u64> = (0..6)
+            .map(|index| budget_share(Some(10), 6, index).unwrap())
+            .collect();
+        assert_eq!(shares, [2, 2, 2, 2, 1, 1]);
+        assert_eq!(shares.iter().sum::<u64>(), 10);
+        assert_eq!(budget_share(None, 6, 0), None);
     }
 
     #[test]
