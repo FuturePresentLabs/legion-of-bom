@@ -361,6 +361,17 @@ fn is_power_header_footprint(footprint: &str) -> bool {
     footprint.contains("PinHeader_2x")
 }
 
+/// Connectors whose mating interface must be reachable from outside the board.
+///
+/// This classification is intentionally footprint-based: the footprint is the
+/// source of truth for physical geometry, while a refdes or value is not. Keep
+/// this narrow until another connector family has a proven edge requirement.
+pub fn is_edge_connector_footprint(footprint: &str) -> bool {
+    footprint.contains("Connector_USB:USB_")
+        || footprint.contains("Connector_Coaxial:U.FL_")
+        || footprint.contains("Connector_Coaxial:SMA_")
+}
+
 /// A Eurorack power header mounts on the **back** of a module board.
 ///
 /// The front face carries the panel controls and sits against the panel, so a
@@ -618,6 +629,24 @@ pub struct SeededPlacer {
     /// the computed centroid target so a later attempt explores a different spot.
     /// Empty on the first pass.
     pub nudges: HashMap<String, (f64, f64)>,
+    /// Which faces automatic placement may populate. Generic boards are
+    /// front-only; a caller must explicitly opt into the Eurorack convention
+    /// that puts the power header on the rear face.
+    pub side_policy: PlacementSidePolicy,
+}
+
+/// Assembly-face policy for deterministic placement.
+///
+/// This is deliberately a property of the placer rather than an inference from
+/// SMD/THT geometry. A two-layer copper stack does not imply two-sided assembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlacementSidePolicy {
+    /// Populate only the front face. This is the generic-board default.
+    #[default]
+    FrontOnly,
+    /// Honor explicitly declared component sides and put Eurorack power headers
+    /// on the rear face as required by that mechanical format.
+    Eurorack,
 }
 
 /// How much harder a `critical()`-tagged net pulls its parts together than an
@@ -786,7 +815,14 @@ impl SeededPlacer {
             origin_mm,
             anchors,
             nudges: HashMap::new(),
+            side_policy: PlacementSidePolicy::FrontOnly,
         }
+    }
+
+    /// Opt into the mechanically-required Eurorack rear power-header policy.
+    pub fn eurorack(mut self) -> Self {
+        self.side_policy = PlacementSidePolicy::Eurorack;
+        self
     }
 }
 
@@ -814,7 +850,9 @@ impl Placer for SeededPlacer {
                 pin_offsets: HashMap::new(),
             })
         };
-        let side_of = |refdes: &str| facts_of(refdes).side == Side::Back;
+        let side_of = |refdes: &str| {
+            self.side_policy == PlacementSidePolicy::Eurorack && facts_of(refdes).side == Side::Back
+        };
         // The keep-out centre offset from the footprint origin, mirrored in Y for a
         // back-side part. Placement works in keep-out-centre space and converts
         // back to a footprint origin on output.
@@ -876,12 +914,113 @@ impl Placer for SeededPlacer {
             placed.insert(refdes.clone());
         }
 
+        // External mating interfaces are mechanical anchors too. Put them on
+        // the bottom edge before packing any free parts, with the footprint's
+        // complete courtyard tangent to the outline. This leaves all copper and
+        // mounting holes on-board while making the receptacle reachable; it also
+        // reserves the courtyard so later packing cannot bury the connector.
+        let mut edge_connectors: Vec<String> = circuit
+            .parts()
+            .iter()
+            .filter(|p| !self.anchors.contains_key(&p.refdes.0))
+            .filter(|p| {
+                p.footprint
+                    .as_deref()
+                    .is_some_and(is_edge_connector_footprint)
+            })
+            .map(|p| p.refdes.0.clone())
+            .collect();
+        edge_connectors.sort();
+        for refdes in &edge_connectors {
+            let f = facts_of(refdes);
+            let back = side_of(refdes);
+            // Prefer the bottom edge in the footprint's authored orientation.
+            // Scan along it to avoid anchored controls/earlier connectors. If
+            // that edge has no legal slot, turn the connector 90 degrees and
+            // scan the left edge. These are bounded, deterministic poses—not
+            // arbitrary rotation invented by the model.
+            let mut found = None;
+            for rotation_deg in [0.0, 90.0] {
+                let (w, h) = if rotation_deg == 0.0 {
+                    f.extent
+                } else {
+                    (f.extent.1, f.extent.0)
+                };
+                if rotation_deg == 0.0 && w <= self.width_mm && h <= self.height_mm {
+                    let mut cx = w / 2.0;
+                    while cx + w / 2.0 <= self.width_mm + crate::rules::TOLERANCE_MM {
+                        let cand = (cx - w / 2.0, 0.0, cx + w / 2.0, h);
+                        if placement_clear(
+                            &cand,
+                            back,
+                            f.height_mm,
+                            f.standoff_mm,
+                            &[],
+                            &boxes,
+                            clearance,
+                        ) {
+                            found = Some((rotation_deg, cx, h / 2.0, cand));
+                            break;
+                        }
+                        cx += step;
+                    }
+                } else if rotation_deg == 90.0 && w <= self.width_mm && h <= self.height_mm {
+                    let mut cy = h / 2.0;
+                    while cy + h / 2.0 <= self.height_mm + crate::rules::TOLERANCE_MM {
+                        let cand = (0.0, cy - h / 2.0, w, cy + h / 2.0);
+                        if placement_clear(
+                            &cand,
+                            back,
+                            f.height_mm,
+                            f.standoff_mm,
+                            &[],
+                            &boxes,
+                            clearance,
+                        ) {
+                            found = Some((rotation_deg, w / 2.0, cy, cand));
+                            break;
+                        }
+                        cy += step;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            let (rotation_deg, cx, cy, body) = found.unwrap_or_else(|| {
+                let (w, h) = f.extent;
+                let body = overflow_drop(0.0, (w, h), &mut (self.height_mm + OVERFLOW_GAP_MM));
+                (0.0, w / 2.0, (body.1 + body.3) / 2.0, body)
+            });
+            let (ox, oy) = rotate_local(offset_of(&f, back), rotation_deg);
+            let (px, py) = (cx - ox, cy - oy);
+            out.insert(
+                refdes.clone(),
+                Placement {
+                    x_mm: self.origin_mm.0 + px,
+                    y_mm: self.origin_mm.1 + py,
+                    rotation_deg,
+                    back,
+                },
+            );
+            boxes.push(Placed {
+                body,
+                back,
+                height_mm: f.height_mm,
+                standoff_mm: f.standoff_mm,
+                tht_pads: f.tht_pads_at(px, py, back, rotation_deg),
+            });
+            pos.insert(refdes.clone(), (cx, cy));
+            placed.insert(refdes.clone());
+        }
+
         // Power header(s): laid horizontal against the top edge, out of the
         // control field (the cable exits the board, not the panel).
         let power_headers = power_header_refdes(circuit, &self.anchors);
         let mut header_x = margin;
         for refdes in &power_headers {
-            let back = POWER_HEADER_ON_BACK || side_of(refdes);
+            let back = self.side_policy == PlacementSidePolicy::Eurorack
+                && (POWER_HEADER_ON_BACK || side_of(refdes));
             let f = facts_of(refdes);
             let (ew, eh) = f.extent;
             // Horizontal = long axis along X; rotate a portrait header 90°.
@@ -942,6 +1081,7 @@ impl Placer for SeededPlacer {
             .map(|p| p.refdes.0.clone())
             .filter(|r| !self.anchors.contains_key(r))
             .filter(|r| !power_headers.contains(r))
+            .filter(|r| !edge_connectors.contains(r))
             .collect();
         free.sort();
         if let Some(depth) = signal_flow_depth(circuit) {
@@ -1760,6 +1900,7 @@ fn fits_outline(
             origin_mm: (0.0, 0.0),
             anchors,
             nudges: HashMap::new(),
+            side_policy: PlacementSidePolicy::FrontOnly,
         };
         let mut placements = placer.place(circuit, facts);
         let pinned = placer.anchored();
@@ -3417,6 +3558,93 @@ pub(crate) fn det_uuid(seed: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{Circuit, Net, Part, PinRef};
+
+    fn placement_fact(extent: (f64, f64), side: Side) -> PartFacts {
+        PartFacts {
+            extent,
+            body_extent: extent,
+            origin_offset: (0.0, 0.0),
+            side,
+            height_mm: 2.0,
+            standoff_mm: None,
+            tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
+        }
+    }
+
+    fn usb_part(refdes: &str) -> Part {
+        Part::new(refdes, "USB-C")
+            .with_footprint("Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12")
+    }
+
+    #[test]
+    fn edge_entry_connector_is_tangent_to_board_edge() {
+        let c = Circuit {
+            name: "edge-usb".into(),
+            parts: vec![usb_part("J1")],
+            nets: Vec::new(),
+        };
+        let facts = HashMap::from([("J1".into(), placement_fact((10.0, 6.0), Side::Front))]);
+        let placer = SeededPlacer::new(20.0, 20.0, (30.0, 40.0), HashMap::new());
+        let p = placer.place(&c, &facts)["J1"];
+        let body = facts["J1"].keepout_at_rot(p.x_mm - 30.0, p.y_mm - 40.0, p.back, p.rotation_deg);
+        assert_eq!(p.rotation_deg, 0.0);
+        assert!(
+            (body.1 - 0.0).abs() < crate::rules::TOLERANCE_MM,
+            "{body:?}"
+        );
+        assert!(!p.back, "generic boards are front-only");
+    }
+
+    #[test]
+    fn edge_connector_rotates_to_the_side_when_bottom_pose_cannot_fit() {
+        let c = Circuit {
+            name: "narrow-usb".into(),
+            parts: vec![usb_part("J1")],
+            nets: Vec::new(),
+        };
+        let facts = HashMap::from([("J1".into(), placement_fact((10.0, 4.0), Side::Front))]);
+        let p = SeededPlacer::new(6.0, 20.0, (0.0, 0.0), HashMap::new()).place(&c, &facts)["J1"];
+        let body = facts["J1"].keepout_at_rot(p.x_mm, p.y_mm, p.back, p.rotation_deg);
+        assert_eq!(p.rotation_deg, 90.0);
+        assert!(
+            (body.0 - 0.0).abs() < crate::rules::TOLERANCE_MM,
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn edge_connector_uses_collision_free_fallback_pose() {
+        let c = Circuit {
+            name: "blocked-usb".into(),
+            parts: vec![Part::new("H1", "fixed"), usb_part("J1")],
+            nets: Vec::new(),
+        };
+        let facts = HashMap::from([
+            ("H1".into(), placement_fact((12.0, 6.0), Side::Front)),
+            ("J1".into(), placement_fact((6.0, 4.0), Side::Front)),
+        ]);
+        let anchors = HashMap::from([("H1".into(), (6.0, 3.0))]);
+        let p = SeededPlacer::new(12.0, 24.0, (0.0, 0.0), anchors).place(&c, &facts);
+        assert_eq!(p["J1"].rotation_deg, 90.0);
+        assert!(first_overlap("J1", &p["J1"], &p, &facts).is_none());
+    }
+
+    #[test]
+    fn backside_population_requires_explicit_eurorack_policy() {
+        let c = Circuit {
+            name: "sides".into(),
+            parts: vec![usb_part("J1").with_side(Side::Back)],
+            nets: Vec::new(),
+        };
+        let facts = HashMap::from([("J1".into(), placement_fact((6.0, 4.0), Side::Back))]);
+        let front = SeededPlacer::new(20.0, 20.0, (0.0, 0.0), HashMap::new()).place(&c, &facts);
+        let rear = SeededPlacer::new(20.0, 20.0, (0.0, 0.0), HashMap::new())
+            .eurorack()
+            .place(&c, &facts);
+        assert!(!front["J1"].back);
+        assert!(rear["J1"].back);
+    }
 
     fn route_pad(refdes: &str, pad: &str) -> PadPoint {
         PadPoint {

@@ -822,7 +822,7 @@ pub fn eurorack_trial_build(
         origin_mm: origin,
         anchors: anchors.clone(),
     });
-    Ok((opts, SeededPlacer::new(w, h, origin, anchors)))
+    Ok((opts, SeededPlacer::new(w, h, origin, anchors).eurorack()))
 }
 
 /// The panel widths a Eurorack module is actually sold in, from `floor` upward.

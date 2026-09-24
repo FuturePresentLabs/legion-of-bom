@@ -46,6 +46,22 @@ use Verifiable::{Artifact, Proxy, TestOnly};
 
 pub const CATALOG: &[Standard] = &[
     Standard {
+        id: "embedded-digital-black-book",
+        designation: "Puget artifact-visible embedded/audio/RF engineering profile v1",
+        title: "Deterministic power, decoupling, clock, interface and RF-macro checks",
+        brief_example: "must pass the embedded digital black-book topology checks",
+        requirements: &[
+            Requirement { aspect: "power-tree source provenance", verifiable: Artifact },
+            Requirement { aspect: "MCU, codec and radio supply decoupling topology", verifiable: Artifact },
+            Requirement { aspect: "clock-source topology", verifiable: Artifact },
+            Requirement { aspect: "digital interface pin bindings", verifiable: Artifact },
+            Requirement { aspect: "cited SX1262 reference-macro integrity", verifiable: Artifact },
+            Requirement { aspect: "physical electrical, SI/PI, EMC and RF performance", verifiable: TestOnly },
+        ],
+        status: Status::Implemented { module: "legion_of_bom_core::engineering::verify" },
+        public: true,
+    },
+    Standard {
         id: "usb-type-c-2.0-sink",
         designation: "USB Type-C Cable and Connector Specification, Release 2.0 (2019)",
         title: "USB Type-C receptacle used as a power sink",
@@ -190,6 +206,10 @@ pub fn verify(
                 status: Status::Planned { .. },
                 ..
             }) => Err(StandardsError::NotImplemented(id.clone())),
+            Some(Standard {
+                id: "embedded-digital-black-book",
+                ..
+            }) => Ok(crate::engineering::verify(circuit)),
             Some(Standard {
                 id: "usb-type-c-2.0-sink",
                 ..

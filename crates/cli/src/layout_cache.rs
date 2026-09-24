@@ -74,6 +74,7 @@ pub fn key(
             "origin_mm": template.origin_mm,
             "anchors": anchors,
             "nudges": nudges,
+            "side_policy": format!("{:?}", template.side_policy),
         },
         "layout": {
             "mode": cfg.mode.as_str(),
@@ -220,6 +221,7 @@ mod tests {
                 origin_mm: (1.0, 2.0),
                 anchors: Default::default(),
                 nudges: Default::default(),
+                side_policy: legion_of_bom_core::PlacementSidePolicy::FrontOnly,
             },
             LayoutLoop::default(),
         )

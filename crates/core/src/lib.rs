@@ -25,6 +25,7 @@ pub mod dsp_import;
 pub mod eagle;
 pub mod easyeda;
 pub mod edit;
+pub mod engineering;
 pub mod fab;
 pub mod family;
 pub mod fetch;

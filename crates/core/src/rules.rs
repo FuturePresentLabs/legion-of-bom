@@ -370,12 +370,22 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
         refs.sort_unstable();
         for r in refs {
             let Some(fact) = f.get(r) else { continue };
+            let edge_entry = circuit
+                .parts()
+                .iter()
+                .find(|p| p.refdes.0 == r)
+                .and_then(|p| p.footprint.as_deref())
+                .is_some_and(crate::board::is_edge_connector_footprint);
             rules.push(Rule::EdgeClearance {
                 refdes: r.to_string(),
                 extent: fact.extent,
                 origin_offset: fact.origin_offset,
                 bounds,
-                min_mm: EDGE_CLEARANCE_MM,
+                // An edge-entry connector's complete courtyard may be tangent
+                // to the routed outline. Its copper and holes remain inside;
+                // applying the ordinary component inset would bury its mating
+                // face in the board instead of protecting it.
+                min_mm: if edge_entry { 0.0 } else { EDGE_CLEARANCE_MM },
                 tier: Tier::Physical,
             });
         }

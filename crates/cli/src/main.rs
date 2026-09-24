@@ -1887,7 +1887,7 @@ fn seeded_template(panel: &Option<PathBuf>) -> Result<Option<SeededPlacer>> {
     match panel {
         Some(spec_path) => {
             let (w, h, origin, anchors) = panel_geometry(spec_path)?;
-            Ok(Some(SeededPlacer::new(w, h, origin, anchors)))
+            Ok(Some(SeededPlacer::new(w, h, origin, anchors).eurorack()))
         }
         None => Ok(None),
     }
