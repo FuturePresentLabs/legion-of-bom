@@ -9,9 +9,9 @@
 [![license](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](#license)
 [![rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg?logo=rust)](https://www.rust-lang.org)
 [![kicad](https://img.shields.io/badge/KiCad-9-314cb0.svg)](https://www.kicad.org)
-[![tests](https://img.shields.io/badge/tests-572%20passing-brightgreen.svg)](#dev-loop)
+[![tests](https://img.shields.io/badge/tests-593%20passing-brightgreen.svg)](#dev-loop)
 [![families](https://img.shields.io/badge/curated%20families-2-8a2be2.svg)](#the-pipeline)
-[![datasheets](https://img.shields.io/badge/pinned%20datasheets-7-orange.svg)](#the-pipeline)
+[![datasheets](https://img.shields.io/badge/pinned%20datasheets-1-orange.svg)](#the-pipeline)
 [![benchmarked](https://img.shields.io/badge/benchmarked%20by-PCBBench-black.svg)](https://github.com/FuturePresentLabs/pcbbench)
 
 *SKiDLs are better with friends.*
@@ -23,6 +23,23 @@ lob spec board --brief "stereo line in and out, no I2C setup" --out design
 lob schematic design.json --out board.py
 lob board board.py && lob drc out/board/board.kicad_pcb
 ```
+
+Engineering profiles are explicit constraints, never claims inferred from a
+brief. `--require-standard` puts an implemented profile into every RLCD request
+and the replayable spec; `lob standards` then checks the produced circuit
+deterministically:
+
+```bash
+lob spec board --brief "USB-C powered stereo codec" \
+  --require-standard usb-type-c-2.0-sink --out design
+lob schematic design.json --out circuit.py
+lob standards circuit.py --require usb-type-c-2.0-sink --json standards.json
+```
+
+Reports distinguish artifact checks from proxies and physical tests. A USB-C
+CC topology can pass while electrical/interoperability testing remains `TEST`;
+Legion does not turn a design review into a certification claim. Run
+`lob standards` without a circuit to see implemented and planned profiles.
 
 That's a design brief becoming an STM32H743 audio board: a codec **decided**
 from what you asked for, pins wired by the names in the official KiCad symbols,

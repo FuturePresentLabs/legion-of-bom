@@ -60,16 +60,34 @@ pub fn generate(
     trace: &mut Trace,
     brief: &str,
 ) -> Result<Spec, FamilyError> {
+    generate_with_standards(family, client, trace, brief, &[])
+}
+
+pub fn generate_with_standards(
+    family: &str,
+    client: &impl Client,
+    trace: &mut Trace,
+    brief: &str,
+    required_standards: &[String],
+) -> Result<Spec, FamilyError> {
     match family {
-        "fuzz-pedal" => Ok(Spec::FuzzPedal(generate_fuzz_pedal_spec(
-            client, trace, brief,
-        )?)),
+        "fuzz-pedal" if required_standards.is_empty() => Ok(Spec::FuzzPedal(
+            generate_fuzz_pedal_spec(client, trace, brief)?,
+        )),
+        "fuzz-pedal" => Err(FamilyError::Synth(SynthError::Invalid(
+            "engineering standards are currently supported only by the board family".into(),
+        ))),
         "board" => {
             let catalog = Catalog::load(&default_catalog_dir())?;
             let symbols = crate::skidl::kicad_symbol_dir();
             let symbol_dir = symbols.as_ref().map(|s| s.path());
-            Ok(Spec::Board(synth::design(
-                client, trace, brief, &catalog, symbol_dir,
+            Ok(Spec::Board(synth::design_with_standards(
+                client,
+                trace,
+                brief,
+                &catalog,
+                symbol_dir,
+                required_standards,
             )?))
         }
         other => Err(FamilyError::Unknown(other.to_string())),
@@ -179,6 +197,7 @@ mod tests {
     fn a_synthesized_board_spec_round_trips_and_has_no_panel() {
         let spec = Spec::Board(DesignSpec {
             brief: "b".into(),
+            required_standards: vec!["usb-type-c-2.0-sink".into()],
             requirements: [("line_out".to_string(), true)].into(),
             parts: [(
                 "audio".to_string(),
@@ -195,6 +214,13 @@ mod tests {
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["family"], "board");
         assert_eq!(Spec::from_json(json).unwrap(), spec);
+        assert_eq!(
+            match &spec {
+                Spec::Board(board) => board.required_standards.as_slice(),
+                _ => unreachable!(),
+            },
+            ["usb-type-c-2.0-sink"]
+        );
         assert!(spec.panel().is_none(), "a board has no front panel");
     }
 

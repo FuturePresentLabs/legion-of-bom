@@ -49,6 +49,10 @@ pub struct Selection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesignSpec {
     pub brief: String,
+    /// Engineering standards/profiles the brief requires. A profile is never
+    /// inferred downstream: checks run because the spec explicitly names it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_standards: Vec<String>,
     pub requirements: BTreeMap<String, bool>,
     /// Slot → parts: `function`, `mcu`, `needs:hse`, `rail:+3V3`, `port:line_out`, …
     pub parts: BTreeMap<String, Selection>,
@@ -85,6 +89,7 @@ fn pick(
     client: &impl Client,
     trace: &mut Trace,
     brief: &str,
+    required_standards: &[String],
     key: &str,
     question: &str,
     options: Vec<(String, String)>,
@@ -100,8 +105,11 @@ fn pick(
                 .iter()
                 .map(|(k, d)| (k.as_str(), d.clone()))
                 .collect();
-            let request = Request::new(serde_json::json!({ "brief": brief }))
-                .with(key, Question::choice(question, criteria));
+            let request = Request::new(serde_json::json!({
+                "brief": brief,
+                "required_standards": required_standards,
+            }))
+            .with(key, Question::choice(question, criteria));
             let outcome = client.decide(&request).map_err(SpecError::from)?;
             let chosen = expect_choice(&outcome, trace, key)?;
             if !options.iter().any(|(k, _)| *k == chosen) {
@@ -371,8 +379,34 @@ pub fn design(
     catalog: &Catalog,
     symbol_dir: Option<&Path>,
 ) -> Result<DesignSpec, SynthError> {
+    design_with_standards(client, trace, brief, catalog, symbol_dir, &[])
+}
+
+pub fn design_with_standards(
+    client: &impl Client,
+    trace: &mut Trace,
+    brief: &str,
+    catalog: &Catalog,
+    symbol_dir: Option<&Path>,
+    required_standards: &[String],
+) -> Result<DesignSpec, SynthError> {
+    for id in required_standards {
+        let Some(standard) = crate::standards::find(id) else {
+            return Err(SynthError::Invalid(format!(
+                "unknown engineering standard/profile '{id}'"
+            )));
+        };
+        if matches!(standard.status, crate::standards::Status::Planned { .. }) {
+            return Err(SynthError::Invalid(format!(
+                "engineering standard/profile '{id}' is catalogued but not implemented"
+            )));
+        }
+    }
     // 1. Requirements.
-    let mut request = Request::new(serde_json::json!({ "brief": brief }));
+    let mut request = Request::new(serde_json::json!({
+        "brief": brief,
+        "required_standards": required_standards,
+    }));
     for f in &catalog.features {
         request = request.with(&f.key, Question::noul(&f.question));
     }
@@ -405,6 +439,7 @@ pub fn design(
             client,
             trace,
             brief,
+            required_standards,
             "form_factor",
             "What form factor should the board have?",
             catalog
@@ -433,6 +468,7 @@ pub fn design(
         client,
         trace,
         brief,
+        required_standards,
         "function",
         "Which parts should the board be built around?",
         options,
@@ -453,6 +489,7 @@ pub fn design(
                 client,
                 trace,
                 brief,
+                required_standards,
                 &key,
                 &format!("Which part should be the {slot_name} of {}?", sub.name),
                 catalog.candidates(slot).map(describe).collect(),
@@ -477,6 +514,7 @@ pub fn design(
         client,
         trace,
         brief,
+        required_standards,
         "mcu",
         "Which microcontroller should the board use?",
         options,
@@ -506,6 +544,7 @@ pub fn design(
                 client,
                 trace,
                 brief,
+                required_standards,
                 &slot,
                 &format!("Which part should supply {kind}?"),
                 options,
@@ -543,6 +582,7 @@ pub fn design(
             client,
             trace,
             brief,
+            required_standards,
             &role,
             &format!("Which part should supply {rail}?"),
             options,
@@ -566,13 +606,22 @@ pub fn design(
     for f in &wanted {
         let slot = format!("port:{}", f.key);
         let q = format!("Which connector carries {}?", f.key);
-        let sel = pick(client, trace, brief, &slot, &q, ports(&f.port, "port"))?;
+        let sel = pick(
+            client,
+            trace,
+            brief,
+            required_standards,
+            &slot,
+            &q,
+            ports(&f.port, "port"),
+        )?;
         parts.insert(slot, sel);
     }
     let supply = pick(
         client,
         trace,
         brief,
+        required_standards,
         "port:supply",
         "Which connector brings in the 5 V supply?",
         ports("power-in", "port"),
@@ -583,6 +632,7 @@ pub fn design(
             client,
             trace,
             brief,
+            required_standards,
             "port:swd",
             "Which footprint lands the SWD programmer?",
             ports("swd", "debugger"),
@@ -643,6 +693,7 @@ pub fn design(
             client,
             trace,
             brief,
+            required_standards,
             &format!("bind_{kind}"),
             &question,
             options,
@@ -666,6 +717,7 @@ pub fn design(
 
     Ok(DesignSpec {
         brief: brief.to_string(),
+        required_standards: required_standards.to_vec(),
         requirements,
         parts,
         bindings,

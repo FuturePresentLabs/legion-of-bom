@@ -70,6 +70,7 @@ pub mod sourcing;
 pub mod spec;
 pub mod spice;
 pub mod stage;
+pub mod standards;
 pub mod subboard;
 pub mod summing;
 pub mod svg2pdf;

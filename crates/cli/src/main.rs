@@ -82,6 +82,18 @@ enum Command {
         #[command(subcommand)]
         action: CatalogCmd,
     },
+    /// Inspect supported engineering standards or verify a circuit against
+    /// explicitly required profiles without claiming physical certification.
+    Standards {
+        /// Circuit definition to run and inspect. Omit to print the catalog.
+        circuit: Option<PathBuf>,
+        /// Required profile id; repeat for more than one.
+        #[arg(long = "require")]
+        required: Vec<String>,
+        /// Also write the structured verification reports here.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
     /// Generate a BOM for a circuit, optionally priced live from Mouser.
     Bom {
         /// Path to the circuit definition (e.g. a SKiDL script).
@@ -269,6 +281,10 @@ enum Command {
         /// here, for eval scoring (e.g. PCBBench).
         #[arg(long)]
         trace: Option<PathBuf>,
+        /// Force an implemented engineering profile into the spec and its
+        /// decision context; repeat for multiple requirements.
+        #[arg(long = "require-standard")]
+        required_standards: Vec<String>,
     },
     /// Concept -> spec, DAG variant: assemble a fuzz-pedal circuit as a
     /// chain of gain-stage nodes via sequential typed decisions ("add
@@ -660,7 +676,13 @@ fn main() -> ExitCode {
             brief,
             out,
             trace,
-        } => spec_cmd(family, brief, out, trace),
+            required_standards,
+        } => spec_cmd(family, brief, out, trace, required_standards),
+        Command::Standards {
+            circuit,
+            required,
+            json,
+        } => standards_cmd(circuit, required, json),
         Command::SpecChain {
             brief,
             vcc,
@@ -865,11 +887,66 @@ fn run(circuit: PathBuf) -> Result<()> {
 /// spec -- raw text (`<out>.txt`) plus machine-readable JSON (`<out>.json`) --
 /// with NO schematic. Today's curated set has one family ("fuzz-pedal"); an
 /// unknown family fails loud rather than guessing at one.
+fn standards_cmd(
+    circuit: Option<PathBuf>,
+    required: Vec<String>,
+    json_path: Option<PathBuf>,
+) -> Result<()> {
+    let Some(circuit) = circuit else {
+        for standard in legion_of_bom_core::standards::CATALOG {
+            let state = match standard.status {
+                legion_of_bom_core::standards::Status::Implemented { .. } => "implemented",
+                legion_of_bom_core::standards::Status::Planned { .. } => "planned",
+            };
+            println!("{:<24} {:<12} {}", standard.id, state, standard.designation);
+        }
+        return Ok(());
+    };
+    if required.is_empty() {
+        anyhow::bail!("a circuit check needs at least one --require <profile-id>");
+    }
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let reports = legion_of_bom_core::standards::verify(&model, &required)?;
+    for report in &reports {
+        println!("{} — {}", report.standard, report.designation);
+        for result in &report.results {
+            let mark = match result.verdict {
+                legion_of_bom_core::standards::Verdict::Passed => "PASS",
+                legion_of_bom_core::standards::Verdict::Failed => "FAIL",
+                legion_of_bom_core::standards::Verdict::NeedsTest => "TEST",
+            };
+            println!("  [{mark}] {} — {}", result.aspect, result.detail);
+        }
+    }
+    if let Some(path) = json_path {
+        std::fs::write(&path, serde_json::to_string_pretty(&reports)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    if reports.iter().all(|report| report.design_passes()) {
+        Ok(())
+    } else {
+        anyhow::bail!("one or more deterministic standards checks failed")
+    }
+}
+
 fn spec_cmd(
     family: String,
     brief: String,
     out: PathBuf,
     trace_path: Option<PathBuf>,
+    required_standards: Vec<String>,
 ) -> Result<()> {
     // Fail on an unknown family before asking for credentials: the typo is
     // the more useful error.
@@ -885,8 +962,9 @@ fn spec_cmd(
     );
     let mut trace = ooda::Trace::new();
 
-    let spec = family::generate(&family, &client, &mut trace, &brief)
-        .with_context(|| "spec generation failed")?;
+    let spec =
+        family::generate_with_standards(&family, &client, &mut trace, &brief, &required_standards)
+            .with_context(|| "spec generation failed")?;
 
     let json_path = with_extension_appended(&out, "json");
     let text_path = with_extension_appended(&out, "txt");
@@ -900,6 +978,12 @@ fn spec_cmd(
             let mut t = format!("Brief: {brief}\n\nRequirements (typed decisions):\n");
             for (k, v) in &d.requirements {
                 t.push_str(&format!("  {k:<14} {}\n", if *v { "yes" } else { "no" }));
+            }
+            if !d.required_standards.is_empty() {
+                t.push_str("\nRequired engineering standards/profiles:\n");
+                for standard in &d.required_standards {
+                    t.push_str(&format!("  {standard}\n"));
+                }
             }
             t.push_str("\nParts (from the catalog):\n");
             for (slot, sel) in &d.parts {
