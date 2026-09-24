@@ -38,6 +38,7 @@ pub mod images;
 pub mod import;
 pub mod jlcpcb;
 pub mod layout;
+pub mod layout_repair;
 pub mod legalize;
 pub mod logo;
 pub mod manifest;
@@ -144,9 +145,11 @@ pub use import::{
 };
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use layout::{
-    eurorack_trial_build, measure, minimum_routable_hp, run_layout_loop, score, CostWeights,
-    HpSearch, HpTrial, LayoutLoop, LayoutMode, LayoutReport, PlacementMetrics, RoutableHp,
+    eurorack_trial_build, measure, minimum_routable_hp, run_layout_loop,
+    run_layout_loop_with_decider, score, CostWeights, HpSearch, HpTrial, LayoutLoop, LayoutMode,
+    LayoutReport, PlacementMetrics, RepairDecider, RoutableHp,
 };
+pub use layout_repair::{decide_repair, valid_actions, RepairAction, RepairEvidence, RuleEvidence};
 pub use legalize::{legalize, Report as LegalizeReport};
 pub use logo::Logo;
 pub use manifest::{BuildCopy, CircuitEntry, Defaults, Manifest, ManifestError, RepoMeta};

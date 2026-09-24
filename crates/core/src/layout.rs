@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use crate::board::{generate_board_artifacts, BoardError, BoardOptions, Placement, SeededPlacer};
 use crate::drc::{run_drc, DrcReport};
+use crate::layout_repair::{decide_repair, RepairAction, RepairEvidence, RuleEvidence};
 use crate::route::RouteOutput;
 use crate::source::CircuitSource;
 use crate::stage::Finding;
@@ -261,6 +262,15 @@ pub struct LayoutReport {
     pub drc: Option<DrcReport>,
     /// Human-facing observations (info/warning/error), incl. unresolved criticals.
     pub findings: Vec<Finding>,
+    /// Bounded repair strategies selected during this run, in attempt order.
+    pub repair_actions: Vec<RepairAction>,
+}
+
+/// Optional RLCD seam for repair strategy selection. The caller owns the
+/// client and trace; the loop owns when (and how often) a decision is allowed.
+pub struct RepairDecider<'a> {
+    pub client: &'a dyn ooda::Client,
+    pub trace: &'a mut ooda::Trace,
 }
 
 /// Run the iterative layout loop. `template` carries the panel dimensions and
@@ -269,9 +279,20 @@ pub struct LayoutReport {
 /// `options`' router, route settings, ground pour, and outline are used as-is.
 pub fn run_layout_loop(
     circuit: &dyn CircuitSource,
+    options: BoardOptions,
+    template: SeededPlacer,
+    cfg: &LayoutLoop,
+) -> Result<LayoutReport, BoardError> {
+    run_layout_loop_with_decider(circuit, options, template, cfg, None)
+}
+
+/// [`run_layout_loop`] with bounded RLCD repair selection enabled.
+pub fn run_layout_loop_with_decider(
+    circuit: &dyn CircuitSource,
     mut options: BoardOptions,
     template: SeededPlacer,
     cfg: &LayoutLoop,
+    mut decider: Option<RepairDecider<'_>>,
 ) -> Result<LayoutReport, BoardError> {
     // One placement attempt's result, so the loop can keep the best by score.
     struct Attempt {
@@ -318,6 +339,7 @@ pub fn run_layout_loop(
     let mut ran = 0;
     // Consecutive attempts that did not improve on the best so far.
     let mut stale = 0usize;
+    let mut repair_actions = Vec::new();
 
     for i in 0..iters {
         ran += 1;
@@ -342,6 +364,32 @@ pub fn run_layout_loop(
                 }
             }
         }
+
+        // Snapshot the complete decision observation before the winning-attempt
+        // branch moves `metrics`/`drc` into storage.
+        let repair_evidence = RepairEvidence {
+            attempt: i + 1,
+            attempts_remaining: iters - i - 1,
+            unrouted_connections: art.route.conflicts.len(),
+            route_conflicts: art.route.conflicts.clone(),
+            rule_violations: violations_this_attempt
+                .iter()
+                .map(|v| RuleEvidence {
+                    tier: format!("{:?}", v.tier).to_ascii_lowercase(),
+                    by_mm: v.by_mm,
+                    description: v.what.clone(),
+                    repairable: v.repair.is_some(),
+                })
+                .collect(),
+            drc_errors: drc.as_ref().map_or(0, DrcReport::error_count),
+            drc_error_kinds: drc
+                .as_ref()
+                .map(|r| r.errors().map(|v| v.kind.clone()).collect())
+                .unwrap_or_default(),
+            signal_hpwl_mm: metrics.signal_hpwl_mm,
+            critical_hpwl_mm: metrics.critical_hpwl_mm,
+            via_count: metrics.via_count,
+        };
 
         let (unrouted, penalty) = (metrics.unrouted, metrics.rule_penalty);
         let broken = crate::rules::by_tier(&metrics.violations);
@@ -404,7 +452,22 @@ pub fn run_layout_loop(
         // Repair: perturb the free parts so the next attempt explores a different
         // arrangement the router may find easier (DESIGN §6.5 step 4). Deterministic
         // shake — no RNG — so each attempt is a clean, reproducible git diff.
-        nudges = repair_nudges(&free, i + 1, &art.placements, &violations_this_attempt);
+        let action = match decider.as_mut() {
+            Some(d) => decide_repair(d.client, d.trace, &repair_evidence)
+                .map_err(|e| BoardError::Other(format!("layout repair decision failed: {e}")))?,
+            None if repair_evidence.rule_violations.iter().any(|v| v.repairable) => {
+                RepairAction::FollowRuleHints
+            }
+            None => RepairAction::ExploreLocal,
+        };
+        repair_actions.push(action);
+        nudges = repair_nudges(
+            &free,
+            i + 1,
+            &art.placements,
+            &violations_this_attempt,
+            action,
+        );
     }
 
     let Attempt {
@@ -499,6 +562,7 @@ pub fn run_layout_loop(
         not_placed,
         drc,
         findings,
+        repair_actions,
     })
 }
 
@@ -547,11 +611,15 @@ fn repair_nudges(
     attempt: usize,
     placements: &HashMap<String, Placement>,
     violations: &[crate::rules::Violation],
+    action: RepairAction,
 ) -> HashMap<String, (f64, f64)> {
     const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653; // radians
     /// Fraction of a repair hint's distance to actually move each attempt.
     const REPAIR_STEP: f64 = 0.6;
-    let mag = 2.0 + 1.5 * attempt as f64;
+    let mag = match action {
+        RepairAction::FollowRuleHints | RepairAction::ExploreLocal => 2.0 + 1.5 * attempt as f64,
+        RepairAction::ExploreWide => 2.0 * (2.0 + 1.5 * attempt as f64),
+    };
 
     // Last violation naming a part wins if several do — one guided step per
     // part per attempt, same as everything else in this loop.
@@ -565,11 +633,13 @@ fn repair_nudges(
     free.iter()
         .enumerate()
         .map(|(k, r)| {
-            if let (Some(&(tx, ty)), Some(p)) = (targeted.get(r.as_str()), placements.get(r)) {
-                return (
-                    r.clone(),
-                    ((tx - p.x_mm) * REPAIR_STEP, (ty - p.y_mm) * REPAIR_STEP),
-                );
+            if action == RepairAction::FollowRuleHints {
+                if let (Some(&(tx, ty)), Some(p)) = (targeted.get(r.as_str()), placements.get(r)) {
+                    return (
+                        r.clone(),
+                        ((tx - p.x_mm) * REPAIR_STEP, (ty - p.y_mm) * REPAIR_STEP),
+                    );
+                }
             }
             let ang = GOLDEN_ANGLE * (k + attempt) as f64;
             (r.clone(), (mag * ang.cos(), mag * ang.sin()))
@@ -1019,11 +1089,35 @@ mod tests {
         let placements = HashMap::new();
         let violations = Vec::new();
         assert_eq!(
-            repair_nudges(&free, 1, &placements, &violations),
-            repair_nudges(&free, 1, &placements, &violations)
+            repair_nudges(
+                &free,
+                1,
+                &placements,
+                &violations,
+                RepairAction::ExploreLocal
+            ),
+            repair_nudges(
+                &free,
+                1,
+                &placements,
+                &violations,
+                RepairAction::ExploreLocal
+            )
         );
-        let mag1 = mag(&repair_nudges(&free, 1, &placements, &violations)["C1"]);
-        let mag3 = mag(&repair_nudges(&free, 3, &placements, &violations)["C1"]);
+        let mag1 = mag(&repair_nudges(
+            &free,
+            1,
+            &placements,
+            &violations,
+            RepairAction::ExploreLocal,
+        )["C1"]);
+        let mag3 = mag(&repair_nudges(
+            &free,
+            3,
+            &placements,
+            &violations,
+            RepairAction::ExploreLocal,
+        )["C1"]);
         assert!(mag3 > mag1, "later attempts perturb further");
     }
 
@@ -1054,7 +1148,13 @@ mod tests {
             }),
         }];
 
-        let guided = repair_nudges(&free, 1, &placements, &violations);
+        let guided = repair_nudges(
+            &free,
+            1,
+            &placements,
+            &violations,
+            RepairAction::FollowRuleHints,
+        );
         // 0.6 (REPAIR_STEP) of the 10mm gap toward the hint, straight along X.
         assert!(
             (guided["C1"].0 - 6.0).abs() < 1e-9,
@@ -1070,7 +1170,13 @@ mod tests {
         // R1 (unmentioned by any violation, and absent from placements too)
         // matches the plain golden-angle nudge exactly, as if there were no
         // violations at all.
-        let unguided = repair_nudges(&free, 1, &HashMap::new(), &Vec::new());
+        let unguided = repair_nudges(
+            &free,
+            1,
+            &HashMap::new(),
+            &Vec::new(),
+            RepairAction::FollowRuleHints,
+        );
         assert_eq!(guided["R1"], unguided["R1"]);
     }
 
