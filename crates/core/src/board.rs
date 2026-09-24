@@ -1108,8 +1108,14 @@ impl Placer for SeededPlacer {
                     let target = if den > 0.0 {
                         (num.0 / den, num.1 / den)
                     } else {
-                        let ty = (y0 + (free_index[&r] as f64 + 0.5) / n * (y1 - y0))
-                            .clamp(y0, y1 - ext.1);
+                        // On deliberately undersized trial outlines the usable
+                        // span can be smaller than the footprint. `clamp`
+                        // requires min <= max; collapse that impossible range
+                        // to its lower edge and let `nearest_clear_spot` fail so
+                        // the part enters the explicit overflow lane.
+                        let max_y = (y1 - ext.1).max(y0);
+                        let ty =
+                            (y0 + (free_index[&r] as f64 + 0.5) / n * (y1 - y0)).clamp(y0, max_y);
                         ((x0 + x1) / 2.0, ty)
                     };
                     let target = (target.0 + nudge.0, target.1 + nudge.1);
@@ -4725,6 +4731,17 @@ mod tests {
             b.1 >= a.3,
             "overflow parts stack instead of overlapping: {a:?} {b:?}"
         );
+    }
+
+    #[test]
+    fn an_undersized_outline_overflows_instead_of_panicking() {
+        let mut circuit = Circuit::new("too-small");
+        circuit.parts.push(Part::new("R1", "1k"));
+        let facts = HashMap::from([("R1".into(), a_fact((3.0, 3.0), (0.0, 0.0), vec![]))]);
+        let board_h = 2.6;
+        let placed =
+            SeededPlacer::new(2.6, board_h, (0.0, 0.0), HashMap::new()).place(&circuit, &facts);
+        assert!(placed["R1"].y_mm > board_h);
     }
 
     #[test]
