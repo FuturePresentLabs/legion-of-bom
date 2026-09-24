@@ -281,10 +281,10 @@ enum Command {
         /// here, for eval scoring (e.g. PCBBench).
         #[arg(long)]
         trace: Option<PathBuf>,
-        /// Decision model slug. May name a conventional LLM or an RLCD model.
-        /// Overrides OODA_MODEL for this invocation.
-        #[arg(long)]
-        model: Option<String>,
+        /// RLCD/System-One decision model slug. Overrides OODA_MODEL for this
+        /// invocation. `--model` remains as a compatibility alias.
+        #[arg(long = "rlcd-model", visible_alias = "model")]
+        rlcd_model: Option<String>,
         /// Force an implemented engineering profile into the spec and its
         /// decision context; repeat for multiple requirements.
         #[arg(long = "require-standard")]
@@ -315,10 +315,10 @@ enum Command {
         /// Also write the full decision trace (JSON) here.
         #[arg(long)]
         trace: Option<PathBuf>,
-        /// Decision model slug. May name a conventional LLM or an RLCD model.
-        /// Overrides OODA_MODEL for this invocation.
-        #[arg(long)]
-        model: Option<String>,
+        /// RLCD/System-One decision model slug. Overrides OODA_MODEL for this
+        /// invocation. `--model` remains as a compatibility alias.
+        #[arg(long = "rlcd-model", visible_alias = "model")]
+        rlcd_model: Option<String>,
     },
     /// Spec -> design: render a SKiDL schematic from a spec file written by
     /// `lob spec`. A pure function of the spec -- no decision calls, no
@@ -684,9 +684,9 @@ fn main() -> ExitCode {
             brief,
             out,
             trace,
-            model,
+            rlcd_model,
             required_standards,
-        } => spec_cmd(family, brief, out, trace, model, required_standards),
+        } => spec_cmd(family, brief, out, trace, rlcd_model, required_standards),
         Command::Standards {
             circuit,
             required,
@@ -698,8 +698,8 @@ fn main() -> ExitCode {
             enclosure,
             out,
             trace,
-            model,
-        } => spec_chain_cmd(brief, vcc, enclosure, out, trace, model),
+            rlcd_model,
+        } => spec_chain_cmd(brief, vcc, enclosure, out, trace, rlcd_model),
         Command::Schematic { spec, out, panel } => schematic_cmd(spec, out, panel),
     };
 
@@ -957,7 +957,7 @@ fn spec_cmd(
     brief: String,
     out: PathBuf,
     trace_path: Option<PathBuf>,
-    model: Option<String>,
+    rlcd_model: Option<String>,
     required_standards: Vec<String>,
 ) -> Result<()> {
     // Fail on an unknown family before asking for credentials: the typo is
@@ -969,7 +969,7 @@ fn spec_cmd(
     let mut http = ooda::HttpClient::from_env().with_context(|| {
             "OODA_API_KEY not set (see .env.example) -- lob spec needs a Jev/System One-compatible endpoint"
         })?;
-    if let Some(model) = model {
+    if let Some(model) = rlcd_model {
         http = http.with_model(model);
     }
     let client = ooda::CapturingClient::new(
@@ -1077,13 +1077,13 @@ fn spec_chain_cmd(
     enclosure: String,
     out: PathBuf,
     trace_path: Option<PathBuf>,
-    model: Option<String>,
+    rlcd_model: Option<String>,
 ) -> Result<()> {
     let enclosure_size = parse_enclosure(&enclosure)?;
     let mut http = ooda::HttpClient::from_env().with_context(|| {
             "OODA_API_KEY not set (see .env.example) -- lob spec-chain needs a Jev/System One-compatible endpoint"
         })?;
-    if let Some(model) = model {
+    if let Some(model) = rlcd_model {
         http = http.with_model(model);
     }
     let client = ooda::CapturingClient::new(
@@ -4587,7 +4587,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_model_slug_is_an_opaque_cli_value() {
+    fn spec_rlcd_model_slug_is_an_opaque_cli_value() {
         use clap::Parser;
 
         let cli = Cli::parse_from([
@@ -4598,12 +4598,12 @@ mod tests {
             "test",
             "--out",
             "design",
-            "--model",
+            "--rlcd-model",
             "provider/model:variant",
         ]);
         match cli.command {
-            Command::Spec { model, .. } => {
-                assert_eq!(model.as_deref(), Some("provider/model:variant"));
+            Command::Spec { rlcd_model, .. } => {
+                assert_eq!(rlcd_model.as_deref(), Some("provider/model:variant"));
             }
             _ => panic!("expected spec command"),
         }

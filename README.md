@@ -20,14 +20,14 @@
 
 ```bash
 lob spec board --brief "stereo line in and out, no I2C setup" \
-  --model fpl/decide --out design
+  --rlcd-model fpl/decide --out design
 lob schematic design.json --out board.py
 lob board board.py && lob drc out/board/board.kicad_pcb
 ```
 
-`--model` is an opaque gateway model slug: it may select a conventional LLM
-or an RLCD/System-One model. It overrides `OODA_MODEL` for that invocation,
-which lets PCBBench compare models without mutating process-wide configuration.
+`--rlcd-model` selects the bounded RLCD/System-One decision model and overrides
+`OODA_MODEL` for that invocation. The outer agent's LLM is a separate eval
+axis; direct `lob spec` has no outer LLM call.
 
 Engineering profiles are explicit constraints, never claims inferred from a
 brief. `--require-standard` puts an implemented profile into every RLCD request
