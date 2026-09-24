@@ -146,6 +146,9 @@ enum Command {
         /// previews only; this is never a substitute for a routed board + DRC.
         #[arg(long)]
         placement_only: bool,
+        /// Opt into derived local fine-pitch escape portals before global routing.
+        #[arg(long)]
+        fine_pitch_escape: bool,
         /// Maximum A* heap expansions across one routing attempt.
         #[arg(long, default_value_t = 50_000_000)]
         router_max_expansions: u64,
@@ -640,6 +643,7 @@ fn main() -> ExitCode {
             logo,
             model: model_glb,
             placement_only,
+            fine_pitch_escape,
             router_max_expansions,
             router_timeout_ms,
             routing_report,
@@ -653,6 +657,7 @@ fn main() -> ExitCode {
                 logo,
                 model_glb,
                 placement_only,
+                fine_pitch_escape,
                 router_max_expansions,
                 router_timeout_ms,
                 routing_report,
@@ -1949,6 +1954,7 @@ struct BoardOutputOptions {
     logo: Option<PathBuf>,
     model_glb: Option<PathBuf>,
     placement_only: bool,
+    fine_pitch_escape: bool,
     router_max_expansions: u64,
     router_timeout_ms: u64,
     routing_report: Option<PathBuf>,
@@ -1966,6 +1972,7 @@ fn board_cmd(
         logo,
         model_glb,
         placement_only,
+        fine_pitch_escape,
         router_max_expansions,
         router_timeout_ms,
         routing_report,
@@ -1994,6 +2001,7 @@ fn board_cmd(
     options.route_options.max_expansions = Some(router_max_expansions);
     options.route_options.max_wall_time_ms = Some(router_timeout_ms);
     options.route_options.emit_progress_jsonl = routing_report.is_some();
+    options.route_options.fine_pitch_escape = fine_pitch_escape;
     if placement_only {
         options.router = None;
     }
@@ -4665,17 +4673,20 @@ mod tests {
             "5678",
             "--routing-report",
             "route.json",
+            "--fine-pitch-escape",
         ]);
         match cli.command {
             Command::Board {
                 router_max_expansions,
                 router_timeout_ms,
                 routing_report,
+                fine_pitch_escape,
                 ..
             } => {
                 assert_eq!(router_max_expansions, 1234);
                 assert_eq!(router_timeout_ms, 5678);
                 assert_eq!(routing_report, Some(PathBuf::from("route.json")));
+                assert!(fine_pitch_escape);
             }
             _ => panic!("expected board command"),
         }

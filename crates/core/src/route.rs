@@ -185,6 +185,9 @@ pub struct RouteOptions {
     pub max_wall_time_ms: Option<u64>,
     /// Emit each bounded progress snapshot as one JSON object on stderr.
     pub emit_progress_jsonl: bool,
+    /// Experimental hierarchical fanout: escape geometrically buried SMD pad
+    /// fields to derived coarse-grid portals before board-wide routing.
+    pub fine_pitch_escape: bool,
 }
 
 impl Default for RouteOptions {
@@ -216,6 +219,7 @@ impl Default for RouteOptions {
             max_expansions: Some(50_000_000),
             max_wall_time_ms: Some(300_000),
             emit_progress_jsonl: false,
+            fine_pitch_escape: false,
         }
     }
 }
@@ -795,6 +799,193 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
         }
         previous = Some(surface);
         res /= 2.0;
+    }
+}
+
+/// Output of the experimental local-fine/global-coarse routing seam.
+///
+/// `nets` expose coarse-grid portals to the global router. `tracks` are the
+/// straight-neck/45-degree escape copper. `obstacles` sample that copper so the
+/// global router cannot cross it. Nothing here is package-name or pitch based.
+#[derive(Debug, Default)]
+pub struct FinePitchEscape {
+    pub nets: Vec<RouteNet>,
+    pub tracks: Vec<Track>,
+}
+
+/// Escape only SMD package pad fields that are buried at the configured global
+/// grid. Portal pitch and neck length derive from trace width, clearance, grid,
+/// and actual pad extents. This stays opt-in until end-to-end KiCad results beat
+/// the baseline, but remains a first-class seam we can iterate on.
+pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> FinePitchEscape {
+    let routable: Vec<&RouteNet> = nets.iter().filter(|n| n.pads.len() >= 2).collect();
+    if routable.is_empty() {
+        return FinePitchEscape {
+            nets: nets.to_vec(),
+            tracks: Vec::new(),
+        };
+    }
+    let coarse = paint_surface(nets, &routable, opts, opts.grid_mm.max(0.01));
+    let fine_refs: HashSet<String> = coarse.buried_pads.iter().map(|p| p.0.clone()).collect();
+    if fine_refs.is_empty() {
+        return FinePitchEscape {
+            nets: nets.to_vec(),
+            tracks: Vec::new(),
+        };
+    }
+
+    let mut bounds: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
+    for p in nets.iter().flat_map(|n| &n.pads) {
+        if fine_refs.contains(&p.refdes) && p.layer != PadLayer::Both {
+            let b = bounds.entry(p.refdes.clone()).or_insert((
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ));
+            b.0 = b.0.min(p.x_mm);
+            b.1 = b.1.min(p.y_mm);
+            b.2 = b.2.max(p.x_mm);
+            b.3 = b.3.max(p.y_mm);
+        }
+    }
+    let grid = opts.grid_mm.max(0.01);
+    let snap = |v: f64| (v / grid).round() * grid;
+    let pad_extent = nets
+        .iter()
+        .flat_map(|n| &n.pads)
+        .filter(|p| fine_refs.contains(&p.refdes) && p.layer != PadLayer::Both)
+        .map(|p| p.w_mm.max(p.h_mm))
+        .fold(0.0_f64, f64::max);
+    let neck = pad_extent + opts.clearance_mm + opts.signal_width_mm + grid;
+    let pitch =
+        ((opts.signal_width_mm + opts.clearance_mm + CLEARANCE_MARGIN_MM) / grid).ceil() * grid;
+
+    // Package side 0/1/2/3 = left/right/top/bottom; tangent ordering prevents
+    // fanout crossings. Two-sided connector rows are deliberately left alone.
+    let mut sides: HashMap<(String, usize), Vec<(String, f64)>> = HashMap::new();
+    for p in nets.iter().flat_map(|n| &n.pads) {
+        let Some(&(x0, y0, x1, y1)) = bounds.get(&p.refdes) else {
+            continue;
+        };
+        if p.layer == PadLayer::Both {
+            continue;
+        }
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let horizontal = (p.x_mm - cx).abs() >= (p.y_mm - cy).abs();
+        let side = if horizontal {
+            usize::from(p.x_mm >= cx)
+        } else {
+            2 + usize::from(p.y_mm >= cy)
+        };
+        sides
+            .entry((p.refdes.clone(), side))
+            .or_default()
+            .push((p.pad.clone(), if horizontal { p.y_mm } else { p.x_mm }));
+    }
+    let mut side_count: HashMap<String, usize> = HashMap::new();
+    for (r, _) in sides.keys() {
+        *side_count.entry(r.clone()).or_default() += 1;
+    }
+    let mut portals: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    for ((r, side), pads) in &mut sides {
+        if side_count.get(r).copied().unwrap_or(0) < 3 {
+            continue;
+        }
+        pads.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let &(x0, y0, x1, y1) = &bounds[r];
+        let center = if *side < 2 {
+            (y0 + y1) / 2.0
+        } else {
+            (x0 + x1) / 2.0
+        };
+        let first = center - pitch * pads.len().saturating_sub(1) as f64 / 2.0;
+        for (i, (pad, original_tangent)) in pads.iter().enumerate() {
+            let tangent = snap(first + i as f64 * pitch);
+            let spread = (tangent - original_tangent).abs();
+            let point = match *side {
+                0 => (snap(x0 - neck - spread), tangent),
+                1 => (snap(x1 + neck + spread), tangent),
+                2 => (tangent, snap(y0 - neck - spread)),
+                _ => (tangent, snap(y1 + neck + spread)),
+            };
+            portals.insert((r.clone(), pad.clone()), point);
+        }
+    }
+
+    let mut transformed = nets.to_vec();
+    let mut tracks = Vec::new();
+    let mut obstacles = Vec::new();
+    for net in &mut transformed {
+        if net.net_idx == 0 {
+            continue;
+        }
+        for p in &mut net.pads {
+            let Some(&portal) = portals.get(&(p.refdes.clone(), p.pad.clone())) else {
+                continue;
+            };
+            let original = p.clone();
+            let &(x0, y0, x1, y1) = &bounds[&p.refdes];
+            let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            let horizontal = (p.x_mm - cx).abs() >= (p.y_mm - cy).abs();
+            let bend = if horizontal {
+                let d = (portal.1 - p.y_mm).abs();
+                (portal.0 - d.copysign(portal.0 - p.x_mm), p.y_mm)
+            } else {
+                let d = (portal.0 - p.x_mm).abs();
+                (p.x_mm, portal.1 - d.copysign(portal.1 - p.y_mm))
+            };
+            let layer = if p.layer == PadLayer::Back {
+                opts.back.clone()
+            } else {
+                opts.front.clone()
+            };
+            for (start, end) in [((p.x_mm, p.y_mm), bend), (bend, portal)] {
+                if start == end {
+                    continue;
+                }
+                tracks.push(Track {
+                    start,
+                    end,
+                    width_mm: opts.signal_width_mm,
+                    layer: layer.clone(),
+                    net_idx: net.net_idx,
+                });
+                let count = ((end.0 - start.0).hypot(end.1 - start.1) / (grid / 2.0))
+                    .ceil()
+                    .max(1.0) as usize;
+                for i in 0..=count {
+                    let t = i as f64 / count as f64;
+                    obstacles.push(RouteNet {
+                        net_idx: net.net_idx,
+                        name: net.name.clone(),
+                        pads: vec![PadPoint {
+                            refdes: original.refdes.clone(),
+                            pad: format!("{}.escape.{i}", original.pad),
+                            x_mm: start.0 + (end.0 - start.0) * t,
+                            y_mm: start.1 + (end.1 - start.1) * t,
+                            w_mm: opts.signal_width_mm,
+                            h_mm: opts.signal_width_mm,
+                            layer: original.layer,
+                        }],
+                    });
+                }
+            }
+            obstacles.push(RouteNet {
+                net_idx: net.net_idx,
+                name: net.name.clone(),
+                pads: vec![original],
+            });
+            p.x_mm = portal.0;
+            p.y_mm = portal.1;
+            p.w_mm = opts.signal_width_mm;
+            p.h_mm = opts.signal_width_mm;
+        }
+    }
+    transformed.extend(obstacles);
+    FinePitchEscape {
+        nets: transformed,
+        tracks,
     }
 }
 
@@ -3214,6 +3405,23 @@ mod tests {
         assert!(out.conflicts.is_empty(), "unrouted: {:#?}", out.conflicts);
         let bad = clearance_violations(&nets, &out, opts.clearance_mm);
         assert!(bad.is_empty(), "clearance violations: {bad:#?}");
+    }
+
+    #[test]
+    fn fine_pitch_escape_is_derived_and_opt_in() {
+        let (nets, opts) = lqfp_fanout_board();
+        assert!(!opts.fine_pitch_escape);
+        let escaped = prepare_fine_pitch_escape(&nets, &opts);
+        assert!(!escaped.tracks.is_empty());
+        assert!(
+            escaped.nets.len() > nets.len(),
+            "escape copper must become obstacles"
+        );
+        for track in &escaped.tracks {
+            let dx = (track.end.0 - track.start.0).abs();
+            let dy = (track.end.1 - track.start.1).abs();
+            assert!(dx < 1e-9 || dy < 1e-9 || (dx - dy).abs() < 1e-9);
+        }
     }
 
     #[test]

@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 use crate::logo::Logo;
 use crate::model::Side;
 use crate::route::{
-    track_sexpr, via_sexpr, PadLayer, PadPoint, PathfinderRouter, RouteNet, RouteOptions,
-    RouteOutput, Router, Track, Via,
+    prepare_fine_pitch_escape, track_sexpr, via_sexpr, PadLayer, PadPoint, PathfinderRouter,
+    RouteNet, RouteOptions, RouteOutput, Router, Track, Via,
 };
 use crate::sexpr::Sexpr;
 use crate::source::CircuitSource;
@@ -2410,7 +2410,24 @@ pub fn generate_board_artifacts(
         if route_opts.bounds.is_none() {
             route_opts.bounds = outline;
         }
-        route = router.route(&nets, &route_opts);
+        if route_opts.fine_pitch_escape {
+            let escaped = prepare_fine_pitch_escape(&nets, &route_opts);
+            route = router.route(&escaped.nets, &route_opts);
+            let failed: HashSet<usize> = route
+                .conflicts
+                .iter()
+                .filter_map(|c| c.strip_prefix("net ")?.split_once(' ')?.0.parse().ok())
+                .collect();
+            route.tracks.splice(
+                0..0,
+                escaped
+                    .tracks
+                    .into_iter()
+                    .filter(|track| !failed.contains(&track.net_idx)),
+            );
+        } else {
+            route = router.route(&nets, &route_opts);
+        }
         for track in &route.tracks {
             board.push(track_sexpr(track));
         }
