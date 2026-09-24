@@ -38,6 +38,7 @@ pub mod images;
 pub mod import;
 pub mod jlcpcb;
 pub mod layout;
+pub mod layout_cache;
 pub mod layout_repair;
 pub mod legalize;
 pub mod logo;
@@ -149,6 +150,7 @@ pub use layout::{
     run_layout_loop_with_decider, score, CostWeights, HpSearch, HpTrial, LayoutLoop, LayoutMode,
     LayoutReport, PlacementMetrics, RepairDecider, RoutableHp,
 };
+pub use layout_cache::LayoutCache;
 pub use layout_repair::{decide_repair, valid_actions, RepairAction, RepairEvidence, RuleEvidence};
 pub use legalize::{legalize, Report as LegalizeReport};
 pub use logo::Logo;
