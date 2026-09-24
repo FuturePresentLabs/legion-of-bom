@@ -12,10 +12,9 @@ authors = ["Future Present Labs"]
 [workspace.dependencies]
 legion-of-bom-core = { path = "crates/core" }
 legion-of-bom-web = { path = "crates/web" }
-# Shared typed-decision client (Jev/Laya-compatible "System One" APIs) —
-# lives in its own repo since it's consumed across the FPL ecosystem, not
-# just here. Path dependency for now: not yet published or pushed.
-ooda = { path = "../../rlcd/ooda/crates/ooda" }
+# Shared typed-decision client (Jev/Laya-compatible "System One" APIs).
+# Pin the owning repository so local and Fab builds use the same interface.
+ooda = { git = "https://github.com/FuturePresentLabs/ooda.git", rev = "d35d6179afe7eb368a601146cfbad2caca2e77ad" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"

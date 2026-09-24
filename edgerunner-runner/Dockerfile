@@ -4,7 +4,6 @@ ARG EDGERUNNER_BASE_IMAGE=registry.fpl.dev/edgerunner-runner:latest
 FROM rust:1.98-bookworm AS build
 WORKDIR /src
 COPY . .
-COPY --from=ooda . /rlcd/ooda
 RUN cargo build --release --locked -p legion-of-bom-cli
 RUN cargo build --release --locked --manifest-path edgerunner-runner/Cargo.toml
 
