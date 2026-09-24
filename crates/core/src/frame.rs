@@ -25,7 +25,9 @@ pub struct BoardFrame {
     pub pinned: BTreeMap<String, Point>,
     /// Parts pinned in the corners — top left, top right, bottom left, bottom
     /// right, in that order — each inset just far enough that its keep-out
-    /// (a screw head's) stays on the board.
+    /// (a screw head's) keeps the board's edge clearance
+    /// ([`crate::rules::EDGE_CLEARANCE_MM`]), which a pinned part cannot be
+    /// moved to satisfy.
     #[serde(default)]
     pub corners: Vec<String>,
 }
@@ -90,7 +92,8 @@ impl BoardFrame {
             .collect();
         for (i, r) in self.corners.iter().enumerate() {
             let Some(f) = facts.get(r) else { continue };
-            let (ix, iy) = (f.extent.0 / 2.0, f.extent.1 / 2.0);
+            let edge = crate::rules::EDGE_CLEARANCE_MM;
+            let (ix, iy) = (f.extent.0 / 2.0 + edge, f.extent.1 / 2.0 + edge);
             let x = if i % 2 == 0 { ix } else { w - ix };
             let y = if i < 2 { iy } else { h - iy };
             out.insert(r.clone(), (x, y));
@@ -126,5 +129,43 @@ mod tests {
             BoardFrame::from_toml("outlines = 1").is_err(),
             "a typo is an error"
         );
+    }
+
+    #[test]
+    fn corner_parts_keep_the_edge_clearance_at_any_size() {
+        use crate::board::PartFacts;
+        use crate::model::Side;
+        let hole = PartFacts {
+            extent: (6.9, 6.9),
+            body_extent: (6.9, 6.9),
+            origin_offset: (0.0, 0.0),
+            side: Side::Front,
+            height_mm: 0.0,
+            standoff_mm: None,
+            tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
+        };
+        let facts: HashMap<String, PartFacts> = ["H1", "H2", "H3", "H4"]
+            .iter()
+            .map(|r| (r.to_string(), hole.clone()))
+            .collect();
+        let frame = BoardFrame {
+            corners: vec!["H1".into(), "H2".into(), "H3".into(), "H4".into()],
+            ..BoardFrame::default()
+        };
+        let inset = 6.9 / 2.0 + crate::rules::EDGE_CLEARANCE_MM;
+        for (w, h) in [(30.0, 30.0), (50.0, 40.0)] {
+            let a = frame.anchors(w, h, &facts);
+            assert_eq!(a["H1"], (inset, inset));
+            assert_eq!(a["H2"], (w - inset, inset));
+            assert_eq!(a["H3"], (inset, h - inset));
+            assert_eq!(a["H4"], (w - inset, h - inset));
+        }
+        assert!(frame.check(&facts).is_ok());
+        let missing = BoardFrame {
+            corners: vec!["H9".into()],
+            ..BoardFrame::default()
+        };
+        assert!(matches!(missing.check(&facts), Err(FrameError::UnknownPart(r)) if r == "H9"));
     }
 }

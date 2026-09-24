@@ -1659,17 +1659,21 @@ pub fn minimum_free_outline(
     facts: &HashMap<String, PartFacts>,
 ) -> (f64, f64) {
     minimum_framed_outline(circuit, facts, &crate::frame::BoardFrame::default())
+        .unwrap_or((MAX_FREE_SIDE_MM, MAX_FREE_SIDE_MM))
 }
+
+/// The largest free board side [`minimum_framed_outline`] tries.
+pub const MAX_FREE_SIDE_MM: f64 = 300.0;
 
 /// [`minimum_free_outline`] with a frame's parts pinned at every trial size:
 /// a corner mounting hole moves with its corner, so the board it reports has
-/// room for the holes *and* the parts.
+/// room for the holes *and* the parts. `None` when nothing up to
+/// [`MAX_FREE_SIDE_MM`] fits.
 pub fn minimum_framed_outline(
     circuit: &dyn CircuitSource,
     facts: &HashMap<String, PartFacts>,
     frame: &crate::frame::BoardFrame,
-) -> (f64, f64) {
-    const MAX_SIDE_MM: f64 = 300.0;
+) -> Option<(f64, f64)> {
     let area: f64 = circuit
         .parts()
         .iter()
@@ -1682,13 +1686,13 @@ pub fn minimum_framed_outline(
         .map(|f| f.extent.0.max(f.extent.1))
         .fold(0.0, f64::max);
     let mut side = area.sqrt().max(widest).ceil();
-    while side < MAX_SIDE_MM {
+    while side < MAX_FREE_SIDE_MM {
         if fits_outline(circuit, facts, side, side, frame.anchors(side, side, facts)) {
-            return (side, side);
+            return Some((side, side));
         }
         side += 1.0;
     }
-    (MAX_SIDE_MM, MAX_SIDE_MM)
+    None
 }
 
 /// Set a board with **no panel** (an MCU board, a regulator) up as a free
@@ -1718,7 +1722,11 @@ pub fn framed_template(
         .map_err(|e| BoardError::Frame(e.to_string()))?;
     let (w, h) = match frame.outline {
         Some(s) => (s.width_mm, s.height_mm),
-        None => minimum_framed_outline(circuit, &facts, frame),
+        None => minimum_framed_outline(circuit, &facts, frame).ok_or_else(|| {
+            BoardError::Frame(format!(
+                "no square board up to {MAX_FREE_SIDE_MM} mm fits the parts with the frame's pinned parts in place"
+            ))
+        })?,
     };
     let template = SeededPlacer::new(w, h, (0.0, 0.0), frame.anchors(w, h, &facts));
     options.fixed_outline = Some((0.0, 0.0, w, h));
