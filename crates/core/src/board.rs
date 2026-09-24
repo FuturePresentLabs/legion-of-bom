@@ -1833,7 +1833,11 @@ pub fn minimum_framed_outline(
         .fold(0.0, f64::max);
     let mut side = area.sqrt().max(widest).ceil();
     while side < MAX_FREE_SIDE_MM {
-        if fits_outline(circuit, facts, side, side, frame.anchors(side, side, facts)) {
+        let Ok(anchors) = frame.anchors(side, side, facts) else {
+            side += 1.0;
+            continue;
+        };
+        if fits_outline(circuit, facts, side, side, anchors) {
             return Some((side, side));
         }
         side += 1.0;
@@ -1874,7 +1878,10 @@ pub fn framed_template(
             ))
         })?,
     };
-    let template = SeededPlacer::new(w, h, (0.0, 0.0), frame.anchors(w, h, &facts));
+    let anchors = frame
+        .anchors(w, h, &facts)
+        .map_err(|e| BoardError::Frame(e.to_string()))?;
+    let template = SeededPlacer::new(w, h, (0.0, 0.0), anchors);
     options.fixed_outline = Some((0.0, 0.0, w, h));
     options.placer = Box::new(template.clone());
     Ok(template)

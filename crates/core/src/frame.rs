@@ -46,6 +46,32 @@ pub struct Point {
     pub y_mm: f64,
 }
 
+/// Deterministic output of the corner-standoff board tool.
+///
+/// The footprint remains the source of truth for the physical hole and its
+/// courtyard. This tool turns those measured facts into board-relative
+/// placement and keep-out geometry; callers do not guess an M3 inset again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StandoffPattern {
+    pub holes: Vec<StandoffHole>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StandoffHole {
+    pub reference: String,
+    pub center: Point,
+    /// Axis-aligned footprint/courtyard keep-out on the finished board.
+    pub keepout: Keepout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Keepout {
+    pub min_x_mm: f64,
+    pub min_y_mm: f64,
+    pub max_x_mm: f64,
+    pub max_y_mm: f64,
+}
+
 /// A frame file that could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -53,6 +79,17 @@ pub enum FrameError {
     UnknownPart(String),
     #[error("frame puts {0} parts in the corners; a board has 4")]
     TooManyCorners(usize),
+    #[error("board outline must be positive, got {width_mm} × {height_mm} mm")]
+    InvalidOutline { width_mm: f64, height_mm: f64 },
+    #[error(
+        "{width_mm} × {height_mm} mm board is too small for corner standoffs; their measured keep-outs require at least {required_width_mm} × {required_height_mm} mm"
+    )]
+    StandoffsDoNotFit {
+        width_mm: f64,
+        height_mm: f64,
+        required_width_mm: f64,
+        required_height_mm: f64,
+    },
 }
 
 impl BoardFrame {
@@ -78,27 +115,98 @@ impl BoardFrame {
         Ok(())
     }
 
-    /// Where each pinned part's keep-out centre sits on a `w × h` board.
+    /// Run the bounded corner-standoff tool for a `w × h` board.
+    ///
+    /// Insets and keep-outs come from the actual footprint facts. Two holes on
+    /// an edge must have non-overlapping keep-outs; impossible outlines fail
+    /// here, before placement or routing.
+    pub fn standoff_pattern(
+        &self,
+        w: f64,
+        h: f64,
+        facts: &HashMap<String, PartFacts>,
+    ) -> Result<StandoffPattern, FrameError> {
+        if w <= 0.0 || h <= 0.0 {
+            return Err(FrameError::InvalidOutline {
+                width_mm: w,
+                height_mm: h,
+            });
+        }
+        if self.corners.is_empty() {
+            return Ok(StandoffPattern { holes: Vec::new() });
+        }
+
+        let edge = crate::rules::EDGE_CLEARANCE_MM;
+        let mut left_w = 0.0_f64;
+        let mut right_w = 0.0_f64;
+        let mut top_h = 0.0_f64;
+        let mut bottom_h = 0.0_f64;
+        for (i, reference) in self.corners.iter().enumerate() {
+            let Some(f) = facts.get(reference) else {
+                return Err(FrameError::UnknownPart(reference.clone()));
+            };
+            if i % 2 == 0 {
+                left_w = left_w.max(f.extent.0);
+            } else {
+                right_w = right_w.max(f.extent.0);
+            }
+            if i < 2 {
+                top_h = top_h.max(f.extent.1);
+            } else {
+                bottom_h = bottom_h.max(f.extent.1);
+            }
+        }
+        let required_w = 2.0 * edge + left_w + right_w;
+        let required_h = 2.0 * edge + top_h + bottom_h;
+        if w < required_w || h < required_h {
+            return Err(FrameError::StandoffsDoNotFit {
+                width_mm: w,
+                height_mm: h,
+                required_width_mm: required_w,
+                required_height_mm: required_h,
+            });
+        }
+
+        let mut holes = Vec::with_capacity(self.corners.len());
+        for (i, reference) in self.corners.iter().enumerate() {
+            let Some(f) = facts.get(reference) else {
+                return Err(FrameError::UnknownPart(reference.clone()));
+            };
+            let (fw, fh) = f.extent;
+            let ix = fw / 2.0 + edge;
+            let iy = fh / 2.0 + edge;
+            let x = if i % 2 == 0 { ix } else { w - ix };
+            let y = if i < 2 { iy } else { h - iy };
+            holes.push(StandoffHole {
+                reference: reference.clone(),
+                center: Point { x_mm: x, y_mm: y },
+                keepout: Keepout {
+                    min_x_mm: x - fw / 2.0,
+                    min_y_mm: y - fh / 2.0,
+                    max_x_mm: x + fw / 2.0,
+                    max_y_mm: y + fh / 2.0,
+                },
+            });
+        }
+        Ok(StandoffPattern { holes })
+    }
+
+    /// Where every pinned part's keep-out centre sits on a `w × h` board.
     pub fn anchors(
         &self,
         w: f64,
         h: f64,
         facts: &HashMap<String, PartFacts>,
-    ) -> HashMap<String, (f64, f64)> {
+    ) -> Result<HashMap<String, (f64, f64)>, FrameError> {
         let mut out: HashMap<String, (f64, f64)> = self
             .pinned
             .iter()
             .map(|(r, p)| (r.clone(), (p.x_mm, p.y_mm)))
             .collect();
-        for (i, r) in self.corners.iter().enumerate() {
-            let Some(f) = facts.get(r) else { continue };
-            let edge = crate::rules::EDGE_CLEARANCE_MM;
-            let (ix, iy) = (f.extent.0 / 2.0 + edge, f.extent.1 / 2.0 + edge);
-            let x = if i % 2 == 0 { ix } else { w - ix };
-            let y = if i < 2 { iy } else { h - iy };
-            out.insert(r.clone(), (x, y));
+        for hole in self.standoff_pattern(w, h, facts)?.holes {
+            out.insert(hole.reference, (hole.center.x_mm, hole.center.y_mm));
         }
-        out
+        Ok(out)
     }
 }
 
@@ -155,7 +263,7 @@ mod tests {
         };
         let inset = 6.9 / 2.0 + crate::rules::EDGE_CLEARANCE_MM;
         for (w, h) in [(30.0, 30.0), (50.0, 40.0)] {
-            let a = frame.anchors(w, h, &facts);
+            let a = frame.anchors(w, h, &facts).unwrap();
             assert_eq!(a["H1"], (inset, inset));
             assert_eq!(a["H2"], (w - inset, inset));
             assert_eq!(a["H3"], (inset, h - inset));
@@ -167,5 +275,39 @@ mod tests {
             ..BoardFrame::default()
         };
         assert!(matches!(missing.check(&facts), Err(FrameError::UnknownPart(r)) if r == "H9"));
+    }
+
+    #[test]
+    fn standoff_tool_exposes_keepouts_and_rejects_an_impossible_board() {
+        use crate::model::Side;
+        let hole = PartFacts {
+            extent: (6.9, 6.9),
+            body_extent: (6.9, 6.9),
+            origin_offset: (0.0, 0.0),
+            side: Side::Front,
+            height_mm: 0.0,
+            standoff_mm: None,
+            tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
+        };
+        let facts = ["H1", "H2", "H3", "H4"]
+            .into_iter()
+            .map(|r| (r.to_string(), hole.clone()))
+            .collect();
+        let frame = BoardFrame {
+            corners: vec!["H1".into(), "H2".into(), "H3".into(), "H4".into()],
+            ..BoardFrame::default()
+        };
+
+        let pattern = frame.standoff_pattern(40.0, 30.0, &facts).unwrap();
+        assert_eq!(pattern.holes.len(), 4);
+        let first = &pattern.holes[0];
+        assert_eq!(first.reference, "H1");
+        assert_eq!(first.keepout.min_x_mm, crate::rules::EDGE_CLEARANCE_MM);
+        assert_eq!(first.keepout.min_y_mm, crate::rules::EDGE_CLEARANCE_MM);
+        assert!(matches!(
+            frame.standoff_pattern(16.0, 30.0, &facts),
+            Err(FrameError::StandoffsDoNotFit { .. })
+        ));
     }
 }

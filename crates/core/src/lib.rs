@@ -130,6 +130,7 @@ pub use fab::{
     strip_smd, zip_dir, BoardSides, MountCounts, Populate, Quality,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
+pub use frame::{Keepout as BoardKeepout, StandoffHole, StandoffPattern};
 pub use gerber::{layers_to_svg, read_layers, Layer as GerberLayer, LayerKind};
 pub use git::{stage as git_stage, staged_paths, GitError};
 pub use gltf::{export_board_glb, GltfError, MeshMaterial};
