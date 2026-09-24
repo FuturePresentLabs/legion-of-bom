@@ -145,6 +145,15 @@ enum Command {
         /// previews only; this is never a substitute for a routed board + DRC.
         #[arg(long)]
         placement_only: bool,
+        /// Maximum A* heap expansions across one routing attempt.
+        #[arg(long, default_value_t = 50_000_000)]
+        router_max_expansions: u64,
+        /// Wall-clock safety cap for one routing attempt, in milliseconds.
+        #[arg(long, default_value_t = 300_000)]
+        router_timeout_ms: u64,
+        /// Write machine-readable routing progress and final budget evidence.
+        #[arg(long)]
+        routing_report: Option<PathBuf>,
     },
     /// Render a readable schematic diagram (symbols + routed nets) from a
     /// circuit â SVG for viewing/iterating, PDF for a shareable final export.
@@ -630,6 +639,9 @@ fn main() -> ExitCode {
             logo,
             model: model_glb,
             placement_only,
+            router_max_expansions,
+            router_timeout_ms,
+            routing_report,
         } => board_cmd(
             circuit,
             out,
@@ -640,6 +652,9 @@ fn main() -> ExitCode {
                 logo,
                 model_glb,
                 placement_only,
+                router_max_expansions,
+                router_timeout_ms,
+                routing_report,
             },
         ),
         Command::Diagram { circuit, svg, pdf } => diagram_cmd(circuit, svg, pdf),
@@ -1755,6 +1770,7 @@ struct Layout {
     collisions: Vec<String>,
     /// Parts with no footprint at all â off-board hardware, absent from the board.
     not_placed: Vec<String>,
+    routing: Option<legion_of_bom_core::route::RoutingReport>,
 }
 
 /// Generate a board the way every command **must**: the iterative layout loop when
@@ -1817,6 +1833,7 @@ fn build_layout(
                 conflicts: report.unresolved,
                 collisions: report.collisions,
                 not_placed: report.not_placed,
+                routing: report.routing,
             })
         }
         _ => {
@@ -1826,6 +1843,7 @@ fn build_layout(
                 conflicts: art.route.conflicts,
                 collisions: art.collisions,
                 not_placed: art.not_placed,
+                routing: art.route.report,
             })
         }
     }
@@ -1899,6 +1917,9 @@ struct BoardOutputOptions {
     logo: Option<PathBuf>,
     model_glb: Option<PathBuf>,
     placement_only: bool,
+    router_max_expansions: u64,
+    router_timeout_ms: u64,
+    routing_report: Option<PathBuf>,
 }
 
 fn board_cmd(
@@ -1913,6 +1934,9 @@ fn board_cmd(
         logo,
         model_glb,
         placement_only,
+        router_max_expansions,
+        router_timeout_ms,
+        routing_report,
     } = output;
     let circuit = circuit
         .canonicalize()
@@ -1935,6 +1959,9 @@ fn board_cmd(
     let frame = read_frame(&circuit, stem)?;
     let mut options =
         board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
+    options.route_options.max_expansions = Some(router_max_expansions);
+    options.route_options.max_wall_time_ms = Some(router_timeout_ms);
+    options.route_options.emit_progress_jsonl = routing_report.is_some();
     if placement_only {
         options.router = None;
     }
@@ -1958,12 +1985,21 @@ fn board_cmd(
         conflicts,
         collisions,
         not_placed,
+        routing,
     } = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?;
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
     let tracks = board.matches("(segment").count();
     let vias = board.matches("(via").count();
     println!("wrote {}", path.display());
+    if let Some(report_path) = routing_report {
+        let report = routing.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--routing-report requires routing (remove --placement-only)")
+        })?;
+        std::fs::write(&report_path, serde_json::to_string_pretty(report)?)
+            .with_context(|| format!("writing {}", report_path.display()))?;
+        println!("  wrote {} (routing evidence)", report_path.display());
+    }
     if placement_only {
         println!("  placement preview: unrouted, outline + GND pour");
     } else {
@@ -4571,6 +4607,35 @@ mod tests {
             parse_mode(&board).is_ok(),
             "the shared default mode {board:?} does not parse"
         );
+    }
+
+    #[test]
+    fn board_accepts_explicit_router_budgets_and_report_path() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "lob",
+            "board",
+            "c.py",
+            "--router-max-expansions",
+            "1234",
+            "--router-timeout-ms",
+            "5678",
+            "--routing-report",
+            "route.json",
+        ]);
+        match cli.command {
+            Command::Board {
+                router_max_expansions,
+                router_timeout_ms,
+                routing_report,
+                ..
+            } => {
+                assert_eq!(router_max_expansions, 1234);
+                assert_eq!(router_timeout_ms, 5678);
+                assert_eq!(routing_report, Some(PathBuf::from("route.json")));
+            }
+            _ => panic!("expected board command"),
+        }
     }
 
     #[test]

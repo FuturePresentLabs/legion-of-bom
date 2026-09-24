@@ -30,6 +30,9 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::board::{det_uuid, mm};
 use crate::sexpr::Sexpr;
@@ -111,6 +114,43 @@ pub struct RouteOutput {
     /// Connections left unrouted — handed to the iterative loop (j54.6) or manual
     /// routing (6.8). Empty when everything routed cleanly.
     pub conflicts: Vec<String>,
+    /// Machine-readable evidence from routers that support bounded attempts.
+    pub report: Option<RoutingReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStopReason {
+    Completed,
+    IterationLimit,
+    ExpansionBudget,
+    WallTimeBudget,
+    Stalled,
+}
+
+/// A bounded progress sample. Pathfinder records at most one sample per ten
+/// rounds plus the final state, so reports stay small on hard boards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingProgress {
+    pub iteration: usize,
+    pub expansions: u64,
+    pub elapsed_ms: u64,
+    pub completed_connections: usize,
+    pub unresolved_connections: usize,
+    pub overused_cells: usize,
+    pub tracks: usize,
+    pub vias: usize,
+}
+
+/// Final evidence for a routing attempt, suitable for CLI/eval artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingReport {
+    pub stop_reason: RoutingStopReason,
+    pub expansion_budget: Option<u64>,
+    pub wall_time_budget_ms: Option<u64>,
+    pub expansions: u64,
+    pub elapsed_ms: u64,
+    pub progress: Vec<RoutingProgress>,
 }
 
 /// Track/via geometry, clearance, grid resolution, and the routable area.
@@ -138,6 +178,12 @@ pub struct RouteOptions {
     pub bounds: Option<(f64, f64, f64, f64)>,
     pub front: String,
     pub back: String,
+    /// Deterministic A* heap-pop budget for the complete router invocation.
+    pub max_expansions: Option<u64>,
+    /// Wall-clock safety cap for the complete router invocation.
+    pub max_wall_time_ms: Option<u64>,
+    /// Emit each bounded progress snapshot as one JSON object on stderr.
+    pub emit_progress_jsonl: bool,
 }
 
 impl Default for RouteOptions {
@@ -166,7 +212,63 @@ impl Default for RouteOptions {
             bounds: None,
             front: "F.Cu".into(),
             back: "B.Cu".into(),
+            max_expansions: Some(50_000_000),
+            max_wall_time_ms: Some(300_000),
+            emit_progress_jsonl: false,
         }
+    }
+}
+
+struct RoutingBudget {
+    started: Instant,
+    max_expansions: Option<u64>,
+    deadline: Option<Instant>,
+    expansions: u64,
+    exhausted: Option<RoutingStopReason>,
+}
+
+impl RoutingBudget {
+    fn new(opts: &RouteOptions) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            max_expansions: opts.max_expansions,
+            deadline: opts
+                .max_wall_time_ms
+                .map(|ms| started + Duration::from_millis(ms)),
+            expansions: 0,
+            exhausted: None,
+        }
+    }
+
+    fn expand(&mut self) -> bool {
+        if self.exhausted.is_some() {
+            return false;
+        }
+        if self
+            .max_expansions
+            .is_some_and(|limit| self.expansions >= limit)
+        {
+            self.exhausted = Some(RoutingStopReason::ExpansionBudget);
+            return false;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.exhausted = Some(RoutingStopReason::WallTimeBudget);
+            return false;
+        }
+        self.expansions += 1;
+        true
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -308,7 +410,11 @@ impl Router for GridRouter {
         let mut base: Vec<usize> = (0..routable.len()).collect();
         base.sort_by_key(|&i| routable[i].net_idx);
         let neutral = Congestion::neutral();
-        search_orderings(nets, &routable, base, opts, &neutral)
+        let mut budget = RoutingBudget::new(opts);
+        let mut out = search_orderings(nets, &routable, base, opts, &neutral, &mut budget);
+        let reason = budget.exhausted.unwrap_or(RoutingStopReason::Completed);
+        finish_report(&mut out, reason, opts, &budget, Vec::new());
+        out
     }
 }
 
@@ -329,6 +435,7 @@ fn search_orderings(
     base: Vec<usize>,
     opts: &RouteOptions,
     learned: &Congestion,
+    budget: &mut RoutingBudget,
 ) -> RouteOutput {
     {
         // `net_idx → routable index` maps a blocker (known by net index) back to
@@ -345,7 +452,7 @@ fn search_orderings(
         for _ in 0..RIPUP_MAX_ITERS {
             let order = topo_order(&base, &before);
             let (out, failed, blame) =
-                route_pass(nets, routable, &order, &net_to_rt, opts, learned);
+                route_pass(nets, routable, &order, &net_to_rt, opts, learned, budget);
             if failed.is_empty() {
                 return out;
             }
@@ -354,6 +461,9 @@ fn search_orderings(
                 .is_none_or(|b| out.conflicts.len() < b.conflicts.len())
             {
                 best = Some(out);
+            }
+            if budget.exhausted.is_some() {
+                break;
             }
             // Rip up: each boxed-in net must precede the nets that boxed it in.
             //
@@ -799,6 +909,7 @@ fn route_pass(
     net_to_rt: &HashMap<usize, usize>,
     opts: &RouteOptions,
     learned: &Congestion,
+    budget: &mut RoutingBudget,
 ) -> (RouteOutput, Vec<usize>, HashMap<usize, HashSet<usize>>) {
     let mut out = RouteOutput::default();
     // Same discretisation as `PathfinderRouter`, so the two are comparable.
@@ -853,6 +964,7 @@ fn route_pass(
                 ViaCheck::Live(via_halo),
                 learned,
                 0,
+                budget,
             ) {
                 Some(path) => {
                     emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
@@ -1050,6 +1162,7 @@ impl Grid {
         vias: ViaCheck<'_>,
         cong: &Congestion,
         p_fac: i64,
+        budget: &mut RoutingBudget,
     ) -> Option<Vec<(usize, usize, usize)>> {
         // Search a window around the connection first. A connection that can
         // be made at all nearly always can be made near its own endpoints, and
@@ -1081,8 +1194,16 @@ impl Grid {
             (r1 + margin).min(self.rows - 1),
         );
         let whole = (0, 0, self.cols - 1, self.rows - 1);
-        let search = |w| self.search(net, sources, targets, costs, vias, cong, p_fac, w);
-        search(window).or_else(|| (window != whole).then(|| search(whole)).flatten())
+        let first = self.search(
+            net, sources, targets, costs, vias, cong, p_fac, window, budget,
+        );
+        if first.is_some() || budget.exhausted.is_some() || window == whole {
+            first
+        } else {
+            self.search(
+                net, sources, targets, costs, vias, cong, p_fac, whole, budget,
+            )
+        }
     }
 
     /// [`route_one_soft`](Self::route_one_soft) confined to the inclusive cell
@@ -1098,6 +1219,7 @@ impl Grid {
         cong: &Congestion,
         p_fac: i64,
         (c0, r0, c1, r1): (usize, usize, usize, usize),
+        budget: &mut RoutingBudget,
     ) -> Option<Vec<(usize, usize, usize)>> {
         let Costs {
             step,
@@ -1147,6 +1269,9 @@ impl Grid {
             .map(|&(c, r, l)| local(c, r, l))
             .collect();
         while let Some(Reverse((_f, g, i))) = heap.pop() {
+            if !budget.expand() {
+                return None;
+            }
             if g > dist[i] {
                 continue;
             }
@@ -1481,6 +1606,10 @@ impl Router for PathfinderRouter {
         let mm_of = move |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
         let mut cong = Congestion::new(surface.cells());
         let mut routes: Vec<NetRoute> = vec![NetRoute::default(); routable.len()];
+        let mut budget = RoutingBudget::new(opts);
+        let mut progress = Vec::new();
+        let mut rounds_run = 0usize;
+        let mut stop_reason = RoutingStopReason::IterationLimit;
         let mut p_fac = PF_PRESENT_START;
         // The best round seen, by (connections it could not reach, cells still
         // contested). Negotiation does not improve monotonically — a round can be
@@ -1489,16 +1618,20 @@ impl Router for PathfinderRouter {
         // Consecutive rounds that did not improve on `best`. See PF_STALL_ROUNDS.
         let mut stalled = 0usize;
 
-        for _it in 0..self.max_iters.max(1) {
+        for it in 0..self.max_iters.max(1) {
+            rounds_run = it + 1;
             for &ni in &order {
                 // Rip up first, so the net does not negotiate against itself: with
                 // its own copper removed, every contested cell it sees belongs to
                 // somebody else.
                 cong.remove(&routes[ni]);
-                let mut rt = route_net_soft(&surface, routable[ni], ni, &cong, p_fac);
+                let mut rt = route_net_soft(&surface, routable[ni], ni, &cong, p_fac, &mut budget);
                 rt.claim(&surface);
                 cong.add(&rt);
                 routes[ni] = rt;
+                if budget.exhausted.is_some() {
+                    break;
+                }
             }
             let over = (0..cong.core.len()).filter(|&i| cong.overused(i)).count();
             let unreached: usize = routes.iter().map(|r| r.unreached.len()).sum();
@@ -1511,7 +1644,7 @@ impl Router for PathfinderRouter {
                 .as_ref()
                 .is_none_or(|(u, o, _, _)| (unreached, over) < (*u, *o));
             if improved && std::env::var_os("LOB_PF_TRACE").is_some() {
-                eprintln!("  pf round {_it}: unreached {unreached}, overused {over}");
+                eprintln!("  pf round {it}: unreached {unreached}, overused {over}");
             }
             if improved {
                 let contested: Vec<usize> = (0..routable.len())
@@ -1528,13 +1661,28 @@ impl Router for PathfinderRouter {
             } else {
                 stalled += 1;
             }
+            if it % 10 == 0 || budget.exhausted.is_some() || over == 0 {
+                let sample = progress_snapshot(it, &budget, &routable, &routes, over, opts, &mm_of);
+                if opts.emit_progress_jsonl {
+                    if let Ok(json) = serde_json::to_string(&sample) {
+                        eprintln!("{json}");
+                    }
+                }
+                progress.push(sample);
+            }
+            if let Some(reason) = budget.exhausted {
+                stop_reason = reason;
+                break;
+            }
             if over == 0 {
+                stop_reason = RoutingStopReason::Completed;
                 break;
             }
             // Nothing has got better for a long time. More rounds of a
             // negotiation that has stopped negotiating are just wall clock, and
             // the fallback ordering search below still gets the history map.
             if stalled >= PF_STALL_ROUNDS {
+                stop_reason = RoutingStopReason::Stalled;
                 break;
             }
             cong.age();
@@ -1559,6 +1707,32 @@ impl Router for PathfinderRouter {
                     ));
                 }
             }
+            finish_report(&mut out, stop_reason, opts, &budget, progress);
+            return out;
+        }
+
+        // A hard budget is a contract: do not start the unbounded ordering
+        // fallbacks after it fires. Preserve every conflict-free route from the
+        // best round and report the rest as unresolved evidence.
+        if budget.exhausted.is_some() {
+            let mut out = partial_output(&routable, &order, best.as_ref(), opts, &mm_of);
+            if progress
+                .last()
+                .is_none_or(|p| p.expansions != budget.expansions)
+            {
+                let over = best.as_ref().map_or(0, |(_, o, _, _)| *o);
+                let routes = best.as_ref().map_or(&routes, |(_, _, r, _)| r);
+                progress.push(progress_snapshot(
+                    rounds_run.saturating_sub(1),
+                    &budget,
+                    &routable,
+                    routes,
+                    over,
+                    opts,
+                    &mm_of,
+                ));
+            }
+            finish_report(&mut out, stop_reason, opts, &budget, progress);
             return out;
         }
         // Negotiation did not settle. Spend what it learned on the same
@@ -1576,7 +1750,13 @@ impl Router for PathfinderRouter {
             halo: Vec::new(),
             hist,
         };
-        let guided = search_orderings(nets, &routable, biased, opts, &learned);
+        let guided = search_orderings(nets, &routable, biased, opts, &learned, &mut budget);
+
+        if let Some(reason) = budget.exhausted {
+            let mut out = guided;
+            finish_report(&mut out, reason, opts, &budget, progress);
+            return out;
+        }
 
         // …and keep it only if it actually helped. A history map from a
         // negotiation that never settled can be misleading, and steering the
@@ -1584,13 +1764,109 @@ impl Router for PathfinderRouter {
         // one on boards the plain one handles. Running the unbiased search too
         // costs one pass and makes "never worse than the baseline" a property of
         // the code rather than a hope.
-        let plain = search_orderings(nets, &routable, order, opts, &Congestion::neutral());
-        if guided.conflicts.len() <= plain.conflicts.len() {
+        let plain = search_orderings(
+            nets,
+            &routable,
+            order,
+            opts,
+            &Congestion::neutral(),
+            &mut budget,
+        );
+        let mut out = if guided.conflicts.len() <= plain.conflicts.len() {
             guided
         } else {
             plain
+        };
+        let final_reason = budget.exhausted.unwrap_or(stop_reason);
+        finish_report(&mut out, final_reason, opts, &budget, progress);
+        out
+    }
+}
+
+fn progress_snapshot(
+    iteration: usize,
+    budget: &RoutingBudget,
+    nets: &[&RouteNet],
+    routes: &[NetRoute],
+    overused_cells: usize,
+    opts: &RouteOptions,
+    mm_of: &impl Fn(usize, usize) -> (f64, f64),
+) -> RoutingProgress {
+    let mut geometry = RouteOutput::default();
+    let mut completed = 0usize;
+    let mut unresolved = 0usize;
+    for (net, route) in nets.iter().zip(routes) {
+        completed += route.paths.len();
+        unresolved += net.pads.len().saturating_sub(1 + route.paths.len());
+        for path in &route.paths {
+            emit_path(path, 0, opts, mm_of, &mut geometry);
         }
     }
+    RoutingProgress {
+        iteration,
+        expansions: budget.expansions,
+        elapsed_ms: budget.elapsed_ms(),
+        completed_connections: completed,
+        unresolved_connections: unresolved,
+        overused_cells,
+        tracks: geometry.tracks.len(),
+        vias: geometry.vias.len(),
+    }
+}
+
+fn partial_output(
+    routable: &[&RouteNet],
+    order: &[usize],
+    best: Option<&(usize, usize, Vec<NetRoute>, Vec<usize>)>,
+    opts: &RouteOptions,
+    mm_of: &impl Fn(usize, usize) -> (f64, f64),
+) -> RouteOutput {
+    let mut out = RouteOutput::default();
+    let Some((_, _, routes, contested)) = best else {
+        for &ni in order {
+            out.conflicts.push(format!(
+                "net {} ({}): routing budget exhausted before a legal route was found",
+                routable[ni].net_idx, routable[ni].name
+            ));
+        }
+        return out;
+    };
+    for &ni in order {
+        let net = routable[ni];
+        if contested[ni] == 0 && routes[ni].paths.len() + 1 == net.pads.len() {
+            for path in &routes[ni].paths {
+                emit_path(path, net.net_idx, opts, mm_of, &mut out);
+            }
+        } else {
+            out.conflicts.push(format!(
+                "net {} ({}): unresolved when routing budget was exhausted",
+                net.net_idx, net.name
+            ));
+        }
+    }
+    out
+}
+
+fn finish_report(
+    out: &mut RouteOutput,
+    reason: RoutingStopReason,
+    opts: &RouteOptions,
+    budget: &RoutingBudget,
+    mut progress: Vec<RoutingProgress>,
+) {
+    if let Some(last) = progress.last_mut() {
+        last.tracks = out.tracks.len();
+        last.vias = out.vias.len();
+        last.unresolved_connections = out.conflicts.len();
+    }
+    out.report = Some(RoutingReport {
+        stop_reason: reason,
+        expansion_budget: opts.max_expansions,
+        wall_time_budget_ms: opts.max_wall_time_ms,
+        expansions: budget.expansions,
+        elapsed_ms: budget.elapsed_ms(),
+        progress,
+    });
 }
 
 /// Which connections are **impossible for this placement**, whatever the router.
@@ -1633,6 +1909,7 @@ fn route_net_soft(
     ni: usize,
     cong: &Congestion,
     p_fac: i64,
+    budget: &mut RoutingBudget,
 ) -> NetRoute {
     let mut rt = NetRoute::default();
     let mut connected: Vec<(usize, usize, usize)> = Vec::new();
@@ -1658,6 +1935,7 @@ fn route_net_soft(
             ViaCheck::Table(&s.via_table),
             cong,
             p_fac,
+            budget,
         ) {
             Some(path) => {
                 for &(c, r, l) in &path {
@@ -2866,5 +3144,51 @@ mod tests {
         assert!(out.conflicts.is_empty(), "unrouted: {:#?}", out.conflicts);
         let bad = clearance_violations(&nets, &out, opts.clearance_mm);
         assert!(bad.is_empty(), "clearance violations: {bad:#?}");
+    }
+
+    #[test]
+    fn pathfinder_expansion_budget_returns_structured_partial_evidence() {
+        let net = RouteNet {
+            net_idx: 1,
+            name: "SIG".into(),
+            pads: vec![pad("J1", "1", 0.0, 0.0), pad("J2", "1", 20.0, 20.0)],
+        };
+        let opts = RouteOptions {
+            bounds: Some((-1.0, -1.0, 21.0, 21.0)),
+            max_expansions: Some(1),
+            max_wall_time_ms: None,
+            ..RouteOptions::default()
+        };
+        let out = PathfinderRouter::default().route(&[net], &opts);
+        let report = out.report.expect("Pathfinder always reports its attempt");
+        assert_eq!(report.stop_reason, RoutingStopReason::ExpansionBudget);
+        assert_eq!(report.expansions, 1);
+        assert_eq!(report.expansion_budget, Some(1));
+        assert!(!out.conflicts.is_empty());
+        assert!(!report.progress.is_empty());
+        assert_eq!(report.progress.last().unwrap().unresolved_connections, 1);
+    }
+
+    #[test]
+    fn pathfinder_success_reports_deterministic_work_and_geometry() {
+        let net = RouteNet {
+            net_idx: 1,
+            name: "SIG".into(),
+            pads: vec![pad("J1", "1", 0.0, 0.0), pad("J2", "1", 2.0, 0.0)],
+        };
+        let opts = RouteOptions {
+            max_wall_time_ms: None,
+            ..RouteOptions::default()
+        };
+        let a = PathfinderRouter::default().route(std::slice::from_ref(&net), &opts);
+        let b = PathfinderRouter::default().route(&[net], &opts);
+        let ar = a.report.unwrap();
+        let br = b.report.unwrap();
+        assert_eq!(ar.stop_reason, RoutingStopReason::Completed);
+        assert_eq!(ar.expansions, br.expansions);
+        assert_eq!(ar.progress.len(), br.progress.len());
+        assert_eq!(a.tracks, b.tracks);
+        assert_eq!(a.vias, b.vias);
+        assert!(a.conflicts.is_empty());
     }
 }

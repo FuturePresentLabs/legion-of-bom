@@ -252,6 +252,8 @@ pub struct LayoutReport {
     pub metrics: PlacementMetrics,
     /// Connections surfaced for manual routing (§6.8) — the router's conflicts.
     pub unresolved: Vec<String>,
+    /// Router budget/progress evidence from the winning attempt.
+    pub routing: Option<crate::route::RoutingReport>,
     /// Mechanical clearance problems: parts under a stacked sub-board taller than
     /// its standoff (DESIGN 6.7). Surfaced, not auto-fixed.
     pub collisions: Vec<String>,
@@ -307,6 +309,7 @@ pub fn run_layout_loop_with_decider(
         board: String,
         metrics: PlacementMetrics,
         unresolved: Vec<String>,
+        routing: Option<crate::route::RoutingReport>,
         collisions: Vec<String>,
         not_placed: Vec<String>,
         drc: Option<DrcReport>,
@@ -412,6 +415,7 @@ pub fn run_layout_loop_with_decider(
                 board: art.pcb,
                 metrics,
                 unresolved: art.route.conflicts.clone(),
+                routing: art.route.report.clone(),
                 collisions: art.collisions.clone(),
                 not_placed: art.not_placed,
                 drc,
@@ -478,6 +482,7 @@ pub fn run_layout_loop_with_decider(
         board,
         metrics,
         unresolved,
+        routing,
         collisions,
         not_placed,
         mut drc,
@@ -558,6 +563,7 @@ pub fn run_layout_loop_with_decider(
         score,
         metrics,
         unresolved,
+        routing,
         collisions,
         not_placed,
         drc,
