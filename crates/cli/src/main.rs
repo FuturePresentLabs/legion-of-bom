@@ -2451,6 +2451,13 @@ fn fab_cmd(
         );
     }
     let assembly = jlc_assembly_bom(&bom, &hand_soldered);
+    if !assembly.unsourceable.is_empty() {
+        anyhow::bail!(
+            "refusing fabrication package: {} machine-placed component(s) lack an exact LCSC C-code: {}. Resolve each part before fabrication; manufacturer MPNs are not valid substitutes in JLCPCB's LCSC column",
+            assembly.unsourceable.len(),
+            assembly.unsourceable.join(" ")
+        );
+    }
     std::fs::write(&bom_path, &assembly.csv)
         .with_context(|| format!("writing {}", bom_path.display()))?;
 
@@ -2469,27 +2476,7 @@ fn fab_cmd(
         assembly.lines,
         bom_path.display()
     );
-    // The PCB half of this package is orderable on its own. The ASSEMBLY half is
-    // not, unless every line the fab is asked to place carries a part number â
-    // and saying "upload the CPL + BOM for assembly" over a BOM with none is how
-    // a package that cannot be quoted looks finished (`legion-of-bom-g5a`).
-    if assembly.unsourceable.is_empty() {
-        println!(
-            "  â JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly"
-        );
-    } else {
-        println!("  â JLCPCB: upload the gerber zip â the PCB is ready to order.");
-        println!(
-            "  â  NOT an assembly order yet: {} part(s) on the BOM have no LCSC number, so the\n    \
-             fab cannot source them â {}",
-            assembly.unsourceable.len(),
-            assembly.unsourceable.join(" ")
-        );
-        println!(
-            "    resolve them (`lob parts suggest {stem}` â `lob parts fetch` â `lob parts verify`)\n    \
-             or match them by hand in JLCPCB's BOM step."
-        );
-    }
+    println!("  â JLCPCB: upload the gerber zip for the PCB, then the CPL + BOM for assembly");
     Ok(())
 }
 

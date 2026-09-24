@@ -680,7 +680,8 @@ pub fn jlc_cpl_from_kicad_pos(
 /// Format a [`Bom`] as a JLCPCB assembly BOM
 /// (`Comment,Designator,Footprint,LCSC Part #`). Parts are already grouped by
 /// [`BomLine`](crate::bom::BomLine); the footprint short name (after `lib:`) is
-/// used, and the MPN goes in the LCSC column when present.
+/// used. Only a real LCSC component code (`C` followed by digits) goes in the
+/// LCSC column; a manufacturer MPN is not interchangeable with that order code.
 pub fn jlc_bom_csv(bom: &Bom, hand_soldered: &std::collections::HashSet<String>) -> String {
     jlc_assembly_bom(bom, hand_soldered).csv
 }
@@ -707,7 +708,7 @@ pub fn jlc_assembly_bom(
     let lines = csv.lines().count().saturating_sub(1);
     let mut unsourceable: Vec<String> = Vec::new();
     for line in bom.components() {
-        if line.mpn.as_deref().unwrap_or("").is_empty() {
+        if !line.mpn.as_deref().is_some_and(is_lcsc_code) {
             unsourceable.extend(
                 line.refdes
                     .iter()
@@ -761,10 +762,21 @@ fn jlc_bom_rows(bom: &Bom, hand_soldered: &std::collections::HashSet<String>) ->
             csv_field(&line.value),
             csv_field(&designators),
             csv_field(footprint),
-            csv_field(line.mpn.as_deref().unwrap_or("")),
+            csv_field(
+                line.mpn
+                    .as_deref()
+                    .filter(|v| is_lcsc_code(v))
+                    .unwrap_or("")
+            ),
         ));
     }
     out
+}
+
+fn is_lcsc_code(value: &str) -> bool {
+    value
+        .strip_prefix('C')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Quote a CSV field if it contains a comma, quote, or newline (RFC 4180).
@@ -919,7 +931,7 @@ mod tests {
                 },
                 BomLine {
                     kind: LineKind::Component,
-                    mpn: Some("TL072CDR".into()),
+                    mpn: Some("C6961".into()),
                     value: "TL072".into(),
                     footprint: Some("Package_SO:SOIC-8".into()),
                     refdes: vec!["U1".into()],
@@ -933,7 +945,7 @@ mod tests {
         assert!(csv.starts_with("Comment,Designator,Footprint,LCSC Part #\n"));
         // Multi-designator field is quoted (contains a comma); footprint short name.
         assert!(csv.contains("159n,\"C1, C5\",C_0805_2012Metric,\n"));
-        assert!(csv.contains("TL072,U1,SOIC-8,TL072CDR\n"));
+        assert!(csv.contains("TL072,U1,SOIC-8,C6961\n"));
     }
 
     /// The fab BOM is what JLCPCB assembles from, and it does surface-mount.
