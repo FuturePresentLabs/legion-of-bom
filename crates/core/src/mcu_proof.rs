@@ -107,7 +107,7 @@ pub fn check_mcu_minimum_system(input: McuProofInput<'_>) -> McuProofReport {
         .filter(|p| p.refdes.0.starts_with('C'))
         .filter_map(|p| {
             let nets = part_nets(circuit, &p.refdes);
-            (nets.len() == 2).then(|| (p, nets))
+            (nets.len() == 2).then_some((p, nets))
         })
         .collect();
     for rail in rail_names {

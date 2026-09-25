@@ -3903,10 +3903,12 @@ mod tests {
             sim: None,
             sim_excluded: false,
             side: None,
+            fields: Default::default(),
         };
         let node = |r: &str, p: &str| PinRef {
             refdes: RefDes(r.into()),
             pin: p.into(),
+            electrical_type: None,
         };
         let net = |name: &str, pins: Vec<PinRef>| Net {
             name: name.into(),
@@ -3959,6 +3961,7 @@ mod tests {
                 sim: None,
                 sim_excluded: false,
                 side: None,
+                fields: Default::default(),
             }],
             nets: vec![],
         };
@@ -3987,6 +3990,7 @@ mod tests {
             sim: None,
             sim_excluded: false,
             side: None,
+            fields: Default::default(),
         };
         let c = Circuit {
             name: "t".into(),
@@ -4147,6 +4151,7 @@ mod tests {
                 sim: None,
                 sim_excluded: false,
                 side: None,
+                fields: Default::default(),
             }],
             nets: vec![],
         };
@@ -5390,10 +5395,12 @@ mod tests {
             // Declared front, exactly as SKiDL writes it — the house rule for a
             // Eurorack power header still has to win, or no board gets it right.
             side: Some(Side::Front),
+            fields: Default::default(),
         };
         let pin = |p: &str| PinRef {
             refdes: RefDes("J3".into()),
             pin: p.into(),
+            electrical_type: None,
         };
         let circuit = Circuit {
             name: "pwr".into(),

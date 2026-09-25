@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub const EE_SOURCE_SCHEMA: &str = "lob.ee-source.v1";
+pub const EE_SOURCE_SCHEMA: &str = "lob.ee-source.v2";
 
 #[derive(Debug, Serialize)]
 pub struct EeSourceExport {
@@ -29,12 +29,19 @@ pub struct EePart {
     pub manufacturer_part_number: Option<String>,
     pub lcsc_part_number: Option<String>,
     pub ratings: BTreeMap<String, String>,
+    pub declared_fields: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EeNet {
     pub id: String,
-    pub pins: Vec<String>,
+    pub pins: Vec<EePin>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct EePin {
+    pub endpoint: String,
+    pub electrical_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +86,7 @@ pub fn export_ee_source_with_ratings(
                 .get(&part.refdes.0)
                 .cloned()
                 .unwrap_or_default(),
+            declared_fields: part.fields.clone(),
         })
         .collect();
     parts.sort_by(|a, b| a.id.cmp(&b.id));
@@ -89,9 +97,14 @@ pub fn export_ee_source_with_ratings(
             let mut pins: Vec<_> = net
                 .pins
                 .iter()
-                .map(|pin| format!("{}:{}", pin.refdes.0, pin.pin))
+                .map(|pin| EePin {
+                    endpoint: format!("{}:{}", pin.refdes.0, pin.pin),
+                    electrical_type: pin
+                        .electrical_type
+                        .map(|kind| format!("{kind:?}").to_ascii_lowercase()),
+                })
                 .collect();
-            pins.sort();
+            pins.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
             EeNet {
                 id: net.name.clone(),
                 pins,
@@ -156,7 +169,14 @@ mod tests {
         ));
         let export = export_ee_source(&circuit, Some("ERC ERROR: broken\n"));
         assert_eq!(export.parts[0].id, "R1");
-        assert_eq!(export.nets[0].pins, ["R1:2", "R2:1"]);
+        assert_eq!(
+            export.nets[0]
+                .pins
+                .iter()
+                .map(|pin| pin.endpoint.as_str())
+                .collect::<Vec<_>>(),
+            ["R1:2", "R2:1"]
+        );
         assert_eq!(export.erc[0].severity, "error");
         let json = serde_json::to_string(&export).unwrap();
         assert!(!json.contains("passed"));

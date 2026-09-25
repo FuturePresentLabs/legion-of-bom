@@ -844,6 +844,7 @@ mod tests {
         PinRef {
             refdes: RefDes(r.into()),
             pin: p.into(),
+            electrical_type: None,
         }
     }
 
@@ -1104,6 +1105,7 @@ mod tests {
                 sim: None,
                 sim_excluded: false,
                 side: None,
+                fields: Default::default(),
             }],
             nets: vec![],
         };

@@ -600,10 +600,12 @@ mod tests {
             sim: None,
             sim_excluded: false,
             side: None,
+            fields: Default::default(),
         };
         let node = |r: &str, p: &str| PinRef {
             refdes: RefDes(r.into()),
             pin: p.into(),
+            electrical_type: None,
         };
         Circuit {
             name: "t".into(),

@@ -3,6 +3,7 @@
 //! Stages read this through [`CircuitSource`](crate::source::CircuitSource);
 //! they never touch a concrete DSL or netlist type. See DESIGN.md 2.3, 3.3.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// A reference designator, e.g. `R1`, `C3`, `U2`.
@@ -88,6 +89,10 @@ pub struct Part {
     /// The board side this part is declared to mount on (a `Side` field). `None`
     /// means the default, front.
     pub side: Option<Side>,
+    /// Source-declared component fields not promoted to first-class model
+    /// properties. Engineering proof consumes namespaced `Power.*` fields
+    /// from here; it never guesses ratings from a part number or value.
+    pub fields: BTreeMap<String, String>,
 }
 
 impl Part {
@@ -103,6 +108,7 @@ impl Part {
             sim: None,
             sim_excluded: false,
             side: None,
+            fields: BTreeMap::new(),
         }
     }
 
@@ -131,6 +137,45 @@ impl Part {
     }
 }
 
+/// Electrical behavior declared by the source symbol for one connected pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PinElectricalType {
+    Input,
+    Output,
+    Bidirectional,
+    TriState,
+    Passive,
+    PowerInput,
+    PowerOutput,
+    OpenCollector,
+    OpenEmitter,
+    NoConnect,
+    Unspecified,
+}
+
+impl PinElectricalType {
+    /// Parse KiCad/SKiDL's netlist spelling without silently reclassifying an
+    /// unfamiliar type.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_uppercase().replace(['_', '-'], "");
+        Some(match normalized.as_str() {
+            "INPUT" => Self::Input,
+            "OUTPUT" => Self::Output,
+            "BIDIRECTIONAL" | "BIDI" => Self::Bidirectional,
+            "TRISTATE" => Self::TriState,
+            "PASSIVE" => Self::Passive,
+            "POWERIN" | "POWERINPUT" => Self::PowerInput,
+            "POWEROUT" | "POWEROUTPUT" => Self::PowerOutput,
+            "OPENCOLLECTOR" => Self::OpenCollector,
+            "OPENEMITTER" => Self::OpenEmitter,
+            "NOCONNECT" | "NC" => Self::NoConnect,
+            "UNSPECIFIED" => Self::Unspecified,
+            _ => return None,
+        })
+    }
+}
+
 /// A reference to one pin of one part, as it appears on a net.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PinRef {
@@ -138,6 +183,8 @@ pub struct PinRef {
     pub refdes: RefDes,
     /// Pin number or name (`"1"`, `"2"`, `"OUT"`).
     pub pin: String,
+    /// Source symbol electrical type, when the frontend supplied it.
+    pub electrical_type: Option<PinElectricalType>,
 }
 
 impl PinRef {
@@ -145,7 +192,15 @@ impl PinRef {
         PinRef {
             refdes: refdes.into(),
             pin: pin.into(),
+            electrical_type: None,
         }
+    }
+
+    /// Attach a source-declared electrical type.
+    #[must_use]
+    pub fn with_electrical_type(mut self, electrical_type: PinElectricalType) -> Self {
+        self.electrical_type = Some(electrical_type);
+        self
     }
 }
 

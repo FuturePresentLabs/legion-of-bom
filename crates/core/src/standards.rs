@@ -51,7 +51,8 @@ pub const CATALOG: &[Standard] = &[
         title: "Deterministic power, decoupling, clock, interface and RF-macro checks",
         brief_example: "must pass the embedded digital black-book topology checks",
         requirements: &[
-            Requirement { aspect: "power-tree source provenance", verifiable: Artifact },
+            Requirement { aspect: "typed-pin connectivity and driver compatibility", verifiable: Artifact },
+            Requirement { aspect: "source-to-load power reachability and declared current budgets", verifiable: Artifact },
             Requirement { aspect: "MCU, codec and radio supply decoupling topology", verifiable: Artifact },
             Requirement { aspect: "clock-source topology", verifiable: Artifact },
             Requirement { aspect: "digital interface pin bindings", verifiable: Artifact },

@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::model::{Circuit, Net, Part, PinRef, RefDes, Side, SimModel};
+use crate::model::{Circuit, Net, Part, PinElectricalType, PinRef, RefDes, Side, SimModel};
 use crate::sexpr::Sexpr;
 use crate::stage::StageError;
 
@@ -70,6 +70,7 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
             });
             // Which board side the circuit declares this part on (a `Side` field).
             let side = field_value(comp, "Side").and_then(|s| Side::parse(&s));
+            let fields = all_fields(comp);
             parts.push(Part {
                 refdes: RefDes(refdes.to_string()),
                 value,
@@ -79,6 +80,7 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 sim,
                 sim_excluded: field_value(comp, "Sim.Enable").is_some_and(|v| v.trim() == "0"),
                 side,
+                fields,
             });
         }
     }
@@ -90,7 +92,11 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
             let mut pins: Vec<PinRef> = net
                 .get_all("node")
                 .into_iter()
-                .filter_map(|node| Some(PinRef::new(node.field("ref")?, node.field("pin")?)))
+                .filter_map(|node| {
+                    let mut pin = PinRef::new(node.field("ref")?, node.field("pin")?);
+                    pin.electrical_type = node.field("pintype").and_then(PinElectricalType::parse);
+                    Some(pin)
+                })
                 .collect();
             pins.sort_by(|a, b| (&a.refdes, &a.pin).cmp(&(&b.refdes, &b.pin)));
             // KiCad emits `(class "Default")` on every net; a circuit author who
@@ -125,6 +131,22 @@ fn field_value(comp: &Sexpr, wanted: &str) -> Option<String> {
         .and_then(|f| f.nth_atom(2))
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+}
+
+fn all_fields(comp: &Sexpr) -> std::collections::BTreeMap<String, String> {
+    comp.get("fields")
+        .map(|fields| {
+            fields
+                .get_all("field")
+                .into_iter()
+                .filter_map(|field| {
+                    let name = field.get("name")?.nth_atom(1)?.to_string();
+                    let value = field.nth_atom(2)?.to_string();
+                    (!name.is_empty() && !value.is_empty()).then_some((name, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -194,7 +216,14 @@ mod tests {
         let out = c.nets().iter().find(|n| n.name == "OUT").unwrap();
         assert_eq!(
             out.pins,
-            vec![PinRef::new("C1", "1"), PinRef::new("R1", "2")]
+            vec![
+                PinRef::new("C1", "1").with_electrical_type(PinElectricalType::Passive),
+                PinRef::new("R1", "2").with_electrical_type(PinElectricalType::Passive),
+            ]
+        );
+        assert_eq!(
+            out.pins[0].electrical_type,
+            Some(PinElectricalType::Passive)
         );
 
         // Every net here is the default class — none is critical, and the default
@@ -252,6 +281,34 @@ mod tests {
         // A generic part with no MPN field resolves to None.
         let r1 = c.parts.iter().find(|p| p.refdes.0 == "R1").unwrap();
         assert_eq!(r1.mpn, None);
+    }
+
+    #[test]
+    fn preserves_namespaced_power_intent_fields() {
+        let nl = r#"
+        (export (version "E")
+          (components
+            (comp (ref "U1") (value "LDO")
+              (fields
+                (field (name "Power.Role") "regulator")
+                (field (name "Power.OutputCurrentA") "0.3")
+                (field (name "Power.DropoutV") "0.2"))
+              (libsource (lib "Regulator_Linear") (part "LDO"))))
+          (nets))"#;
+        let c = parse_netlist_str(nl, "power").unwrap();
+        let fields = &c.parts[0].fields;
+        assert_eq!(
+            fields.get("Power.Role").map(String::as_str),
+            Some("regulator")
+        );
+        assert_eq!(
+            fields.get("Power.OutputCurrentA").map(String::as_str),
+            Some("0.3")
+        );
+        assert_eq!(
+            fields.get("Power.DropoutV").map(String::as_str),
+            Some("0.2")
+        );
     }
 
     #[test]

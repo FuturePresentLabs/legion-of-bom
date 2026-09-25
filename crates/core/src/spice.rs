@@ -1324,6 +1324,7 @@ mod tests {
                     sim: None,
                     sim_excluded: false,
                     side: None,
+                    fields: Default::default(),
                 },
                 Part::new("R1", "9k"),
                 Part::new("R2", "1k"),

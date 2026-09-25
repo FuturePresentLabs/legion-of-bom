@@ -356,6 +356,7 @@ mod tests {
                     sim: None,
                     sim_excluded: false,
                     side: None,
+                    fields: Default::default(),
                 },
                 Part::new("R1", rf), // feedback: OUT ↔ FB
                 Part::new("R2", rg), // ground:   FB ↔ GND

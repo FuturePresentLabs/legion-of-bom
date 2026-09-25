@@ -18,7 +18,8 @@ pub fn verify(circuit: &dyn CircuitSource) -> StandardReport {
         standard: PROFILE.into(),
         designation: "Puget artifact-visible embedded/audio/RF engineering profile v1".into(),
         results: vec![
-            power_tree(circuit),
+            crate::electrical_proof::connectivity_check(circuit),
+            crate::electrical_proof::power_tree_check(circuit),
             decoupling(circuit),
             clock_topology(circuit),
             interface_bindings(circuit),
@@ -80,48 +81,6 @@ fn ground_refs(circuit: &dyn CircuitSource) -> BTreeSet<RefDes> {
         .filter(|net| is_ground_net(&net.name))
         .flat_map(|net| net.pins.iter().map(|pin| pin.refdes.clone()))
         .collect()
-}
-
-fn power_tree(circuit: &dyn CircuitSource) -> CheckResult {
-    let mut failures = Vec::new();
-    let mut proven = Vec::new();
-    for net in circuit
-        .nets()
-        .iter()
-        .filter(|net| is_supply_rail(&net.name))
-    {
-        let sources: Vec<_> = net
-            .pins
-            .iter()
-            .filter(|pin| {
-                let name = pin.pin.to_ascii_uppercase();
-                let Some(owner) = part(circuit, &pin.refdes) else {
-                    return false;
-                };
-                name == "VOUT"
-                    || name == "VO"
-                    || name == "VBUS"
-                    || (owner.refdes.0.starts_with('J') && !name.contains("GND"))
-            })
-            .map(|pin| format!("{}.{}", pin.refdes, pin.pin))
-            .collect();
-        if sources.is_empty() {
-            failures.push(format!(
-                "{} has consumers but no regulator output or external connector provenance",
-                net.name
-            ));
-        } else {
-            proven.push(format!("{} <- {}", net.name, sources.join(", ")));
-        }
-    }
-    if proven.is_empty() && failures.is_empty() {
-        failures.push("no named supply rail was present".into());
-    }
-    result(
-        "power-tree source provenance",
-        failures,
-        format!("netlist-visible sources: {}", proven.join("; ")),
-    )
 }
 
 /// Screen each digital IC rail for a capacitor that bridges that rail to ground.
@@ -450,7 +409,7 @@ mod tests {
             Net::new("HSE_IN", pins(&[("U1", "PH0"), ("Y1", "1"), ("C2", "1")])),
             Net::new("HSE_OUT", pins(&[("U1", "PH1"), ("Y1", "3"), ("C3", "1")])),
         ];
-        for (name, codec_pin) in [
+        for (index, (name, codec_pin)) in [
             ("I2S_BCK", "SCLK"),
             ("I2S_LRCK", "LRCK"),
             ("I2S_MCLK", "MCLK"),
@@ -458,9 +417,15 @@ mod tests {
             ("I2S_DIN", "ASDOUT"),
             ("I2C_SCL", "CCLK"),
             ("I2C_SDA", "CDATA"),
-        ] {
-            c.nets
-                .push(Net::new(name, pins(&[("U1", "GPIO"), ("U2", codec_pin)])));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let gpio = format!("GPIO{index}");
+            c.nets.push(Net::new(
+                name,
+                vec![PinRef::new("U1", gpio), PinRef::new("U2", codec_pin)],
+            ));
         }
         c
     }
@@ -468,12 +433,32 @@ mod tests {
     #[test]
     fn good_audio_fixture_passes_applicable_checks_without_certification_claim() {
         let report = verify(&audio());
-        assert_eq!(report.results[0].verdict, Verdict::Passed);
-        assert_eq!(report.results[1].verdict, Verdict::Passed);
-        assert_eq!(report.results[2].verdict, Verdict::Passed);
-        assert_eq!(report.results[3].verdict, Verdict::Passed);
-        assert_eq!(report.results[4].verdict, Verdict::NeedsReview);
-        assert_eq!(report.results[5].verdict, Verdict::NeedsTest);
+        let verdict = |aspect: &str| {
+            report
+                .results
+                .iter()
+                .find(|result| result.aspect == aspect)
+                .unwrap()
+                .verdict
+        };
+        assert_eq!(
+            verdict("typed-pin connectivity and driver compatibility"),
+            Verdict::NeedsReview
+        );
+        assert_eq!(
+            verdict("source-to-load power reachability and declared current budgets"),
+            Verdict::NeedsReview
+        );
+        assert_eq!(
+            verdict("MCU, codec and radio supply decoupling topology"),
+            Verdict::Passed
+        );
+        assert_eq!(verdict("clock-source topology"), Verdict::Passed);
+        assert_eq!(verdict("digital interface pin bindings"), Verdict::Passed);
+        assert_eq!(
+            verdict("physical electrical, SI/PI, EMC and RF performance"),
+            Verdict::NeedsTest
+        );
         assert!(report.needs_physical_test());
     }
 
@@ -483,9 +468,21 @@ mod tests {
         c.nets
             .retain(|net| net.name != "GND" && net.name != "HSE_OUT" && net.name != "I2S_MCLK");
         let report = verify(&c);
-        assert_eq!(report.results[1].verdict, Verdict::Failed);
-        assert_eq!(report.results[2].verdict, Verdict::Failed);
-        assert_eq!(report.results[3].verdict, Verdict::Failed);
+        for aspect in [
+            "MCU, codec and radio supply decoupling topology",
+            "clock-source topology",
+            "digital interface pin bindings",
+        ] {
+            assert_eq!(
+                report
+                    .results
+                    .iter()
+                    .find(|result| result.aspect == aspect)
+                    .unwrap()
+                    .verdict,
+                Verdict::Failed
+            );
+        }
     }
 
     #[test]
@@ -498,8 +495,18 @@ mod tests {
         c.nets
             .push(Net::new("SPI_SCK", pins(&[("U1", "PA5"), ("U2", "SCK")])));
         let report = verify(&c);
-        assert_eq!(report.results[3].verdict, Verdict::Failed);
-        assert_eq!(report.results[4].verdict, Verdict::Failed);
-        assert!(report.results[4].detail.contains("PE4259"));
+        let interfaces = report
+            .results
+            .iter()
+            .find(|result| result.aspect == "digital interface pin bindings")
+            .unwrap();
+        let rf = report
+            .results
+            .iter()
+            .find(|result| result.aspect == "cited SX1262 915 MHz reference-macro integrity")
+            .unwrap();
+        assert_eq!(interfaces.verdict, Verdict::Failed);
+        assert_eq!(rf.verdict, Verdict::Failed);
+        assert!(rf.detail.contains("PE4259"));
     }
 }
