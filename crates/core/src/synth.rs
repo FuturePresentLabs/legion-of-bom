@@ -1304,13 +1304,7 @@ pub fn circuit(
         ..Circuit::default()
     };
     for pl in &placed {
-        let mut fields = BTreeMap::from([("MPN".to_string(), pl.part.mpn.clone())]);
-        if let Some(l) = &pl.part.lcsc {
-            fields.insert("LCSC".into(), l.clone());
-        }
-        if pl.part.sim_excluded {
-            fields.insert("Sim.Enable".into(), "0".into());
-        }
+        let fields = pl.part.netlist_fields();
         c.parts.push(EmitPart {
             reference: pl.reference.clone(),
             symbol: match &pl.part.symbol {

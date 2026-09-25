@@ -48,6 +48,9 @@ pub struct CatalogPart {
     /// each cited like any other fact.
     #[serde(default)]
     pub params: BTreeMap<String, Param>,
+    /// Cited source/load/regulator intent carried into the emitted netlist.
+    #[serde(default)]
+    pub power: Option<PowerIntent>,
     #[serde(default)]
     pub interfaces: Vec<Interface>,
     #[serde(default)]
@@ -55,6 +58,59 @@ pub struct CatalogPart {
     /// Not an analog circuit SPICE models (an IC, a crystal): `Sim.Enable = 0`.
     #[serde(default)]
     pub sim_excluded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PowerRole {
+    Source,
+    Regulator,
+    Load,
+}
+
+impl PowerRole {
+    fn field_value(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Regulator => "regulator",
+            Self::Load => "load",
+        }
+    }
+}
+
+/// Power intent is catalog evidence, not a synthesis guess. Net names describe
+/// the rails at the component boundary; numeric facts retain their own citation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerIntent {
+    pub role: PowerRole,
+    #[serde(default)]
+    pub input_net: Option<String>,
+    #[serde(default)]
+    pub output_net: Option<String>,
+    pub cite: Cite,
+    #[serde(default)]
+    pub input_voltage_v: Option<Param>,
+    #[serde(default)]
+    pub output_voltage_v: Option<Param>,
+    #[serde(default)]
+    pub output_current_a: Option<Param>,
+    #[serde(default)]
+    pub load_current_a: Option<Param>,
+    #[serde(default)]
+    pub dropout_v: Option<Param>,
+}
+
+impl PowerIntent {
+    fn facts(&self) -> [(&'static str, Option<&Param>); 5] {
+        [
+            ("Power.InputVoltageV", self.input_voltage_v.as_ref()),
+            ("Power.OutputVoltageV", self.output_voltage_v.as_ref()),
+            ("Power.OutputCurrentA", self.output_current_a.as_ref()),
+            ("Power.LoadCurrentA", self.load_current_a.as_ref()),
+            ("Power.DropoutV", self.dropout_v.as_ref()),
+        ]
+    }
 }
 
 /// Where the part's pins come from.
@@ -152,6 +208,22 @@ pub enum Cite {
         #[serde(default)]
         confirmed_by: Option<String>,
     },
+}
+
+impl Cite {
+    /// Whether this citation is strong enough to drive deterministic output.
+    /// Quotes are checked against pinned documents; readings require an
+    /// explicit confirmer. Unconfirmed readings remain visible but inert.
+    fn verified(&self) -> bool {
+        matches!(
+            self,
+            Cite::Quote { .. }
+                | Cite::Reading {
+                    confirmed_by: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 /// An endpoint of a [`Support`] or an [`Signal::At`].
@@ -802,6 +874,39 @@ impl CatalogPart {
             cites.extend(pins.iter().map(|p| &p.cite));
         }
         cites.extend(self.params.values().map(|p| &p.cite));
+        if let Some(power) = &self.power {
+            cites.push(&power.cite);
+            cites.extend(
+                power
+                    .facts()
+                    .into_iter()
+                    .filter_map(|(_, fact)| fact.map(|p| &p.cite)),
+            );
+            let missing = match power.role {
+                PowerRole::Source => power.output_net.is_none(),
+                PowerRole::Regulator => power.input_net.is_none() || power.output_net.is_none(),
+                PowerRole::Load => power.input_net.is_none(),
+            };
+            if missing {
+                out.push(format!(
+                    "power role {} is missing its required input/output net",
+                    power.role.field_value()
+                ));
+            }
+            for net in [power.input_net.as_deref(), power.output_net.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if !crate::model::is_supply_rail(net) {
+                    out.push(format!("power net {net:?} is not a named supply rail"));
+                }
+            }
+            for (name, fact) in power.facts() {
+                if fact.is_some_and(|fact| !fact.value.is_finite() || fact.value < 0.0) {
+                    out.push(format!("{name} must be finite and non-negative"));
+                }
+            }
+        }
         if self.datasheet.is_none() && cites.iter().any(|c| matches!(c, Cite::Quote { .. })) {
             out.push("quotes a datasheet but names none".into());
         }
@@ -813,6 +918,15 @@ impl CatalogPart {
         let mut out: Vec<&Cite> = self.support.iter().map(|s| &s.cite).collect();
         out.extend(self.interfaces.iter().filter_map(|i| i.cite.as_ref()));
         out.extend(self.params.values().map(|p| &p.cite));
+        if let Some(power) = &self.power {
+            out.push(&power.cite);
+            out.extend(
+                power
+                    .facts()
+                    .into_iter()
+                    .filter_map(|(_, fact)| fact.map(|p| &p.cite)),
+            );
+        }
         if let PartSymbol::Inline { pins } = &self.symbol {
             out.extend(pins.iter().map(|p| &p.cite));
         }
@@ -827,6 +941,36 @@ impl CatalogPart {
     /// Every reading no person has confirmed yet.
     pub fn unconfirmed(&self) -> Vec<String> {
         unconfirmed_of(&self.mpn, self.cites())
+    }
+
+    /// Netlist fields whose provenance is verified. This is the single adapter
+    /// used by synthesis and replay plans, so the two paths cannot drift.
+    #[must_use]
+    pub fn netlist_fields(&self) -> BTreeMap<String, String> {
+        let mut fields = BTreeMap::from([("MPN".into(), self.mpn.clone())]);
+        if let Some(lcsc) = &self.lcsc {
+            fields.insert("LCSC".into(), lcsc.clone());
+        }
+        if self.sim_excluded {
+            fields.insert("Sim.Enable".into(), "0".into());
+        }
+        if let Some(power) = &self.power {
+            if power.cite.verified() {
+                fields.insert("Power.Role".into(), power.role.field_value().into());
+                if let Some(net) = &power.input_net {
+                    fields.insert("Power.InputNet".into(), net.clone());
+                }
+                if let Some(net) = &power.output_net {
+                    fields.insert("Power.OutputNet".into(), net.clone());
+                }
+            }
+            for (name, fact) in power.facts() {
+                if let Some(fact) = fact.filter(|fact| fact.cite.verified()) {
+                    fields.insert(name.into(), fact.value.to_string());
+                }
+            }
+        }
+        fields
     }
 
     /// `(number, name)` for every pin, from the KiCad symbol or the inline
@@ -1024,6 +1168,47 @@ mod tests {
     }
 
     #[test]
+    fn power_roles_require_their_boundary_nets() {
+        let json = part_json(
+            r#", "power": {"role": "regulator", "input_net": "+5V",
+                "cite": {"reading": "fixture", "confirmed_by": "test"}}"#,
+        );
+        let err = load_one(&json).unwrap_err().to_string();
+        assert!(
+            err.contains("missing its required input/output net"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_verified_power_facts_become_netlist_fields() {
+        let json = part_json(
+            r#", "power": {"role": "regulator", "input_net": "+5V",
+                "output_net": "+3V3",
+                "cite": {"reading": "topology", "confirmed_by": "test"},
+                "output_voltage_v": {"value": 3.3,
+                    "cite": {"reading": "marked value", "confirmed_by": "test"}},
+                "output_current_a": {"value": 0.5,
+                    "cite": {"reading": "not checked yet"}}}"#,
+        );
+        let catalog = load_one(&json).unwrap();
+        let fields = catalog.parts[0].netlist_fields();
+        assert_eq!(
+            fields.get("Power.Role").map(String::as_str),
+            Some("regulator")
+        );
+        assert_eq!(
+            fields.get("Power.InputNet").map(String::as_str),
+            Some("+5V")
+        );
+        assert_eq!(
+            fields.get("Power.OutputVoltageV").map(String::as_str),
+            Some("3.3")
+        );
+        assert!(!fields.contains_key("Power.OutputCurrentA"));
+    }
+
+    #[test]
     fn a_file_must_be_named_for_its_part() {
         let json = part_json("").replace(r#""mpn": "X1""#, r#""mpn": "OTHER""#);
         let err = load_one(&json).unwrap_err().to_string();
@@ -1039,6 +1224,24 @@ mod tests {
         assert!(
             cat.providing("i2s-dac").count() >= 3,
             "DAC options to choose among"
+        );
+        let ams = cat.part("AMS1117-3.3").expect("catalogued regulator");
+        let fields = ams.netlist_fields();
+        assert_eq!(
+            fields.get("Power.Role").map(String::as_str),
+            Some("regulator")
+        );
+        assert_eq!(
+            fields.get("Power.InputNet").map(String::as_str),
+            Some("+5V")
+        );
+        assert_eq!(
+            fields.get("Power.OutputNet").map(String::as_str),
+            Some("+3V3")
+        );
+        assert_eq!(
+            fields.get("Power.OutputVoltageV").map(String::as_str),
+            Some("3.3")
         );
     }
 

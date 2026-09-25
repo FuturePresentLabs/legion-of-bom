@@ -125,13 +125,7 @@ impl CircuitPlan {
                                 .collect(),
                         ),
                     };
-                    let mut fields = BTreeMap::from([("MPN".into(), part.mpn.clone())]);
-                    if let Some(lcsc) = &part.lcsc {
-                        fields.insert("LCSC".into(), lcsc.clone());
-                    }
-                    if part.sim_excluded {
-                        fields.insert("Sim.Enable".into(), "0".into());
-                    }
+                    let fields = part.netlist_fields();
                     part_indexes.insert(reference.clone(), circuit.parts.len());
                     part_pins.insert(reference.clone(), pins);
                     circuit.parts.push(EmitPart {
@@ -300,7 +294,7 @@ pub enum PlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CatalogPart, Cite, InlinePin};
+    use crate::catalog::{CatalogPart, Cite, InlinePin, Param, PowerIntent, PowerRole};
 
     fn catalog() -> Catalog {
         Catalog {
@@ -337,6 +331,28 @@ mod tests {
                 datasheet: None,
                 provides: vec![],
                 params: BTreeMap::new(),
+                power: Some(PowerIntent {
+                    role: PowerRole::Load,
+                    input_net: Some("+5V".into()),
+                    output_net: None,
+                    cite: Cite::Reading {
+                        reading: "fixture load".into(),
+                        page: None,
+                        confirmed_by: Some("test".into()),
+                    },
+                    input_voltage_v: None,
+                    output_voltage_v: None,
+                    output_current_a: None,
+                    load_current_a: Some(Param {
+                        value: 0.001,
+                        cite: Cite::Reading {
+                            reading: "fixture current".into(),
+                            page: None,
+                            confirmed_by: Some("test".into()),
+                        },
+                    }),
+                    dropout_v: None,
+                }),
                 interfaces: vec![],
                 support: vec![],
                 sim_excluded: false,
@@ -359,9 +375,9 @@ mod tests {
                     reference: "R1".into(),
                     value: "10k".into(),
                 },
-                CircuitOp::CreateNet { name: "VIN".into() },
+                CircuitOp::CreateNet { name: "+5V".into() },
                 CircuitOp::Connect {
-                    net: "VIN".into(),
+                    net: "+5V".into(),
                     reference: "R1".into(),
                     pin: PinSelector::Number(1),
                 },
@@ -388,6 +404,9 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.contains("r1.p[2] += builtins.NC"));
         assert!(first.contains(r#"r1.fields["LCSC"] = "C25804""#));
+        assert!(first.contains(r#"r1.fields["Power.Role"] = "load""#));
+        assert!(first.contains(r#"r1.fields["Power.InputNet"] = "+5V""#));
+        assert!(first.contains(r#"r1.fields["Power.LoadCurrentA"] = "0.001""#));
     }
 
     #[test]
@@ -399,12 +418,12 @@ mod tests {
                 pin: PinSelector::Number(2),
             },
             CircuitOp::Connect {
-                net: "VIN".into(),
+                net: "+5V".into(),
                 reference: "MISSING".into(),
                 pin: PinSelector::Number(2),
             },
             CircuitOp::Connect {
-                net: "VIN".into(),
+                net: "+5V".into(),
                 reference: "R1".into(),
                 pin: PinSelector::Number(1),
             },
@@ -423,7 +442,7 @@ mod tests {
     fn nonexistent_pin_is_rejected_before_emission() {
         let mut candidate = plan();
         candidate.operations.push(CircuitOp::Connect {
-            net: "VIN".into(),
+            net: "+5V".into(),
             reference: "R1".into(),
             pin: PinSelector::Number(99),
         });

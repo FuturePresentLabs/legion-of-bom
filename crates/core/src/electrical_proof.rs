@@ -252,8 +252,23 @@ pub fn prove_power_tree(circuit: &dyn CircuitSource) -> PowerTreeProof {
                 .map(|net| net.name.clone())
                 .collect::<Vec<_>>()
         };
-        let inputs = attached(is_input_pin);
-        let outputs = attached(is_output_pin);
+        let declared = |name: &str| {
+            field(component, name).and_then(|wanted| {
+                rail_nets
+                    .iter()
+                    .find(|net| {
+                        net.name.eq_ignore_ascii_case(wanted)
+                            && net.pins.iter().any(|pin| pin.refdes == component.refdes)
+                    })
+                    .map(|net| net.name.clone())
+            })
+        };
+        let inputs = declared("Power.InputNet")
+            .map(|net| vec![net])
+            .unwrap_or_else(|| attached(is_input_pin));
+        let outputs = declared("Power.OutputNet")
+            .map(|net| vec![net])
+            .unwrap_or_else(|| attached(is_output_pin));
         match role(component).map(str::to_ascii_lowercase).as_deref() {
             Some("source") => roots.extend(outputs.iter().cloned().chain(inputs.iter().cloned())),
             Some("regulator") => {
@@ -341,7 +356,8 @@ pub fn prove_power_tree(circuit: &dyn CircuitSource) -> PowerTreeProof {
                         matches!(
                             role(owner).map(str::to_ascii_lowercase).as_deref(),
                             Some("source" | "regulator")
-                        ) && (is_output_pin(&pin.pin) || is_input_pin(&pin.pin))
+                        ) && field(owner, "Power.OutputNet")
+                            .is_some_and(|declared| declared.eq_ignore_ascii_case(&net.name))
                     })
             })
             .map(|pin| format!("{}.{}", pin.refdes, pin.pin))
@@ -531,6 +547,7 @@ mod tests {
     fn proves_source_regulator_load_path_and_budget() {
         let mut source = Part::new("J1", "USB");
         source.fields.insert("Power.Role".into(), "source".into());
+        source.fields.insert("Power.OutputNet".into(), "5V".into());
         source
             .fields
             .insert("Power.OutputCurrentA".into(), "0.5".into());
@@ -540,11 +557,19 @@ mod tests {
             .insert("Power.Role".into(), "regulator".into());
         regulator
             .fields
+            .insert("Power.InputNet".into(), "5V".into());
+        regulator
+            .fields
+            .insert("Power.OutputNet".into(), "3V3".into());
+        regulator
+            .fields
             .insert("Power.OutputCurrentA".into(), "0.3".into());
         regulator
             .fields
             .insert("Power.DropoutV".into(), "0.2".into());
         let mut load = Part::new("U2", "MCU");
+        load.fields.insert("Power.Role".into(), "load".into());
+        load.fields.insert("Power.InputNet".into(), "3V3".into());
         load.fields
             .insert("Power.LoadCurrentA".into(), "0.08".into());
         let mut circuit = Circuit::new("powered");
@@ -553,15 +578,15 @@ mod tests {
             Net::new(
                 "5V",
                 vec![
-                    typed("J1", "VBUS", PinElectricalType::PowerOutput),
-                    typed("U1", "VIN", PinElectricalType::PowerInput),
+                    typed("J1", "1", PinElectricalType::PowerOutput),
+                    typed("U1", "1", PinElectricalType::PowerInput),
                 ],
             ),
             Net::new(
                 "3V3",
                 vec![
-                    typed("U1", "VOUT", PinElectricalType::PowerOutput),
-                    typed("U2", "VDD", PinElectricalType::PowerInput),
+                    typed("U1", "2", PinElectricalType::PowerOutput),
+                    typed("U2", "7", PinElectricalType::PowerInput),
                 ],
             ),
         ];

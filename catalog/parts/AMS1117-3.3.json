@@ -14,6 +14,29 @@
   "provides": [
     "rail:+3V3"
   ],
+  "power": {
+    "role": "regulator",
+    "input_net": "+5V",
+    "output_net": "+3V3",
+    "cite": {
+      "page": 1,
+      "quote": "5V to 3.3V Linear Regulator"
+    },
+    "input_voltage_v": {
+      "value": 5.0,
+      "cite": {
+        "page": 1,
+        "quote": "5V to 3.3V Linear Regulator"
+      }
+    },
+    "output_voltage_v": {
+      "value": 3.3,
+      "cite": {
+        "page": 2,
+        "quote": "AMS1117-3.3 VIN = 4.8V 3.251 3.300 3.349 V"
+      }
+    }
+  },
   "sim_excluded": true,
   "support": [
     {
