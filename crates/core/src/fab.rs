@@ -66,6 +66,56 @@ pub fn jlcpcb_design_rules() -> String {
     )
 }
 
+/// KiCad rules for the directly checkable portion of an ECSS rigid-board
+/// design using normal-pitch outer-layer copper.
+///
+/// This is deliberately a *bounded profile*, not an ECSS compliance switch.
+/// It applies only when all of these inputs are true:
+///
+/// - rigid epoxy PCB, at most 2.2 mm as-designed;
+/// - normal-pitch outer-layer routing with total copper at most 70 µm;
+/// - worst-case peak transient voltage at most 30 V;
+/// - no claim of "reliable insulation" under ECSS clause 13.9; and
+/// - no reliance on conformal coating to reduce conductor spacing.
+///
+/// The generated artifact lets KiCad deterministically check track width,
+/// conductor spacing, copper-to-edge clearance, via aspect ratio (through the
+/// maximum hole length), and conservative external annular width. Supplier
+/// tolerances, as-manufactured annular ring, coupons, inspection, and process
+/// qualification remain separate evidence obligations in
+/// [`crate::standards`].
+///
+/// @derives-from url:https://ecss.nl/wp-content/uploads/2025/05/ECSS-Q-ST-70-12C-Rev.1%2830April2025%29.pdf §§7.3.3, 7.3.5, 7.4.3, 7.5.3, 13.8.2 and Table 13-7 -- artifact-checkable rigid ≤30 V subset; not whole-standard conformity
+#[must_use]
+pub fn ecss_q_st_70_12c_rev1_rigid_30v_design_rules() -> String {
+    // The 0.350 mm spacing is Table 13-7's as-designed value for 10<V≤30,
+    // external normal-pitch copper ≤70 µm without conformal coating. Using it
+    // globally also conservatively covers the table's 0<V≤10 case (0.250 mm).
+    //
+    // KiCad's `hole_length` is the board thickness traversed by a through via.
+    // Combined with the minimum 0.315 mm drill it enforces the §7.3.5 ratio:
+    // 2.2 mm / 0.315 mm = 6.98 ≤ 7. Blind/buried/microvias need a construction-
+    // specific profile and are intentionally outside this one.
+    "(version 1)\n\
+     # ECSS-Q-ST-70-12C Rev.1 bounded profile: rigid epoxy, normal pitch, <=30 V peak.\n\
+     # Passing DRC is not a claim of whole-standard conformity.\n\
+     (rule \"ECSS 7.4.3 normal-pitch outer track width\"\n\
+     \t(constraint track_width (min 0.200mm))\n\
+     \t(condition \"A.Layer == 'F.Cu' || A.Layer == 'B.Cu'\"))\n\
+     (rule \"ECSS 13.8/Table 13-7 external spacing <=30V\"\n\
+     \t(constraint clearance (min 0.350mm))\n\
+     \t(condition \"(A.Layer == 'F.Cu' || A.Layer == 'B.Cu') && (B.Layer == 'F.Cu' || B.Layer == 'B.Cu')\"))\n\
+     (rule \"ECSS 13.8.2h conductor to PCB edge\"\n\
+     \t(constraint edge_clearance (min 0.200mm)))\n\
+     (rule \"ECSS 7.5.3 normal external annular width\"\n\
+     \t(constraint annular_width (min 0.400mm)))\n\
+     (rule \"ECSS 7.3.5 rigid through-via aspect ratio <=7\"\n\
+     \t(constraint hole_size (min 0.315mm))\n\
+     \t(constraint hole_length (max 2.200mm))\n\
+     \t(condition \"A.Type == 'Via'\"))\n"
+        .to_string()
+}
+
 /// Run a `kicad-cli` subcommand, mapping failure to a [`StageError`].
 fn run_kicad(kicad_cli: &Path, args: &[&str], board: &Path) -> Result<(), StageError> {
     let output = Command::new(kicad_cli)
@@ -813,6 +863,33 @@ fn parse_csv_row(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::bom::{Bom, BomLine};
+
+    #[test]
+    fn ecss_rigid_30v_profile_emits_the_bounded_geometry_rules() {
+        let dru = ecss_q_st_70_12c_rev1_rigid_30v_design_rules();
+        for exact_rule in [
+            "track_width (min 0.200mm)",
+            "clearance (min 0.350mm)",
+            "edge_clearance (min 0.200mm)",
+            "annular_width (min 0.400mm)",
+            "hole_size (min 0.315mm)",
+            "hole_length (max 2.200mm)",
+        ] {
+            assert!(dru.contains(exact_rule), "missing {exact_rule} in:\n{dru}");
+        }
+        assert!(dru.contains("A.Type == 'Via'"));
+        assert!(dru.contains("not a claim of whole-standard conformity"));
+    }
+
+    #[test]
+    fn ecss_profile_does_not_silently_inherit_the_looser_fab_limits() {
+        let ecss = ecss_q_st_70_12c_rev1_rigid_30v_design_rules();
+        let fab = jlcpcb_design_rules();
+        assert!(fab.contains("clearance (min 0.127mm)"));
+        assert!(!ecss.contains("clearance (min 0.127mm)"));
+        assert!(fab.contains("annular_width (min 0.075mm)"));
+        assert!(!ecss.contains("annular_width (min 0.075mm)"));
+    }
 
     #[test]
     fn cpl_reformats_to_jlc_columns() {

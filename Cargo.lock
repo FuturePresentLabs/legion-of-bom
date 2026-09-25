@@ -171,6 +171,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "black_book"
+version = "0.1.0"
+source = "git+ssh://git@github.com/FuturePresentLabs/black_book.git?rev=2c4e924d359f71cfe94624ef06282bdeaf8dc129#2c4e924d359f71cfe94624ef06282bdeaf8dc129"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1029,6 +1039,7 @@ name = "legion-of-bom-core"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "black_book",
  "gltf",
  "gltf-json",
  "hmac",

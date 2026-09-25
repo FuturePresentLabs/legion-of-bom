@@ -1,0 +1,11 @@
+{
+  "selections": {
+    "intended_use": "monitoring",
+    "contact": "patient",
+    "applied_part": "cf",
+    "use_environment": "home"
+  },
+  "flags": {
+    "essential_performance": true
+  }
+}

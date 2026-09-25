@@ -106,6 +106,30 @@ pub const CATALOG: &[Standard] = &[
         public: true,
     },
     Standard {
+        id: "ecss-q-st-70-12c-rev1-rigid-30v",
+        designation: "ECSS-Q-ST-70-12C Rev.1 (2025), bounded rigid <=30 V design profile",
+        title: "Artifact-checkable aerospace PCB geometry and explicit supplier evidence",
+        brief_example: "ECSS aerospace PCB geometry for a rigid <=30 V board",
+        requirements: &[
+            Requirement {
+                aspect: "rigid-board track, spacing, edge, annular-ring and through-via geometry",
+                verifiable: Artifact,
+            },
+            Requirement {
+                aspect: "as-manufactured dimensions and process capability",
+                verifiable: TestOnly,
+            },
+            Requirement {
+                aspect: "representative test coupons, inspection and traceability",
+                verifiable: TestOnly,
+            },
+        ],
+        status: Status::Implemented {
+            module: "legion_of_bom_core::fab::ecss_q_st_70_12c_rev1_rigid_30v_design_rules",
+        },
+        public: true,
+    },
+    Standard {
         id: "ipc-2221c",
         designation: "IPC-2221C",
         title: "Generic Standard on Printed Board Design",
@@ -218,9 +242,51 @@ pub fn verify(
                 id: "mil-std-3001-1a-schematic",
                 ..
             }) => Ok(verify_mil_std_3001_schematic(circuit)),
+            Some(Standard {
+                id: "ecss-q-st-70-12c-rev1-rigid-30v",
+                ..
+            }) => Ok(verify_ecss_q_st_70_12_rigid_30v()),
             Some(_) => Err(StandardsError::NotImplemented(id.clone())),
         })
         .collect()
+}
+
+/// Report the claim boundary for the ECSS aerospace PCB geometry profile.
+///
+/// Circuit-only verification cannot prove that a `.kicad_pcb` passed the
+/// generated `.kicad_dru`, so it returns `NeedsReview`, never a synthetic pass.
+/// The board/fab pipeline is responsible for attaching the rule artifact and
+/// running KiCad DRC. Physical manufacture and coupon inspection remain
+/// `TestOnly` even after DRC is clean.
+///
+/// @derives-from url:https://ecss.nl/wp-content/uploads/2025/05/ECSS-Q-ST-70-12C-Rev.1%2830April2025%29.pdf §§7.3-7.5, 13.8 and 15 -- separates CAD-checkable geometry from supplier/process evidence; not whole-standard conformity
+fn verify_ecss_q_st_70_12_rigid_30v() -> StandardReport {
+    StandardReport {
+        standard: "ecss-q-st-70-12c-rev1-rigid-30v".into(),
+        designation:
+            "ECSS-Q-ST-70-12C Rev.1 (2025), bounded rigid <=30 V design profile".into(),
+        results: vec![
+            CheckResult {
+                aspect: "rigid-board track, spacing, edge, annular-ring and through-via geometry"
+                    .into(),
+                verifiable: Artifact,
+                verdict: Verdict::NeedsReview,
+                detail: "attach ecss_q_st_70_12c_rev1_rigid_30v_design_rules() beside the KiCad board and require a clean KiCad DRC; applicable only to rigid epoxy, normal-pitch outer copper <=70 µm, <=2.2 mm board thickness and <=30 V worst-case peak; this is not whole-standard conformity".into(),
+            },
+            CheckResult {
+                aspect: "as-manufactured dimensions and process capability".into(),
+                verifiable: TestOnly,
+                verdict: Verdict::NeedsTest,
+                detail: "ECSS-Q-ST-70-12C Rev.1 clauses 7.4.2, 7.5.3 and 13.8 require supplier tolerance/process evidence and manufactured-dimension inspection; CAD DRC cannot settle these obligations".into(),
+            },
+            CheckResult {
+                aspect: "representative test coupons, inspection and traceability".into(),
+                verifiable: TestOnly,
+                verdict: Verdict::NeedsTest,
+                detail: "ECSS-Q-ST-70-12C Rev.1 clauses 15.1-15.2 require supplier-reviewed representative coupons, applicable tests, inspection and coupon-to-panel traceability".into(),
+            },
+        ],
+    }
 }
 
 /// Verify the artifact-visible subset of MIL-STD-3001-1A's schematic rules.
@@ -488,6 +554,38 @@ mod tests {
             verify(&sink(false, "5.1k"), &["ipc-2221c".into()]),
             Err(StandardsError::NotImplemented(_))
         ));
+    }
+
+    #[test]
+    fn aerospace_pcb_profile_never_turns_circuit_only_evidence_into_compliance() {
+        let reports = verify(
+            &sink(false, "5.1k"),
+            &["ecss-q-st-70-12c-rev1-rigid-30v".into()],
+        )
+        .unwrap();
+        let report = &reports[0];
+        assert_eq!(report.results.len(), 3);
+        assert_eq!(report.results[0].verifiable, Verifiable::Artifact);
+        assert_eq!(report.results[0].verdict, Verdict::NeedsReview);
+        assert_eq!(report.results[1].verifiable, Verifiable::TestOnly);
+        assert_eq!(report.results[1].verdict, Verdict::NeedsTest);
+        assert_eq!(report.results[2].verifiable, Verifiable::TestOnly);
+        assert_eq!(report.results[2].verdict, Verdict::NeedsTest);
+        assert!(report.needs_physical_test());
+        assert!(report.results.iter().all(|result| {
+            !result.detail.to_ascii_lowercase().contains("compliant")
+                && !result.detail.to_ascii_lowercase().contains("certified")
+        }));
+    }
+
+    #[test]
+    fn aerospace_pcb_catalog_exposes_exact_claim_classes() {
+        let profile = find("ecss-q-st-70-12c-rev1-rigid-30v").unwrap();
+        assert!(matches!(profile.status, Status::Implemented { .. }));
+        assert_eq!(profile.requirements.len(), 3);
+        assert_eq!(profile.requirements[0].verifiable, Verifiable::Artifact);
+        assert_eq!(profile.requirements[1].verifiable, Verifiable::TestOnly);
+        assert_eq!(profile.requirements[2].verifiable, Verifiable::TestOnly);
     }
 
     fn readable_signal_chain() -> Circuit {

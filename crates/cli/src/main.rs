@@ -16,21 +16,22 @@ use legion_of_bom_core::family;
 use legion_of_bom_core::frame::BoardFrame;
 use legion_of_bom_core::skidl::{kicad_footprint_dir, kicad_symbol_dir};
 use legion_of_bom_core::{
-    analytic_check, build_facts, build_guide_with, default_image_cache_dir,
-    default_panel_orders_dir, default_parts_dir, derive_panel, derive_panel_for, embed_source,
-    eurorack_trial_build, export_board_glb, export_cpl, export_gerbers, fetch_from_jlcpcb,
-    fetch_from_kicad, framed_template, generate_board_artifacts, generate_bom, generate_fuzz_chain,
-    guide, guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
-    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
-    render_board_png, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg,
-    simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
-    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus, BoardOptions,
-    BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer,
-    FabReadiness, Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType,
-    LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders,
-    PartRecord, PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView,
-    Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
+    analytic_check, assess_assurance_evidence, build_facts, build_guide_with,
+    default_image_cache_dir, default_panel_orders_dir, default_parts_dir, derive_panel,
+    derive_panel_for, embed_source, eurorack_trial_build, export_board_glb, export_cpl,
+    export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, framed_template, generate_board_artifacts,
+    generate_bom, generate_fuzz_chain, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom,
+    jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
+    package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
+    part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, render_spec_text,
+    rules, run_drc, run_layout_loop, schematic_to_svg, simulate_ac, simulate_tran,
+    simulate_tran_drive, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc,
+    value_key, zip_dir, ArtifactKind, ArtifactStatus, AssuranceRequest, BoardOptions, BoardPng,
+    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, FabReadiness,
+    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
+    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
+    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
+    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
     SourcingClients, StageOutcome, TranAnalysis, TranDrive,
 };
 
@@ -92,6 +93,14 @@ enum Command {
         #[arg(long = "require")]
         required: Vec<String>,
         /// Also write the structured verification reports here.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Validate a source-proven cross-domain operating environment contract.
+    Environment {
+        /// TOML contract emitted by a profile tool or verified analysis.
+        contract: PathBuf,
+        /// Write the normalized, validated contract as JSON.
         #[arg(long)]
         json: Option<PathBuf>,
     },
@@ -713,6 +722,7 @@ fn main() -> ExitCode {
             required,
             json,
         } => standards_cmd(circuit, required, json),
+        Command::Environment { contract, json } => environment_cmd(contract, json),
         Command::SpecChain {
             brief,
             vcc,
@@ -971,6 +981,27 @@ fn standards_cmd(
     } else {
         anyhow::bail!("one or more deterministic standards checks failed")
     }
+}
+
+fn environment_cmd(contract_path: PathBuf, json_path: Option<PathBuf>) -> Result<()> {
+    let input = std::fs::read_to_string(&contract_path)
+        .with_context(|| format!("reading {}", contract_path.display()))?;
+    let contract = legion_of_bom_core::OperatingEnvironment::from_toml(&input)
+        .with_context(|| format!("validating {}", contract_path.display()))?;
+    println!(
+        "PASS operating environment: {:.0}s, {:.1}..{:.1} C, {} bus(es), {} source(s)",
+        contract.service_duration_s,
+        contract.thermal.minimum_c,
+        contract.thermal.maximum_c,
+        contract.electrical_buses.len(),
+        contract.provenance.len(),
+    );
+    if let Some(path) = json_path {
+        std::fs::write(&path, serde_json::to_string_pretty(&contract)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
 }
 
 fn spec_cmd(
@@ -2371,6 +2402,10 @@ fn fab_cmd(
         .source
         .canonicalize()
         .with_context(|| format!("circuit not found: {}", resolved.source.display()))?;
+    // Optional, explicit procurement/traveler evidence. A circuit.py uses
+    // circuit.assurance.toml; absence means the ordinary commercial fab flow,
+    // never an implicit aerospace claim.
+    let assurance_request_path = circuit.with_extension("assurance.toml");
     let stem = resolved.name.as_str();
     let work_dir = PathBuf::from("out").join(stem);
 
@@ -2505,6 +2540,31 @@ fn fab_cmd(
             anyhow::anyhow!("reading placements back from the board we just wrote: {e}")
         })?;
     let bom = generate_bom(&model);
+    if assurance_request_path.is_file() {
+        let source = std::fs::read_to_string(&assurance_request_path)
+            .with_context(|| format!("reading {}", assurance_request_path.display()))?;
+        let request: AssuranceRequest = toml::from_str(&source)
+            .with_context(|| format!("parsing {}", assurance_request_path.display()))?;
+        let profile =
+            legion_of_bom_core::evaluate_domain_profile(&request.profile, &request.profile_request)
+                .with_context(|| format!("evaluating {} assurance profile", request.profile))?;
+        let assurance = assess_assurance_evidence(&bom, &profile, &request.evidence);
+        let assurance_path = pkg.join("assurance.json");
+        std::fs::write(&assurance_path, serde_json::to_string_pretty(&assurance)?)
+            .with_context(|| format!("writing {}", assurance_path.display()))?;
+        if !assurance.evidence_complete {
+            anyhow::bail!(
+                "{} assurance evidence is incomplete (evidence: {})",
+                request.profile,
+                assurance_path.display()
+            );
+        }
+        println!(
+            "  {} assurance evidence: {}",
+            request.profile,
+            assurance_path.display()
+        );
+    }
     if !hand_soldered.is_empty() {
         let mut hs: Vec<&String> = hand_soldered.iter().collect();
         hs.sort();

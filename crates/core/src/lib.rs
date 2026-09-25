@@ -12,6 +12,7 @@
 
 pub mod analytical;
 pub mod api500;
+pub mod assurance;
 pub mod board;
 pub mod bom;
 pub mod bom_repair;
@@ -19,13 +20,16 @@ pub mod carrier;
 pub mod catalog;
 pub mod datasheet;
 pub mod decouple;
+pub mod derating;
 pub mod distributor_lua;
+pub mod domain_profile;
 pub mod drc;
 pub mod dsp_import;
 pub mod eagle;
 pub mod easyeda;
 pub mod edit;
 pub mod engineering;
+pub mod environment;
 pub mod fab;
 pub mod family;
 pub mod fetch;
@@ -96,6 +100,11 @@ pub use api500::{
     API500_CARD_EDGE_FOOTPRINT, API500_CARD_EDGE_VALUE, API500_MINUS_16_LIMIT_MA,
     API500_PHANTOM_LIMIT_MA, API500_PIN_COUNT, API500_PIN_PITCH_MM, API500_PLUS_16_LIMIT_MA,
 };
+pub use assurance::{
+    assess_assurance_evidence, AsBuiltPart, AssuranceEvidenceInput, AssuranceFinding,
+    AssuranceManifest, AssuranceRequest, FindingLevel, PartEvidence, RiskDisposition, RiskEvidence,
+    SubstitutionEvidence,
+};
 pub use board::{
     build_facts, decoupling_pairs, framed_template, free_outline_template, generate_board,
     generate_board_artifacts, generate_board_report, minimum_framed_outline, minimum_free_outline,
@@ -111,8 +120,18 @@ pub use carrier::{
     firmware_pinmap_json, AudioChannel, CarrierBuilder, CarrierError, CarrierPlatform,
 };
 pub use decouple::{snap as snap_decoupling, Report as DecoupleReport};
+pub use derating::{
+    assess_part as assess_part_derating, AppliedStress, ComponentFamily, ComponentRatings,
+    ElectricalStress, PartDeratingReport, PartStressInput, Rating, RatingProvenance,
+    StressInputError, StressResult, StressVerdict,
+};
 pub use distributor_lua::{
     distributor_script_dir, load_named_script, DistributorScript, DistributorScriptError,
+};
+pub use domain_profile::{
+    evaluate_domain_profile, Applicability as DomainApplicability, CheckObligation, DomainProfile,
+    DomainProfileError, DomainProfileRequest, EvidenceKind as DomainEvidenceKind,
+    EvidenceObligation, EvidenceScope as DomainEvidenceScope, RequiredFact,
 };
 pub use drc::{run_drc, DrcItem, DrcReport, DrcViolation};
 pub use dsp_import::{
@@ -124,10 +143,16 @@ pub use eagle::{
 };
 pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCandidate};
 pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
+pub use environment::{
+    ElectricalBus, EnvironmentProvenance, OperatingEnvironment, OperatingEnvironmentError,
+    OperatingEnvironmentLoadError, PressureEnvelope, RadiationEnvelope, ShockSpectrum,
+    SpectrumPoint, ThermalEnvelope, TransientEnvelope, VibrationSpectrum,
+};
 pub use fab::{
-    board_sides, export_board_svg, export_cpl, export_gerbers, jlc_assembly_bom, jlc_bom_csv,
-    jlc_cpl_from_kicad_pos, jlcpcb_design_rules, png_to_jpeg, render_board_jpeg, render_board_png,
-    strip_smd, zip_dir, BoardSides, MountCounts, Populate, Quality,
+    board_sides, ecss_q_st_70_12c_rev1_rigid_30v_design_rules, export_board_svg, export_cpl,
+    export_gerbers, jlc_assembly_bom, jlc_bom_csv, jlc_cpl_from_kicad_pos, jlcpcb_design_rules,
+    png_to_jpeg, render_board_jpeg, render_board_png, strip_smd, zip_dir, BoardSides, MountCounts,
+    Populate, Quality,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use frame::{Keepout as BoardKeepout, StandoffHole, StandoffPattern};
