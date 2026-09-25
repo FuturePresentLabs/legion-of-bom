@@ -112,6 +112,7 @@ pub async fn rules(State(state): State<Arc<AppState>>, Path(name): Path<String>)
             facts: facts.as_ref(),
             outline: legion_of_bom_core::guide::board_outline(&pcb),
             fixed_positions: None,
+            intent: None,
         },
     );
     let assessed = legion_of_bom_core::rules::assess(&derived, &placements);

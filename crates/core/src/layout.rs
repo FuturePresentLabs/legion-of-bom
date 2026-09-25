@@ -418,6 +418,7 @@ pub fn run_layout_loop_with_decider(
             facts: facts.as_ref(),
             outline: options.fixed_outline,
             fixed_positions: Some(&fixed_positions),
+            intent: Some(&options.placement_intent),
         },
     );
     let iters = cfg.max_iters.max(1);

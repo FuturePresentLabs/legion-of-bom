@@ -33,9 +33,127 @@ use std::collections::HashMap;
 
 pub use black_book::constraints::ConstraintStatus;
 use black_book::constraints::ScalarConstraint;
+use serde::{Deserialize, Serialize};
 
 use crate::board::Placement;
 use crate::source::CircuitSource;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementIntent {
+    #[serde(default)]
+    pub keepouts: Vec<KeepoutRegion>,
+    #[serde(default)]
+    pub orientations: Vec<OrientationIntent>,
+    #[serde(default)]
+    pub clusters: Vec<ClusterIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepoutRegion {
+    pub name: String,
+    pub min_x_mm: f64,
+    pub min_y_mm: f64,
+    pub max_x_mm: f64,
+    pub max_y_mm: f64,
+    /// Parts mechanically belonging to the region, if any.
+    #[serde(default)]
+    pub exempt: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementSide {
+    Front,
+    Back,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationIntent {
+    pub refdes: String,
+    pub rotation_deg: f64,
+    #[serde(default = "default_angle_tolerance")]
+    pub tolerance_deg: f64,
+    pub side: Option<PlacementSide>,
+    /// When present, the same footprint must also contact this board edge.
+    pub facing_edge: Option<BoardEdge>,
+}
+
+fn default_angle_tolerance() -> f64 {
+    1.0e-6
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterIntent {
+    pub name: String,
+    pub members: Vec<String>,
+    pub max_span_mm: f64,
+}
+
+impl PlacementIntent {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut names = std::collections::HashSet::new();
+        for region in &self.keepouts {
+            if region.name.trim().is_empty()
+                || !names.insert(("keepout", region.name.as_str()))
+                || ![
+                    region.min_x_mm,
+                    region.min_y_mm,
+                    region.max_x_mm,
+                    region.max_y_mm,
+                ]
+                .into_iter()
+                .all(f64::is_finite)
+                || region.min_x_mm >= region.max_x_mm
+                || region.min_y_mm >= region.max_y_mm
+            {
+                return Err(format!("invalid or duplicate keepout {:?}", region.name));
+            }
+        }
+        let mut oriented = std::collections::HashSet::new();
+        for orientation in &self.orientations {
+            if orientation.refdes.trim().is_empty()
+                || !oriented.insert(orientation.refdes.as_str())
+                || !orientation.rotation_deg.is_finite()
+                || !orientation.tolerance_deg.is_finite()
+                || orientation.tolerance_deg < 0.0
+            {
+                return Err(format!(
+                    "invalid or duplicate orientation for {:?}",
+                    orientation.refdes
+                ));
+            }
+        }
+        for cluster in &self.clusters {
+            let unique = cluster
+                .members
+                .iter()
+                .collect::<std::collections::HashSet<_>>();
+            if cluster.name.trim().is_empty()
+                || !names.insert(("cluster", cluster.name.as_str()))
+                || cluster.members.len() < 2
+                || unique.len() != cluster.members.len()
+                || !cluster.max_span_mm.is_finite()
+                || cluster.max_span_mm <= 0.0
+            {
+                return Err(format!("invalid or duplicate cluster {:?}", cluster.name));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// How much a rule matters.
 ///
@@ -88,6 +206,9 @@ pub struct Context<'a> {
     /// These are independently checked after placement; merely excluding a
     /// part from movement is not evidence that it landed on its datum.
     pub fixed_positions: Option<&'a HashMap<String, (f64, f64)>>,
+    /// Product-authored relational placement intent. Empty by default; profiles
+    /// and CircuitPlan adapters may populate it without changing this engine.
+    pub intent: Option<&'a PlacementIntent>,
 }
 
 /// House inset from the board edge, in millimetres.
@@ -195,6 +316,36 @@ pub enum Rule {
         tolerance_mm: f64,
         tier: Tier,
     },
+    Keepout {
+        refdes: String,
+        region: String,
+        extent: (f64, f64),
+        origin_offset: (f64, f64),
+        bounds: (f64, f64, f64, f64),
+        tier: Tier,
+    },
+    Orientation {
+        refdes: String,
+        rotation_deg: f64,
+        tolerance_deg: f64,
+        side: Option<PlacementSide>,
+        extent: (f64, f64),
+        tier: Tier,
+    },
+    FacingEdge {
+        refdes: String,
+        edge: BoardEdge,
+        extent: (f64, f64),
+        origin_offset: (f64, f64),
+        bounds: (f64, f64, f64, f64),
+        tier: Tier,
+    },
+    Cluster {
+        name: String,
+        members: Vec<String>,
+        max_span_mm: f64,
+        tier: Tier,
+    },
 }
 
 impl Rule {
@@ -210,13 +361,25 @@ impl Rule {
             Rule::Proximity { .. }
             | Rule::Separation { .. }
             | Rule::Overlap { .. }
-            | Rule::FixedPosition { .. } => None,
+            | Rule::FixedPosition { .. }
+            | Rule::Orientation { .. }
+            | Rule::Cluster { .. } => None,
             Rule::EdgeClearance {
                 extent,
                 origin_offset,
                 ..
             }
             | Rule::EdgeContact {
+                extent,
+                origin_offset,
+                ..
+            }
+            | Rule::Keepout {
+                extent,
+                origin_offset,
+                ..
+            }
+            | Rule::FacingEdge {
                 extent,
                 origin_offset,
                 ..
@@ -249,7 +412,11 @@ impl Rule {
             | Rule::Separation { tier, .. }
             | Rule::Overlap { tier, .. }
             | Rule::EdgeClearance { tier, .. }
-            | Rule::EdgeContact { tier, .. } => *tier,
+            | Rule::EdgeContact { tier, .. }
+            | Rule::Keepout { tier, .. }
+            | Rule::Orientation { tier, .. }
+            | Rule::FacingEdge { tier, .. }
+            | Rule::Cluster { tier, .. } => *tier,
         }
     }
 }
@@ -361,6 +528,68 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
                     tier: Tier::Physical,
                 }),
         );
+    }
+
+    if let Some(intent) = ctx.intent {
+        for keepout in &intent.keepouts {
+            if let Some(facts) = facts {
+                for part in circuit.parts() {
+                    let reference = part.refdes.0.as_str();
+                    if keepout.exempt.iter().any(|item| item == reference) {
+                        continue;
+                    }
+                    let Some(fact) = facts.get(reference) else {
+                        continue;
+                    };
+                    rules.push(Rule::Keepout {
+                        refdes: reference.to_string(),
+                        region: keepout.name.clone(),
+                        extent: fact.extent,
+                        origin_offset: fact.origin_offset,
+                        bounds: (
+                            keepout.min_x_mm,
+                            keepout.min_y_mm,
+                            keepout.max_x_mm,
+                            keepout.max_y_mm,
+                        ),
+                        tier: Tier::Physical,
+                    });
+                }
+            }
+        }
+        for orientation in &intent.orientations {
+            let Some(fact) = facts.and_then(|facts| facts.get(&orientation.refdes)) else {
+                continue;
+            };
+            rules.push(Rule::Orientation {
+                refdes: orientation.refdes.clone(),
+                rotation_deg: orientation.rotation_deg,
+                tolerance_deg: orientation.tolerance_deg,
+                side: orientation.side,
+                extent: fact.extent,
+                tier: Tier::Physical,
+            });
+            if let (Some(edge), Some(bounds), Some(facts)) =
+                (orientation.facing_edge, ctx.outline, facts)
+            {
+                if let Some(fact) = facts.get(&orientation.refdes) {
+                    rules.push(Rule::FacingEdge {
+                        refdes: orientation.refdes.clone(),
+                        edge,
+                        extent: fact.extent,
+                        origin_offset: fact.origin_offset,
+                        bounds,
+                        tier: Tier::Physical,
+                    });
+                }
+            }
+        }
+        rules.extend(intent.clusters.iter().map(|cluster| Rule::Cluster {
+            name: cluster.name.clone(),
+            members: cluster.members.clone(),
+            max_span_mm: cluster.max_span_mm,
+            tier: Tier::Electrical,
+        }));
     }
 
     // Panel hardware must not collide with panel hardware. Judged on the *panel*
@@ -820,6 +1049,163 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                     }),
                 });
             }
+            Rule::Keepout {
+                refdes,
+                region,
+                bounds,
+                tier,
+                ..
+            } => {
+                let Some(p) = placements.get(refdes) else {
+                    continue;
+                };
+                let Some(part_box) = rule.measured_box(p) else {
+                    continue;
+                };
+                let gap = gap_between(part_box, *bounds);
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: refdes.clone(),
+                    detail: if gap < 0.0 {
+                        format!("{refdes} enters keepout {region} by {:.1}mm", -gap)
+                    } else {
+                        format!("{refdes} clears keepout {region} by {gap:.1}mm")
+                    },
+                    margin_mm: gap,
+                    repair: Some(Repair {
+                        refdes: refdes.clone(),
+                        toward_mm: escape_target(part_box, *bounds, p),
+                    }),
+                });
+            }
+            Rule::Orientation {
+                refdes,
+                rotation_deg,
+                tolerance_deg,
+                side,
+                extent,
+                tier,
+            } => {
+                let Some(p) = placements.get(refdes) else {
+                    continue;
+                };
+                let angle = angular_distance_deg(p.rotation_deg, *rotation_deg);
+                let radius = extent.0.hypot(extent.1) / 2.0;
+                let displacement = 2.0 * radius * (angle.to_radians() / 2.0).sin();
+                let allowed = 2.0 * radius * (tolerance_deg.to_radians() / 2.0).sin();
+                let side_ok =
+                    side.is_none_or(|expected| p.back == matches!(expected, PlacementSide::Back));
+                let margin = if side_ok {
+                    allowed - displacement
+                } else {
+                    -extent.0.max(extent.1)
+                };
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: refdes.clone(),
+                    detail: format!(
+                        "{refdes} rotation is {:.1}° (target {rotation_deg:.1}° ± {tolerance_deg:.1}°), side {}",
+                        p.rotation_deg,
+                        if side_ok { "matches" } else { "does not match" }
+                    ),
+                    margin_mm: margin,
+                    repair: None,
+                });
+            }
+            Rule::FacingEdge {
+                refdes,
+                edge,
+                bounds,
+                tier,
+                ..
+            } => {
+                let Some(p) = placements.get(refdes) else {
+                    continue;
+                };
+                let Some((bx0, by0, bx1, by1)) = rule.measured_box(p) else {
+                    continue;
+                };
+                let (x0, y0, x1, y1) = *bounds;
+                let gap = match edge {
+                    BoardEdge::Left => bx0 - x0,
+                    BoardEdge::Right => x1 - bx1,
+                    BoardEdge::Top => by0 - y0,
+                    BoardEdge::Bottom => y1 - by1,
+                };
+                let mut target = (p.x_mm, p.y_mm);
+                match edge {
+                    BoardEdge::Left => target.0 -= gap,
+                    BoardEdge::Right => target.0 += gap,
+                    BoardEdge::Top => target.1 -= gap,
+                    BoardEdge::Bottom => target.1 += gap,
+                }
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: refdes.clone(),
+                    detail: format!(
+                        "{refdes} is {:.3}mm from the required {edge:?} edge",
+                        gap.abs()
+                    ),
+                    margin_mm: TOLERANCE_MM - gap.abs(),
+                    repair: Some(Repair {
+                        refdes: refdes.clone(),
+                        toward_mm: target,
+                    }),
+                });
+            }
+            Rule::Cluster {
+                name,
+                members,
+                max_span_mm,
+                tier,
+            } => {
+                let points = members
+                    .iter()
+                    .filter_map(|member| placements.get(member).map(|p| (member, p)))
+                    .collect::<Vec<_>>();
+                if points.len() < 2 {
+                    continue;
+                }
+                let min_x = points
+                    .iter()
+                    .map(|(_, p)| p.x_mm)
+                    .fold(f64::INFINITY, f64::min);
+                let max_x = points
+                    .iter()
+                    .map(|(_, p)| p.x_mm)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let min_y = points
+                    .iter()
+                    .map(|(_, p)| p.y_mm)
+                    .fold(f64::INFINITY, f64::min);
+                let max_y = points
+                    .iter()
+                    .map(|(_, p)| p.y_mm)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let span = (max_x - min_x).hypot(max_y - min_y);
+                let centroid = (
+                    points.iter().map(|(_, p)| p.x_mm).sum::<f64>() / points.len() as f64,
+                    points.iter().map(|(_, p)| p.y_mm).sum::<f64>() / points.len() as f64,
+                );
+                let (subject, _) = points
+                    .iter()
+                    .max_by(|(_, a), (_, b)| {
+                        (a.x_mm - centroid.0)
+                            .hypot(a.y_mm - centroid.1)
+                            .total_cmp(&(b.x_mm - centroid.0).hypot(b.y_mm - centroid.1))
+                    })
+                    .expect("two cluster points");
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: (*subject).clone(),
+                    detail: format!("cluster {name} spans {span:.1}mm (max {max_span_mm:.1}mm)"),
+                    margin_mm: max_span_mm - span,
+                    repair: Some(Repair {
+                        refdes: (*subject).clone(),
+                        toward_mm: centroid,
+                    }),
+                });
+            }
         }
     }
     // Worst first: a report should lead with what actually stops the board.
@@ -829,6 +1215,11 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
             .then(x.margin_mm.total_cmp(&y.margin_mm))
     });
     out
+}
+
+fn angular_distance_deg(a: f64, b: f64) -> f64 {
+    let delta = (a - b).rem_euclid(360.0);
+    delta.min(360.0 - delta)
 }
 
 /// Evaluate `rules` against a placement, returning only what was broken.
@@ -1079,6 +1470,7 @@ mod tests {
                 facts: Some(&facts),
                 outline: Some((0.0, 0.0, 30.0, 20.0)),
                 fixed_positions: None,
+                intent: None,
             },
         );
         assert!(rules
@@ -1094,6 +1486,85 @@ mod tests {
         let repair = violation.repair.expect("nearest-edge repair");
         placement.insert("J1".into(), at(repair.toward_mm.0, repair.toward_mm.1));
         assert!(evaluate(&rules, &placement).is_empty());
+    }
+
+    #[test]
+    fn placement_intent_derives_keepout_orientation_facing_and_cluster_constraints() {
+        use crate::board::PartFacts;
+        use crate::model::Side;
+
+        let fact = PartFacts {
+            extent: (4.0, 4.0),
+            body_extent: (4.0, 4.0),
+            origin_offset: (0.0, 0.0),
+            side: Side::Front,
+            height_mm: 2.0,
+            standoff_mm: None,
+            tht_pads: Vec::new(),
+            pin_offsets: HashMap::new(),
+        };
+        let facts: HashMap<String, PartFacts> =
+            [("U1".into(), fact.clone()), ("C2".into(), fact)].into();
+        let intent = PlacementIntent {
+            keepouts: vec![KeepoutRegion {
+                name: "antenna".into(),
+                min_x_mm: 0.0,
+                min_y_mm: 0.0,
+                max_x_mm: 10.0,
+                max_y_mm: 10.0,
+                exempt: vec!["C2".into()],
+            }],
+            orientations: vec![OrientationIntent {
+                refdes: "U1".into(),
+                rotation_deg: 90.0,
+                tolerance_deg: 0.1,
+                side: Some(PlacementSide::Front),
+                facing_edge: Some(BoardEdge::Left),
+            }],
+            clusters: vec![ClusterIntent {
+                name: "converter".into(),
+                members: vec!["U1".into(), "C2".into()],
+                max_span_mm: 5.0,
+            }],
+        };
+        let rules = derive_in(
+            &circuit(),
+            &Context {
+                facts: Some(&facts),
+                outline: Some((0.0, 0.0, 40.0, 20.0)),
+                fixed_positions: None,
+                intent: Some(&intent),
+            },
+        );
+        assert!(rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::Keepout { .. })));
+        assert!(rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::Orientation { .. })));
+        assert!(rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::FacingEdge { .. })));
+        assert!(rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::Cluster { .. })));
+
+        let placements: HashMap<String, Placement> =
+            [("U1".into(), at(5.0, 5.0)), ("C2".into(), at(30.0, 5.0))].into();
+        let broken = evaluate(&rules, &placements);
+        for expected in [
+            "keepout antenna",
+            "rotation",
+            "required Left edge",
+            "cluster converter",
+        ] {
+            assert!(
+                broken
+                    .iter()
+                    .any(|violation| violation.what.contains(expected)),
+                "missing {expected:?} in {broken:?}"
+            );
+        }
     }
 
     #[test]
@@ -1184,6 +1655,7 @@ mod tests {
                 facts: Some(&facts),
                 outline: None,
                 fixed_positions: None,
+                intent: None,
             },
         );
         let Rule::Proximity { max_mm, .. } = &sized[0] else {
@@ -1366,6 +1838,7 @@ mod tests {
                     facts: Some(&facts),
                     outline: Some((origin.0, origin.1, origin.0 + w, origin.1 + h)),
                     fixed_positions: None,
+                    intent: None,
                 },
             );
             let broken: Vec<_> = evaluate(&rules, &placements)

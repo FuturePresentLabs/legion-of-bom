@@ -161,8 +161,8 @@ pub use environment::{
 pub use fab::{
     board_sides, ecss_q_st_70_12c_rev1_rigid_30v_design_rules, export_board_svg, export_cpl,
     export_gerbers, jlc_assembly_bom, jlc_bom_csv, jlc_cpl_from_kicad_pos, jlcpcb_design_rules,
-    png_to_jpeg, render_board_jpeg, render_board_png, strip_smd, zip_dir, BoardSides, MountCounts,
-    Populate, Quality,
+    placement_design_rules, png_to_jpeg, render_board_jpeg, render_board_png, strip_smd, zip_dir,
+    BoardSides, MountCounts, Populate, Quality,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use frame::{Keepout as BoardKeepout, StandoffHole, StandoffPattern};
@@ -240,8 +240,9 @@ pub use route::{
 };
 pub use rules::{
     assess as assess_constraints, derive as derive_rules, derive_in as derive_rules_in,
-    evaluate as evaluate_rules, penalty as rule_penalty, Constraint, ConstraintResult,
-    ConstraintStatus, Context as PcbConstraintContext, Rule, Tier, Violation,
+    evaluate as evaluate_rules, penalty as rule_penalty, BoardEdge, ClusterIntent, Constraint,
+    ConstraintResult, ConstraintStatus, Context as PcbConstraintContext, KeepoutRegion,
+    OrientationIntent, PlacementIntent, PlacementSide, Rule, Tier, Violation,
 };
 pub use scaffold::{ignore_block, is_generated, merge_gitignore, IgnoreRule};
 pub use schematic::schematic_to_svg;

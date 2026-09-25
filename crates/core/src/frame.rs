@@ -30,6 +30,9 @@ pub struct BoardFrame {
     /// moved to satisfy.
     #[serde(default)]
     pub corners: Vec<String>,
+    /// Relational placement requirements selected by the design/profile.
+    #[serde(default)]
+    pub placement: crate::rules::PlacementIntent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -77,6 +80,8 @@ pub struct Keepout {
 pub enum FrameError {
     #[error("frame pins {0}, which the circuit does not have")]
     UnknownPart(String),
+    #[error("invalid placement intent: {0}")]
+    InvalidPlacement(String),
     #[error("frame puts {0} parts in the corners; a board has 4")]
     TooManyCorners(usize),
     #[error("board outline must be positive, got {width_mm} × {height_mm} mm")]
@@ -104,12 +109,37 @@ impl BoardFrame {
     /// Every part the frame pins must be on the board, and at most four
     /// corners — checked before any layout work, so a stale frame fails loud.
     pub fn check(&self, facts: &HashMap<String, PartFacts>) -> Result<(), FrameError> {
+        self.placement
+            .validate()
+            .map_err(FrameError::InvalidPlacement)?;
         if self.corners.len() > 4 {
             return Err(FrameError::TooManyCorners(self.corners.len()));
         }
         for r in self.pinned.keys().chain(&self.corners) {
             if !facts.contains_key(r) {
                 return Err(FrameError::UnknownPart(r.clone()));
+            }
+        }
+        for reference in self
+            .placement
+            .orientations
+            .iter()
+            .map(|orientation| &orientation.refdes)
+            .chain(
+                self.placement
+                    .clusters
+                    .iter()
+                    .flat_map(|cluster| cluster.members.iter()),
+            )
+            .chain(
+                self.placement
+                    .keepouts
+                    .iter()
+                    .flat_map(|region| region.exempt.iter()),
+            )
+        {
+            if !facts.contains_key(reference) {
+                return Err(FrameError::UnknownPart(reference.clone()));
             }
         }
         Ok(())
@@ -230,6 +260,7 @@ mod tests {
             )]
             .into(),
             corners: vec!["H1".into(), "H2".into()],
+            placement: crate::rules::PlacementIntent::default(),
         };
         let back = BoardFrame::from_toml(&frame.to_toml().unwrap()).unwrap();
         assert_eq!(back, frame);

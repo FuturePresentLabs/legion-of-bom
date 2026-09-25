@@ -1605,6 +1605,8 @@ pub struct BoardOptions {
     /// board so the outline is the panel size, not the parts' bounding box. When
     /// `None`, the outline is the pad bounding box + [`outline_margin_mm`].
     pub fixed_outline: Option<(f64, f64, f64, f64)>,
+    /// Relational layout requirements selected by the CircuitPlan/profile.
+    pub placement_intent: crate::rules::PlacementIntent,
     /// Which components get their value ("47nF", "TL072") on silk next to the
     /// refdes (DESIGN 6.10). Defaults to [`SilkValues::HandSoldered`].
     pub silk_values: SilkValues,
@@ -1697,6 +1699,7 @@ impl BoardOptions {
             ground_net: Some("GND".into()),
             outline_margin_mm: 5.0,
             fixed_outline: None,
+            placement_intent: crate::rules::PlacementIntent::default(),
             silk_values: SilkValues::default(),
             title: None,
             legend: SilkLegend::default(),
@@ -1917,6 +1920,7 @@ pub fn framed_template(
         .map_err(|e| BoardError::Frame(e.to_string()))?;
     let template = SeededPlacer::new(w, h, (0.0, 0.0), anchors);
     options.fixed_outline = Some((0.0, 0.0, w, h));
+    options.placement_intent = frame.placement.clone();
     options.placer = Box::new(template.clone());
     Ok(template)
 }
@@ -1959,6 +1963,7 @@ fn fits_outline(
                 facts: Some(facts),
                 outline: Some((0.0, 0.0, w, h)),
                 fixed_positions: Some(&fixed_positions),
+                intent: None,
             },
         );
         // Legalize before judging, because the build does. Asking whether the
@@ -1974,6 +1979,41 @@ fn fits_outline(
         crate::legalize::legalize_pinning(&mut placements, &rules, facts, &pinned);
         let broken = crate::rules::by_tier(&crate::rules::evaluate(&rules, &placements));
         !overflowed && broken[0] <= 0.0
+    }
+}
+
+fn apply_orientation_intent(
+    placements: &mut HashMap<String, Placement>,
+    facts: &HashMap<String, PartFacts>,
+    outline: Option<(f64, f64, f64, f64)>,
+    intent: &crate::rules::PlacementIntent,
+) {
+    for required in &intent.orientations {
+        let (Some(placement), Some(fact)) = (
+            placements.get_mut(&required.refdes),
+            facts.get(&required.refdes),
+        ) else {
+            continue;
+        };
+        placement.rotation_deg = required.rotation_deg.rem_euclid(360.0);
+        if let Some(side) = required.side {
+            placement.back = side == crate::rules::PlacementSide::Back;
+        }
+        let (Some(edge), Some((x0, y0, x1, y1))) = (required.facing_edge, outline) else {
+            continue;
+        };
+        let (bx0, by0, bx1, by1) = fact.keepout_at_rot(
+            placement.x_mm,
+            placement.y_mm,
+            placement.back,
+            placement.rotation_deg,
+        );
+        match edge {
+            crate::rules::BoardEdge::Left => placement.x_mm -= bx0 - x0,
+            crate::rules::BoardEdge::Right => placement.x_mm += x1 - bx1,
+            crate::rules::BoardEdge::Top => placement.y_mm -= by0 - y0,
+            crate::rules::BoardEdge::Bottom => placement.y_mm += y1 - by1,
+        }
     }
 }
 
@@ -2006,6 +2046,10 @@ pub fn generate_board_artifacts(
     circuit: &dyn CircuitSource,
     options: &BoardOptions,
 ) -> Result<BoardArtifacts, BoardError> {
+    options
+        .placement_intent
+        .validate()
+        .map_err(|error| BoardError::Other(format!("placement intent: {error}")))?;
     // Net table: index 0 is the empty/no-net; the rest are the circuit's nets.
     let mut net_names: Vec<String> = circuit.nets().iter().map(|n| n.name.clone()).collect();
     net_names.sort();
@@ -2117,6 +2161,12 @@ pub fn generate_board_artifacts(
     // them off, or the board stops mating its own panel.
     let pinned = options.placer.anchored();
     let fixed_positions = options.placer.fixed_positions();
+    apply_orientation_intent(
+        &mut placements,
+        &facts,
+        options.fixed_outline,
+        &options.placement_intent,
+    );
 
     // Bypass caps go against the power pin they bypass, before anything else
     // gets a say. The placer's decoupling pull is one attractor among many and
@@ -2156,6 +2206,7 @@ pub fn generate_board_artifacts(
                 facts: Some(&facts),
                 outline: options.fixed_outline,
                 fixed_positions: Some(&fixed_positions),
+                intent: Some(&options.placement_intent),
             },
         );
         crate::legalize::legalize_pinning(&mut placements, &rules, &facts, &pinned);
