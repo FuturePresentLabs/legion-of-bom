@@ -105,9 +105,11 @@ pub struct ClusterIntent {
 impl PlacementIntent {
     pub fn validate(&self) -> Result<(), String> {
         let mut names = std::collections::HashSet::new();
+        let mut kicad_area_names = std::collections::HashSet::new();
         for region in &self.keepouts {
             if region.name.trim().is_empty()
                 || !names.insert(("keepout", region.name.as_str()))
+                || !kicad_area_names.insert(kicad_rule_area_name(&region.name))
                 || ![
                     region.min_x_mm,
                     region.min_y_mm,
@@ -153,6 +155,23 @@ impl PlacementIntent {
         }
         Ok(())
     }
+}
+
+/// Stable KiCad rule-area identifier derived from a product-facing keepout name.
+/// Validation rejects collisions after normalization, so the name is safe to use
+/// as the join key between the board and its adjacent `.kicad_dru` file.
+pub(crate) fn kicad_rule_area_name(name: &str) -> String {
+    let id = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("LOB_KEEP_OUT_{id}")
 }
 
 /// How much a rule matters.

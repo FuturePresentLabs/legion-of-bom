@@ -21,19 +21,19 @@ use legion_of_bom_core::{
     derive_panel_for, embed_source, eurorack_trial_build, export_board_glb, export_cpl,
     export_ee_source_with_ratings, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
     framed_template, generate_board_artifacts, generate_bom, generate_fuzz_chain, guide,
-    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
-    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
-    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
-    render_board_png, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg,
-    simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
-    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus,
-    AssuranceRequest, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource,
-    EnclosureSize, EurorackPlacer, FabReadiness, Finding, FuzzConstraints, GuideOptions, HpSearch,
-    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
-    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
-    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
-    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
-    TranDrive,
+    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules_with_placement,
+    kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key,
+    panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
+    photo_source, plan_repair, png_to_jpeg, render_board_png, render_spec_text, rules, run_drc,
+    run_layout_loop, schematic_to_svg, simulate_ac, simulate_tran, simulate_tran_drive,
+    suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key, zip_dir,
+    ArtifactKind, ArtifactStatus, AssuranceRequest, BoardOptions, BoardPng, BomLine, BuildCopy,
+    BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, FabReadiness, Finding,
+    FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo,
+    Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord, PartResolution,
+    PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality, Repair,
+    ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients,
+    StageOutcome, TranAnalysis, TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -2526,8 +2526,16 @@ fn fab_cmd(
     // the board's own directory, so writing it here is what makes the DRC gate
     // below judge against what JLCPCB can make rather than KiCad's defaults.
     let dru_path = pkg.join(format!("{stem}.kicad_dru"));
-    std::fs::write(&dru_path, jlcpcb_design_rules())
-        .with_context(|| format!("writing {}", dru_path.display()))?;
+    let placement_intent = frame
+        .as_ref()
+        .map(|frame| &frame.placement)
+        .cloned()
+        .unwrap_or_default();
+    std::fs::write(
+        &dru_path,
+        jlcpcb_design_rules_with_placement(&placement_intent),
+    )
+    .with_context(|| format!("writing {}", dru_path.display()))?;
 
     // Physical-rule gate, ahead of DRC because KiCad cannot do this one.
     //
@@ -2549,7 +2557,7 @@ fn fab_cmd(
                 facts: Some(&facts),
                 outline: guide::board_outline(&board),
                 fixed_positions: None,
-                intent: None,
+                intent: Some(&placement_intent),
             },
         );
         let placed = guide::placements_from_board(&board)

@@ -2382,6 +2382,9 @@ pub fn generate_board_artifacts(
     // layer — and a two-sided ground is quieter for an analog signal path.
     if let Some(rect) = outline {
         board.push(edge_cuts_rect(rect));
+        let mut keepouts = options.placement_intent.keepouts.iter().collect::<Vec<_>>();
+        keepouts.sort_by(|a, b| a.name.cmp(&b.name));
+        board.extend(keepouts.into_iter().map(placement_rule_area));
         if let Some(gnd) = &options.ground_net {
             if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
                 let idx = net_index[name.as_str()];
@@ -3518,6 +3521,51 @@ fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &s
                 xy(x2, y1),
                 xy(x2, y2),
                 xy(x1, y2),
+            ]),
+        ]),
+    ])
+}
+
+/// A named KiCad rule area. Its built-in keepout switches intentionally allow
+/// everything: the adjacent `.kicad_dru` owns footprint exclusion so a region
+/// can exempt the connector or sensor that mechanically belongs inside it.
+///
+/// @implements url:https://dev-docs.kicad.org/en/file-formats/sexpr-pcb/ Zone Keep Out Settings -- KiCad board-file rule-area encoding
+fn placement_rule_area(region: &crate::rules::KeepoutRegion) -> Sexpr {
+    let xy =
+        |x: f64, y: f64| Sexpr::list(vec![Sexpr::sym("xy"), Sexpr::sym(mm(x)), Sexpr::sym(mm(y))]);
+    let name = crate::rules::kicad_rule_area_name(&region.name);
+    Sexpr::list(vec![
+        Sexpr::sym("zone"),
+        kv("net", Sexpr::sym("0")),
+        kv("net_name", Sexpr::string("")),
+        Sexpr::list(vec![Sexpr::sym("layers"), Sexpr::string("F&B.Cu")]),
+        kv("name", Sexpr::string(&name)),
+        kv(
+            "uuid",
+            Sexpr::string(det_uuid(&format!("rule.area.{name}"))),
+        ),
+        Sexpr::list(vec![
+            Sexpr::sym("hatch"),
+            Sexpr::sym("edge"),
+            Sexpr::sym("0.5"),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("keepout"),
+            kv("tracks", Sexpr::sym("allowed")),
+            kv("vias", Sexpr::sym("allowed")),
+            kv("pads", Sexpr::sym("allowed")),
+            kv("copperpour", Sexpr::sym("allowed")),
+            kv("footprints", Sexpr::sym("allowed")),
+        ]),
+        Sexpr::list(vec![
+            Sexpr::sym("polygon"),
+            Sexpr::list(vec![
+                Sexpr::sym("pts"),
+                xy(region.min_x_mm, region.min_y_mm),
+                xy(region.max_x_mm, region.min_y_mm),
+                xy(region.max_x_mm, region.max_y_mm),
+                xy(region.min_x_mm, region.max_y_mm),
             ]),
         ]),
     ])
@@ -5396,6 +5444,35 @@ mod tests {
             !art.pcb.contains("\"U1\""),
             "U1 has no footprint -- nothing should be emitted for it in the board file"
         );
+    }
+
+    #[test]
+    fn placement_keepout_is_emitted_as_named_kicad_rule_area() {
+        let circuit = Circuit {
+            name: "keepout".into(),
+            parts: vec![],
+            nets: vec![],
+        };
+        let mut options = BoardOptions::new(std::env::temp_dir());
+        options.fixed_outline = Some((0.0, 0.0, 30.0, 20.0));
+        options
+            .placement_intent
+            .keepouts
+            .push(crate::rules::KeepoutRegion {
+                name: "antenna lane".into(),
+                min_x_mm: 20.0,
+                min_y_mm: 2.0,
+                max_x_mm: 29.0,
+                max_y_mm: 18.0,
+                exempt: vec!["AE1".into()],
+            });
+
+        let board = generate_board(&circuit, &options).unwrap();
+        assert!(board.contains("(name \"LOB_KEEP_OUT_antenna_lane\")"));
+        assert!(board.contains("(layers \"F&B.Cu\")"));
+        assert!(board.contains("(footprints allowed)"));
+        assert!(board.contains("(xy 20 2)"));
+        assert!(board.contains("(xy 29 18)"));
     }
 
     #[test]
