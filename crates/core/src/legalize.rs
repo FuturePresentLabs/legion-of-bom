@@ -23,12 +23,6 @@ use std::collections::HashMap;
 use crate::board::{PartFacts, Placement};
 use crate::rules::{Rule, Tier};
 
-/// How many passes to make. Moving one part can push another out, so a couple of
-/// sweeps settle more than one; but this is a repair, not a solver, and a part
-/// that cannot be legalized in a few passes needs a bigger board, not more
-/// iterations.
-const MAX_PASSES: usize = 4;
-
 /// Step size (mm) for the outward search when a part's legal position is
 /// already occupied.
 const SEARCH_STEP_MM: f64 = 0.5;
@@ -76,13 +70,41 @@ pub fn legalize_pinning(
     facts: &HashMap<String, PartFacts>,
     pinned: &std::collections::HashSet<String>,
 ) -> Report {
+    legalize_tier(placements, rules, facts, pinned, Tier::Physical)
+}
+
+/// Restore declared functional clusters after exact electrical snap passes.
+/// Those snaps remain authoritative about which pin a bypass part belongs near;
+/// this pass only chooses the nearest collision-free realization that also
+/// satisfies the product-authored cluster span.
+pub fn legalize_clusters(
+    placements: &mut HashMap<String, Placement>,
+    rules: &[Rule],
+    facts: &HashMap<String, PartFacts>,
+    pinned: &std::collections::HashSet<String>,
+) -> Report {
+    legalize_tier(placements, rules, facts, pinned, Tier::Electrical)
+}
+
+fn legalize_tier(
+    placements: &mut HashMap<String, Placement>,
+    rules: &[Rule],
+    facts: &HashMap<String, PartFacts>,
+    pinned: &std::collections::HashSet<String>,
+    tier: Tier,
+) -> Report {
     let mut report = Report::default();
     let mut travelled: HashMap<String, f64> = HashMap::new();
 
-    for _ in 0..MAX_PASSES {
+    // One full sweep per movable part is enough to propagate a repair through
+    // the longest possible dependency chain. This used to be a fixed four,
+    // which stopped midway on real boards as soon as a cluster repair exposed a
+    // fifth interaction. Derive the budget from the problem instead.
+    let max_passes = placements.len().saturating_sub(pinned.len()).max(1);
+    for _ in 0..max_passes {
         let broken: Vec<(String, (f64, f64))> = crate::rules::assess(rules, placements)
             .into_iter()
-            .filter(|a| a.tier == Tier::Physical && !a.ok())
+            .filter(|a| a.tier == tier && !a.ok())
             .filter_map(|a| a.repair.map(|r| (r.refdes, r.toward_mm)))
             .filter_map(|repair| {
                 if !pinned.contains(&repair.0) {
@@ -100,7 +122,7 @@ pub fn legalize_pinning(
             let Some(current) = placements.get(&refdes).copied() else {
                 continue;
             };
-            let Some(spot) = nearest_free(&refdes, target, current, placements, facts, rules)
+            let Some(spot) = nearest_free(&refdes, target, current, placements, facts, rules, tier)
             else {
                 continue;
             };
@@ -128,7 +150,7 @@ pub fn legalize_pinning(
     report.moved.sort_by(|a, b| b.1.total_cmp(&a.1));
     report.stuck = crate::rules::assess(rules, placements)
         .into_iter()
-        .filter(|a| a.tier == Tier::Physical && !a.ok())
+        .filter(|a| a.tier == tier && !a.ok())
         .map(|a| a.subject)
         .collect();
     report.stuck.sort();
@@ -180,6 +202,7 @@ fn nearest_free(
     placements: &HashMap<String, Placement>,
     facts: &HashMap<String, PartFacts>,
     rules: &[Rule],
+    tier: Tier,
 ) -> Option<(f64, f64)> {
     // A part with no measured facts used to short-circuit to `Some(target)` —
     // moved with NO collision check at all. We cannot check its own body without
@@ -244,7 +267,11 @@ fn nearest_free(
         );
         !crate::rules::assess(rules, &trial)
             .into_iter()
-            .any(|a| a.tier == Tier::Physical && a.subject == refdes && !a.ok())
+            .any(|a| {
+                a.tier == tier
+                    && (tier == Tier::Electrical || a.subject == refdes)
+                    && !a.ok()
+            })
     };
     let accepts = |x: f64, y: f64| satisfies_rules(x, y) && !clashes(x, y);
     if accepts(target.0, target.1) {
@@ -450,6 +477,39 @@ mod tests {
         assert_ne!(placements["J1"], at(41.0, 3.0));
         assert_eq!(placements["J1"].x_mm, 41.0);
         assert!(report.moved.iter().any(|(refdes, _)| refdes == "J1"));
+    }
+
+    #[test]
+    fn cluster_legalization_restores_span_after_a_late_snap() {
+        let facts: HashMap<String, PartFacts> = [
+            ("U2".into(), fact(2.0, 2.0)),
+            ("Y1".into(), fact(2.0, 2.0)),
+            ("C1".into(), fact(1.0, 1.0)),
+        ]
+        .into();
+        let mut placements: HashMap<String, Placement> = [
+            ("U2".into(), at(5.0, 5.0)),
+            ("Y1".into(), at(7.0, 5.0)),
+            // Represents an exact snap performed after global placement.
+            ("C1".into(), at(25.0, 5.0)),
+        ]
+        .into();
+        let rules = vec![Rule::Cluster {
+            name: "clock".into(),
+            members: vec!["U2".into(), "Y1".into(), "C1".into()],
+            max_span_mm: 6.0,
+            tier: Tier::Electrical,
+        }];
+
+        let report = legalize_clusters(
+            &mut placements,
+            &rules,
+            &facts,
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(report.is_clean(), "{report:?}");
+        assert!(placements["C1"].x_mm <= 11.0);
     }
 
     #[test]

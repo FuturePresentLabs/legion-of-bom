@@ -188,6 +188,19 @@ pub trait Placer {
         facts: &HashMap<String, PartFacts>,
     ) -> HashMap<String, Placement>;
 
+    /// Place with product-authored relational intent. Placers that do not
+    /// optimize globally retain their established behavior; the shipping
+    /// [`SeededPlacer`] consumes this to avoid keepouts and pack clusters before
+    /// routing rather than asking legalization to rescue a poor starting point.
+    fn place_with_intent(
+        &self,
+        circuit: &dyn CircuitSource,
+        facts: &HashMap<String, PartFacts>,
+        _intent: &crate::rules::PlacementIntent,
+    ) -> HashMap<String, Placement> {
+        self.place(circuit, facts)
+    }
+
     /// Parts pinned to a panel cutout, which downstream passes must not move.
     ///
     /// A jack's position is not this placer's opinion — it is where the hole is.
@@ -870,6 +883,15 @@ impl Placer for SeededPlacer {
         circuit: &dyn CircuitSource,
         facts: &HashMap<String, PartFacts>,
     ) -> HashMap<String, Placement> {
+        self.place_with_intent(circuit, facts, &crate::rules::PlacementIntent::default())
+    }
+
+    fn place_with_intent(
+        &self,
+        circuit: &dyn CircuitSource,
+        facts: &HashMap<String, PartFacts>,
+        intent: &crate::rules::PlacementIntent,
+    ) -> HashMap<String, Placement> {
         // A part's facts (keep-out size + origin offset), defaulting to a small
         // centred box for a part with no footprint measured.
         let facts_of = |refdes: &str| {
@@ -1164,6 +1186,27 @@ impl Placer for SeededPlacer {
             adj.entry(ic).or_default().push((cap, w));
         }
 
+        // Functional clusters participate in the global solve, not merely the
+        // after-the-fact score. A tighter requested span produces a stronger
+        // attraction relative to the board diagonal; no profile-specific magic
+        // number is needed. The hard span check below still owns feasibility.
+        let board_diagonal = self.width_mm.hypot(self.height_mm);
+        let mut clusters_by_member: HashMap<String, Vec<&crate::rules::ClusterIntent>> =
+            HashMap::new();
+        for cluster in &intent.clusters {
+            let weight = (board_diagonal / cluster.max_span_mm).max(1.0);
+            for (index, a) in cluster.members.iter().enumerate() {
+                clusters_by_member
+                    .entry(a.clone())
+                    .or_default()
+                    .push(cluster);
+                for b in &cluster.members[index + 1..] {
+                    adj.entry(a.clone()).or_default().push((b.clone(), weight));
+                    adj.entry(b.clone()).or_default().push((a.clone(), weight));
+                }
+            }
+        }
+
         // The seed every attempt starts from: anchors + power header, which are
         // not this placer's opinion and never move between attempts.
         let (seed_out, seed_boxes, seed_pos, seed_placed) = (out, boxes, pos, placed);
@@ -1302,15 +1345,50 @@ impl Placer for SeededPlacer {
                             cx + ext.0 / 2.0,
                             cy + ext.1 / 2.0,
                         );
-                        placement_clear(
-                            &body,
-                            back,
-                            f.height_mm,
-                            f.standoff_mm,
-                            &f.tht_pads_at(cx - ox, cy - oy, back, rot),
-                            &boxes,
-                            clearance,
-                        )
+                        let enters_keepout = intent.keepouts.iter().any(|region| {
+                            !region.exempt.iter().any(|exempt| exempt == &r)
+                                && body.0 < region.max_x_mm
+                                && region.min_x_mm < body.2
+                                && body.1 < region.max_y_mm
+                                && region.min_y_mm < body.3
+                        });
+                        if enters_keepout {
+                            return false;
+                        }
+                        let origin = (self.origin_mm.0 + cx - ox, self.origin_mm.1 + cy - oy);
+                        let exceeds_cluster = clusters_by_member.get(&r).is_some_and(|clusters| {
+                            clusters.iter().any(|cluster| {
+                                let points = cluster
+                                    .members
+                                    .iter()
+                                    .filter_map(|member| out.get(member))
+                                    .map(|placement| (placement.x_mm, placement.y_mm))
+                                    .chain(std::iter::once(origin))
+                                    .collect::<Vec<_>>();
+                                if points.len() < 2 {
+                                    return false;
+                                }
+                                let min_x =
+                                    points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                                let max_x =
+                                    points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+                                let min_y =
+                                    points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                                let max_y =
+                                    points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+                                (max_x - min_x).hypot(max_y - min_y) > cluster.max_span_mm
+                            })
+                        });
+                        !exceeds_cluster
+                            && placement_clear(
+                                &body,
+                                back,
+                                f.height_mm,
+                                f.standoff_mm,
+                                &f.tht_pads_at(cx - ox, cy - oy, back, rot),
+                                &boxes,
+                                clearance,
+                            )
                     };
                     nearest_clear_spot(target, ext, bounds, step, clear)
                 };
@@ -2156,7 +2234,10 @@ pub fn generate_board_artifacts(
         loaded.push((refdes, lib_part, part.value.as_str(), fp, pads));
     }
 
-    let mut placements = options.placer.place(circuit, &facts);
+    let mut placements =
+        options
+            .placer
+            .place_with_intent(circuit, &facts, &options.placement_intent);
     // Panel controls are pinned to their cutouts; nothing downstream may slide
     // them off, or the board stops mating its own panel.
     let pinned = options.placer.anchored();
@@ -2174,6 +2255,25 @@ pub fn generate_board_artifacts(
     // copper from the pin that matters — see `crate::decouple`. There is no
     // competing claim on that exact spot, so this is set, not scored.
     crate::decouple::snap(&mut placements, circuit, &facts);
+
+    // Exact electrical snaps can displace a member after global placement has
+    // packed its functional cluster. Reconcile only the declared cluster rules
+    // here, collision-aware, before physical legalization and routing.
+    if !options.placement_intent.clusters.is_empty() {
+        let cluster_rules = crate::rules::derive_in(
+            circuit,
+            &crate::rules::Context {
+                facts: Some(&facts),
+                outline: options.fixed_outline,
+                fixed_positions: Some(&fixed_positions),
+                intent: Some(&options.placement_intent),
+            },
+        )
+        .into_iter()
+        .filter(|rule| matches!(rule, crate::rules::Rule::Cluster { .. }))
+        .collect::<Vec<_>>();
+        crate::legalize::legalize_clusters(&mut placements, &cluster_rules, &facts, &pinned);
+    }
 
     // summing::snap is DELIBERATELY NOT CALLED — see legion-of-bom-6yh.
     //
@@ -4969,6 +5069,62 @@ mod tests {
             !rects_overlap(&ko("A1"), &ko("U1"), 0.0),
             "tall U1 stays clear of the sub-board"
         );
+    }
+
+    #[test]
+    fn seeded_placement_avoids_declared_keepouts() {
+        let circuit = Circuit {
+            name: "keepout-aware".into(),
+            parts: vec![Part::new("U1", "sensor")],
+            nets: vec![],
+        };
+        let facts = [("U1".into(), placement_fact((4.0, 4.0), Side::Front))].into();
+        let intent = crate::rules::PlacementIntent {
+            keepouts: vec![crate::rules::KeepoutRegion {
+                name: "centre".into(),
+                min_x_mm: 5.0,
+                min_y_mm: 5.0,
+                max_x_mm: 15.0,
+                max_y_mm: 15.0,
+                exempt: vec![],
+            }],
+            ..Default::default()
+        };
+        let placement = SeededPlacer::new(20.0, 20.0, (0.0, 0.0), HashMap::new())
+            .place_with_intent(&circuit, &facts, &intent);
+        let body = facts["U1"].keepout_at(
+            placement["U1"].x_mm,
+            placement["U1"].y_mm,
+            placement["U1"].back,
+        );
+        assert!(!rects_overlap(&body, &(5.0, 5.0, 15.0, 15.0), 0.0));
+    }
+
+    #[test]
+    fn seeded_placement_packs_declared_cluster_within_span() {
+        let circuit = Circuit {
+            name: "cluster-aware".into(),
+            parts: vec![Part::new("U1", "radio"), Part::new("Y1", "crystal")],
+            nets: vec![],
+        };
+        let facts = [
+            ("U1".into(), placement_fact((3.0, 3.0), Side::Front)),
+            ("Y1".into(), placement_fact((2.0, 2.0), Side::Front)),
+        ]
+        .into();
+        let intent = crate::rules::PlacementIntent {
+            clusters: vec![crate::rules::ClusterIntent {
+                name: "clock".into(),
+                members: vec!["U1".into(), "Y1".into()],
+                max_span_mm: 6.0,
+            }],
+            ..Default::default()
+        };
+        let placement = SeededPlacer::new(30.0, 30.0, (0.0, 0.0), HashMap::new())
+            .place_with_intent(&circuit, &facts, &intent);
+        let span = (placement["U1"].x_mm - placement["Y1"].x_mm)
+            .hypot(placement["U1"].y_mm - placement["Y1"].y_mm);
+        assert!(span <= 6.0, "cluster span was {span}mm: {placement:?}");
     }
 
     #[test]
