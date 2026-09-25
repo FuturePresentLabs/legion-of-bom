@@ -12,7 +12,7 @@ authors = ["Future Present Labs"]
 [workspace.dependencies]
 legion-of-bom-core = { path = "crates/core" }
 legion-of-bom-web = { path = "crates/web" }
-black_book = { git = "ssh://git@github.com/FuturePresentLabs/black_book.git", rev = "117a3b3f3d82d702abf9f3895aa7050fe12e0039" }
+black_book = { git = "ssh://git@github.com/FuturePresentLabs/black_book.git", rev = "fe88febaf431dbfc37535761aa02aea05c7832d5" }
 # Shared typed-decision client (Jev/Laya-compatible "System One" APIs) —
 # lives in its own repo since it's consumed across the FPL ecosystem, not
 # just here. Path dependency for now: not yet published or pushed.

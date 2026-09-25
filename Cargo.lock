@@ -173,7 +173,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 [[package]]
 name = "black_book"
 version = "0.1.0"
-source = "git+ssh://git@github.com/FuturePresentLabs/black_book.git?rev=117a3b3f3d82d702abf9f3895aa7050fe12e0039#117a3b3f3d82d702abf9f3895aa7050fe12e0039"
+source = "git+ssh://git@github.com/FuturePresentLabs/black_book.git?rev=fe88febaf431dbfc37535761aa02aea05c7832d5#fe88febaf431dbfc37535761aa02aea05c7832d5"
 dependencies = [
  "serde",
  "thiserror",

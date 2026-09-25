@@ -53,6 +53,8 @@ const SHEET_BG: &str = "#fbfbf7";
 /// Sheet geometry (px). The diagram is emitted at these units and scaled by the
 /// viewer's `viewBox`.
 mod sheet {
+    /// SVG units per physical millimetre in the shared drawing furniture.
+    pub const UNITS_PER_MM: f64 = 2.0;
     /// Fixed clearance between one column's real content and the next
     /// column's — the wire-trunk + net-label channel. Kept as a flat
     /// constant deliberately: it is the "small fixed clearance" term next to
@@ -100,9 +102,10 @@ mod sheet {
     /// How far a power/ground stub runs out from its pin before its glyph.
     pub const RAIL_STUB: f64 = 13.0;
     /// Sheet frame inset, and the title block that sits in its bottom-right corner.
-    pub const FRAME: f64 = 12.0;
-    pub const TITLE_W: f64 = 420.0;
-    pub const TITLE_H: f64 = 88.0;
+    pub const FILING_MARGIN: f64 = black_book::technical_drawing::FILING_MARGIN_MM * UNITS_PER_MM;
+    pub const EDGE_MARGIN: f64 = black_book::technical_drawing::EDGE_MARGIN_MM * UNITS_PER_MM;
+    pub const TITLE_W: f64 = black_book::technical_drawing::TITLE_BLOCK_WIDTH_MM * UNITS_PER_MM;
+    pub const TITLE_H: f64 = black_book::technical_drawing::TITLE_BLOCK_HEIGHT_MM * UNITS_PER_MM;
 }
 
 /// A part awaiting placement: refdes, value, its resolved symbol, the pins the
@@ -682,15 +685,18 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
         .map(|p| p.x() + p.content_size().0)
         .fold(0.0_f64, f64::max);
     let w = (content_right + sheet::COL_CHANNEL + sheet::GUTTER + sheet::MARGIN)
-        .max(sheet::TITLE_W + 2.0 * sheet::FRAME + 40.0);
+        .max(sheet::TITLE_W + sheet::FILING_MARGIN + sheet::EDGE_MARGIN + 40.0);
     let content_bottom = placed
         .iter()
         .map(|p| p.y() + p.content_size().1)
         .fold(0.0_f64, f64::max);
     // Room under the drawing for the ground stub + caption, the frame and the
     // title block.
-    let h =
-        content_bottom + sheet::ROW_BOTTOM_BUDGET + sheet::MARGIN + sheet::TITLE_H + sheet::FRAME;
+    let h = content_bottom
+        + sheet::ROW_BOTTOM_BUDGET
+        + sheet::MARGIN
+        + sheet::TITLE_H
+        + sheet::EDGE_MARGIN;
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -997,10 +1003,9 @@ pub fn schematic_to_svg(circuit: &dyn CircuitSource) -> String {
 
 /// The sheet frame plus a compact engineering title/provenance table.
 ///
-/// Its field structure follows the same ISO 7200-inspired pattern as Transmog's
-/// manufacturing drawings, while deliberately carrying only what this model
-/// actually knows.  Missing authorship, approval, revision, and release state are
-/// not invented: generated schematics remain explicitly marked for verification.
+/// Its field structure and sheet geometry share Transmog's black-book drawing
+/// contract. Missing authorship, approval, revision, and release state are not
+/// invented: generated schematics remain explicitly marked for verification.
 ///
 /// @derives-from url:https://www.iso.org/standard/35446.html ISO 7200:2004 — title-block field organization; no claim of whole-standard conformity
 fn frame_and_title_svg(
@@ -1010,80 +1015,130 @@ fn frame_and_title_svg(
     placed: &[Placed],
     ink: &str,
 ) -> String {
-    let f = sheet::FRAME;
+    let frame = black_book::technical_drawing::SheetFrame::from_sheet(w, h, sheet::UNITS_PER_MM)
+        .expect("generated schematic sheet must contain an ISO 5457 drawing frame");
+    let lines = black_book::technical_drawing::LineHierarchy::TRANSMOG.scaled(sheet::UNITS_PER_MM);
     let mut s = format!(
-        "<rect x=\"{f:.1}\" y=\"{f:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"none\" \
-         stroke=\"{ink}\" stroke-width=\"1.4\"/>",
-        w - 2.0 * f,
-        h - 2.0 * f
+        "<rect class=\"drawing-frame\" x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" \
+         height=\"{:.1}\" fill=\"none\" stroke=\"{ink}\" stroke-width=\"{:.1}\"/>",
+        frame.x, frame.y, frame.width, frame.height, lines.frame_mm
     );
-    let (tx, ty) = (w - f - sheet::TITLE_W, h - f - sheet::TITLE_H);
+    let (tx, ty) = frame
+        .bottom_right(sheet::TITLE_W, sheet::TITLE_H)
+        .expect("generated schematic frame must contain its title block");
     s.push_str(&format!(
         "<rect x=\"{tx:.1}\" y=\"{ty:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
-         fill=\"{SHEET_BG}\" stroke=\"{ink}\" stroke-width=\"1.4\"/>",
+         fill=\"{SHEET_BG}\" stroke=\"{ink}\" stroke-width=\"{:.1}\"/>",
         sheet::TITLE_W,
-        sheet::TITLE_H
+        sheet::TITLE_H,
+        lines.frame_mm
     ));
     let symbols = placed.iter().filter(|p| p.sym.is_some()).count();
     let fields = [
         (
+            "LEGAL OWNER",
+            "NOT PROVIDED".into(),
+            0.0,
+            0.0,
+            120.0,
+            20.0,
+            7,
+        ),
+        (
+            "IDENTIFICATION NUMBER",
+            xml_escape(circuit.name()),
+            120.0,
+            0.0,
+            104.0,
+            20.0,
+            7,
+        ),
+        (
+            "REVISION INDEX",
+            "NOT PROVIDED".into(),
+            224.0,
+            0.0,
+            56.0,
+            20.0,
+            6,
+        ),
+        (
+            "DATE OF ISSUE",
+            "GENERATED".into(),
+            280.0,
+            0.0,
+            80.0,
+            20.0,
+            7,
+        ),
+        (
             "TITLE",
             xml_escape(circuit.name()),
             0.0,
-            0.0,
-            250.0,
-            34.0,
-            15,
+            20.0,
+            236.0,
+            36.0,
+            10,
         ),
         (
             "DOCUMENT TYPE",
             "SCHEMATIC".into(),
-            250.0,
-            0.0,
-            100.0,
-            34.0,
-            11,
+            236.0,
+            20.0,
+            64.0,
+            36.0,
+            7,
         ),
-        ("SHEET", "1 / 1".into(), 350.0, 0.0, 70.0, 34.0, 11),
+        (
+            "SEGMENT/SHEET NUMBER",
+            "1".into(),
+            300.0,
+            20.0,
+            60.0,
+            36.0,
+            7,
+        ),
+        (
+            "APPROVAL PERSON",
+            "NOT APPROVED".into(),
+            0.0,
+            56.0,
+            90.0,
+            27.0,
+            7,
+        ),
+        ("CREATOR", "LEGION-OF-BOM".into(), 90.0, 56.0, 90.0, 27.0, 7),
+        ("NUMBER OF SHEETS", "1".into(), 180.0, 56.0, 60.0, 27.0, 7),
+        (
+            "DOCUMENT STATUS",
+            "VERIFY BEFORE RELEASE".into(),
+            240.0,
+            56.0,
+            120.0,
+            27.0,
+            6,
+        ),
         (
             "SOURCE",
             "PARSED CIRCUIT MODEL".into(),
             0.0,
-            34.0,
-            160.0,
+            83.0,
+            180.0,
             27.0,
-            10,
+            7,
         ),
         (
-            "GENERATED BY",
-            "LEGION-OF-BOM".into(),
-            160.0,
-            34.0,
-            130.0,
-            27.0,
-            10,
-        ),
-        (
-            "STATUS",
-            "VERIFY BEFORE RELEASE".into(),
-            290.0,
-            34.0,
-            130.0,
-            27.0,
-            9,
-        ),
-        (
-            "CONTENTS",
+            "CONTENTS / TECHNICAL REFERENCE",
             format!(
                 "{} PARTS / {} NETS / {symbols} KICAD SYMBOLS",
                 placed.len(),
                 circuit.nets().len()
             ),
-            0.0,
-            61.0,
-            420.0,
+            180.0,
+            83.0,
+            180.0,
             27.0,
-            10,
+            6,
         ),
     ];
     for (label, value, dx, dy, cw, ch, value_size) in fields {
@@ -1091,16 +1146,17 @@ fn frame_and_title_svg(
         let cy = ty + dy;
         s.push_str(&format!(
             "<rect class=\"title-block-cell\" x=\"{cx:.1}\" y=\"{cy:.1}\" width=\"{cw:.1}\" \
-             height=\"{ch:.1}\" fill=\"{SHEET_BG}\" stroke=\"{ink}\" stroke-width=\"0.8\"/>\
+             height=\"{ch:.1}\" fill=\"{SHEET_BG}\" stroke=\"{ink}\" stroke-width=\"{:.1}\"/>\
              <text class=\"title-block-label\" x=\"{:.1}\" y=\"{:.1}\" \
-             font-family=\"ui-monospace,monospace\" font-size=\"8\" fill=\"#6b7280\">{label}</text>\
+             font-family=\"ui-monospace,monospace\" font-size=\"5\" fill=\"#6b7280\">{label}</text>\
              <text class=\"title-block-value\" x=\"{:.1}\" y=\"{:.1}\" \
              font-family=\"ui-monospace,monospace\" font-size=\"{value_size}\" \
              font-weight=\"600\" fill=\"{ink}\">{value}</text>",
-            cx + 7.0,
-            cy + 10.0,
-            cx + 7.0,
-            cy + ch - 7.0,
+            lines.narrow_mm,
+            cx + 4.0,
+            cy + 6.0,
+            cx + 4.0,
+            cy + ch - 4.0,
         ));
     }
     s
@@ -1610,6 +1666,14 @@ mod tests {
         assert!(svg.contains("class=\"title-block-cell\""));
         assert!(svg.contains(">PARSED CIRCUIT MODEL<"));
         assert!(svg.contains(">VERIFY BEFORE RELEASE<"));
+        assert!(svg.contains(">NOT APPROVED<"));
+        assert!(svg.contains(">NOT PROVIDED<"));
+        assert_eq!(svg.matches("class=\"title-block-cell\"").count(), 13);
+        // The frame and title-block envelope come from black_book's shared
+        // Transmog drawing contract, scaled into this SVG's coordinate space.
+        assert!(svg.contains("class=\"drawing-frame\" x=\"40.0\" y=\"20.0\""));
+        assert!(svg.contains("stroke-width=\"1.4\""));
+        assert!(svg.contains("width=\"360.0\" height=\"110.0\""));
     }
 
     #[test]
