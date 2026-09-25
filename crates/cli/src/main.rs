@@ -25,15 +25,15 @@ use legion_of_bom_core::{
     kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key,
     panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file, part_kind_of,
     photo_source, plan_repair, png_to_jpeg, render_board_png, render_spec_text, rules, run_drc,
-    run_layout_loop, schematic_to_svg, simulate_ac, simulate_tran, simulate_tran_drive,
-    suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc, value_key, zip_dir,
-    ArtifactKind, ArtifactStatus, AssuranceRequest, BoardOptions, BoardPng, BomLine, BuildCopy,
-    BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, FabReadiness, Finding,
-    FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo,
-    Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord, PartResolution,
-    PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality, Repair,
-    ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients,
-    StageOutcome, TranAnalysis, TranDrive,
+    run_layout_loop, run_layout_loop_with_deciders, schematic_to_svg, simulate_ac, simulate_tran,
+    simulate_tran_drive, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc,
+    value_key, zip_dir, ArtifactKind, ArtifactStatus, AssuranceRequest, BoardOptions, BoardPng,
+    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, FabReadiness,
+    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
+    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
+    PartResolution, PartsLibrary, PipelineReport, PlacementDecider, PlacementFile, Populate,
+    ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig,
+    SkidlRunner, SourcingClients, StageOutcome, TranAnalysis, TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -179,6 +179,14 @@ enum Command {
         /// Iterative layout attempts over a panel board (0 = one-shot placement).
         #[arg(long, default_value_t = 6)]
         iterations: usize,
+        /// OODA bounded-numeric placement model slug (for example a GPC-1
+        /// deployment). Distinct from the optional chat-model fallback.
+        #[arg(long)]
+        rlcd_model: Option<String>,
+        /// OpenAI-compatible chat model used only if bounded numeric placement
+        /// is unavailable or fails validation.
+        #[arg(long)]
+        llm_model: Option<String>,
         /// Brand logo SVG to render on the back silk (bottom-centre).
         #[arg(long)]
         logo: Option<PathBuf>,
@@ -269,6 +277,12 @@ enum Command {
         /// Iterative layout attempts over a panel board (0 = one-shot placement).
         #[arg(long, default_value_t = 6)]
         iterations: usize,
+        /// OODA bounded-numeric placement model slug.
+        #[arg(long)]
+        rlcd_model: Option<String>,
+        /// OpenAI-compatible chat model used only as placement fallback.
+        #[arg(long)]
+        llm_model: Option<String>,
         /// Run full KiCad DRC on every layout attempt (slow; default is a single
         /// final-gate DRC).
         #[arg(long)]
@@ -715,6 +729,8 @@ fn main() -> ExitCode {
             panel,
             mode,
             iterations,
+            rlcd_model,
+            llm_model,
             logo,
             model: model_glb,
             placement_only,
@@ -736,6 +752,8 @@ fn main() -> ExitCode {
                 router_max_expansions,
                 router_timeout_ms,
                 routing_report,
+                rlcd_model,
+                llm_model,
             },
         ),
         Command::Diagram { circuit, svg, pdf } => diagram_cmd(circuit, svg, pdf),
@@ -763,9 +781,23 @@ fn main() -> ExitCode {
             panel,
             mode,
             iterations,
+            rlcd_model,
+            llm_model,
             drc_every_iter,
             logo,
-        } => fab_cmd(circuit, out, panel, mode, iterations, drc_every_iter, logo),
+        } => fab_cmd(
+            circuit,
+            out,
+            panel,
+            FabOptions {
+                mode,
+                iterations,
+                drc_every_iter,
+                logo,
+                rlcd_model,
+                llm_model,
+            },
+        ),
         Command::Guide {
             circuit,
             out,
@@ -1876,6 +1908,47 @@ struct Layout {
     routing: Option<legion_of_bom_core::route::RoutingReport>,
 }
 
+/// The two placement-model capabilities are deliberately separate: a bounded
+/// numeric deployment and an ordinary chat-completion fallback do not share a
+/// wire protocol merely because both happen to be models.
+struct LayoutModels {
+    numeric: Option<ooda::Gpc1Client>,
+    llm: Option<ooda::HttpClient>,
+}
+
+impl LayoutModels {
+    fn from_slugs(rlcd_model: Option<&str>, llm_model: Option<&str>) -> Result<Option<Self>> {
+        if rlcd_model.is_none() && llm_model.is_none() {
+            return Ok(None);
+        }
+        let numeric = rlcd_model
+            .map(|model| {
+                ooda::HttpClient::from_env()
+                    .map(|client| ooda::Gpc1Client::new(client.with_model(model)))
+            })
+            .transpose()
+            .context("configuring the bounded numeric placement model")?;
+        let llm = llm_model
+            .map(|model| ooda::HttpClient::from_env().map(|client| client.with_model(model)))
+            .transpose()
+            .context("configuring the LLM placement fallback")?;
+        Ok(Some(Self { numeric, llm }))
+    }
+
+    fn decider(&self) -> PlacementDecider<'_> {
+        PlacementDecider {
+            numeric: self
+                .numeric
+                .as_ref()
+                .map(|client| client as &dyn ooda::BoundedPredictor),
+            llm_fallback: self
+                .llm
+                .as_ref()
+                .map(|client| client as &dyn ooda::Complete),
+        }
+    }
+}
+
 /// Generate a board the way every command **must**: the iterative layout loop when
 /// there is a panel to anchor to, one-shot placement when there is not.
 ///
@@ -1897,6 +1970,7 @@ fn build_layout(
     panel: &Option<PathBuf>,
     frame: Option<&BoardFrame>,
     cfg: &LayoutLoop,
+    models: Option<&LayoutModels>,
 ) -> Result<Layout> {
     if panel.is_some() && frame.is_some() {
         anyhow::bail!("the board has both a panel and a form-factor frame; it can have only one");
@@ -1924,17 +1998,32 @@ fn build_layout(
         n if n > 0 => {
             let cache = layout_cache::cache();
             let cache_key = layout_cache::key(model, &options, &template, cfg)?;
-            if let Some(hit) = layout_cache::read(&cache, &cache_key)? {
-                println!("  layout cache: hit {cache_key}");
-                return Ok(Layout {
-                    board: hit.board,
-                    conflicts: hit.conflicts,
-                    collisions: hit.collisions,
-                    not_placed: hit.not_placed,
-                    routing: hit.routing,
-                });
+            // An assisted run is a fresh model evaluation. Until the cache key
+            // includes model identity and proposal evidence, never substitute a
+            // deterministic cached board and pretend the model ran.
+            if models.is_none() {
+                if let Some(hit) = layout_cache::read(&cache, &cache_key)? {
+                    println!("  layout cache: hit {cache_key}");
+                    return Ok(Layout {
+                        board: hit.board,
+                        conflicts: hit.conflicts,
+                        collisions: hit.collisions,
+                        not_placed: hit.not_placed,
+                        routing: hit.routing,
+                    });
+                }
             }
-            let report = run_layout_loop(model, options, template, cfg)?;
+            let report = match models {
+                Some(models) => run_layout_loop_with_deciders(
+                    model,
+                    options,
+                    template,
+                    cfg,
+                    None,
+                    Some(models.decider()),
+                )?,
+                None => run_layout_loop(model, options, template, cfg)?,
+            };
             println!(
                 "  seeded layout ({}): {} attempt(s), signal HPWL {:.0}mm, critical {:.0}mm, {} via(s)",
                 cfg.mode.as_str(),
@@ -1943,6 +2032,20 @@ fn build_layout(
                 report.metrics.critical_hpwl_mm,
                 report.metrics.via_count,
             );
+            for (index, evidence) in report.placement_proposals.iter().enumerate() {
+                println!(
+                    "  placement proposal {}: backend={}, model={}, time={}ms, retries={}",
+                    index + 1,
+                    evidence.backend,
+                    evidence.resolved_model.as_deref().unwrap_or("unreported"),
+                    evidence
+                        .elapsed_ms
+                        .map_or_else(|| "unreported".into(), |ms| ms.to_string()),
+                    evidence
+                        .retries
+                        .map_or_else(|| "unreported".into(), |count| count.to_string()),
+                );
+            }
             let cacheable = report.unresolved.is_empty()
                 && report.collisions.is_empty()
                 && report.metrics.violations.is_empty()
@@ -1954,7 +2057,7 @@ fn build_layout(
                 not_placed: report.not_placed,
                 routing: report.routing,
             };
-            if cacheable {
+            if cacheable && models.is_none() {
                 layout_cache::write(
                     &cache,
                     &cache_key,
@@ -2055,6 +2158,17 @@ struct BoardOutputOptions {
     router_max_expansions: u64,
     router_timeout_ms: u64,
     routing_report: Option<PathBuf>,
+    rlcd_model: Option<String>,
+    llm_model: Option<String>,
+}
+
+struct FabOptions {
+    mode: String,
+    iterations: usize,
+    drc_every_iter: bool,
+    logo: Option<PathBuf>,
+    rlcd_model: Option<String>,
+    llm_model: Option<String>,
 }
 
 fn board_cmd(
@@ -2073,6 +2187,8 @@ fn board_cmd(
         router_max_expansions,
         router_timeout_ms,
         routing_report,
+        rlcd_model,
+        llm_model,
     } = output;
     let circuit = circuit
         .canonicalize()
@@ -2117,13 +2233,31 @@ fn board_cmd(
         kicad_cli: None,
         drc_every_iter: false,
     };
+    let layout_models = LayoutModels::from_slugs(rlcd_model.as_deref(), llm_model.as_deref())?;
+    if layout_models.is_some() {
+        if iterations == 0 {
+            anyhow::bail!("placement models require --iterations greater than zero");
+        }
+        println!(
+            "  placement models: RLCD={}, LLM fallback={}",
+            rlcd_model.as_deref().unwrap_or("off"),
+            llm_model.as_deref().unwrap_or("off")
+        );
+    }
     let Layout {
         board,
         conflicts,
         collisions,
         not_placed,
         routing,
-    } = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?;
+    } = build_layout(
+        &model,
+        options,
+        &panel,
+        frame.as_ref(),
+        &cfg,
+        layout_models.as_ref(),
+    )?;
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
     let tracks = board.matches("(segment").count();
@@ -2457,11 +2591,16 @@ fn fab_cmd(
     circuit: PathBuf,
     out: Option<PathBuf>,
     panel: Option<PathBuf>,
-    mode: String,
-    iterations: usize,
-    drc_every_iter: bool,
-    logo: Option<PathBuf>,
+    options: FabOptions,
 ) -> Result<()> {
+    let FabOptions {
+        mode,
+        iterations,
+        drc_every_iter,
+        logo,
+        rlcd_model,
+        llm_model,
+    } = options;
     let resolved = resolve_circuit(&circuit)?;
     let panel = panel.or_else(|| resolved.panel.clone());
     let circuit = resolved
@@ -2506,9 +2645,27 @@ fn fab_cmd(
         kicad_cli: drc_every_iter.then(|| kicad.clone()),
         drc_every_iter,
     };
+    let layout_models = LayoutModels::from_slugs(rlcd_model.as_deref(), llm_model.as_deref())?;
+    if layout_models.is_some() {
+        if iterations == 0 {
+            anyhow::bail!("placement models require --iterations greater than zero");
+        }
+        println!(
+            "  placement models: RLCD={}, LLM fallback={}",
+            rlcd_model.as_deref().unwrap_or("off"),
+            llm_model.as_deref().unwrap_or("off")
+        );
+    }
     let Layout {
         board, conflicts, ..
-    } = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?;
+    } = build_layout(
+        &model,
+        options,
+        &panel,
+        frame.as_ref(),
+        &cfg,
+        layout_models.as_ref(),
+    )?;
 
     let pkg = out.unwrap_or_else(|| work_dir.join("fab"));
     std::fs::create_dir_all(&pkg)?;
@@ -2943,10 +3100,14 @@ fn build_cmd(name: Option<String>) -> Result<()> {
                     arg(),
                     None,
                     None,
-                    LAYOUT_MODE.into(),
-                    LAYOUT_ITERS,
-                    false,
-                    None,
+                    FabOptions {
+                        mode: LAYOUT_MODE.into(),
+                        iterations: LAYOUT_ITERS,
+                        drc_every_iter: false,
+                        logo: None,
+                        rlcd_model: None,
+                        llm_model: None,
+                    },
                 ),
             ),
         ];
@@ -3084,7 +3245,7 @@ fn guide_cmd(
         kicad_cli: None,
         drc_every_iter: false,
     };
-    let board = build_layout(&model, options, &panel, frame.as_ref(), &cfg)?.board;
+    let board = build_layout(&model, options, &panel, frame.as_ref(), &cfg, None)?.board;
 
     let guide_opts = GuideOptions {
         include_smd: resolved.guide_smd,
@@ -5000,6 +5161,38 @@ mod tests {
                 assert!(fine_pitch_escape);
             }
             _ => panic!("expected board command"),
+        }
+    }
+
+    #[test]
+    fn board_and_fab_keep_rlcd_and_llm_model_slugs_distinct() {
+        use clap::Parser;
+
+        for command in ["board", "fab"] {
+            let cli = Cli::parse_from([
+                "lob",
+                command,
+                "c.py",
+                "--rlcd-model",
+                "fpl/gpc-1:layout",
+                "--llm-model",
+                "openai/gpt-fallback",
+            ]);
+            let (rlcd_model, llm_model) = match cli.command {
+                Command::Board {
+                    rlcd_model,
+                    llm_model,
+                    ..
+                }
+                | Command::Fab {
+                    rlcd_model,
+                    llm_model,
+                    ..
+                } => (rlcd_model, llm_model),
+                _ => unreachable!(),
+            };
+            assert_eq!(rlcd_model.as_deref(), Some("fpl/gpc-1:layout"));
+            assert_eq!(llm_model.as_deref(), Some("openai/gpt-fallback"));
         }
     }
 

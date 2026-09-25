@@ -37,6 +37,19 @@ pub struct PlacementProposalRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlacementProposal {
     pub values: BTreeMap<String, f64>,
+    pub evidence: ProposalEvidence,
+}
+
+/// Observable backend facts for eval and cost accounting. Cost is deliberately
+/// not guessed here: the eval layer can join the resolved model and provider
+/// metadata with its authoritative price table.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProposalEvidence {
+    pub backend: String,
+    pub resolved_model: Option<String>,
+    pub elapsed_ms: Option<u128>,
+    pub retries: Option<u32>,
+    pub provider_metadata: Option<Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,12 +196,20 @@ pub fn propose_bounded(
 ) -> Result<PlacementProposal, ProposalError> {
     request.validate()?;
     let outcome = predictor.estimate_numeric(&request.numeric_request())?;
+    let evidence = ProposalEvidence {
+        backend: "bounded_numeric".into(),
+        resolved_model: outcome.resolved_model,
+        elapsed_ms: outcome.elapsed_ms,
+        retries: outcome.retries,
+        provider_metadata: outcome.provider_metadata,
+    };
     request.validate_proposal(PlacementProposal {
         values: outcome
             .estimates
             .into_iter()
             .map(|estimate| (estimate.key, estimate.map_value))
             .collect(),
+        evidence,
     })
 }
 
@@ -210,11 +231,26 @@ pub fn propose_llm(
     )
     .with_temperature(0.0)
     .with_max_tokens(1024);
+    let started = std::time::Instant::now();
     let raw = completer.complete(&prompt)?;
-    let proposal: PlacementProposal = serde_json::from_str(raw.trim()).map_err(|error| {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LlmValues {
+        values: BTreeMap<String, f64>,
+    }
+    let proposal: LlmValues = serde_json::from_str(raw.trim()).map_err(|error| {
         ProposalError::InvalidResponse(format!("LLM response is not exact proposal JSON: {error}"))
     })?;
-    request.validate_proposal(proposal)
+    request.validate_proposal(PlacementProposal {
+        values: proposal.values,
+        evidence: ProposalEvidence {
+            backend: "llm_fallback".into(),
+            resolved_model: None,
+            elapsed_ms: Some(started.elapsed().as_millis()),
+            retries: None,
+            provider_metadata: None,
+        },
+    })
 }
 
 /// Prefer the native bounded model, falling back to the schematized LLM path

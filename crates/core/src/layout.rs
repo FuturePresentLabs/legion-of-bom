@@ -26,6 +26,7 @@ use crate::drc::{run_drc, DrcReport};
 use crate::layout_repair::{decide_repair, RepairAction, RepairEvidence, RuleEvidence};
 use crate::placement_proposal::{
     propose_bounded, propose_llm, propose_with_fallback, PlacementField, PlacementProposalRequest,
+    ProposalEvidence,
 };
 use crate::route::RouteOutput;
 use crate::source::CircuitSource;
@@ -321,6 +322,9 @@ pub struct LayoutReport {
     pub findings: Vec<Finding>,
     /// Bounded repair strategies selected during this run, in attempt order.
     pub repair_actions: Vec<RepairAction>,
+    /// Numeric-model calls made while producing attempts, including backend,
+    /// resolved model, retry count, and observed latency.
+    pub placement_proposals: Vec<ProposalEvidence>,
     /// Policy which produced the winning candidate.
     pub policy: LayoutPolicy,
 }
@@ -472,6 +476,7 @@ pub fn run_layout_loop_with_deciders(
     // Consecutive attempts that did not improve on the best so far.
     let mut stale = 0usize;
     let mut repair_actions = Vec::new();
+    let mut placement_proposals = Vec::new();
 
     for i in 0..iters {
         ran += 1;
@@ -647,6 +652,7 @@ pub fn run_layout_loop_with_deciders(
                 .map_err(|error| {
                     BoardError::Other(format!("numeric placement proposal failed: {error}"))
                 })?;
+                placement_proposals.push(proposal.evidence.clone());
                 free.iter()
                     .map(|refdes| {
                         (
@@ -759,6 +765,7 @@ pub fn run_layout_loop_with_deciders(
         drc,
         findings,
         repair_actions,
+        placement_proposals,
         policy,
     })
 }
