@@ -6,7 +6,7 @@
 //! the symbol gives them wherever possible, through a `pins()` helper that
 //! fails hard when a name is missing — SKiDL on its own only logs it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Where a part's pins come from.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +46,8 @@ pub struct Circuit {
     pub title: String,
     pub parts: Vec<EmitPart>,
     pub nets: BTreeMap<String, Vec<(String, PinRef)>>,
+    /// Pins deliberately left electrically unconnected by the operation plan.
+    pub no_connects: BTreeSet<(String, PinRef)>,
 }
 
 impl Circuit {
@@ -108,6 +110,22 @@ impl Circuit {
                 })
                 .collect();
             body.push_str(&format!("    Net({net:?}).connect({})\n", refs.join(", ")));
+        }
+        for (reference, pin) in &self.no_connects {
+            match pin {
+                PinRef::Name(name) => body.push_str(&format!(
+                    "    for pin in pins({}, {name:?}):\n        pin += builtins.NC\n",
+                    var(reference)
+                )),
+                PinRef::NameAt(name, index) => body.push_str(&format!(
+                    "    pins({}, {name:?})[{index}] += builtins.NC\n",
+                    var(reference)
+                )),
+                PinRef::Num(number) => body.push_str(&format!(
+                    "    {}.p[{number}] += builtins.NC\n",
+                    var(reference)
+                )),
+            }
         }
 
         format!(
