@@ -66,6 +66,8 @@ pub struct SimConfig {
     /// circuit actually uses (e.g. an op-amp's `VCC`/`VEE`).
     pub supplies: Vec<(String, f64)>,
     pub ac: AcSweep,
+    /// Optional evaluator test load from output to ground.
+    pub output_load_ohms: Option<f64>,
 }
 
 impl Default for SimConfig {
@@ -76,6 +78,7 @@ impl Default for SimConfig {
             ground_nets: vec!["GND".into(), "0".into()],
             supplies: vec![("VCC".into(), 15.0), ("VEE".into(), -15.0)],
             ac: AcSweep::default(),
+            output_load_ohms: None,
         }
     }
 }
@@ -201,6 +204,7 @@ impl SimConfig {
                 supplies
             },
             ac: AcSweep::default(),
+            output_load_ohms: None,
         }
     }
 }
@@ -546,6 +550,14 @@ pub fn generate_ac_deck(
     lines.push(format!("Vlob_src {in_node} 0 DC 0 AC 1"));
 
     let out_node = config.node(&config.output_net);
+    if let Some(load) = config.output_load_ohms {
+        if !load.is_finite() || load <= 0.0 {
+            return Err(StageError::Other(
+                "output load must be finite and positive".into(),
+            ));
+        }
+        lines.push(format!("Rlob_load {out_node} 0 {}", fmt_num(load)));
+    }
     lines.push(".control".into());
     lines.push(format!(
         "ac dec {} {} {}",
@@ -678,6 +690,14 @@ pub fn generate_tran_deck(
     }
     lines.extend(supply_lines(config, &net_names));
     lines.extend(components);
+    if let Some(load) = config.output_load_ohms {
+        if !load.is_finite() || load <= 0.0 {
+            return Err(StageError::Other(
+                "output load must be finite and positive".into(),
+            ));
+        }
+        lines.push(format!("Rlob_load {out_node} 0 {}", fmt_num(load)));
+    }
     // Input step as a sharp PWL ramp at step_at_s.
     let edge = tran.step_s.clamp(1e-9, 1e-6);
     lines.push(format!(
@@ -841,6 +861,14 @@ fn generate_tran_deck_drive(
     }
     lines.extend(supply_lines(config, &net_names));
     lines.extend(components);
+    if let Some(load) = config.output_load_ohms {
+        if !load.is_finite() || load <= 0.0 {
+            return Err(StageError::Other(
+                "output load must be finite and positive".into(),
+            ));
+        }
+        lines.push(format!("Rlob_load {probe_node} 0 {}", fmt_num(load)));
+    }
     lines.push(pwl_source_line(&in_node, &drive.pwl));
     // Extra forced control nets (e.g. RATE_CV), each its own PWL source. A net the
     // circuit doesn't have is skipped (not an error) so a generic control — a RATE

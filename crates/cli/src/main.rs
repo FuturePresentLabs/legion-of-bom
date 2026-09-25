@@ -116,6 +116,30 @@ enum Command {
         #[arg(long)]
         ratings: Option<PathBuf>,
     },
+    /// Export raw AC and sine-transient samples for an independent evaluator.
+    AnalogExport {
+        circuit: PathBuf,
+        #[arg(long)]
+        ac_out: Option<PathBuf>,
+        #[arg(long)]
+        transient_out: Option<PathBuf>,
+        #[arg(long)]
+        input_net: Option<String>,
+        #[arg(long)]
+        output_net: Option<String>,
+        #[arg(long, default_value_t = 2.0)]
+        ac_start_hz: f64,
+        #[arg(long, default_value_t = 200_000.0)]
+        ac_stop_hz: f64,
+        #[arg(long, default_value_t = 40)]
+        ac_points_per_decade: u32,
+        #[arg(long, default_value_t = 1000.0)]
+        transient_hz: f64,
+        #[arg(long, default_value_t = 1.0)]
+        input_peak_v: f64,
+        #[arg(long)]
+        load_ohms: Option<f64>,
+    },
     /// Generate a BOM for a circuit, optionally priced live from Mouser.
     Bom {
         /// Path to the circuit definition (e.g. a SKiDL script).
@@ -653,6 +677,31 @@ fn main() -> ExitCode {
             out,
             ratings,
         } => ee_export_cmd(circuit, out, ratings),
+        Command::AnalogExport {
+            circuit,
+            ac_out,
+            transient_out,
+            input_net,
+            output_net,
+            ac_start_hz,
+            ac_stop_hz,
+            ac_points_per_decade,
+            transient_hz,
+            input_peak_v,
+            load_ohms,
+        } => analog_export_cmd(
+            circuit,
+            ac_out,
+            transient_out,
+            input_net,
+            output_net,
+            ac_start_hz,
+            ac_stop_hz,
+            ac_points_per_decade,
+            transient_hz,
+            input_peak_v,
+            load_ohms,
+        ),
         Command::Bom {
             circuit,
             price,
@@ -3185,6 +3234,126 @@ fn ee_export_cmd(circuit: PathBuf, out: PathBuf, ratings: Option<PathBuf>) -> Re
     std::fs::write(&out, serde_json::to_vec_pretty(&export)?)
         .with_context(|| format!("writing {}", out.display()))?;
     println!("wrote {}", out.display());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analog_export_cmd(
+    circuit: PathBuf,
+    ac_out: Option<PathBuf>,
+    transient_out: Option<PathBuf>,
+    input_net: Option<String>,
+    output_net: Option<String>,
+    ac_start_hz: f64,
+    ac_stop_hz: f64,
+    ac_points_per_decade: u32,
+    transient_hz: f64,
+    input_peak_v: f64,
+    load_ohms: Option<f64>,
+) -> Result<()> {
+    if ac_out.is_none() && transient_out.is_none() {
+        anyhow::bail!("at least one of --ac-out or --transient-out is required");
+    }
+    if !(ac_start_hz > 0.0 && ac_stop_hz > ac_start_hz && ac_points_per_decade > 0) {
+        anyhow::bail!("invalid AC sweep");
+    }
+    if !(transient_hz > 0.0 && input_peak_v > 0.0) {
+        anyhow::bail!("transient frequency and input peak must be positive");
+    }
+    if load_ohms.is_some_and(|load| !load.is_finite() || load <= 0.0) {
+        anyhow::bail!("test load must be finite and positive");
+    }
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem).join("analog-export");
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let digest =
+        export_ee_source_with_ratings(&model, run.erc_report.as_deref(), &Default::default())
+            .source_digest;
+    let mut config = SimConfig::infer(&model);
+    if let Some(net) = input_net {
+        config.input_net = net;
+    }
+    if let Some(net) = output_net {
+        config.output_net = net;
+    }
+    config.output_load_ohms = load_ohms;
+    config.ac = legion_of_bom_core::spice::AcSweep {
+        points_per_decade: ac_points_per_decade,
+        start_hz: ac_start_hz,
+        stop_hz: ac_stop_hz,
+    };
+
+    if let Some(ac_out) = ac_out {
+        let ac = simulate_ac(&model, &config, &work_dir).context("raw AC simulation")?;
+        let ac_json = serde_json::json!({
+        "schema": "lob.analog-source.v1",
+        "provenance": {
+            "source_digest": digest,
+            "simulator": "ngspice",
+            "analysis": "ac",
+            "input_net": config.input_net,
+            "output_net": config.output_net,
+            "test_load_ohms": load_ohms,
+        },
+        "points": ac.points.into_iter().map(|point| serde_json::json!({
+            "frequency_hz": point.freq_hz, "gain_db": point.mag_db
+        })).collect::<Vec<_>>(),
+        });
+        if let Some(parent) = ac_out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&ac_out, serde_json::to_vec_pretty(&ac_json)?)
+            .with_context(|| format!("writing {}", ac_out.display()))?;
+    }
+    if let Some(transient_out) = transient_out {
+        let cycles = 10;
+        let points_per_cycle = 128;
+        let pwl = sine_pwl(transient_hz, input_peak_v, cycles, points_per_cycle);
+        let stop_s = cycles as f64 / transient_hz;
+        let tran = simulate_tran_drive(
+            &model,
+            &config,
+            &TranDrive {
+                step_s: 1.0 / (transient_hz * points_per_cycle as f64),
+                stop_s,
+                pwl,
+                cv: Vec::new(),
+                probe_net: None,
+            },
+            &work_dir,
+        )
+        .context("raw sine transient simulation")?;
+        let transient_json = serde_json::json!({
+        "schema": "lob.analog-source.v1",
+        "provenance": {
+            "source_digest": digest,
+            "simulator": "ngspice",
+            "analysis": "transient",
+            "input_net": config.input_net,
+            "output_net": config.output_net,
+            "test_load_ohms": load_ohms,
+        },
+        "fundamental_hz": transient_hz,
+        "input_peak_v": input_peak_v,
+        "points": tran.points.into_iter().map(|point| serde_json::json!({
+            "time_s": point.t_s, "output_v": point.v
+        })).collect::<Vec<_>>(),
+        });
+        if let Some(parent) = transient_out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&transient_out, serde_json::to_vec_pretty(&transient_json)?)
+            .with_context(|| format!("writing {}", transient_out.display()))?;
+    }
     Ok(())
 }
 
