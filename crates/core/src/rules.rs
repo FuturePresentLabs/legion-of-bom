@@ -675,6 +675,12 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
                 .find(|p| p.refdes.0 == r)
                 .and_then(|p| p.footprint.as_deref())
                 .is_some_and(crate::board::is_edge_connector_footprint);
+            let explicit_facing = ctx.intent.is_some_and(|intent| {
+                intent
+                    .orientations
+                    .iter()
+                    .any(|required| required.refdes == r && required.facing_edge.is_some())
+            });
             rules.push(Rule::EdgeClearance {
                 refdes: r.to_string(),
                 extent: fact.extent,
@@ -684,10 +690,17 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
                 // to the routed outline. Its copper and holes remain inside;
                 // applying the ordinary component inset would bury its mating
                 // face in the board instead of protecting it.
-                min_mm: if edge_entry { 0.0 } else { EDGE_CLEARANCE_MM },
+                min_mm: if edge_entry || explicit_facing {
+                    0.0
+                } else {
+                    EDGE_CLEARANCE_MM
+                },
                 tier: Tier::Physical,
             });
-            if edge_entry {
+            // A product-authored FacingEdge rule is more specific than the
+            // generic "touch whichever edge is nearest" connector heuristic.
+            // Keeping both makes the only legal positions board corners.
+            if edge_entry && !explicit_facing {
                 rules.push(Rule::EdgeContact {
                     refdes: r.to_string(),
                     extent: fact.extent,
@@ -1564,6 +1577,17 @@ mod tests {
         assert!(rules
             .iter()
             .any(|rule| matches!(rule, Rule::FacingEdge { .. })));
+        assert!(rules.iter().any(|rule| matches!(
+            rule,
+            Rule::EdgeClearance {
+                refdes,
+                min_mm,
+                ..
+            } if refdes == "U1" && *min_mm == 0.0
+        )));
+        assert!(!rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::EdgeContact { refdes, .. } if refdes == "U1")));
         assert!(rules
             .iter()
             .any(|rule| matches!(rule, Rule::Cluster { .. })));

@@ -84,7 +84,13 @@ pub fn legalize_pinning(
             .into_iter()
             .filter(|a| a.tier == Tier::Physical && !a.ok())
             .filter_map(|a| a.repair.map(|r| (r.refdes, r.toward_mm)))
-            .filter(|(refdes, _)| !pinned.contains(refdes))
+            .filter_map(|repair| {
+                if !pinned.contains(&repair.0) {
+                    Some(repair)
+                } else {
+                    alternate_overlap_repair(&repair.0, placements, rules, pinned)
+                }
+            })
             .collect();
         if broken.is_empty() {
             break;
@@ -128,6 +134,38 @@ pub fn legalize_pinning(
     report.stuck.sort();
     report.stuck.dedup();
     report
+}
+
+/// Overlap rules are stored in stable refdes order and historically always
+/// repaired `a`. When `a` is a panel datum or mounting hole that ordering is
+/// not authority to move it: search outward from `b` while preserving every
+/// other physical rule that constrains `b`.
+fn alternate_overlap_repair(
+    pinned_refdes: &str,
+    placements: &HashMap<String, Placement>,
+    rules: &[Rule],
+    pinned: &std::collections::HashSet<String>,
+) -> Option<(String, (f64, f64))> {
+    rules.iter().find_map(|rule| {
+        let Rule::Overlap { a, b, .. } = rule else {
+            return None;
+        };
+        if a != pinned_refdes || pinned.contains(b) {
+            return None;
+        }
+        if !crate::rules::assess(std::slice::from_ref(rule), placements)
+            .into_iter()
+            .any(|assessment| !assessment.ok())
+        {
+            return None;
+        }
+        let pb = placements.get(b)?;
+        // Search from b's current position. Starting from the ordinary escape
+        // target can point off a constrained edge; then the eight-direction
+        // search may never revisit the edge line. Around the current point,
+        // vertical candidates naturally slide an edge connector along its edge.
+        Some((b.clone(), (pb.x_mm, pb.y_mm)))
+    })
 }
 
 /// The closest position to `target` where `refdes` clashes with nothing else.
@@ -372,6 +410,46 @@ mod tests {
             "travelled {travelled:.3}mm on a 40mm board: {:?}",
             report.moved
         );
+    }
+
+    #[test]
+    fn overlap_repair_moves_the_unpinned_member() {
+        let facts: HashMap<String, PartFacts> =
+            [("H2".into(), fact(6.0, 6.0)), ("J1".into(), fact(4.0, 4.0))].into();
+        let mut placements: HashMap<String, Placement> =
+            [("H2".into(), at(38.0, 5.0)), ("J1".into(), at(41.0, 3.0))].into();
+        let rules = vec![
+            Rule::Overlap {
+                a: "H2".into(),
+                a_extent: (6.0, 6.0),
+                a_offset: (0.0, 0.0),
+                a_tht: Vec::new(),
+                a_back: false,
+                b: "J1".into(),
+                b_extent: (4.0, 4.0),
+                b_offset: (0.0, 0.0),
+                b_tht: Vec::new(),
+                b_back: false,
+                tier: Tier::Physical,
+            },
+            Rule::FacingEdge {
+                refdes: "J1".into(),
+                edge: crate::rules::BoardEdge::Right,
+                extent: (4.0, 4.0),
+                origin_offset: (0.0, 0.0),
+                bounds: (0.0, 0.0, 43.0, 43.0),
+                tier: Tier::Physical,
+            },
+        ];
+        let pinned = ["H2".to_string()].into_iter().collect();
+
+        let report = legalize_pinning(&mut placements, &rules, &facts, &pinned);
+
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(placements["H2"], at(38.0, 5.0));
+        assert_ne!(placements["J1"], at(41.0, 3.0));
+        assert_eq!(placements["J1"].x_mm, 41.0);
+        assert!(report.moved.iter().any(|(refdes, _)| refdes == "J1"));
     }
 
     #[test]
