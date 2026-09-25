@@ -19,20 +19,21 @@ use legion_of_bom_core::{
     analytic_check, assess_assurance_evidence, build_facts, build_guide_with,
     default_image_cache_dir, default_panel_orders_dir, default_parts_dir, derive_panel,
     derive_panel_for, embed_source, eurorack_trial_build, export_board_glb, export_cpl,
-    export_gerbers, fetch_from_jlcpcb, fetch_from_kicad, framed_template, generate_board_artifacts,
-    generate_bom, generate_fuzz_chain, guide, guide_to_html, guide_to_pdf, jlc_assembly_bom,
-    jlcpcb_design_rules, kicad_cli_path, min_panel_hp_for, minimum_hp, minimum_routable_hp,
-    package_key, panel_from_board, panel_to_dxf, panel_to_kicad_pcb, parse_netlist_file,
-    part_kind_of, photo_source, plan_repair, png_to_jpeg, render_board_png, render_spec_text,
-    rules, run_drc, run_layout_loop, schematic_to_svg, simulate_ac, simulate_tran,
-    simulate_tran_drive, suggest_by_keyword, suggest_mpns, svg_to_pdf_bytes, validate_erc,
-    value_key, zip_dir, ArtifactKind, ArtifactStatus, AssuranceRequest, BoardOptions, BoardPng,
-    BomLine, BuildCopy, BuiltinCutouts, CircuitSource, EnclosureSize, EurorackPlacer, FabReadiness,
-    Finding, FuzzConstraints, GuideOptions, HpSearch, JlcpcbClient, KitType, LayoutLoop,
-    LayoutMode, Logo, Manifest, MouserClient, PanelFile, PanelFormat, PanelOrders, PartRecord,
-    PartResolution, PartsLibrary, PipelineReport, PlacementFile, Populate, ProjectView, Quality,
-    Repair, ResolutionStatus, SeededPlacer, Severity, SilkLegend, SimConfig, SkidlRunner,
-    SourcingClients, StageOutcome, TranAnalysis, TranDrive,
+    export_ee_source_with_ratings, export_gerbers, fetch_from_jlcpcb, fetch_from_kicad,
+    framed_template, generate_board_artifacts, generate_bom, generate_fuzz_chain, guide,
+    guide_to_html, guide_to_pdf, jlc_assembly_bom, jlcpcb_design_rules, kicad_cli_path,
+    min_panel_hp_for, minimum_hp, minimum_routable_hp, package_key, panel_from_board, panel_to_dxf,
+    panel_to_kicad_pcb, parse_netlist_file, part_kind_of, photo_source, plan_repair, png_to_jpeg,
+    render_board_png, render_spec_text, rules, run_drc, run_layout_loop, schematic_to_svg,
+    simulate_ac, simulate_tran, simulate_tran_drive, suggest_by_keyword, suggest_mpns,
+    svg_to_pdf_bytes, validate_erc, value_key, zip_dir, ArtifactKind, ArtifactStatus,
+    AssuranceRequest, BoardOptions, BoardPng, BomLine, BuildCopy, BuiltinCutouts, CircuitSource,
+    EnclosureSize, EurorackPlacer, FabReadiness, Finding, FuzzConstraints, GuideOptions, HpSearch,
+    JlcpcbClient, KitType, LayoutLoop, LayoutMode, Logo, Manifest, MouserClient, PanelFile,
+    PanelFormat, PanelOrders, PartRecord, PartResolution, PartsLibrary, PipelineReport,
+    PlacementFile, Populate, ProjectView, Quality, Repair, ResolutionStatus, SeededPlacer,
+    Severity, SilkLegend, SimConfig, SkidlRunner, SourcingClients, StageOutcome, TranAnalysis,
+    TranDrive,
 };
 
 /// legion-of-bom: circuit-as-code in, manufacturing-ready outputs out.
@@ -103,6 +104,17 @@ enum Command {
         /// Write the normalized, validated contract as JSON.
         #[arg(long)]
         json: Option<PathBuf>,
+    },
+    /// Export circuit facts and raw ERC findings for an independent evaluator.
+    EeExport {
+        /// Path to the circuit definition (for example a SKiDL script).
+        circuit: PathBuf,
+        /// JSON destination. The file contains data only, never a verdict.
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional JSON object mapping refdes to raw sourced rating strings.
+        #[arg(long)]
+        ratings: Option<PathBuf>,
     },
     /// Generate a BOM for a circuit, optionally priced live from Mouser.
     Bom {
@@ -636,6 +648,11 @@ fn main() -> ExitCode {
         Command::Init { dry_run } => init_cmd(dry_run),
         Command::Parts { action } => parts_cmd(action),
         Command::Catalog { action } => catalog_cmd(action),
+        Command::EeExport {
+            circuit,
+            out,
+            ratings,
+        } => ee_export_cmd(circuit, out, ratings),
         Command::Bom {
             circuit,
             price,
@@ -3116,6 +3133,61 @@ fn guide_cmd(
     Ok(())
 }
 
+fn ee_export_cmd(circuit: PathBuf, out: PathBuf, ratings: Option<PathBuf>) -> Result<()> {
+    let circuit = circuit
+        .canonicalize()
+        .with_context(|| format!("circuit not found: {}", circuit.display()))?;
+    let stem = circuit
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("circuit");
+    let work_dir = PathBuf::from("out").join(stem);
+    let run = SkidlRunner::discover(&work_dir)
+        .run(&circuit)
+        .with_context(|| "SKiDL failed (try `lob doctor`)")?;
+    let model = parse_netlist_file(&run.netlist_path)?;
+    let ratings_by_refdes: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = match ratings {
+        Some(path) => {
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading ratings {}", path.display()))?;
+            let parsed: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, String>,
+            > = serde_json::from_str(&source)
+                .with_context(|| format!("parsing ratings {}", path.display()))?;
+            let known: std::collections::BTreeSet<&str> = model
+                .parts
+                .iter()
+                .map(|part| part.refdes.0.as_str())
+                .collect();
+            if let Some(unknown) = parsed
+                .keys()
+                .find(|reference| !known.contains(reference.as_str()))
+            {
+                anyhow::bail!(
+                    "ratings {} references unknown circuit part {}",
+                    path.display(),
+                    unknown
+                );
+            }
+            parsed
+        }
+        None => Default::default(),
+    };
+    let export =
+        export_ee_source_with_ratings(&model, run.erc_report.as_deref(), &ratings_by_refdes);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out, serde_json::to_vec_pretty(&export)?)
+        .with_context(|| format!("writing {}", out.display()))?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
 /// Handle `lob bom <circuit> [--price] [--out] [--visual] [--smd]`.
 fn bom_cmd(
     circuit: PathBuf,
@@ -4772,6 +4844,33 @@ mod tests {
                 assert_eq!(rlcd_model.as_deref(), Some("provider/model:variant"));
             }
             _ => panic!("expected spec command"),
+        }
+    }
+
+    #[test]
+    fn ee_export_accepts_an_explicit_ratings_file() {
+        use clap::Parser;
+
+        let cli = Cli::parse_from([
+            "lob",
+            "ee-export",
+            "circuit.py",
+            "--out",
+            "ee.json",
+            "--ratings",
+            "ratings.json",
+        ]);
+        match cli.command {
+            Command::EeExport {
+                circuit,
+                out,
+                ratings,
+            } => {
+                assert_eq!(circuit, PathBuf::from("circuit.py"));
+                assert_eq!(out, PathBuf::from("ee.json"));
+                assert_eq!(ratings, Some(PathBuf::from("ratings.json")));
+            }
+            _ => panic!("expected ee-export command"),
         }
     }
 

@@ -28,6 +28,7 @@ pub mod dsp_import;
 pub mod eagle;
 pub mod easyeda;
 pub mod edit;
+pub mod ee_export;
 pub mod engineering;
 pub mod environment;
 pub mod fab;
@@ -48,6 +49,7 @@ pub mod layout_repair;
 pub mod legalize;
 pub mod logo;
 pub mod manifest;
+pub mod mcu_proof;
 pub mod model;
 pub mod module_port;
 pub mod mouser;
@@ -63,6 +65,7 @@ pub mod pedal_panel;
 pub mod photo;
 pub mod placement;
 pub mod placement_edit;
+pub mod power_proof;
 pub mod project;
 pub mod readiness;
 pub mod resistor;
@@ -143,6 +146,9 @@ pub use eagle::{
 };
 pub use easyeda::{product_image_url, search_parts as lcsc_search_parts, LcscCandidate};
 pub use edit::{apply_edit_str, edit_manifest, CircuitEdit, EditError, ManifestEdit};
+pub use ee_export::{
+    export_ee_source, export_ee_source_with_ratings, EeSourceExport, EE_SOURCE_SCHEMA,
+};
 pub use environment::{
     ElectricalBus, EnvironmentProvenance, OperatingEnvironment, OperatingEnvironmentError,
     OperatingEnvironmentLoadError, PressureEnvelope, RadiationEnvelope, ShockSpectrum,
