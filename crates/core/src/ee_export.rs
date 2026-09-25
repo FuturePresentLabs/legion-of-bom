@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub const EE_SOURCE_SCHEMA: &str = "lob.ee-source.v2";
+pub const EE_SOURCE_SCHEMA: &str = "lob.ee-source.v3";
 
 #[derive(Debug, Serialize)]
 pub struct EeSourceExport {
@@ -17,6 +17,9 @@ pub struct EeSourceExport {
     pub circuit: String,
     pub parts: Vec<EePart>,
     pub nets: Vec<EeNet>,
+    /// Conductive possibilities recomputed from catalog-confirmed part
+    /// behavior and the actual pin-to-net attachments. Contains no verdict.
+    pub conductive_graph: crate::controlled_path::ConductiveGraph,
     pub erc: Vec<EeErcFinding>,
     pub bom: Vec<EeBomLine>,
 }
@@ -41,6 +44,7 @@ pub struct EeNet {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct EePin {
     pub endpoint: String,
+    pub function: Option<String>,
     pub electrical_type: Option<String>,
 }
 
@@ -99,6 +103,7 @@ pub fn export_ee_source_with_ratings(
                 .iter()
                 .map(|pin| EePin {
                     endpoint: format!("{}:{}", pin.refdes.0, pin.pin),
+                    function: pin.function.clone(),
                     electrical_type: pin
                         .electrical_type
                         .map(|kind| format!("{kind:?}").to_ascii_lowercase()),
@@ -139,8 +144,10 @@ pub fn export_ee_source_with_ratings(
             })
         })
         .collect();
+    let conductive_graph = crate::controlled_path::derive(circuit);
     let canonical =
-        serde_json::to_vec(&(circuit.name(), &parts, &nets, &erc, &bom)).expect("serializable");
+        serde_json::to_vec(&(circuit.name(), &parts, &nets, &conductive_graph, &erc, &bom))
+            .expect("serializable");
     let source_digest = format!("sha256:{:x}", Sha256::digest(canonical));
     EeSourceExport {
         schema: EE_SOURCE_SCHEMA,
@@ -148,6 +155,7 @@ pub fn export_ee_source_with_ratings(
         circuit: circuit.name().into(),
         parts,
         nets,
+        conductive_graph,
         erc,
         bom,
     }
@@ -201,5 +209,31 @@ mod tests {
         );
         assert_eq!(rated.parts[0].ratings["vol_max_v"], "0.4");
         assert_ne!(plain.source_digest, rated.source_digest);
+    }
+
+    #[test]
+    fn export_contains_derived_conductive_graph_without_a_verdict() {
+        let mut circuit = Circuit::new("path");
+        let mut switch = Part::new("Q1", "switch");
+        for (suffix, value) in [
+            ("Id", "main"),
+            ("FromPin", "IN"),
+            ("ToPin", "OUT"),
+            ("DefaultConducting", "false"),
+            ("ReverseConducting", "false"),
+        ] {
+            switch
+                .fields
+                .insert(format!("Conduction.0.{suffix}"), value.into());
+        }
+        circuit.parts.push(switch);
+        circuit.nets.extend([
+            Net::new("A", vec![PinRef::new("Q1", "1").with_function("IN")]),
+            Net::new("B", vec![PinRef::new("Q1", "2").with_function("OUT")]),
+        ]);
+        let export = export_ee_source(&circuit, None);
+        assert_eq!(export.schema, "lob.ee-source.v3");
+        assert_eq!(export.conductive_graph.edges.len(), 1);
+        assert_eq!(export.conductive_graph.edges[0].from_net, "A");
     }
 }

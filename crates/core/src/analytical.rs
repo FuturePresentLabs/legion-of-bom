@@ -605,6 +605,7 @@ mod tests {
         let node = |r: &str, p: &str| PinRef {
             refdes: RefDes(r.into()),
             pin: p.into(),
+            function: None,
             electrical_type: None,
         };
         Circuit {

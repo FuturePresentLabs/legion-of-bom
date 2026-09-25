@@ -94,6 +94,7 @@ pub fn parse_netlist_str(text: &str, name: &str) -> Result<Circuit, StageError> 
                 .into_iter()
                 .filter_map(|node| {
                     let mut pin = PinRef::new(node.field("ref")?, node.field("pin")?);
+                    pin.function = node.field("pinfunction").map(str::to_string);
                     pin.electrical_type = node.field("pintype").and_then(PinElectricalType::parse);
                     Some(pin)
                 })
@@ -169,7 +170,7 @@ mod tests {
         (net (code 1) (name "GND") (class "Default")
           (node (ref "C1") (pin "2") (pintype "PASSIVE")))
         (net (code 2) (name "IN") (class "Default")
-          (node (ref "R1") (pin "1") (pintype "PASSIVE")))
+          (node (ref "R1") (pin "1") (pinfunction "IN") (pintype "PASSIVE")))
         (net (code 3) (name "OUT") (class "Default")
           (node (ref "C1") (pin "1") (pintype "PASSIVE"))
           (node (ref "R1") (pin "2") (pintype "PASSIVE")))))
@@ -225,6 +226,8 @@ mod tests {
             out.pins[0].electrical_type,
             Some(PinElectricalType::Passive)
         );
+        let input = c.nets().iter().find(|n| n.name == "IN").unwrap();
+        assert_eq!(input.pins[0].function.as_deref(), Some("IN"));
 
         // Every net here is the default class — none is critical, and the default
         // normalises away rather than being stored verbatim.

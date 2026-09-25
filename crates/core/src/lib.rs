@@ -19,6 +19,7 @@ pub mod bom_repair;
 pub mod carrier;
 pub mod catalog;
 pub mod circuit_plan;
+pub mod controlled_path;
 pub mod datasheet;
 pub mod decouple;
 pub mod derating;

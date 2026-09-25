@@ -2338,6 +2338,7 @@ mod panel_from_board_tests {
                 pins: vec![PinRef {
                     refdes: RefDes("J1".into()),
                     pin: "1".into(),
+                    function: None,
                     electrical_type: None,
                 }],
                 net_class: None,
@@ -2357,6 +2358,7 @@ mod panel_from_board_tests {
                 .map(|(r, p)| PinRef {
                     refdes: RefDes((*r).into()),
                     pin: (*p).into(),
+                    function: None,
                     electrical_type: None,
                 })
                 .collect(),
@@ -2643,6 +2645,7 @@ mod panel_from_board_tests {
             pins: vec![PinRef {
                 refdes: RefDes("RV2".into()),
                 pin: "3".into(),
+                function: None,
                 electrical_type: None,
             }],
             net_class: None,

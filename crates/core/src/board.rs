@@ -3908,6 +3908,7 @@ mod tests {
         let node = |r: &str, p: &str| PinRef {
             refdes: RefDes(r.into()),
             pin: p.into(),
+            function: None,
             electrical_type: None,
         };
         let net = |name: &str, pins: Vec<PinRef>| Net {
@@ -5399,6 +5400,7 @@ mod tests {
         };
         let pin = |p: &str| PinRef {
             refdes: RefDes("J3".into()),
+            function: None,
             pin: p.into(),
             electrical_type: None,
         };

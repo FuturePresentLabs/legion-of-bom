@@ -183,6 +183,10 @@ pub struct PinRef {
     pub refdes: RefDes,
     /// Pin number or name (`"1"`, `"2"`, `"OUT"`).
     pub pin: String,
+    /// Symbol pin function/name (`VIN`, `OUT`, `EN`) when the netlist carries it.
+    /// Catalog behavior binds to this stable semantic name instead of guessing
+    /// from package pin numbers.
+    pub function: Option<String>,
     /// Source symbol electrical type, when the frontend supplied it.
     pub electrical_type: Option<PinElectricalType>,
 }
@@ -192,6 +196,7 @@ impl PinRef {
         PinRef {
             refdes: refdes.into(),
             pin: pin.into(),
+            function: None,
             electrical_type: None,
         }
     }
@@ -200,6 +205,12 @@ impl PinRef {
     #[must_use]
     pub fn with_electrical_type(mut self, electrical_type: PinElectricalType) -> Self {
         self.electrical_type = Some(electrical_type);
+        self
+    }
+
+    #[must_use]
+    pub fn with_function(mut self, function: impl Into<String>) -> Self {
+        self.function = Some(function.into());
         self
     }
 }

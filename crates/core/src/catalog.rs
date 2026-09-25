@@ -51,6 +51,14 @@ pub struct CatalogPart {
     /// Cited source/load/regulator intent carried into the emitted netlist.
     #[serde(default)]
     pub power: Option<PowerIntent>,
+    /// Source-backed conductive behavior used to reconstruct possible paths
+    /// from the rendered circuit. This describes the part, never a product
+    /// requirement or a pass/fail conclusion.
+    #[serde(default)]
+    pub conduction: Vec<ConductionPath>,
+    /// Source-backed supervisory/control outputs exposed by this part.
+    #[serde(default)]
+    pub control_outputs: Vec<ControlOutput>,
     #[serde(default)]
     pub interfaces: Vec<Interface>,
     #[serde(default)]
@@ -58,6 +66,36 @@ pub struct CatalogPart {
     /// Not an analog circuit SPICE models (an IC, a crystal): `Sim.Enable = 0`.
     #[serde(default)]
     pub sim_excluded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConductionPath {
+    pub id: String,
+    pub from_pin: String,
+    pub to_pin: String,
+    /// Whether current may flow from `to_pin` back toward `from_pin` in the
+    /// state being modeled. Unknown behavior must not be encoded as false.
+    pub reverse_conducting: bool,
+    /// Whether the path conducts before any active controller configures it.
+    pub default_conducting: bool,
+    #[serde(default)]
+    pub control_pin: Option<String>,
+    /// Stable part-local control identity. Equal identities represent one
+    /// control cause; distinct identities may form independent series cuts.
+    #[serde(default)]
+    pub control_identity: Option<String>,
+    pub cite: Cite,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlOutput {
+    /// General function such as `reset`, `watchdog`, `interlock`, or another
+    /// caller-defined kind. This is descriptive behavior, not applicability.
+    pub kind: String,
+    pub pin: String,
+    pub cite: Cite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -907,6 +945,27 @@ impl CatalogPart {
                 }
             }
         }
+        for path in &self.conduction {
+            cites.push(&path.cite);
+            if path.id.trim().is_empty()
+                || path.from_pin.trim().is_empty()
+                || path.to_pin.trim().is_empty()
+            {
+                out.push("conduction paths require non-empty id/from_pin/to_pin".into());
+            }
+            if path.control_pin.is_some() != path.control_identity.is_some() {
+                out.push(format!(
+                    "conduction path {:?} must declare control_pin and control_identity together",
+                    path.id
+                ));
+            }
+        }
+        for output in &self.control_outputs {
+            cites.push(&output.cite);
+            if output.kind.trim().is_empty() || output.pin.trim().is_empty() {
+                out.push("control outputs require non-empty kind and pin".into());
+            }
+        }
         if self.datasheet.is_none() && cites.iter().any(|c| matches!(c, Cite::Quote { .. })) {
             out.push("quotes a datasheet but names none".into());
         }
@@ -927,6 +986,8 @@ impl CatalogPart {
                     .filter_map(|(_, fact)| fact.map(|p| &p.cite)),
             );
         }
+        out.extend(self.conduction.iter().map(|path| &path.cite));
+        out.extend(self.control_outputs.iter().map(|output| &output.cite));
         if let PartSymbol::Inline { pins } = &self.symbol {
             out.extend(pins.iter().map(|p| &p.cite));
         }
@@ -969,6 +1030,37 @@ impl CatalogPart {
                     fields.insert(name.into(), fact.value.to_string());
                 }
             }
+        }
+        for (index, path) in self.conduction.iter().enumerate() {
+            if !path.cite.verified() {
+                continue;
+            }
+            let prefix = format!("Conduction.{index}");
+            fields.insert(format!("{prefix}.Id"), path.id.clone());
+            fields.insert(format!("{prefix}.FromPin"), path.from_pin.clone());
+            fields.insert(format!("{prefix}.ToPin"), path.to_pin.clone());
+            fields.insert(
+                format!("{prefix}.ReverseConducting"),
+                path.reverse_conducting.to_string(),
+            );
+            fields.insert(
+                format!("{prefix}.DefaultConducting"),
+                path.default_conducting.to_string(),
+            );
+            if let Some(control_pin) = &path.control_pin {
+                fields.insert(format!("{prefix}.ControlPin"), control_pin.clone());
+            }
+            if let Some(identity) = &path.control_identity {
+                fields.insert(format!("{prefix}.ControlIdentity"), identity.clone());
+            }
+        }
+        for (index, output) in self.control_outputs.iter().enumerate() {
+            if !output.cite.verified() {
+                continue;
+            }
+            let prefix = format!("ControlOutput.{index}");
+            fields.insert(format!("{prefix}.Kind"), output.kind.clone());
+            fields.insert(format!("{prefix}.Pin"), output.pin.clone());
         }
         fields
     }
@@ -1029,6 +1121,31 @@ pub fn check_symbols(catalog: &Catalog, symbol_dir: &Path) -> Result<Vec<String>
                         }
                     }
                 }
+            }
+        }
+        for path in &part.conduction {
+            for pin in [
+                Some(path.from_pin.as_str()),
+                Some(path.to_pin.as_str()),
+                path.control_pin.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !pins.iter().any(|(_, name)| name == pin) {
+                    problems.push(format!(
+                        "{}: conduction path {} names pin {pin:?}, which the symbol lacks",
+                        part.mpn, path.id
+                    ));
+                }
+            }
+        }
+        for output in &part.control_outputs {
+            if !pins.iter().any(|(_, name)| name == &output.pin) {
+                problems.push(format!(
+                    "{}: control output {} names pin {:?}, which the symbol lacks",
+                    part.mpn, output.kind, output.pin
+                ));
             }
         }
     }
@@ -1178,6 +1295,30 @@ mod tests {
             err.contains("missing its required input/output net"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn only_confirmed_behavior_becomes_netlist_evidence() {
+        let json = part_json(
+            r#", "conduction": [
+                {"id": "main", "from_pin": "IN", "to_pin": "OUT",
+                 "reverse_conducting": false, "default_conducting": false,
+                 "control_pin": "EN", "control_identity": "enable",
+                 "cite": {"reading": "confirmed behavior", "confirmed_by": "test"}},
+                {"id": "guess", "from_pin": "A", "to_pin": "B",
+                 "reverse_conducting": true, "default_conducting": true,
+                 "cite": {"reading": "unconfirmed behavior"}}
+            ], "control_outputs": [
+                {"kind": "watchdog", "pin": "WDO",
+                 "cite": {"reading": "confirmed output", "confirmed_by": "test"}}
+            ]"#,
+        );
+        let catalog = load_one(&json).unwrap();
+        let fields = catalog.parts[0].netlist_fields();
+        assert_eq!(fields["Conduction.0.FromPin"], "IN");
+        assert_eq!(fields["Conduction.0.ControlPin"], "EN");
+        assert!(!fields.contains_key("Conduction.1.FromPin"));
+        assert_eq!(fields["ControlOutput.0.Kind"], "watchdog");
     }
 
     #[test]

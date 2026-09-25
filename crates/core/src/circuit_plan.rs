@@ -353,6 +353,8 @@ mod tests {
                     }),
                     dropout_v: None,
                 }),
+                conduction: vec![],
+                control_outputs: vec![],
                 interfaces: vec![],
                 support: vec![],
                 sim_excluded: false,

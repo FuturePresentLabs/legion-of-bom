@@ -844,6 +844,7 @@ mod tests {
         PinRef {
             refdes: RefDes(r.into()),
             pin: p.into(),
+            function: None,
             electrical_type: None,
         }
     }
