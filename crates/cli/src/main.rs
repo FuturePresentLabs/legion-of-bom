@@ -2548,6 +2548,7 @@ fn fab_cmd(
             &rules::Context {
                 facts: Some(&facts),
                 outline: guide::board_outline(&board),
+                fixed_positions: None,
             },
         );
         let placed = guide::placements_from_board(&board)

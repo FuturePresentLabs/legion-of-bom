@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &rules::Context {
             facts: facts.as_ref(),
             outline: guide::board_outline(&src),
+            fixed_positions: None,
         },
     );
     let assessed = rules::assess(&derived, &guide::placements_from_board(&src)?);

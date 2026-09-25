@@ -198,6 +198,16 @@ pub trait Placer {
     fn anchored(&self) -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
     }
+
+    /// Exact board-space positions imposed by a mechanical interface.
+    ///
+    /// This is deliberately stronger than [`Self::anchored`]: the latter only
+    /// prevents downstream movement, while this record lets the rule engine
+    /// independently prove that an anchor was actually honored. Coordinates
+    /// include the sheet origin because [`Placement`] does too.
+    fn fixed_positions(&self) -> HashMap<String, (f64, f64)> {
+        HashMap::new()
+    }
 }
 
 /// Extra gap (mm) left between adjacent grid cells, on top of each part's extent.
@@ -421,6 +431,18 @@ pub struct EurorackPlacer {
 impl Placer for EurorackPlacer {
     fn anchored(&self) -> std::collections::HashSet<String> {
         self.anchors.keys().cloned().collect()
+    }
+
+    fn fixed_positions(&self) -> HashMap<String, (f64, f64)> {
+        self.anchors
+            .iter()
+            .map(|(reference, &(x, y))| {
+                (
+                    reference.clone(),
+                    (x + self.origin_mm.0, y + self.origin_mm.1),
+                )
+            })
+            .collect()
     }
 
     fn place(
@@ -829,6 +851,18 @@ impl SeededPlacer {
 impl Placer for SeededPlacer {
     fn anchored(&self) -> std::collections::HashSet<String> {
         self.anchors.keys().cloned().collect()
+    }
+
+    fn fixed_positions(&self) -> HashMap<String, (f64, f64)> {
+        self.anchors
+            .iter()
+            .map(|(reference, &(x, y))| {
+                (
+                    reference.clone(),
+                    (x + self.origin_mm.0, y + self.origin_mm.1),
+                )
+            })
+            .collect()
     }
 
     fn place(
@@ -1911,6 +1945,7 @@ fn fits_outline(
         };
         let mut placements = placer.place(circuit, facts);
         let pinned = placer.anchored();
+        let fixed_positions = placer.fixed_positions();
         // A part in the overflow lane sits below the board bottom (y > height).
         let overflowed = placements.values().any(|p| p.y_mm > h + 0.01);
         // …but "nothing overflowed" is not "buildable". The lane only catches
@@ -1923,6 +1958,7 @@ fn fits_outline(
             &crate::rules::Context {
                 facts: Some(facts),
                 outline: Some((0.0, 0.0, w, h)),
+                fixed_positions: Some(&fixed_positions),
             },
         );
         // Legalize before judging, because the build does. Asking whether the
@@ -2080,6 +2116,7 @@ pub fn generate_board_artifacts(
     // Panel controls are pinned to their cutouts; nothing downstream may slide
     // them off, or the board stops mating its own panel.
     let pinned = options.placer.anchored();
+    let fixed_positions = options.placer.fixed_positions();
 
     // Bypass caps go against the power pin they bypass, before anything else
     // gets a say. The placer's decoupling pull is one attractor among many and
@@ -2118,6 +2155,7 @@ pub fn generate_board_artifacts(
             &crate::rules::Context {
                 facts: Some(&facts),
                 outline: options.fixed_outline,
+                fixed_positions: Some(&fixed_positions),
             },
         );
         crate::legalize::legalize_pinning(&mut placements, &rules, &facts, &pinned);

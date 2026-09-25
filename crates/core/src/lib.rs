@@ -239,8 +239,9 @@ pub use route::{
     RouteOptions, RouteOutput, Router, Track, Via,
 };
 pub use rules::{
-    derive as derive_rules, evaluate as evaluate_rules, penalty as rule_penalty, Rule, Tier,
-    Violation,
+    assess as assess_constraints, derive as derive_rules, derive_in as derive_rules_in,
+    evaluate as evaluate_rules, penalty as rule_penalty, Constraint, ConstraintResult,
+    ConstraintStatus, Context as PcbConstraintContext, Rule, Tier, Violation,
 };
 pub use scaffold::{ignore_block, is_generated, merge_gitignore, IgnoreRule};
 pub use schematic::schematic_to_svg;

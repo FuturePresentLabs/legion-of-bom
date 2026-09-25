@@ -19,7 +19,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::board::{generate_board_artifacts, BoardError, BoardOptions, Placement, SeededPlacer};
+use crate::board::{
+    generate_board_artifacts, BoardError, BoardOptions, Placement, Placer, SeededPlacer,
+};
 use crate::drc::{run_drc, DrcReport};
 use crate::layout_repair::{decide_repair, RepairAction, RepairEvidence, RuleEvidence};
 use crate::route::RouteOutput;
@@ -335,22 +337,21 @@ struct CandidateRank {
 
 impl CandidateRank {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.unrouted
-            .cmp(&other.unrouted)
+        // Physical feasibility is a gate, not a weighted preference. A routed
+        // board with its USB socket stranded in the middle or a mounting hole
+        // off its datum is not a better candidate than a legal board that still
+        // needs routing repair.
+        self.broken[0]
+            .total_cmp(&other.broken[0])
+            .then_with(|| self.unrouted.cmp(&other.unrouted))
             .then_with(|| self.drc_errors.cmp(&other.drc_errors))
-            .then_with(|| cmp_f64_array(self.broken, other.broken))
+            .then_with(|| self.broken[1].total_cmp(&other.broken[1]))
+            .then_with(|| self.broken[2].total_cmp(&other.broken[2]))
             .then_with(|| self.area_mm2.total_cmp(&other.area_mm2))
             .then_with(|| self.runtime_work.cmp(&other.runtime_work))
             .then_with(|| self.preference.total_cmp(&other.preference))
             .then_with(|| self.policy_index.cmp(&other.policy_index))
     }
-}
-
-fn cmp_f64_array(left: [f64; 3], right: [f64; 3]) -> Ordering {
-    left[0]
-        .total_cmp(&right[0])
-        .then_with(|| left[1].total_cmp(&right[1]))
-        .then_with(|| left[2].total_cmp(&right[2]))
 }
 
 fn budget_share(total: Option<u64>, candidates: usize, index: usize) -> Option<u64> {
@@ -410,11 +411,13 @@ pub fn run_layout_loop_with_decider(
     // Size-aware rules: how close a cap *can* get to its chip depends on how big
     // both are, and a limit smaller than that floor can never be met.
     let facts = crate::board::build_facts(circuit, &options.footprint_dir).ok();
+    let fixed_positions = template.fixed_positions();
     let rules = crate::rules::derive_in(
         circuit,
         &crate::rules::Context {
             facts: facts.as_ref(),
             outline: options.fixed_outline,
+            fixed_positions: Some(&fixed_positions),
         },
     );
     let iters = cfg.max_iters.max(1);
@@ -1154,7 +1157,12 @@ mod tests {
     }
 
     #[test]
-    fn candidate_order_is_connectivity_then_drc_then_area_work_preference() {
+    fn candidate_order_is_physical_feasibility_then_connectivity_and_drc() {
+        let mut physically_broken = candidate(0, 0, 1.0, 1, 1.0);
+        physically_broken.broken[0] = 0.1;
+        let legal_but_unrouted = candidate(1, 99, 10_000.0, 99_000, 99_000.0);
+        assert!(legal_but_unrouted.cmp(&physically_broken).is_lt());
+
         let routed = candidate(0, 99, 10_000.0, 99_000, 99_000.0);
         let unrouted = candidate(1, 0, 1.0, 1, 1.0);
         assert!(routed.cmp(&unrouted).is_lt());
@@ -1162,11 +1170,6 @@ mod tests {
         let drc_clean = candidate(0, 0, 10_000.0, 99_000, 99_000.0);
         let drc_broken = candidate(0, 1, 1.0, 1, 1.0);
         assert!(drc_clean.cmp(&drc_broken).is_lt());
-
-        let rules_clean = candidate(0, 0, 10_000.0, 99_000, 99_000.0);
-        let mut rules_broken = candidate(0, 0, 1.0, 1, 1.0);
-        rules_broken.broken[0] = 0.1;
-        assert!(rules_clean.cmp(&rules_broken).is_lt());
 
         assert!(candidate(0, 0, 99.0, 999, 999.0)
             .cmp(&candidate(0, 0, 100.0, 1, 1.0))

@@ -31,6 +31,9 @@
 
 use std::collections::HashMap;
 
+pub use black_book::constraints::ConstraintStatus;
+use black_book::constraints::ScalarConstraint;
+
 use crate::board::Placement;
 use crate::source::CircuitSource;
 
@@ -81,6 +84,10 @@ pub struct Context<'a> {
     /// edge-clearance rule would be circular: the outline is derived from the
     /// very placement the rule would constrain, so nothing can ever overhang.
     pub outline: Option<(f64, f64, f64, f64)>,
+    /// Positions imposed by a panel, enclosure, or mounting-hole pattern.
+    /// These are independently checked after placement; merely excluding a
+    /// part from movement is not evidence that it landed on its datum.
+    pub fixed_positions: Option<&'a HashMap<String, (f64, f64)>>,
 }
 
 /// House inset from the board edge, in millimetres.
@@ -96,6 +103,14 @@ pub const EDGE_CLEARANCE_MM: f64 = 1.5;
 /// nobody evaluates is worse than no rule, because it reads as a guarantee.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rule {
+    /// A mechanical interface fixes a footprint origin at one board-space
+    /// coordinate. Mounting holes and panel controls are the common cases.
+    FixedPosition {
+        refdes: String,
+        at_mm: (f64, f64),
+        tolerance_mm: f64,
+        tier: Tier,
+    },
     /// `a` must sit within `max_mm` of `b`, centre to centre.
     Proximity {
         a: String,
@@ -169,6 +184,17 @@ pub enum Rule {
         min_mm: f64,
         tier: Tier,
     },
+    /// An edge-entry connector must actually expose its mating face at some
+    /// board edge. EdgeClearance alone only says it *may* touch an edge and
+    /// therefore also accepts a USB connector stranded in the board centre.
+    EdgeContact {
+        refdes: String,
+        extent: (f64, f64),
+        origin_offset: (f64, f64),
+        bounds: (f64, f64, f64, f64),
+        tolerance_mm: f64,
+        tier: Tier,
+    },
 }
 
 impl Rule {
@@ -181,8 +207,16 @@ impl Rule {
     /// disagreeing with each other for months.
     pub fn measured_box(&self, p: &Placement) -> Option<(f64, f64, f64, f64)> {
         match self {
-            Rule::Proximity { .. } | Rule::Separation { .. } | Rule::Overlap { .. } => None,
+            Rule::Proximity { .. }
+            | Rule::Separation { .. }
+            | Rule::Overlap { .. }
+            | Rule::FixedPosition { .. } => None,
             Rule::EdgeClearance {
+                extent,
+                origin_offset,
+                ..
+            }
+            | Rule::EdgeContact {
                 extent,
                 origin_offset,
                 ..
@@ -210,10 +244,12 @@ impl Rule {
 
     pub fn tier(&self) -> Tier {
         match self {
-            Rule::Proximity { tier, .. }
+            Rule::FixedPosition { tier, .. }
+            | Rule::Proximity { tier, .. }
             | Rule::Separation { tier, .. }
             | Rule::Overlap { tier, .. }
-            | Rule::EdgeClearance { tier, .. } => *tier,
+            | Rule::EdgeClearance { tier, .. }
+            | Rule::EdgeContact { tier, .. } => *tier,
         }
     }
 }
@@ -312,6 +348,21 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
         })
         .collect();
 
+    if let Some(fixed) = ctx.fixed_positions {
+        let mut positions = fixed.iter().collect::<Vec<_>>();
+        positions.sort_by_key(|(reference, _)| *reference);
+        rules.extend(
+            positions
+                .into_iter()
+                .map(|(reference, &at_mm)| Rule::FixedPosition {
+                    refdes: reference.clone(),
+                    at_mm,
+                    tolerance_mm: TOLERANCE_MM,
+                    tier: Tier::Physical,
+                }),
+        );
+    }
+
     // Panel hardware must not collide with panel hardware. Judged on the *panel*
     // envelope — knob, nut, finger room — because that is what a builder's hands
     // meet, and it is far bigger than the PCB courtyard the placer otherwise
@@ -388,6 +439,16 @@ pub fn derive_in(circuit: &dyn CircuitSource, ctx: &Context<'_>) -> Vec<Rule> {
                 min_mm: if edge_entry { 0.0 } else { EDGE_CLEARANCE_MM },
                 tier: Tier::Physical,
             });
+            if edge_entry {
+                rules.push(Rule::EdgeContact {
+                    refdes: r.to_string(),
+                    extent: fact.extent,
+                    origin_offset: fact.origin_offset,
+                    bounds,
+                    tolerance_mm: TOLERANCE_MM,
+                    tier: Tier::Physical,
+                });
+            }
         }
     }
 
@@ -470,7 +531,32 @@ impl Assessment {
     pub fn ok(&self) -> bool {
         self.margin_mm >= -TOLERANCE_MM
     }
+
+    pub fn status(&self) -> ConstraintStatus {
+        ScalarConstraint::Minimum {
+            value: -TOLERANCE_MM,
+        }
+        .evaluate(self.margin_mm)
+        .expect("placement constraint margins are finite")
+        .status
+    }
+
+    /// Millimetres that must be removed before this result is feasible.
+    pub fn residual_mm(&self) -> f64 {
+        ScalarConstraint::Minimum {
+            value: -TOLERANCE_MM,
+        }
+        .evaluate(self.margin_mm)
+        .expect("placement constraint margins are finite")
+        .residual
+    }
 }
+
+/// Public constraint vocabulary names. The aliases preserve the established
+/// `rules` API while making the same records usable by future KiCad and viewer
+/// adapters without creating a second representation.
+pub type Constraint = Rule;
+pub type ConstraintResult = Assessment;
 
 /// Assess every rule against a placement — passes included.
 ///
@@ -481,6 +567,29 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
     let mut out = Vec::new();
     for rule in rules {
         match rule {
+            Rule::FixedPosition {
+                refdes,
+                at_mm,
+                tolerance_mm,
+                tier,
+            } => {
+                let Some(p) = placements.get(refdes) else {
+                    continue;
+                };
+                let distance = (p.x_mm - at_mm.0).hypot(p.y_mm - at_mm.1);
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: refdes.clone(),
+                    detail: format!(
+                        "{refdes} is {distance:.3}mm from its fixed mechanical datum (max {tolerance_mm:.6}mm)"
+                    ),
+                    margin_mm: tolerance_mm - distance,
+                    repair: Some(Repair {
+                        refdes: refdes.clone(),
+                        toward_mm: *at_mm,
+                    }),
+                });
+            }
             Rule::Proximity {
                 a,
                 b,
@@ -665,6 +774,49 @@ pub fn assess(rules: &[Rule], placements: &HashMap<String, Placement>) -> Vec<As
                             p.x_mm + (px.clamp(ax0, ax1) - px),
                             p.y_mm + (py.clamp(ay0, ay1) - py),
                         ),
+                    }),
+                });
+            }
+            Rule::EdgeContact {
+                refdes,
+                bounds,
+                tolerance_mm,
+                tier,
+                ..
+            } => {
+                let Some(p) = placements.get(refdes) else {
+                    continue;
+                };
+                let Some((bx0, by0, bx1, by1)) = rule.measured_box(p) else {
+                    continue;
+                };
+                let (x0, y0, x1, y1) = *bounds;
+                let gaps = [bx0 - x0, x1 - bx1, by0 - y0, y1 - by1];
+                let (edge, gap) = gaps
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+                    .map(|(edge, gap)| (edge, *gap))
+                    .expect("four board edges");
+                let mut target = (p.x_mm, p.y_mm);
+                match edge {
+                    0 => target.0 -= gap,
+                    1 => target.0 += gap,
+                    2 => target.1 -= gap,
+                    3 => target.1 += gap,
+                    _ => unreachable!(),
+                }
+                out.push(Assessment {
+                    tier: *tier,
+                    subject: refdes.clone(),
+                    detail: format!(
+                        "{refdes} mating envelope is {:.3}mm from the nearest board edge (max {tolerance_mm:.6}mm)",
+                        gap.abs()
+                    ),
+                    margin_mm: tolerance_mm - gap.abs(),
+                    repair: Some(Repair {
+                        refdes: refdes.clone(),
+                        toward_mm: target,
                     }),
                 });
             }
@@ -873,6 +1025,78 @@ mod tests {
     }
 
     #[test]
+    fn fixed_mechanical_positions_are_derived_and_report_a_residual() {
+        let fixed: HashMap<String, (f64, f64)> = [("U1".into(), (12.0, 8.0))].into();
+        let rules = derive_in(
+            &circuit(),
+            &Context {
+                fixed_positions: Some(&fixed),
+                ..Context::default()
+            },
+        );
+        let misplaced: HashMap<String, Placement> = [("U1".into(), at(15.0, 12.0))].into();
+        let assessment = assess(&rules, &misplaced)
+            .into_iter()
+            .find(|result| result.subject == "U1")
+            .expect("fixed-position result");
+        assert_eq!(assessment.status(), ConstraintStatus::Violated);
+        assert!((assessment.margin_mm + 5.0).abs() < 0.001);
+        assert_eq!(
+            assessment.repair.expect("bounded repair").toward_mm,
+            (12.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn usb_connector_must_reach_an_edge_not_merely_fit_inside_the_board() {
+        use crate::board::PartFacts;
+        use crate::model::Side;
+
+        let circuit = Circuit {
+            name: "usb".into(),
+            parts: vec![Part::new("J1", "USB-C").with_footprint(
+                "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+            )],
+            nets: Vec::new(),
+        };
+        let facts: HashMap<String, PartFacts> = [(
+            "J1".into(),
+            PartFacts {
+                extent: (10.0, 4.0),
+                body_extent: (10.0, 4.0),
+                origin_offset: (0.0, 0.0),
+                side: Side::Front,
+                height_mm: 3.0,
+                standoff_mm: None,
+                tht_pads: Vec::new(),
+                pin_offsets: HashMap::new(),
+            },
+        )]
+        .into();
+        let rules = derive_in(
+            &circuit,
+            &Context {
+                facts: Some(&facts),
+                outline: Some((0.0, 0.0, 30.0, 20.0)),
+                fixed_positions: None,
+            },
+        );
+        assert!(rules
+            .iter()
+            .any(|rule| matches!(rule, Rule::EdgeContact { .. })));
+
+        let mut placement: HashMap<String, Placement> = [("J1".into(), at(15.0, 10.0))].into();
+        let violation = evaluate(&rules, &placement)
+            .into_iter()
+            .find(|violation| violation.what.contains("mating envelope"))
+            .expect("centre placement cannot mate outside the board");
+        assert!((violation.by_mm - 8.0).abs() < 0.001);
+        let repair = violation.repair.expect("nearest-edge repair");
+        placement.insert("J1".into(), at(repair.toward_mm.0, repair.toward_mm.1));
+        assert!(evaluate(&rules, &placement).is_empty());
+    }
+
+    #[test]
     fn a_bypass_cap_derives_a_proximity_rule_to_its_ic() {
         let rules = derive(&circuit());
         assert_eq!(rules.len(), 1);
@@ -959,6 +1183,7 @@ mod tests {
             &Context {
                 facts: Some(&facts),
                 outline: None,
+                fixed_positions: None,
             },
         );
         let Rule::Proximity { max_mm, .. } = &sized[0] else {
@@ -1140,6 +1365,7 @@ mod tests {
                 &Context {
                     facts: Some(&facts),
                     outline: Some((origin.0, origin.1, origin.0 + w, origin.1 + h)),
+                    fixed_positions: None,
                 },
             );
             let broken: Vec<_> = evaluate(&rules, &placements)
