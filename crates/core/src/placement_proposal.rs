@@ -230,7 +230,11 @@ pub fn propose_llm(
         ),
     )
     .with_temperature(0.0)
-    .with_max_tokens(1024);
+    // Reasoning-capable chat fallbacks can otherwise spend the entire small
+    // response budget thinking and return zero JSON bytes. The host has already
+    // done the engineering and bounded the domain; this call only fills it.
+    .with_reasoning_effort("low")
+    .with_max_tokens(4096);
     let started = std::time::Instant::now();
     let raw = completer.complete(&prompt)?;
     #[derive(Deserialize)]
