@@ -31,6 +31,7 @@ pub mod easyeda;
 pub mod edit;
 pub mod ee_export;
 pub mod electrical_proof;
+pub mod electrical_supervision;
 pub mod engineering;
 pub mod environment;
 pub mod fab;

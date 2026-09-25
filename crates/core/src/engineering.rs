@@ -14,23 +14,25 @@ const PROFILE: &str = "embedded-digital-black-book";
 
 #[must_use]
 pub fn verify(circuit: &dyn CircuitSource) -> StandardReport {
+    let mut results = vec![
+        crate::electrical_proof::connectivity_check(circuit),
+        crate::electrical_proof::power_tree_check(circuit),
+        decoupling(circuit),
+        clock_topology(circuit),
+        interface_bindings(circuit),
+        rf_macro(circuit),
+    ];
+    results.extend(crate::electrical_supervision::checks(circuit));
+    results.push(CheckResult {
+        aspect: "physical electrical, SI/PI, EMC and RF performance".into(),
+        verifiable: Verifiable::TestOnly,
+        verdict: Verdict::NeedsTest,
+        detail: "requires bench measurements and the applicable compliance program; this topology profile does not certify the product".into(),
+    });
     StandardReport {
         standard: PROFILE.into(),
         designation: "Puget artifact-visible embedded/audio/RF engineering profile v1".into(),
-        results: vec![
-            crate::electrical_proof::connectivity_check(circuit),
-            crate::electrical_proof::power_tree_check(circuit),
-            decoupling(circuit),
-            clock_topology(circuit),
-            interface_bindings(circuit),
-            rf_macro(circuit),
-            CheckResult {
-                aspect: "physical electrical, SI/PI, EMC and RF performance".into(),
-                verifiable: Verifiable::TestOnly,
-                verdict: Verdict::NeedsTest,
-                detail: "requires bench measurements and the applicable compliance program; this topology profile does not certify the product".into(),
-            },
-        ],
+        results,
     }
 }
 
