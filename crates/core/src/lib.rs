@@ -69,6 +69,7 @@ pub mod pedal_panel;
 pub mod photo;
 pub mod placement;
 pub mod placement_edit;
+pub mod placement_proposal;
 pub mod power_proof;
 pub mod project;
 pub mod readiness;
@@ -185,8 +186,9 @@ pub use import::{
 pub use jlcpcb::{JlcpcbClient, JlcpcbComponent, JlcpcbError};
 pub use layout::{
     eurorack_trial_build, measure, minimum_routable_hp, run_layout_loop,
-    run_layout_loop_with_decider, score, CostWeights, HpSearch, HpTrial, LayoutLoop, LayoutMode,
-    LayoutReport, PlacementMetrics, RepairDecider, RoutableHp,
+    run_layout_loop_with_decider, run_layout_loop_with_deciders, score, CostWeights, HpSearch,
+    HpTrial, LayoutLoop, LayoutMode, LayoutReport, PlacementDecider, PlacementMetrics,
+    RepairDecider, RoutableHp,
 };
 pub use layout_cache::LayoutCache;
 pub use layout_repair::{decide_repair, valid_actions, RepairAction, RepairEvidence, RuleEvidence};

@@ -24,6 +24,9 @@ use crate::board::{
 };
 use crate::drc::{run_drc, DrcReport};
 use crate::layout_repair::{decide_repair, RepairAction, RepairEvidence, RuleEvidence};
+use crate::placement_proposal::{
+    propose_bounded, propose_llm, propose_with_fallback, PlacementField, PlacementProposalRequest,
+};
 use crate::route::RouteOutput;
 use crate::source::CircuitSource;
 use crate::stage::Finding;
@@ -368,6 +371,18 @@ pub struct RepairDecider<'a> {
     pub trace: &'a mut ooda::Trace,
 }
 
+/// Optional bounded numeric placement assistance. This is separate from the
+/// repair-action decider because GPC-1 and the fallback LLM are distinct model
+/// capabilities and may use different model slugs.
+pub struct PlacementDecider<'a> {
+    /// Native bounded-numeric model (for example GPC-1). When present, it
+    /// chooses placement deltas inside Lob-derived millimetre domains.
+    pub numeric: Option<&'a dyn ooda::BoundedPredictor>,
+    /// Slower chat-model compatibility path. It receives the same strict schema
+    /// and is used only when `numeric` is absent or its call fails.
+    pub llm_fallback: Option<&'a dyn ooda::Complete>,
+}
+
 /// Run the iterative layout loop. `template` carries the panel dimensions and
 /// anchored cutouts; each iteration rebuilds a [`SeededPlacer`] from it (with
 /// repair nudges) and installs it into `options` before generating the board.
@@ -384,10 +399,23 @@ pub fn run_layout_loop(
 /// [`run_layout_loop`] with bounded RLCD repair selection enabled.
 pub fn run_layout_loop_with_decider(
     circuit: &dyn CircuitSource,
+    options: BoardOptions,
+    template: SeededPlacer,
+    cfg: &LayoutLoop,
+    decider: Option<RepairDecider<'_>>,
+) -> Result<LayoutReport, BoardError> {
+    run_layout_loop_with_deciders(circuit, options, template, cfg, decider, None)
+}
+
+/// Layout loop with independently configurable bounded action and numeric
+/// placement models. Callers may supply either capability or both.
+pub fn run_layout_loop_with_deciders(
+    circuit: &dyn CircuitSource,
     mut options: BoardOptions,
     template: SeededPlacer,
     cfg: &LayoutLoop,
-    mut decider: Option<RepairDecider<'_>>,
+    mut repair_decider: Option<RepairDecider<'_>>,
+    placement_decider: Option<PlacementDecider<'_>>,
 ) -> Result<LayoutReport, BoardError> {
     // One placement attempt's result, so the loop can keep the best by score.
     struct Attempt {
@@ -585,7 +613,7 @@ pub fn run_layout_loop_with_decider(
         // Repair: perturb the free parts so the next attempt explores a different
         // arrangement the router may find easier (DESIGN §6.5 step 4). Deterministic
         // shake — no RNG — so each attempt is a clean, reproducible git diff.
-        let action = match decider.as_mut() {
+        let action = match repair_decider.as_mut() {
             Some(d) => decide_repair(d.client, d.trace, &repair_evidence)
                 .map_err(|e| BoardError::Other(format!("layout repair decision failed: {e}")))?,
             None if repair_evidence.rule_violations.iter().any(|v| v.repairable) => {
@@ -594,13 +622,45 @@ pub fn run_layout_loop_with_decider(
             None => RepairAction::ExploreLocal,
         };
         repair_actions.push(action);
-        nudges = repair_nudges(
+        let deterministic_nudges = repair_nudges(
             &free,
             i + 1,
             &art.placements,
             &violations_this_attempt,
             action,
         );
+        nudges = match placement_decider.as_ref() {
+            Some(d) if d.numeric.is_some() || d.llm_fallback.is_some() => {
+                let request = placement_repair_request(
+                    &repair_evidence,
+                    action,
+                    &deterministic_nudges,
+                    template.width_mm,
+                    template.height_mm,
+                );
+                let proposal = match (d.numeric, d.llm_fallback) {
+                    (Some(numeric), Some(llm)) => propose_with_fallback(numeric, llm, &request),
+                    (Some(numeric), None) => propose_bounded(numeric, &request),
+                    (None, Some(llm)) => propose_llm(llm, &request),
+                    (None, None) => unreachable!(),
+                }
+                .map_err(|error| {
+                    BoardError::Other(format!("numeric placement proposal failed: {error}"))
+                })?;
+                free.iter()
+                    .map(|refdes| {
+                        (
+                            refdes.clone(),
+                            (
+                                proposal.values[&format!("{refdes}_dx_mm")],
+                                proposal.values[&format!("{refdes}_dy_mm")],
+                            ),
+                        )
+                    })
+                    .collect()
+            }
+            _ => deterministic_nudges,
+        };
     }
 
     let Attempt {
@@ -731,10 +791,7 @@ fn repair_nudges(
     const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653; // radians
     /// Fraction of a repair hint's distance to actually move each attempt.
     const REPAIR_STEP: f64 = 0.6;
-    let mag = match action {
-        RepairAction::FollowRuleHints | RepairAction::ExploreLocal => 2.0 + 1.5 * attempt as f64,
-        RepairAction::ExploreWide => 2.0 * (2.0 + 1.5 * attempt as f64),
-    };
+    let mag = repair_magnitude(action, attempt);
 
     // Last violation naming a part wins if several do — one guided step per
     // part per attempt, same as everything else in this loop.
@@ -760,6 +817,67 @@ fn repair_nudges(
             (r.clone(), (mag * ang.cos(), mag * ang.sin()))
         })
         .collect()
+}
+
+fn repair_magnitude(action: RepairAction, attempt: usize) -> f64 {
+    let local = 2.0 + 1.5 * attempt as f64;
+    match action {
+        RepairAction::FollowRuleHints | RepairAction::ExploreLocal => local,
+        RepairAction::ExploreWide => 2.0 * local,
+    }
+}
+
+/// Turn the deterministic repair into a closed numeric search domain. The
+/// existing nudge is included as evidence, not imposed as the answer. Bounds
+/// are derived from the board and the selected repair mode, so a model cannot
+/// move a part farther than one board span in a single iteration.
+fn placement_repair_request(
+    evidence: &RepairEvidence,
+    action: RepairAction,
+    suggested: &HashMap<String, (f64, f64)>,
+    board_width_mm: f64,
+    board_height_mm: f64,
+) -> PlacementProposalRequest {
+    let base_limit = repair_magnitude(action, evidence.attempt).max(0.5);
+    let mut parts = suggested.keys().cloned().collect::<Vec<_>>();
+    parts.sort();
+    let mut fields = Vec::with_capacity(parts.len() * 2);
+    for refdes in &parts {
+        let (suggested_x, suggested_y) = suggested[refdes];
+        let x_limit = base_limit
+            .max(suggested_x.abs())
+            .min(board_width_mm.abs().max(0.5));
+        let y_limit = base_limit
+            .max(suggested_y.abs())
+            .min(board_height_mm.abs().max(0.5));
+        fields.push(PlacementField {
+            key: format!("{refdes}_dx_mm"),
+            description: format!("horizontal repair displacement for {refdes}"),
+            minimum: -x_limit,
+            maximum: x_limit,
+            unit: "mm".into(),
+            reference: format!("{refdes} current footprint origin"),
+        });
+        fields.push(PlacementField {
+            key: format!("{refdes}_dy_mm"),
+            description: format!("vertical repair displacement for {refdes}"),
+            minimum: -y_limit,
+            maximum: y_limit,
+            unit: "mm".into(),
+            reference: format!("{refdes} current footprint origin"),
+        });
+    }
+    PlacementProposalRequest {
+        observation: serde_json::json!({
+            "repair_evidence": evidence,
+            "selected_strategy": action.key(),
+            "host_suggested_deltas_mm": suggested,
+            "board_size_mm": {"width": board_width_mm, "height": board_height_mm}
+        }),
+        instruction: "Choose one x/y repair delta for every listed free component. Improve routing and rule satisfaction while preserving the host's keepouts, pinned hardware, and cluster constraints. Values are relative displacements, not absolute coordinates.".into(),
+        fields,
+        correlation: Some(format!("layout-repair-{}", evidence.attempt)),
+    }
 }
 
 /// Run KiCad DRC on a board string by writing it to a temp file first (KiCad
@@ -1310,6 +1428,44 @@ mod tests {
             RepairAction::FollowRuleHints,
         );
         assert_eq!(guided["R1"], unguided["R1"]);
+    }
+
+    #[test]
+    fn numeric_repair_domain_is_derived_from_board_and_host_nudges() {
+        let evidence = RepairEvidence {
+            attempt: 2,
+            attempts_remaining: 1,
+            unrouted_connections: 3,
+            route_conflicts: vec!["SPI_SCK blocked".into()],
+            rule_violations: vec![],
+            drc_errors: 0,
+            drc_error_kinds: vec![],
+            signal_hpwl_mm: 20.0,
+            critical_hpwl_mm: 4.0,
+            via_count: 1,
+        };
+        let suggested = HashMap::from([("U2".into(), (12.0, -2.0))]);
+        let request =
+            placement_repair_request(&evidence, RepairAction::ExploreLocal, &suggested, 10.0, 8.0);
+
+        assert_eq!(request.fields.len(), 2);
+        let x = request
+            .fields
+            .iter()
+            .find(|field| field.key == "U2_dx_mm")
+            .unwrap();
+        assert_eq!((x.minimum, x.maximum), (-10.0, 10.0));
+        let y = request
+            .fields
+            .iter()
+            .find(|field| field.key == "U2_dy_mm")
+            .unwrap();
+        assert_eq!((y.minimum, y.maximum), (-5.0, 5.0));
+        assert_eq!(request.correlation.as_deref(), Some("layout-repair-2"));
+        assert_eq!(
+            request.observation["host_suggested_deltas_mm"]["U2"][0],
+            12.0
+        );
     }
 
     fn mag((x, y): &(f64, f64)) -> f64 {
