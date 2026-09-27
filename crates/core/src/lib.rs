@@ -14,6 +14,8 @@ pub mod analytical;
 pub mod api500;
 pub mod assurance;
 pub mod board;
+pub mod board_contract;
+pub mod board_contract_export;
 pub mod bom;
 pub mod bom_repair;
 pub mod carrier;
@@ -120,6 +122,16 @@ pub use board::{
     generate_board_artifacts, generate_board_report, minimum_framed_outline, minimum_free_outline,
     minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
     Placement, PlacementSidePolicy, Placer, PourNet, SeededPlacer, SilkLegend, SilkValues,
+};
+pub use board_contract::{
+    BoardCompatibility, BoardDatum, BoardElectromechanicalArtifact, BoardEnvelope,
+    BoardMassProperties, BoardRevision, CatalogIdentity, ConnectorInterface, ContractProvenance,
+    EnvelopeKind, MechanicalMountingHole, Point2Mm, Point3Mm, PowerInput, ThermalPowerMetadata,
+    UnitVector3, BOARD_ELECTROMECHANICAL_SCHEMA,
+};
+pub use board_contract_export::{
+    export_board_electromechanical_contract, BoardContractExportError, BoardContractExportSpec,
+    ConnectorExportSource, MountingHoleExportSource,
 };
 pub use bom::{generate_bom, Bom, BomLine, LineKind};
 pub use bom_repair::{

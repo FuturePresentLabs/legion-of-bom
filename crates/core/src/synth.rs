@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::{
     Catalog, CatalogPart, Endpoint, Interface, PartSymbol, Scoped, Signal, Subcircuit,
 };
+use crate::circuit_plan::{generate_plan, CircuitPlan, PlanError, PlanGenerationError};
 use crate::oscillator::{fmt_pf, load_cap_pf, round_e12_pf};
 use crate::skidl_emit::{Circuit, EmitPart, PinRef, SymbolSrc};
 use crate::spec::{expect_choice, expect_noul, SpecError};
@@ -49,6 +50,10 @@ pub struct Selection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesignSpec {
     pub brief: String,
+    /// Present on new generic board designs: the topology and wiring authored
+    /// step-by-step by RLCD. Absent only on legacy role-synthesis specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_plan: Option<Box<CircuitPlan>>,
     /// Engineering standards/profiles the brief requires. A profile is never
     /// inferred downstream: checks run because the spec explicitly names it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -73,12 +78,53 @@ pub enum SynthError {
     Decision(#[from] SpecError),
     #[error(transparent)]
     Stage(#[from] StageError),
+    #[error(transparent)]
+    Plan(#[from] PlanGenerationError),
+    #[error(transparent)]
+    PlanReplay(#[from] PlanError),
     #[error("no catalog part can fill {0}")]
     Unfilled(String),
     #[error("the catalog changed since this spec was decided (spec {spec}, catalog {now}): decide again")]
     StaleCatalog { spec: String, now: String },
     #[error("{0}")]
     Invalid(String),
+}
+
+/// New prompt-to-board path: RLCD authors the generic circuit operation plan.
+/// The legacy role-cover fields remain empty solely for persisted-spec schema
+/// compatibility; no topology is selected by this function.
+pub fn design_plan(
+    client: &impl Client,
+    trace: &mut Trace,
+    brief: &str,
+    catalog: &Catalog,
+    symbol_dir: &Path,
+    required_standards: &[String],
+) -> Result<DesignSpec, SynthError> {
+    for id in required_standards {
+        let Some(standard) = crate::standards::find(id) else {
+            return Err(SynthError::Invalid(format!(
+                "unknown engineering standard/profile '{id}'"
+            )));
+        };
+        if matches!(standard.status, crate::standards::Status::Planned { .. }) {
+            return Err(SynthError::Invalid(format!(
+                "engineering standard/profile '{id}' is catalogued but not implemented"
+            )));
+        }
+    }
+    Ok(DesignSpec {
+        brief: brief.to_owned(),
+        circuit_plan: Some(Box::new(generate_plan(
+            client, trace, brief, catalog, symbol_dir,
+        )?)),
+        required_standards: required_standards.to_vec(),
+        requirements: BTreeMap::new(),
+        parts: BTreeMap::new(),
+        bindings: BTreeMap::new(),
+        form_factor: None,
+        catalog: catalog.fingerprint(),
+    })
 }
 
 /// The board's supply input net.
@@ -730,6 +776,7 @@ pub fn design_with_standards(
 
     Ok(DesignSpec {
         brief: brief.to_string(),
+        circuit_plan: None,
         required_standards: required_standards.to_vec(),
         requirements,
         parts,
@@ -870,6 +917,9 @@ pub fn circuit(
             spec: spec.catalog.clone(),
             now: catalog.fingerprint(),
         });
+    }
+    if let Some(plan) = &spec.circuit_plan {
+        return plan.replay(catalog, symbol_dir).map_err(Into::into);
     }
 
     // Place every chosen part, in a fixed order so designators are stable.

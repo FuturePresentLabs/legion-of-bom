@@ -267,11 +267,7 @@ fn nearest_free(
         );
         !crate::rules::assess(rules, &trial)
             .into_iter()
-            .any(|a| {
-                a.tier == tier
-                    && (tier == Tier::Electrical || a.subject == refdes)
-                    && !a.ok()
-            })
+            .any(|a| a.tier == tier && (tier == Tier::Electrical || a.subject == refdes) && !a.ok())
     };
     let accepts = |x: f64, y: f64| satisfies_rules(x, y) && !clashes(x, y);
     if accepts(target.0, target.1) {

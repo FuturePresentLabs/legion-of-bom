@@ -79,14 +79,13 @@ pub fn generate_with_standards(
         ))),
         "board" => {
             let catalog = Catalog::load(&default_catalog_dir())?;
-            let symbols = crate::skidl::kicad_symbol_dir();
-            let symbol_dir = symbols.as_ref().map(|s| s.path());
-            Ok(Spec::Board(synth::design_with_standards(
+            let symbols = crate::skidl::kicad_symbol_dir().ok_or(FamilyError::NoSymbols)?;
+            Ok(Spec::Board(synth::design_plan(
                 client,
                 trace,
                 brief,
                 &catalog,
-                symbol_dir,
+                symbols.path(),
                 required_standards,
             )?))
         }
@@ -197,6 +196,7 @@ mod tests {
     fn a_synthesized_board_spec_round_trips_and_has_no_panel() {
         let spec = Spec::Board(DesignSpec {
             brief: "b".into(),
+            circuit_plan: None,
             required_standards: vec!["usb-type-c-2.0-sink".into()],
             requirements: [("line_out".to_string(), true)].into(),
             parts: [(

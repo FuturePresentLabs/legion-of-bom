@@ -1,0 +1,94 @@
+{
+  "schema": "lob.board-electromechanical.v1",
+  "board_id": "flight-computer",
+  "board_revision": { "design": "A", "variant": "flight" },
+  "outline_mm": [
+    { "x": 0.0, "y": 0.0 },
+    { "x": 80.0, "y": 0.0 },
+    { "x": 80.0, "y": 30.0 },
+    { "x": 0.0, "y": 30.0 }
+  ],
+  "thickness_mm": 1.6,
+  "datums": [{
+    "id": "pcb-origin",
+    "origin_mm": { "x": 0.0, "y": 0.0, "z": 0.0 },
+    "x_axis": { "x": 1.0, "y": 0.0, "z": 0.0 },
+    "y_axis": { "x": 0.0, "y": 1.0, "z": 0.0 }
+  }],
+  "mounting_holes": [{
+    "id": "mh1",
+    "datum_id": "pcb-origin",
+    "center_mm": { "x": 4.0, "y": 4.0 },
+    "finished_diameter_mm": 3.2,
+    "diameter_tolerance_mm": 0.1,
+    "position_tolerance_mm": 0.2,
+    "plated": false
+  }],
+  "connectors": [{
+    "id": "usb-service",
+    "reference_designator": "J1",
+    "interface": "usb-c-receptacle",
+    "catalog_identity": { "manufacturer": "GCT", "part_number": "USB4105-GF-A" },
+    "datum_id": "pcb-origin",
+    "location_mm": { "x": 80.0, "y": 15.0, "z": 0.8 },
+    "mating_direction": { "x": 1.0, "y": 0.0, "z": 0.0 }
+  }],
+  "envelopes": [
+    {
+      "id": "component-height-top",
+      "kind": "height",
+      "datum_id": "pcb-origin",
+      "footprint_mm": [{ "x": 0.0, "y": 0.0 }, { "x": 80.0, "y": 0.0 }, { "x": 80.0, "y": 30.0 }, { "x": 0.0, "y": 30.0 }],
+      "z_min_mm": 0.8,
+      "z_max_mm": 12.0
+    },
+    {
+      "id": "usb-cable-mate",
+      "kind": "cable",
+      "datum_id": "pcb-origin",
+      "footprint_mm": [{ "x": 80.0, "y": 10.0 }, { "x": 120.0, "y": 10.0 }, { "x": 120.0, "y": 20.0 }, { "x": 80.0, "y": 20.0 }],
+      "z_min_mm": -1.0,
+      "z_max_mm": 8.0,
+      "connector_id": "usb-service"
+    },
+    {
+      "id": "radio-antenna-keepout",
+      "kind": "antenna",
+      "datum_id": "pcb-origin",
+      "footprint_mm": [{ "x": 5.0, "y": 22.0 }, { "x": 25.0, "y": 22.0 }, { "x": 25.0, "y": 30.0 }, { "x": 5.0, "y": 30.0 }],
+      "z_min_mm": -5.0,
+      "z_max_mm": 15.0
+    },
+    {
+      "id": "debug-probe-service",
+      "kind": "service",
+      "datum_id": "pcb-origin",
+      "footprint_mm": [{ "x": 28.0, "y": 8.0 }, { "x": 52.0, "y": 8.0 }, { "x": 52.0, "y": 22.0 }, { "x": 28.0, "y": 22.0 }],
+      "z_min_mm": 0.8,
+      "z_max_mm": 35.0
+    }
+  ],
+  "mass_properties": {
+    "mass_g": 42.0,
+    "center_of_gravity_mm": { "x": 39.0, "y": 15.2, "z": 1.7 }
+  },
+  "thermal_power": {
+    "operating_temperature_min_c": -20.0,
+    "operating_temperature_max_c": 70.0,
+    "maximum_dissipation_w": 8.0,
+    "power_inputs": [{
+      "id": "usb-vbus",
+      "connector_id": "usb-service",
+      "nominal_voltage_v": 5.0,
+      "maximum_current_a": 3.0
+    }]
+  },
+  "provenance": {
+    "producer": "legion-of-bom",
+    "source_artifact": "flight-computer.kicad_pcb",
+    "source_revision": "git:0123456789abcdef",
+    "generated_by": "lob board-contract 0.1.0",
+    "generated_at": "2026-09-25T00:00:00Z",
+    "digest": "sha256:fixture"
+  }
+}
