@@ -24,6 +24,7 @@ use crate::board::{
 };
 use crate::drc::{run_drc, DrcReport};
 use crate::layout_repair::{decide_repair, RepairAction, RepairEvidence, RuleEvidence};
+use crate::pcb_drc::FirstPartyDrcSummary;
 use crate::placement_proposal::{
     propose_bounded, propose_llm, propose_with_fallback, PlacementField, PlacementProposalRequest,
     ProposalEvidence,
@@ -318,6 +319,10 @@ pub struct LayoutReport {
     pub not_placed: Vec<String>,
     /// Final-gate DRC report, when `kicad_cli` was provided.
     pub drc: Option<DrcReport>,
+    /// First-party copper DRC of the winning board — always run, scoped to
+    /// `IMPLEMENTED_CHECKS`; see [`crate::pcb_drc`]. `None` when no router
+    // ran (an unrouted preview has no copper verdict).
+    pub first_party_drc: Option<DrcReport>,
     /// Human-facing observations (info/warning/error), incl. unresolved criticals.
     pub findings: Vec<Finding>,
     /// Bounded repair strategies selected during this run, in attempt order.
@@ -435,6 +440,9 @@ pub fn run_layout_loop_with_deciders(
         collisions: Vec<String>,
         not_placed: Vec<String>,
         drc: Option<DrcReport>,
+        /// The first-party copper DRC this attempt's emitted copper produced —
+        /// always run when a router ran, so the winner carries its own verdict.
+        first_party_drc: Option<DrcReport>,
         rank: CandidateRank,
         policy: LayoutPolicy,
     }
@@ -532,7 +540,16 @@ pub fn run_layout_loop_with_deciders(
                     repairable: v.repair.is_some(),
                 })
                 .collect(),
-            drc_errors: drc.as_ref().map_or(0, DrcReport::error_count),
+            // KiCad's DRC when it ran; otherwise the first-party copper DRC, so
+            // candidates are still ranked against real rule violations.
+            drc_errors: drc.as_ref().map_or_else(
+                || {
+                    art.first_party_drc
+                        .as_ref()
+                        .map_or(0, DrcReport::error_count)
+                },
+                DrcReport::error_count,
+            ),
             drc_error_kinds: drc
                 .as_ref()
                 .map(|r| r.errors().map(|v| v.kind.clone()).collect())
@@ -548,7 +565,14 @@ pub fn run_layout_loop_with_deciders(
         // Fabrication ordering: connectivity and actual DRC decide first. When
         // DRC is unavailable or tied, the black-book rule tiers prevent a
         // candidate buying compactness with a known physical/electrical defect.
-        let drc_errors = drc.as_ref().map_or(0, DrcReport::error_count);
+        let drc_errors = drc.as_ref().map_or_else(
+            || {
+                art.first_party_drc
+                    .as_ref()
+                    .map_or(0, DrcReport::error_count)
+            },
+            DrcReport::error_count,
+        );
         let area_mm2 = options.fixed_outline.map_or_else(
             || {
                 (template.width_mm + 2.0 * options.outline_margin_mm)
@@ -579,6 +603,7 @@ pub fn run_layout_loop_with_deciders(
                 collisions: art.collisions.clone(),
                 not_placed: art.not_placed,
                 drc,
+                first_party_drc: art.first_party_drc,
                 rank,
                 policy,
             });
@@ -680,6 +705,7 @@ pub fn run_layout_loop_with_deciders(
         collisions,
         not_placed,
         mut drc,
+        first_party_drc,
         rank: _,
         policy,
     } = best.expect("loop runs at least once");
@@ -752,6 +778,41 @@ pub fn run_layout_loop_with_deciders(
             findings.push(Finding::info("KiCad DRC clean"));
         }
     }
+    // The first-party checker runs whenever a router did; its verdict rides
+    // along on the report so a board is never called clean without saying what
+    // was actually checked (clearance/edge/connectivity; deferred kinds remain
+    // KiCad's job — see `crate::pcb_drc::DEFERRED_CHECKS`).
+    match first_party_drc.as_ref() {
+        Some(drc) => {
+            let first_party = FirstPartyDrcSummary::of(drc);
+            if first_party.error_count > 0 {
+                let kinds = first_party
+                    .error_kinds
+                    .iter()
+                    .map(|(k, n)| format!("{k}\u{d7}{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(Finding::error(format!(
+                    "first-party copper DRC: {} error(s): {kinds}",
+                    first_party.error_count
+                )));
+            } else {
+                findings.push(Finding::info(format!(
+                    "first-party copper DRC clean ({})",
+                    first_party.implemented_checks.join("/")
+                )));
+            }
+            if first_party.warning_count > 0 {
+                findings.push(Finding::warning(format!(
+                    "first-party copper DRC: {} warning(s)",
+                    first_party.warning_count
+                )));
+            }
+        }
+        None => findings.push(Finding::info(
+            "first-party copper DRC: not run (no router ran this attempt)",
+        )),
+    }
 
     Ok(LayoutReport {
         board,
@@ -763,6 +824,7 @@ pub fn run_layout_loop_with_deciders(
         collisions,
         not_placed,
         drc,
+        first_party_drc,
         findings,
         repair_actions,
         placement_proposals,

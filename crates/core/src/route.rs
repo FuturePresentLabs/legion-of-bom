@@ -29,9 +29,18 @@
 //! 0.25 mm signal traces, 0.8/0.4 mm vias, ~0.2 mm clearance.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
+
+use black_book::pcb_escape::{
+    assess_straight_escape, EscapeAssignment as BlackBookEscapeAssignment,
+    EscapeCondition as BlackBookEscapeCondition, EscapeRegion as BlackBookEscapeRegion,
+    EscapeViolation as BlackBookEscapeViolation, Point as BlackBookPoint,
+    Portal as BlackBookPortal, Side as BlackBookSide,
+};
+use black_book::pcb_routing::LinearRoutingRule;
 use serde::{Deserialize, Serialize};
 
 use crate::board::{det_uuid, mm};
@@ -48,7 +57,7 @@ pub enum PadLayer {
 }
 
 impl PadLayer {
-    fn on(self, layer: usize) -> bool {
+    pub(crate) fn on(self, layer: usize) -> bool {
         match self {
             PadLayer::Front => layer == FRONT,
             PadLayer::Back => layer == BACK,
@@ -59,7 +68,7 @@ impl PadLayer {
     /// both, so it bridges them for free — no via needed to change layers there.
     ///
     /// [`Both`]: PadLayer::Both
-    fn layers(self) -> &'static [usize] {
+    pub(crate) fn layers(self) -> &'static [usize] {
         match self {
             PadLayer::Front => &[FRONT],
             PadLayer::Back => &[BACK],
@@ -152,6 +161,17 @@ pub struct RoutingReport {
     pub expansions: u64,
     pub elapsed_ms: u64,
     pub progress: Vec<RoutingProgress>,
+    /// Packages whose fine-pitch escape candidate failed black_book's
+    /// straight-path oracle and fell back to their original pads. Empty unless
+    /// `fine_pitch_escape` is enabled and a package was rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escape_rejections: Vec<String>,
+    /// First-party copper DRC over the emitted tracks/vias, attached by the
+    /// board generator after routing. `None` only when no copper was checked;
+    /// the routing report shows its own verdict instead of deferring to an
+    /// external oracle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_party_drc: Option<crate::pcb_drc::FirstPartyDrcSummary>,
 }
 
 /// Track/via geometry, clearance, grid resolution, and the routable area.
@@ -188,17 +208,137 @@ pub struct RouteOptions {
     /// Experimental hierarchical fanout: escape geometrically buried SMD pad
     /// fields to derived coarse-grid portals before board-wide routing.
     pub fine_pitch_escape: bool,
+    /// Route each negotiation round's nets in parallel against a congestion
+    /// snapshot (Jacobi) instead of one at a time (Gauss-Seidel). Faster per
+    /// round on a multicore host, but **measured to regress badly**: on the
+    /// CC1101 node it drove best overuse to ~1540 and left 43 unrouted versus
+    /// the sequential router's ~249 and 28. Simultaneous updates oscillate;
+    /// Pathfinder's sequential sweep is what settles. Kept (default off) for
+    /// further work on block/independent-set scheduling.
+    pub parallel_rounds: bool,
+    /// The board's design rules as *data*: per-net-class clearance, width, and
+    /// via geometry. When present it is the single source the router resolves
+    /// from (per-net widths, the strictest pair clearance for obstacle
+    /// painting, edge clearance from a stated constraint); the scalar fields
+    /// above are what the fallback (`None`) and the `Default` class must agree
+    /// with. The checker and the emitted `.kicad_dru` read the same object.
+    pub design_rules: Option<crate::design_rules::DesignRules>,
+}
+
+impl RouteOptions {
+    /// Per-net track width: the width of that net's class when rules are set,
+    /// else the scalar default.
+    #[must_use]
+    pub fn width_for(&self, net: &str) -> f64 {
+        self.design_rules
+            .as_ref()
+            .and_then(|r| r.net_class(net).map(|c| c.track_width_mm))
+            .unwrap_or(self.signal_width_mm)
+    }
+
+    /// Per-net via annular diameter.
+    #[must_use]
+    pub fn via_size_for(&self, net: &str) -> f64 {
+        self.design_rules
+            .as_ref()
+            .and_then(|r| r.net_class(net).map(|c| c.via_dia_mm))
+            .unwrap_or(self.via_size_mm)
+    }
+
+    /// Per-net via drill diameter.
+    #[must_use]
+    pub fn via_drill_for(&self, net: &str) -> f64 {
+        self.design_rules
+            .as_ref()
+            .and_then(|r| r.net_class(net).map(|c| c.via_drill_mm))
+            .unwrap_or(self.via_drill_mm)
+    }
+
+    /// Clearance between two specific nets (the stricter class wins).
+    #[must_use]
+    pub fn clearance_for(&self, a: &str, b: &str) -> f64 {
+        match &self.design_rules {
+            Some(rules) => rules.pair_clearance(a, b).max(self.clearance_mm),
+            None => self.clearance_mm,
+        }
+    }
+
+    /// The clearance the *shared* obstacle grid must enforce everywhere: the
+    /// strictest pair any two nets on the board could form. Painting every
+    /// halo at this distance is conservative per-pair, never permissive —
+    /// a route that clears it clears every class pair on the board.
+    #[must_use]
+    pub fn grid_clearance(&self) -> f64 {
+        let strictest = self
+            .design_rules
+            .as_ref()
+            .and_then(|r| r.strictest_clearance())
+            .unwrap_or(0.0);
+        self.clearance_mm.max(strictest)
+    }
+
+    /// The widest track any class on the board could emit — the conservative
+    /// half-width for obstacle painting.
+    #[must_use]
+    pub fn grid_half_width(&self) -> f64 {
+        let widest = self
+            .design_rules
+            .as_ref()
+            .and_then(|r| r.widest_track())
+            .unwrap_or(0.0);
+        self.signal_width_mm.max(widest) / 2.0
+    }
+
+    /// Full width of the widest class track — the conservative geometry for the
+    /// shared maze grid and the fine-pitch escape necks.
+    #[must_use]
+    pub fn grid_track_width(&self) -> f64 {
+        2.0 * self.grid_half_width()
+    }
+
+    /// Largest via annular diameter any class could emit.
+    #[must_use]
+    pub fn grid_via_size(&self) -> f64 {
+        self.design_rules
+            .as_ref()
+            .map(|r| {
+                r.net_classes
+                    .iter()
+                    .map(|c| c.via_dia_mm)
+                    .fold(self.via_size_mm, f64::max)
+            })
+            .unwrap_or(self.via_size_mm)
+    }
+
+    /// Board-edge clearance: a stated `edge_clearance` constraint, else the
+    /// scalar default.
+    #[must_use]
+    pub fn edge_clearance(&self) -> f64 {
+        self.design_rules
+            .as_ref()
+            .and_then(|r| r.edge_clearance_mm())
+            .unwrap_or(self.edge_clearance_mm)
+    }
 }
 
 impl Default for RouteOptions {
     fn default() -> Self {
-        // Eurorack-conventional defaults (see module docs).
+        // Eurorack-conventional defaults (see module docs). The copper numbers
+        // come from the one source (`DesignRules::jlcpcb_two_layer_default`) so
+        // the router's fallback, the checker, and the emitted `.kicad_dru`
+        // cannot drift apart; only the search knobs live here.
+        let rules = crate::design_rules::DesignRules::jlcpcb_two_layer_default();
+        let dflt = rules
+            .default_class()
+            .expect("default rules have a Default class");
         RouteOptions {
-            signal_width_mm: 0.25,
-            via_size_mm: 0.8,
-            via_drill_mm: 0.4,
-            clearance_mm: 0.2,
-            edge_clearance_mm: 0.5,
+            signal_width_mm: dflt.track_width_mm,
+            via_size_mm: dflt.via_dia_mm,
+            via_drill_mm: dflt.via_drill_mm,
+            clearance_mm: dflt.clearance_mm,
+            edge_clearance_mm: rules
+                .edge_clearance_mm()
+                .expect("default rules state edge clearance"),
             grid_mm: 0.2,
             // A via is worth about this much detour. 2.0mm was far too cheap:
             // at 0.2mm grid it bought a layer change for ten steps, so the
@@ -216,10 +356,18 @@ impl Default for RouteOptions {
             bounds: None,
             front: "F.Cu".into(),
             back: "B.Cu".into(),
-            max_expansions: Some(50_000_000),
+            // No expansion ceiling by default. A fixed expansion count is a
+            // blunt cap that fires mid-round, so a negotiation which is still
+            // settling is cut off and ships a partial board — exactly what
+            // happened on the CC1101 node. The real stops are "settled"
+            // (no over-used cell) and PF_STALL_ROUNDS; the wall-clock cap is the
+            // hard safety.
+            max_expansions: None,
             max_wall_time_ms: Some(300_000),
             emit_progress_jsonl: false,
             fine_pitch_escape: false,
+            parallel_rounds: false,
+            design_rules: None,
         }
     }
 }
@@ -291,6 +439,90 @@ impl RoutingBudget {
             .try_into()
             .unwrap_or(u64::MAX)
     }
+
+    /// Account for expansions a batched-parallel round spent on per-net
+    /// [`LocalBudget`]s, enforcing the attempt caps at the round boundary.
+    /// Returns true if an attempt cap has fired.
+    fn record(&mut self, expansions: u64) -> bool {
+        self.expansions = self.expansions.saturating_add(expansions);
+        if self.exhausted.is_none() {
+            if self
+                .max_expansions
+                .is_some_and(|limit| self.expansions >= limit)
+            {
+                self.exhausted = Some(RoutingStopReason::ExpansionBudget);
+            } else if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.exhausted = Some(RoutingStopReason::WallTimeBudget);
+            }
+        }
+        self.exhausted.is_some()
+    }
+}
+
+/// What one A* invocation may spend. [`RoutingBudget`] owns the attempt-level
+/// wall-clock and total-expansion caps; [`LocalBudget`] is a per-net allowance
+/// with neither, so a round can route many nets in parallel. Both bound each
+/// single search by the finite state space, which is what stops one impossible
+/// connection from spending a whole round.
+trait SearchLimiter {
+    fn begin_search(&mut self, states: usize);
+    fn expand(&mut self) -> bool;
+    /// True once the attempt-level cap has fired (never for a local budget).
+    fn exhausted(&self) -> bool;
+}
+
+impl SearchLimiter for RoutingBudget {
+    fn begin_search(&mut self, states: usize) {
+        RoutingBudget::begin_search(self, states);
+    }
+    fn expand(&mut self) -> bool {
+        RoutingBudget::expand(self)
+    }
+    fn exhausted(&self) -> bool {
+        self.exhausted.is_some()
+    }
+}
+
+/// A standalone allowance for one net's search. Used by the batched-parallel
+/// round: each net gets an identical, scheduling-independent budget, and the
+/// round's total is summed back into the global budget afterwards.
+struct LocalBudget {
+    expansions: u64,
+    search_limit: u64,
+}
+
+impl LocalBudget {
+    fn new() -> Self {
+        Self {
+            expansions: 0,
+            search_limit: u64::MAX,
+        }
+    }
+    fn reset(&mut self) {
+        self.expansions = 0;
+        self.search_limit = u64::MAX;
+    }
+}
+
+impl SearchLimiter for LocalBudget {
+    fn begin_search(&mut self, states: usize) {
+        self.search_limit = self
+            .expansions
+            .saturating_add(u64::try_from(states).unwrap_or(u64::MAX).saturating_mul(2));
+    }
+    fn expand(&mut self) -> bool {
+        if self.expansions >= self.search_limit {
+            return false;
+        }
+        self.expansions += 1;
+        true
+    }
+    fn exhausted(&self) -> bool {
+        false
+    }
 }
 
 /// Turns placed pads + nets into copper — **the** routing extensibility seam. The
@@ -323,7 +555,7 @@ impl Router for MstRouter {
                 out.tracks.push(Track {
                     start: a,
                     end: b,
-                    width_mm: opts.signal_width_mm,
+                    width_mm: opts.width_for(&net.name),
                     layer: opts.front.clone(),
                     net_idx: net.net_idx,
                 });
@@ -612,6 +844,11 @@ struct Surface {
     /// full clearance plus a track width away. A disc of cell offsets — see
     /// [`keepout_disc`].
     track_disc: Vec<(isize, isize)>,
+    /// Per-owner track exclusion, keyed by net index: each net's copper
+    /// reserves exactly the distance *it* needs against the widest possible
+    /// visitor, so a wide power rail does not coarsen the corridor around
+    /// narrow signals. Absent ⇒ [`track_disc`](Self::track_disc).
+    owner_track_discs: HashMap<usize, Vec<(isize, isize)>>,
     /// [`track_disc`](Self::track_disc)'s radius in cells, for searches that
     /// only need to know how far a net's influence reaches.
     track_halo: isize,
@@ -635,6 +872,15 @@ impl Surface {
     #[inline]
     fn cells(&self) -> usize {
         self.cols * self.rows * 2
+    }
+
+    /// The exclusion disc a net's own copper must reserve: its per-owner disc
+    /// when the rules gave it one, else the all-widest default.
+    #[inline]
+    fn disc_for(&self, net: usize) -> &[(isize, isize)] {
+        self.owner_track_discs
+            .get(&net)
+            .map_or(&self.track_disc, |d| d.as_slice())
     }
 }
 
@@ -811,18 +1057,139 @@ fn build_surface(nets: &[RouteNet], routable: &[&RouteNet], opts: &RouteOptions)
 pub struct FinePitchEscape {
     pub nets: Vec<RouteNet>,
     pub tracks: Vec<Track>,
+    /// Packages with one or more necks rejected by validation. Each rejected
+    /// pad keeps its original position for the global router; the package's
+    /// remaining necks still escape.
+    pub rejected: Vec<FinePitchEscapeRejection>,
+}
+
+/// A package with one or more escape necks rejected by validation. The rejected
+/// pads keep their original position, so this is a fallback with a reason, never
+/// a silent short.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FinePitchEscapeRejection {
+    pub refdes: String,
+    /// Package-local straight-path violations from black_book.
+    pub violations: Vec<BlackBookEscapeViolation>,
+    /// Collisions black_book's package-local model cannot see: a neck that
+    /// would short a neighbouring pad, cross another package's committed
+    /// escape, or leave the board-edge clearance.
+    pub conflicts: Vec<String>,
+}
+
+impl FinePitchEscapeRejection {
+    /// A single actionable line naming the package and the first failure.
+    /// Callers surface this as routing evidence; the fallback itself is
+    /// deterministic and needs no retry to stay correct.
+    pub fn summary(&self) -> String {
+        let mut details: Vec<String> = if self.conflicts.is_empty() {
+            self.violations
+                .iter()
+                .map(describe_escape_violation)
+                .collect()
+        } else {
+            self.conflicts.clone()
+        };
+        let first = details
+            .drain(..1)
+            .next()
+            .unwrap_or_else(|| "unspecified escape geometry violation".to_owned());
+        if details.is_empty() {
+            format!("{}: {first}", self.refdes)
+        } else {
+            format!("{}: {first} (+{} more)", self.refdes, details.len())
+        }
+    }
+}
+
+/// Translate one black_book escape violation into a reviewer-facing sentence.
+fn describe_escape_violation(violation: &BlackBookEscapeViolation) -> String {
+    use BlackBookEscapeViolation::*;
+    match violation {
+        UnassignedPad { pad_index } => format!("pad {pad_index} has no escape portal"),
+        DuplicatePad { pad_index } => {
+            format!("pad {pad_index} is assigned to more than one portal")
+        }
+        DuplicatePortal { portal_index } => {
+            format!("portal {portal_index} is reused by more than one pad")
+        }
+        SideCapacity {
+            side,
+            residual_routes,
+        } => format!(
+            "{} escape edge is short by {residual_routes} route(s)",
+            escape_side_name(*side)
+        ),
+        PortalBoundaryClearance {
+            portal_index,
+            residual,
+        } => format!(
+            "portal {portal_index} is {residual:.3}mm too close to the escape boundary"
+        ),
+        PortalSpacing {
+            first_portal_index,
+            second_portal_index,
+            residual,
+        } => format!(
+            "portals {first_portal_index} and {second_portal_index} are {residual:.3}mm too close"
+        ),
+        PathBoundaryClearance {
+            assignment_index,
+            residual,
+        } => format!(
+            "escape path {assignment_index} is {residual:.3}mm too close to the boundary"
+        ),
+        PathSeparation {
+            first_assignment_index,
+            second_assignment_index,
+            residual,
+        } => format!(
+            "escape paths {first_assignment_index} and {second_assignment_index} are {residual:.3}mm too close"
+        ),
+    }
+}
+
+fn escape_side_name(side: BlackBookSide) -> &'static str {
+    match side {
+        BlackBookSide::Left => "left",
+        BlackBookSide::Right => "right",
+        BlackBookSide::Top => "top",
+        BlackBookSide::Bottom => "bottom",
+    }
+}
+
+/// A candidate straight escape neck: pad centre to its package portal.
+struct EscapeNeck {
+    net_idx: usize,
+    pad: String,
+    start: (f64, f64),
+    end: (f64, f64),
+    layer: PadLayer,
+}
+
+/// A committed escape neck, reduced to the geometry later packages must clear.
+#[derive(Clone, Copy)]
+struct CommittedEscape {
+    net_idx: usize,
+    start: (f64, f64),
+    end: (f64, f64),
 }
 
 /// Escape only SMD package pad fields that are buried at the configured global
-/// grid. Portal pitch and neck length derive from trace width, clearance, grid,
-/// and actual pad extents. This stays opt-in until end-to-end KiCad results beat
-/// the baseline, but remains a first-class seam we can iterate on.
+/// grid. Each perimeter pad gets a perpendicular neck to a portal one neck
+/// length outside the package; the neck length derives from trace width,
+/// clearance, grid, and actual pad extents. black_book validates the straight
+/// path, and a board-level pass drops any neck that would short a neighbour,
+/// cross committed escape copper, or leave the board-edge band. This stays
+/// opt-in until end-to-end KiCad results beat the baseline, but remains a
+/// first-class seam we can iterate on.
 pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> FinePitchEscape {
     let routable: Vec<&RouteNet> = nets.iter().filter(|n| n.pads.len() >= 2).collect();
     if routable.is_empty() {
         return FinePitchEscape {
             nets: nets.to_vec(),
             tracks: Vec::new(),
+            rejected: Vec::new(),
         };
     }
     let coarse = paint_surface(nets, &routable, opts, opts.grid_mm.max(0.01));
@@ -831,12 +1198,26 @@ pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> Fine
         return FinePitchEscape {
             nets: nets.to_vec(),
             tracks: Vec::new(),
+            rejected: Vec::new(),
         };
     }
 
+    // Escape geometry is per *electrical* pad, and portals are keyed by
+    // `(refdes, pad)`. A KiCad footprint can represent one exposed pad as
+    // several pad primitives that share a pad number; feeding each primitive to
+    // black_book would look like duplicate portals at one offset and reject a
+    // perfectly escapable package. Collapse to the first point per pad.
+    let mut unique_pads: Vec<&PadPoint> = Vec::new();
+    let mut seen_pads = HashSet::<(String, String)>::new();
+    for pad in nets.iter().flat_map(|net| &net.pads) {
+        if pad.layer != PadLayer::Both && seen_pads.insert((pad.refdes.clone(), pad.pad.clone())) {
+            unique_pads.push(pad);
+        }
+    }
+
     let mut bounds: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
-    for p in nets.iter().flat_map(|n| &n.pads) {
-        if fine_refs.contains(&p.refdes) && p.layer != PadLayer::Both {
+    for p in unique_pads.iter().copied() {
+        if fine_refs.contains(&p.refdes) {
             let b = bounds.entry(p.refdes.clone()).or_insert((
                 f64::INFINITY,
                 f64::INFINITY,
@@ -850,25 +1231,33 @@ pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> Fine
         }
     }
     let grid = opts.grid_mm.max(0.01);
-    let snap = |v: f64| (v / grid).round() * grid;
-    let pad_extent = nets
+    let pad_extent = unique_pads
         .iter()
-        .flat_map(|n| &n.pads)
-        .filter(|p| fine_refs.contains(&p.refdes) && p.layer != PadLayer::Both)
+        .filter(|p| fine_refs.contains(&p.refdes))
         .map(|p| p.w_mm.max(p.h_mm))
         .fold(0.0_f64, f64::max);
-    let neck = pad_extent + opts.clearance_mm + opts.signal_width_mm + grid;
-    let pitch =
-        ((opts.signal_width_mm + opts.clearance_mm + CLEARANCE_MARGIN_MM) / grid).ceil() * grid;
+    let neck = pad_extent + opts.grid_clearance() + opts.grid_track_width() + grid;
 
-    // Package side 0/1/2/3 = left/right/top/bottom; tangent ordering prevents
-    // fanout crossings. Two-sided connector rows are deliberately left alone.
+    // Package side 0/1/2/3 = left/right/top/bottom. Every perimeter pad escapes
+    // straight out along its own tangent: a perpendicular neck stays centred in
+    // the channel between its neighbours, where a diagonal fanout would cut
+    // across the adjacent pads (a clearance violation both DRC and black_book's
+    // spacing oracle reject) and adjacent sides cannot cross at the corners.
+    // Two-sided connector rows are deliberately left alone.
     let mut sides: HashMap<(String, usize), Vec<(String, f64)>> = HashMap::new();
-    for p in nets.iter().flat_map(|n| &n.pads) {
+    for p in unique_pads.iter().copied() {
         let Some(&(x0, y0, x1, y1)) = bounds.get(&p.refdes) else {
             continue;
         };
-        if p.layer == PadLayer::Both {
+        // Only a pad on the package perimeter can escape through an edge portal.
+        // A centre thermal pad given a portal would need a straight path across
+        // the whole package, crossing every perimeter path — black_book rejects
+        // that, correctly. Interior pads stay for the global router.
+        let on_perimeter = (p.x_mm - x0).abs() < 1e-9
+            || (p.x_mm - x1).abs() < 1e-9
+            || (p.y_mm - y0).abs() < 1e-9
+            || (p.y_mm - y1).abs() < 1e-9;
+        if !on_perimeter {
             continue;
         }
         let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
@@ -887,31 +1276,217 @@ pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> Fine
     for (r, _) in sides.keys() {
         *side_count.entry(r.clone()).or_default() += 1;
     }
-    let mut portals: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    let mut portal_tangents: HashMap<(String, String), (usize, f64)> = HashMap::new();
     for ((r, side), pads) in &mut sides {
         if side_count.get(r).copied().unwrap_or(0) < 3 {
             continue;
         }
         pads.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        let &(x0, y0, x1, y1) = &bounds[r];
-        let center = if *side < 2 {
-            (y0 + y1) / 2.0
-        } else {
-            (x0 + x1) / 2.0
-        };
-        let first = center - pitch * pads.len().saturating_sub(1) as f64 / 2.0;
-        for (i, (pad, original_tangent)) in pads.iter().enumerate() {
-            let tangent = snap(first + i as f64 * pitch);
-            let spread = (tangent - original_tangent).abs();
-            let point = match *side {
-                0 => (snap(x0 - neck - spread), tangent),
-                1 => (snap(x1 + neck + spread), tangent),
-                2 => (tangent, snap(y0 - neck - spread)),
-                _ => (tangent, snap(y1 + neck + spread)),
-            };
-            portals.insert((r.clone(), pad.clone()), point);
+        for (pad, tangent) in pads.iter() {
+            portal_tangents.insert((r.clone(), pad.clone()), (*side, *tangent));
         }
     }
+
+    // Every side terminates on one straight package boundary, so black_book has
+    // one exact escape rectangle to validate.
+    let mut escape_regions: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
+    for (r, &(x0, y0, x1, y1)) in &bounds {
+        if side_count.get(r).copied().unwrap_or(0) < 3 {
+            continue;
+        }
+        escape_regions.insert(r.clone(), (x0 - neck, y0 - neck, x1 + neck, y1 + neck));
+    }
+    let mut portals: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    let mut portal_sides: HashMap<(String, String), usize> = HashMap::new();
+    for ((r, pad), &(side, tangent)) in &portal_tangents {
+        let Some(&(left, top, right, bottom)) = escape_regions.get(r) else {
+            continue;
+        };
+        let point = match side {
+            0 => (left, tangent),
+            1 => (right, tangent),
+            2 => (tangent, top),
+            _ => (tangent, bottom),
+        };
+        portals.insert((r.clone(), pad.clone()), point);
+        portal_sides.insert((r.clone(), pad.clone()), side);
+    }
+
+    let routing_rule = LinearRoutingRule::try_new(
+        opts.grid_track_width(),
+        opts.grid_clearance() + CLEARANCE_MARGIN_MM,
+        0.0,
+    )
+    .expect("route options have positive finite copper geometry");
+    let mut rejected = Vec::new();
+    for (refdes, &(left, top, right, bottom)) in &escape_regions {
+        let mut package_pads: Vec<&PadPoint> = unique_pads
+            .iter()
+            .copied()
+            .filter(|pad| {
+                pad.refdes == *refdes
+                    && portals.contains_key(&(pad.refdes.clone(), pad.pad.clone()))
+            })
+            .collect();
+        package_pads.sort_by(|a, b| a.pad.cmp(&b.pad));
+        let black_book_pads: Vec<BlackBookPoint> = package_pads
+            .iter()
+            .map(|pad| BlackBookPoint {
+                x: pad.x_mm,
+                y: pad.y_mm,
+            })
+            .collect();
+        let black_book_portals: Vec<BlackBookPortal> = package_pads
+            .iter()
+            .map(|pad| {
+                let key = (pad.refdes.clone(), pad.pad.clone());
+                let &(x, y) = &portals[&key];
+                let side = match portal_sides[&key] {
+                    0 => BlackBookSide::Left,
+                    1 => BlackBookSide::Right,
+                    2 => BlackBookSide::Top,
+                    _ => BlackBookSide::Bottom,
+                };
+                BlackBookPortal {
+                    side,
+                    offset: if matches!(side, BlackBookSide::Left | BlackBookSide::Right) {
+                        y
+                    } else {
+                        x
+                    },
+                }
+            })
+            .collect();
+        let assignments: Vec<BlackBookEscapeAssignment> = (0..package_pads.len())
+            .map(|index| BlackBookEscapeAssignment {
+                pad_index: index,
+                portal_index: index,
+            })
+            .collect();
+        let assessment = assess_straight_escape(
+            BlackBookEscapeRegion::try_new(left, top, right, bottom)
+                .expect("derived escape region is non-degenerate"),
+            &black_book_pads,
+            &black_book_portals,
+            &assignments,
+            routing_rule,
+        )
+        .expect("derived escape inputs are finite");
+        if assessment.condition != BlackBookEscapeCondition::FeasibleForStraightPathModel {
+            portals.retain(|(candidate_refdes, _), _| candidate_refdes != refdes);
+            rejected.push(FinePitchEscapeRejection {
+                refdes: refdes.clone(),
+                violations: assessment.violations,
+                conflicts: Vec::new(),
+            });
+        }
+    }
+
+    // black_book validates the package against itself. A straight neck can still
+    // short a neighbouring part's pad, cross another package's committed escape,
+    // or leave the board-edge band; reject those candidates here so no escape
+    // copper is emitted that the global router would have to undo. Packages are
+    // accepted in refdes order, so the outcome is deterministic.
+    let clearance = opts.grid_clearance() + CLEARANCE_MARGIN_MM;
+    let half_track = opts.grid_half_width();
+    let mut by_package: BTreeMap<String, Vec<EscapeNeck>> = BTreeMap::new();
+    for net in nets.iter().filter(|net| net.net_idx != 0) {
+        for pad in &net.pads {
+            let Some(&portal) = portals.get(&(pad.refdes.clone(), pad.pad.clone())) else {
+                continue;
+            };
+            by_package
+                .entry(pad.refdes.clone())
+                .or_default()
+                .push(EscapeNeck {
+                    net_idx: net.net_idx,
+                    pad: pad.pad.clone(),
+                    start: (pad.x_mm, pad.y_mm),
+                    end: portal,
+                    layer: pad.layer,
+                });
+        }
+    }
+    // Drop only the necks that collide; the rest of the package still escapes.
+    // Removing paths from a black_book-feasible assignment cannot introduce a
+    // package-local violation, so the survivors stay valid.
+    let mut dropped: HashSet<(String, String)> = HashSet::new();
+    let mut committed: Vec<CommittedEscape> = Vec::new();
+    for (refdes, candidates) in &by_package {
+        let mut reasons = Vec::new();
+        for neck in candidates {
+            let neck_layer = match neck.layer {
+                PadLayer::Back => BACK,
+                _ => FRONT,
+            };
+            let mut conflict = None;
+            'neighbour: for other in nets.iter().filter(|net| net.net_idx != neck.net_idx) {
+                for p in other.pads.iter().filter(|p| p.layer.on(neck_layer)) {
+                    if &p.refdes == refdes && p.pad == neck.pad {
+                        continue;
+                    }
+                    let gap = seg_pad(neck.start, neck.end, p) - half_track;
+                    if gap < clearance {
+                        conflict = Some(format!(
+                            "neck {refdes}.{} passes {gap:.3}mm from {}.{} (needs {clearance:.3}mm)",
+                            neck.pad, p.refdes, p.pad
+                        ));
+                        break 'neighbour;
+                    }
+                }
+            }
+            if conflict.is_none() {
+                if let Some((x0, y0, x1, y1)) = opts.bounds {
+                    let inset = opts.edge_clearance() + half_track + CLEARANCE_MARGIN_MM;
+                    if neck.end.0 < x0 + inset
+                        || neck.end.0 > x1 - inset
+                        || neck.end.1 < y0 + inset
+                        || neck.end.1 > y1 - inset
+                    {
+                        conflict = Some(format!(
+                            "neck {refdes}.{} reaches ({:.2}, {:.2}), inside the {:.2}mm board-edge band",
+                            neck.pad, neck.end.0, neck.end.1, opts.edge_clearance()
+                        ));
+                    }
+                }
+            }
+            if conflict.is_none() {
+                for other in &committed {
+                    if other.net_idx == neck.net_idx {
+                        continue;
+                    }
+                    let gap = seg_seg(neck.start, neck.end, other.start, other.end)
+                        - opts.grid_track_width();
+                    if gap < clearance {
+                        conflict = Some(format!(
+                            "neck {refdes}.{} passes {gap:.3}mm from committed escape copper (needs {clearance:.3}mm)",
+                            neck.pad
+                        ));
+                        break;
+                    }
+                }
+            }
+            match conflict {
+                Some(reason) => {
+                    reasons.push(reason);
+                    dropped.insert((refdes.clone(), neck.pad.clone()));
+                }
+                None => committed.push(CommittedEscape {
+                    net_idx: neck.net_idx,
+                    start: neck.start,
+                    end: neck.end,
+                }),
+            }
+        }
+        if !reasons.is_empty() {
+            rejected.push(FinePitchEscapeRejection {
+                refdes: refdes.clone(),
+                violations: Vec::new(),
+                conflicts: reasons,
+            });
+        }
+    }
+    portals.retain(|key, _| !dropped.contains(key));
 
     let mut transformed = nets.to_vec();
     let mut tracks = Vec::new();
@@ -925,29 +1500,19 @@ pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> Fine
                 continue;
             };
             let original = p.clone();
-            let &(x0, y0, x1, y1) = &bounds[&p.refdes];
-            let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-            let horizontal = (p.x_mm - cx).abs() >= (p.y_mm - cy).abs();
-            let bend = if horizontal {
-                let d = (portal.1 - p.y_mm).abs();
-                (portal.0 - d.copysign(portal.0 - p.x_mm), p.y_mm)
-            } else {
-                let d = (portal.0 - p.x_mm).abs();
-                (p.x_mm, portal.1 - d.copysign(portal.1 - p.y_mm))
-            };
             let layer = if p.layer == PadLayer::Back {
                 opts.back.clone()
             } else {
                 opts.front.clone()
             };
-            for (start, end) in [((p.x_mm, p.y_mm), bend), (bend, portal)] {
+            for (start, end) in [((p.x_mm, p.y_mm), portal)] {
                 if start == end {
                     continue;
                 }
                 tracks.push(Track {
                     start,
                     end,
-                    width_mm: opts.signal_width_mm,
+                    width_mm: opts.width_for(&net.name),
                     layer: layer.clone(),
                     net_idx: net.net_idx,
                 });
@@ -964,8 +1529,8 @@ pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> Fine
                             pad: format!("{}.escape.{i}", original.pad),
                             x_mm: start.0 + (end.0 - start.0) * t,
                             y_mm: start.1 + (end.1 - start.1) * t,
-                            w_mm: opts.signal_width_mm,
-                            h_mm: opts.signal_width_mm,
+                            w_mm: opts.grid_track_width(),
+                            h_mm: opts.grid_track_width(),
                             layer: original.layer,
                         }],
                     });
@@ -978,14 +1543,15 @@ pub fn prepare_fine_pitch_escape(nets: &[RouteNet], opts: &RouteOptions) -> Fine
             });
             p.x_mm = portal.0;
             p.y_mm = portal.1;
-            p.w_mm = opts.signal_width_mm;
-            p.h_mm = opts.signal_width_mm;
+            p.w_mm = opts.grid_track_width();
+            p.h_mm = opts.grid_track_width();
         }
     }
     transformed.extend(obstacles);
     FinePitchEscape {
         nets: transformed,
         tracks,
+        rejected,
     }
 }
 
@@ -1002,8 +1568,8 @@ fn paint_surface(
     // edge, so it is used as-is.
     let (bounded, (minx, miny, maxx, maxy)) = match opts.bounds {
         Some((x0, y0, x1, y1)) => {
-            let inset = opts.edge_clearance_mm
-                + (opts.via_size_mm / 2.0).max(opts.signal_width_mm / 2.0)
+            let inset = opts.edge_clearance()
+                + (opts.grid_via_size() / 2.0).max(opts.grid_half_width())
                 + CLEARANCE_MARGIN_MM;
             if x1 - x0 > 2.0 * inset && y1 - y0 > 2.0 * inset {
                 (true, (x0 + inset, y0 + inset, x1 - inset, y1 - inset))
@@ -1046,12 +1612,35 @@ fn paint_surface(
         rows,
         cells: vec![Cell::Free; cols * rows * 2],
     };
-    let (clr, half_track) = (opts.clearance_mm, opts.signal_width_mm / 2.0);
+    // Resolve copper geometry through the design rules when present. The maze
+    // is a *shared* grid, so every obstacle exclusion must hold against the
+    // widest thing that could ever pass it: an owner's exclusion radius is its
+    // own half-width plus the widest class half-width at the strictest pair
+    // clearance — a route that clears this grid clears every net-class pair
+    // the checker will later assert, which is what makes "the router avoids an
+    // implemented-kind violation" true rather than lucky. With no rules this
+    // is exactly the old scalar behaviour: every owner's sep is `clr + 2 *
+    // signal_width/2`, the same number the grid has always used.
+    let clr = opts.grid_clearance();
+    let half_track = opts.grid_half_width();
+    let via_size = opts.grid_via_size();
     let track_sep = clr + 2.0 * half_track;
-    let via_sep = opts.via_size_mm / 2.0 + clr + half_track.max(opts.via_size_mm / 2.0);
+    let via_sep = via_size / 2.0 + clr + half_track.max(via_size / 2.0);
     let (track_disc, via_disc) = (keepout_disc(track_sep, res), keepout_disc(via_sep, res));
     let track_halo = keepout_cells(track_sep, res);
     let via_halo = keepout_cells(via_sep, res);
+    // Per-owner exclusion: `track_sep` (the widest owner) over-blocks the
+    // corridor around a narrow signal when a wide power rail exists, so each
+    // net gets its own disc sized for *it* against the fattest possible
+    // visitor. Exact for fat visitors, conservative only for thin-thin pairs
+    // (true per-pair asymmetry is legion-of-bom-4s7y).
+    let owner_track_discs: HashMap<usize, Vec<(isize, isize)>> = nets
+        .iter()
+        .map(|n| {
+            let sep = clr + opts.width_for(&n.name) / 2.0 + half_track;
+            (n.net_idx, keepout_disc(sep, res))
+        })
+        .collect();
 
     // Paint every pad (and its clearance halo) as its net's territory. Do the
     // cores first so a halo never overwrites a real pad connection point.
@@ -1127,6 +1716,7 @@ fn paint_surface(
         miny,
         via_table,
         track_disc,
+        owner_track_discs,
         track_halo,
         via_disc,
         via_halo,
@@ -1171,6 +1761,14 @@ fn route_pass(
     let mm_of = move |c: usize, r: usize| (minx + c as f64 * res, miny + r as f64 * res);
     let pad_cells = surface.pad_cells.clone();
     let (track_disc, via_disc) = (surface.track_disc.clone(), surface.via_disc.clone());
+    let owner_track_discs = surface.owner_track_discs.clone();
+    // The owner exclusion for the net currently committing: its own disc
+    // when the rules gave it one, else the all-widest default.
+    let disc_for = |n: usize| -> &[(isize, isize)] {
+        owner_track_discs
+            .get(&n)
+            .map_or(track_disc.as_slice(), |d| d.as_slice())
+    };
     let grid = &mut surface.grid;
 
     // Route each net in the given order, growing a tree from pad 0.
@@ -1180,6 +1778,11 @@ fn route_pass(
     let mut blame: HashMap<usize, HashSet<usize>> = HashMap::new();
     // How far around an unreachable pad to look for the nets fencing it in.
     let blame_radius = (track_halo * 3).max(6);
+    // One A* workspace for the whole pass.
+    let mut scratch = SearchScratch::new();
+    // Sequential routing rips each net up before re-routing, so it never sees
+    // its own copper; the mask stays inactive.
+    let mask = SelfMask::new();
     for &ni in order {
         let net = routable[ni];
         let costs = Costs {
@@ -1211,12 +1814,14 @@ fn route_pass(
                 ViaCheck::Live(via_halo),
                 learned,
                 0,
+                &mask,
+                &mut scratch,
                 budget,
             ) {
                 Some(path) => {
-                    emit_path(&path, net.net_idx, opts, &mm_of, &mut out);
+                    emit_path(&path, net.net_idx, &net.name, opts, &mm_of, &mut out);
                     for &(c, r, l) in &path {
-                        grid.commit(c, r, l, net.net_idx, &track_disc);
+                        grid.commit(c, r, l, net.net_idx, disc_for(net.net_idx));
                         if !connected.contains(&(c, r, l)) {
                             connected.push((c, r, l));
                         }
@@ -1400,7 +2005,7 @@ impl Grid {
     /// fought over. Both are ≥ 1, so the octile heuristic stays admissible and A*
     /// still finds the true least-cost path.
     #[allow(clippy::too_many_arguments)]
-    fn route_one_soft(
+    fn route_one_soft<L: SearchLimiter>(
         &self,
         net: usize,
         sources: &[(usize, usize, usize)],
@@ -1409,7 +2014,9 @@ impl Grid {
         vias: ViaCheck<'_>,
         cong: &Congestion,
         p_fac: i64,
-        budget: &mut RoutingBudget,
+        mask: &SelfMask,
+        scratch: &mut SearchScratch,
+        budget: &mut L,
     ) -> Option<Vec<(usize, usize, usize)>> {
         // Search a window around the connection first. A connection that can
         // be made at all nearly always can be made near its own endpoints, and
@@ -1442,13 +2049,13 @@ impl Grid {
         );
         let whole = (0, 0, self.cols - 1, self.rows - 1);
         let first = self.search(
-            net, sources, targets, costs, vias, cong, p_fac, window, budget,
+            net, sources, targets, costs, vias, cong, p_fac, window, mask, scratch, budget,
         );
-        if first.is_some() || budget.exhausted.is_some() || window == whole {
+        if first.is_some() || budget.exhausted() || window == whole {
             first
         } else {
             self.search(
-                net, sources, targets, costs, vias, cong, p_fac, whole, budget,
+                net, sources, targets, costs, vias, cong, p_fac, whole, mask, scratch, budget,
             )
         }
     }
@@ -1456,7 +2063,7 @@ impl Grid {
     /// [`route_one_soft`](Self::route_one_soft) confined to the inclusive cell
     /// rectangle `(c0, r0, c1, r1)`, with search state sized to it.
     #[allow(clippy::too_many_arguments)]
-    fn search(
+    fn search<L: SearchLimiter>(
         &self,
         net: usize,
         sources: &[(usize, usize, usize)],
@@ -1466,7 +2073,9 @@ impl Grid {
         cong: &Congestion,
         p_fac: i64,
         (c0, r0, c1, r1): (usize, usize, usize, usize),
-        budget: &mut RoutingBudget,
+        mask: &SelfMask,
+        scratch: &mut SearchScratch,
+        budget: &mut L,
     ) -> Option<Vec<(usize, usize, usize)>> {
         let Costs {
             step,
@@ -1481,8 +2090,7 @@ impl Grid {
             let (l, rem) = (i / wa, i % wa);
             (c0 + rem % ww, r0 + rem / ww, l)
         };
-        let mut dist = vec![i64::MAX; wa * 2];
-        let mut prev = vec![usize::MAX; wa * 2];
+        scratch.begin(wa * 2);
         let heuristic = |c: usize, r: usize| -> i64 {
             targets
                 .iter()
@@ -1497,17 +2105,20 @@ impl Grid {
         // What entering cell `j` (a global index) really costs, once contention
         // is priced in.
         let toll = |j: usize, base: i64| -> i64 {
-            let present = (PF_ONE + p_fac.saturating_mul(cong.contest(j))).min(PF_PRESENT_MAX);
+            // In a batched-parallel round the snapshot still holds this net's
+            // own previous route; discount it so the net negotiates against the
+            // other nets, exactly as the sequential rip-up does.
+            let own = mask.bits_of(j) as i64;
+            let contest = (cong.contest(j) - (own & 1) - ((own >> 1) & 1)).max(0);
+            let present = (PF_ONE + p_fac.saturating_mul(contest)).min(PF_PRESENT_MAX);
             let scaled = base.saturating_mul(present) / PF_ONE;
             scaled.saturating_mul(cong.hist_at(j)) / PF_ONE
         };
         let inside = |c: usize, r: usize| c >= c0 && c <= c1 && r >= r0 && r <= r1;
-        let mut heap: BinaryHeap<Reverse<(i64, i64, usize)>> = BinaryHeap::new();
         for &(c, r, l) in sources.iter().filter(|&&(c, r, _)| inside(c, r)) {
             let i = local(c, r, l);
-            if dist[i] != 0 {
-                dist[i] = 0;
-                heap.push(Reverse((heuristic(c, r), 0i64, i)));
+            if scratch.dist_of(i) != 0 {
+                scratch.seed(i, heuristic(c, r));
             }
         }
         let tgt: Vec<usize> = targets
@@ -1515,11 +2126,11 @@ impl Grid {
             .filter(|&&(c, r, _)| inside(c, r))
             .map(|&(c, r, l)| local(c, r, l))
             .collect();
-        while let Some(Reverse((_f, g, i))) = heap.pop() {
+        while let Some(Reverse((_f, g, i))) = scratch.heap.pop() {
             if !budget.expand() {
                 return None;
             }
-            if g > dist[i] {
+            if g > scratch.dist_of(i) {
                 continue;
             }
             if tgt.contains(&i) {
@@ -1527,7 +2138,7 @@ impl Grid {
                 let mut cur = i;
                 while cur != usize::MAX {
                     path.push(cell(cur));
-                    cur = prev[cur];
+                    cur = scratch.prev_of(cur);
                 }
                 path.reverse();
                 return Some(path);
@@ -1565,14 +2176,11 @@ impl Grid {
                     step
                 };
                 let base = straight + if layer == BACK { back_penalty } else { 0 };
-                relax(
+                scratch.relax(
                     local(nc, nr, layer),
                     g + toll(self.idx(nc, nr, layer), base),
                     heuristic(nc, nr),
                     i,
-                    &mut dist,
-                    &mut prev,
-                    &mut heap,
                 );
             }
             // A via still needs its whole body clear of *pads*; other nets' copper
@@ -1583,14 +2191,11 @@ impl Grid {
                 ViaCheck::Table(t) => t.allows(c, r, net),
             };
             if via_ok {
-                relax(
+                scratch.relax(
                     local(c, r, other),
                     g + toll(self.idx(c, r, other), via_cost),
                     heuristic(c, r),
                     i,
-                    &mut dist,
-                    &mut prev,
-                    &mut heap,
                 );
             }
         }
@@ -1715,7 +2320,7 @@ impl NetRoute {
     /// Work out which cells this route holds: the copper, and the clearance
     /// around it. Sorted and deduped, so a net is counted once per cell however
     /// many times its own path crosses it.
-    fn claim(&mut self, s: &Surface) {
+    fn claim(&mut self, s: &Surface, net: usize) {
         let mut core: Vec<usize> = Vec::new();
         let mut halo: Vec<usize> = Vec::new();
         let disc = |v: &mut Vec<usize>, c: usize, r: usize, l: usize, offs: &[(isize, isize)]| {
@@ -1743,7 +2348,7 @@ impl NetRoute {
         }
         for path in &self.paths {
             for &(c, r, l) in path {
-                disc(&mut halo, c, r, l, &s.track_disc);
+                disc(&mut halo, c, r, l, s.disc_for(net));
             }
         }
         core.sort_unstable();
@@ -1852,6 +2457,8 @@ impl Router for PathfinderRouter {
         let mut cong = Congestion::new(surface.cells());
         let mut routes: Vec<NetRoute> = vec![NetRoute::default(); routable.len()];
         let mut budget = RoutingBudget::new(opts);
+        // One A* workspace for the whole negotiation (see SearchScratch).
+        let mut scratch = SearchScratch::new();
         let mut progress = Vec::new();
         let mut rounds_run = 0usize;
         let mut stop_reason = RoutingStopReason::IterationLimit;
@@ -1863,24 +2470,76 @@ impl Router for PathfinderRouter {
         // Consecutive rounds that did not improve on `best`. See PF_STALL_ROUNDS.
         let mut stalled = 0usize;
 
+        // Sequential routing rips each net up before re-routing, so an inactive
+        // mask is correct there; the parallel branch installs per-net masks.
+        let mask = SelfMask::new();
         for it in 0..self.max_iters.max(1) {
             rounds_run = it + 1;
-            for &ni in &order {
-                // Rip up first, so the net does not negotiate against itself: with
-                // its own copper removed, every contested cell it sees belongs to
-                // somebody else.
-                cong.remove(&routes[ni]);
-                let mut rt = route_net_soft(&surface, routable[ni], ni, &cong, p_fac, &mut budget);
-                rt.claim(&surface);
-                cong.add(&rt);
-                routes[ni] = rt;
-                // Keep visiting the remaining nets after the budget fires.
-                // `route_one_soft` then returns immediately, while
-                // `route_net_soft` records every one of those connections as
-                // unreached. Breaking here left untouched `NetRoute::default()`
-                // values behind, which looked complete to the settled-output
-                // path and let whole signal nets disappear from both copper and
-                // the routing evidence.
+            if opts.parallel_rounds {
+                // Batched-parallel (Jacobi) round: every net negotiates against
+                // the round-start congestion snapshot, with its own copper
+                // discounted, so the nets are independent and run on the pool.
+                // `collect` preserves `order`, so the merge is deterministic.
+                let results: Vec<(usize, NetRoute, u64)> = order
+                    .par_iter()
+                    .map_init(
+                        || (SearchScratch::new(), SelfMask::new(), LocalBudget::new()),
+                        |(scratch, mask, local), &ni| {
+                            local.reset();
+                            mask.set(surface.cells(), &routes[ni].core, &routes[ni].halo);
+                            let mut rt = route_net_soft(
+                                &surface,
+                                routable[ni],
+                                ni,
+                                &cong,
+                                p_fac,
+                                mask,
+                                scratch,
+                                local,
+                            );
+                            rt.claim(&surface, routable[ni].net_idx);
+                            (ni, rt, local.expansions)
+                        },
+                    )
+                    .collect();
+                let mut spent = 0u64;
+                for (ni, rt, expansions) in results {
+                    spent = spent.saturating_add(expansions);
+                    routes[ni] = rt;
+                }
+                let mut next = Congestion::new(surface.cells());
+                for &ni in &order {
+                    next.add(&routes[ni]);
+                }
+                cong = next;
+                budget.record(spent);
+            } else {
+                for &ni in &order {
+                    // Rip up first, so the net does not negotiate against itself:
+                    // with its own copper removed, every contested cell it sees
+                    // belongs to somebody else.
+                    cong.remove(&routes[ni]);
+                    let mut rt = route_net_soft(
+                        &surface,
+                        routable[ni],
+                        ni,
+                        &cong,
+                        p_fac,
+                        &mask,
+                        &mut scratch,
+                        &mut budget,
+                    );
+                    rt.claim(&surface, routable[ni].net_idx);
+                    cong.add(&rt);
+                    routes[ni] = rt;
+                    // Keep visiting the remaining nets after the budget fires.
+                    // `route_one_soft` then returns immediately, while
+                    // `route_net_soft` records every one of those connections as
+                    // unreached. Breaking here left untouched `NetRoute::default()`
+                    // values behind, which looked complete to the settled-output
+                    // path and let whole signal nets disappear from both copper and
+                    // the routing evidence.
+                }
             }
             let over = (0..cong.core.len()).filter(|&i| cong.overused(i)).count();
             let unreached: usize = routes.iter().map(|r| r.unreached.len()).sum();
@@ -1947,7 +2606,7 @@ impl Router for PathfinderRouter {
             for &ni in &order {
                 let net = routable[ni];
                 for path in &settled[ni].paths {
-                    emit_path(path, net.net_idx, opts, &mm_of, &mut out);
+                    emit_path(path, net.net_idx, &net.name, opts, &mm_of, &mut out);
                 }
                 for &k in &settled[ni].unreached {
                     out.conflicts.push(format!(
@@ -2048,7 +2707,7 @@ fn progress_snapshot(
         completed += route.paths.len();
         unresolved += net.pads.len().saturating_sub(1 + route.paths.len());
         for path in &route.paths {
-            emit_path(path, 0, opts, mm_of, &mut geometry);
+            emit_path(path, 0, &net.name, opts, mm_of, &mut geometry);
         }
     }
     RoutingProgress {
@@ -2087,7 +2746,7 @@ fn partial_output(
         let net = routable[ni];
         if contested[ni] == 0 && routes[ni].paths.len() + 1 == net.pads.len() {
             for path in &routes[ni].paths {
-                emit_path(path, net.net_idx, opts, mm_of, &mut out);
+                emit_path(path, net.net_idx, &net.name, opts, mm_of, &mut out);
             }
         } else {
             // Conflicts are connection-level evidence, not net-level summaries.
@@ -2125,6 +2784,8 @@ fn finish_report(
         expansions: budget.expansions,
         elapsed_ms: budget.elapsed_ms(),
         progress,
+        escape_rejections: Vec::new(),
+        first_party_drc: None,
     });
 }
 
@@ -2147,10 +2808,21 @@ pub fn unroutable_by_placement(nets: &[RouteNet], opts: &RouteOptions) -> Vec<St
     let free = Congestion::neutral();
     let mut out = Vec::new();
     let mut budget = RoutingBudget::new(opts);
+    let mut scratch = SearchScratch::new();
+    let mask = SelfMask::new();
     for (ni, net) in routable.iter().enumerate() {
         // p_fac = 0 and no history: nothing costs more than its own length, and
         // no other net is on the board at all.
-        let rt = route_net_soft(&surface, net, ni, &free, 0, &mut budget);
+        let rt = route_net_soft(
+            &surface,
+            net,
+            ni,
+            &free,
+            0,
+            &mask,
+            &mut scratch,
+            &mut budget,
+        );
         for &k in &rt.unreached {
             out.push(format!(
                 "net {} ({}): pad {}.{} unreachable even with the board to itself",
@@ -2163,13 +2835,16 @@ pub fn unroutable_by_placement(nets: &[RouteNet], opts: &RouteOptions) -> Vec<St
 
 /// Route one net's whole tree against the current congestion, growing from pad 0
 /// and letting each later pad reach whatever the net has already built.
-fn route_net_soft(
+#[allow(clippy::too_many_arguments)]
+fn route_net_soft<L: SearchLimiter>(
     s: &Surface,
     net: &RouteNet,
     ni: usize,
     cong: &Congestion,
     p_fac: i64,
-    budget: &mut RoutingBudget,
+    mask: &SelfMask,
+    scratch: &mut SearchScratch,
+    budget: &mut L,
 ) -> NetRoute {
     let mut rt = NetRoute::default();
     let mut connected: Vec<(usize, usize, usize)> = Vec::new();
@@ -2196,6 +2871,8 @@ fn route_net_soft(
             ViaCheck::Table(&s.via_table),
             cong,
             p_fac,
+            mask,
+            scratch,
             budget,
         ) {
             Some(path) => {
@@ -2214,20 +2891,141 @@ fn route_net_soft(
     rt
 }
 
-fn relax(
-    j: usize,
-    nd: i64,
-    hj: i64,
-    from: usize,
-    dist: &mut [i64],
-    prev: &mut [usize],
-    heap: &mut BinaryHeap<Reverse<(i64, i64, usize)>>,
-) {
-    // `nd` is the actual cost g to reach j; the heap is ordered by f = g + h.
-    if nd < dist[j] {
-        dist[j] = nd;
-        prev[j] = from;
-        heap.push(Reverse((nd + hj, nd, j)));
+/// Reusable A* workspace, so a negotiation with thousands of searches does not
+/// allocate a fresh `dist`/`prev` pair (and clear them) per search.
+///
+/// `dist`/`prev` hold no meaning until `stamp[i] == gen`; a new search just
+/// bumps `gen`, which makes every array entry stale without touching it. Only
+/// the cells a search actually visits are written. One scratch is used for a
+/// whole pass (or a whole Pathfinder run), and one per thread once the per-round
+/// searches are parallelised.
+struct SearchScratch {
+    dist: Vec<i64>,
+    prev: Vec<usize>,
+    stamp: Vec<u32>,
+    gen: u32,
+    heap: BinaryHeap<Reverse<(i64, i64, usize)>>,
+}
+
+impl SearchScratch {
+    fn new() -> Self {
+        Self {
+            dist: Vec::new(),
+            prev: Vec::new(),
+            stamp: Vec::new(),
+            gen: 0,
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    /// Start a search over up to `states` local cell indices. Growth is
+    /// amortised; clearing is O(1) except on the rare generation wrap.
+    fn begin(&mut self, states: usize) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.stamp.iter_mut().for_each(|s| *s = 0);
+            self.gen = 1;
+        }
+        if self.dist.len() < states {
+            self.dist.resize(states, i64::MAX);
+            self.prev.resize(states, usize::MAX);
+            self.stamp.resize(states, 0);
+        }
+        self.heap.clear();
+    }
+
+    #[inline]
+    fn dist_of(&self, i: usize) -> i64 {
+        if self.stamp[i] == self.gen {
+            self.dist[i]
+        } else {
+            i64::MAX
+        }
+    }
+
+    #[inline]
+    fn prev_of(&self, i: usize) -> usize {
+        self.prev[i]
+    }
+
+    /// Seed a source cell at g = 0 and enqueue it with heuristic `h`.
+    #[inline]
+    fn seed(&mut self, i: usize, h: i64) {
+        self.stamp[i] = self.gen;
+        self.dist[i] = 0;
+        self.prev[i] = usize::MAX;
+        self.heap.push(Reverse((h, 0, i)));
+    }
+
+    /// `nd` is the actual cost g to reach `j`; the heap is ordered by f = g + h.
+    #[inline]
+    fn relax(&mut self, j: usize, nd: i64, hj: i64, from: usize) {
+        if self.stamp[j] != self.gen || nd < self.dist[j] {
+            self.stamp[j] = self.gen;
+            self.dist[j] = nd;
+            self.prev[j] = from;
+            self.heap.push(Reverse((nd + hj, nd, j)));
+        }
+    }
+}
+
+/// One net's own copper, so a batched-parallel (Jacobi) round lets it negotiate
+/// against the *other* nets and not against itself. Sequential routing rips the
+/// net up instead, so the mask stays inactive there and contributes nothing.
+struct SelfMask {
+    stamp: Vec<u32>,
+    bits: Vec<u8>,
+    gen: u32,
+    active: bool,
+}
+
+impl SelfMask {
+    fn new() -> Self {
+        Self {
+            stamp: Vec::new(),
+            bits: Vec::new(),
+            gen: 0,
+            active: false,
+        }
+    }
+
+    /// Mark `core` (bit 0) and `halo` (bit 1) cells as this net's own, over
+    /// global cell indices.
+    fn set(&mut self, cells: usize, core: &[usize], halo: &[usize]) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.stamp.iter_mut().for_each(|s| *s = 0);
+            self.gen = 1;
+        }
+        if self.stamp.len() < cells {
+            self.stamp.resize(cells, 0);
+            self.bits.resize(cells, 0);
+        }
+        for &i in core {
+            self.mark(i, 1);
+        }
+        for &i in halo {
+            self.mark(i, 2);
+        }
+        self.active = true;
+    }
+
+    #[inline]
+    fn mark(&mut self, i: usize, bit: u8) {
+        if self.stamp[i] != self.gen {
+            self.stamp[i] = self.gen;
+            self.bits[i] = 0;
+        }
+        self.bits[i] |= bit;
+    }
+
+    #[inline]
+    fn bits_of(&self, i: usize) -> u8 {
+        if self.active && self.stamp[i] == self.gen {
+            self.bits[i]
+        } else {
+            0
+        }
     }
 }
 
@@ -2237,6 +3035,7 @@ fn relax(
 fn emit_path(
     path: &[(usize, usize, usize)],
     net_idx: usize,
+    net_name: &str,
     opts: &RouteOptions,
     mm_of: &impl Fn(usize, usize) -> (f64, f64),
     out: &mut RouteOutput,
@@ -2260,13 +3059,13 @@ fn emit_path(
         while j + 1 < path.len() && path[j + 1].2 == layer {
             j += 1;
         }
-        emit_straight_runs(path, i, j, net_idx, opts, &layer_name, mm_of, out);
+        emit_straight_runs(path, i, j, net_idx, net_name, opts, &layer_name, mm_of, out);
         if j + 1 < path.len() {
             let (vc, vr, _) = path[j];
             out.vias.push(Via {
                 at: mm_of(vc, vr),
-                size_mm: opts.via_size_mm,
-                drill_mm: opts.via_drill_mm,
+                size_mm: opts.via_size_for(net_name),
+                drill_mm: opts.via_drill_for(net_name),
                 net_idx,
             });
         }
@@ -2281,6 +3080,7 @@ fn emit_straight_runs(
     i: usize,
     j: usize,
     net_idx: usize,
+    net_name: &str,
     opts: &RouteOptions,
     layer_name: &impl Fn(usize) -> String,
     mm_of: &impl Fn(usize, usize) -> (f64, f64),
@@ -2300,12 +3100,16 @@ fn emit_straight_runs(
     for k in (i + 1)..j {
         let d = dir(k, k + 1);
         if d != cur {
-            push_track(path, seg_start, k, net_idx, opts, layer_name, mm_of, out);
+            push_track(
+                path, seg_start, k, net_idx, net_name, opts, layer_name, mm_of, out,
+            );
             seg_start = k;
             cur = d;
         }
     }
-    push_track(path, seg_start, j, net_idx, opts, layer_name, mm_of, out);
+    push_track(
+        path, seg_start, j, net_idx, net_name, opts, layer_name, mm_of, out,
+    );
 }
 
 /// Emit one straight track for `path[a..=b]` (same layer), skipping empties.
@@ -2315,6 +3119,7 @@ fn push_track(
     a: usize,
     b: usize,
     net_idx: usize,
+    net_name: &str,
     opts: &RouteOptions,
     layer_name: &impl Fn(usize) -> String,
     mm_of: &impl Fn(usize, usize) -> (f64, f64),
@@ -2331,7 +3136,7 @@ fn push_track(
     out.tracks.push(Track {
         start: mm_of(ac, ar),
         end: mm_of(bc, br),
-        width_mm: opts.signal_width_mm,
+        width_mm: opts.width_for(net_name),
         layer: layer_name(layer),
         net_idx,
     });
@@ -2433,6 +3238,54 @@ pub(crate) fn via_sexpr(v: &Via, front: &str, back: &str) -> Sexpr {
             Sexpr::string(det_uuid(&format!("via:{}:{:?}", v.net_idx, v.at))),
         ]),
     ])
+}
+
+/// Distance from point `p` to segment `a`-`b`.
+pub(crate) fn pt_seg(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+    };
+    let (qx, qy) = (a.0 + t * dx, a.1 + t * dy);
+    ((p.0 - qx).powi(2) + (p.1 - qy).powi(2)).sqrt()
+}
+
+/// True when segments `a`-`b` and `c`-`d` properly cross.
+pub(crate) fn segs_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    let (o1, o2) = (orient(a, b, c), orient(a, b, d));
+    let (o3, o4) = (orient(c, d, a), orient(c, d, b));
+    o1 * o2 < 0.0 && o3 * o4 < 0.0
+}
+
+/// Minimum distance between segments `a`-`b` and `c`-`d` (0 when they cross).
+pub(crate) fn seg_seg(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> f64 {
+    if segs_cross(a, b, c, d) {
+        return 0.0;
+    }
+    pt_seg(a, c, d)
+        .min(pt_seg(b, c, d))
+        .min(pt_seg(c, a, b))
+        .min(pt_seg(d, a, b))
+}
+
+/// Distance from segment `a`-`b` to a pad's rectangle (0 if they touch).
+pub(crate) fn seg_pad(a: (f64, f64), b: (f64, f64), p: &PadPoint) -> f64 {
+    let (x0, y0) = (p.x_mm - p.w_mm / 2.0, p.y_mm - p.h_mm / 2.0);
+    let (x1, y1) = (p.x_mm + p.w_mm / 2.0, p.y_mm + p.h_mm / 2.0);
+    let inside = |q: (f64, f64)| q.0 >= x0 && q.0 <= x1 && q.1 >= y0 && q.1 <= y1;
+    if inside(a) || inside(b) {
+        return 0.0;
+    }
+    let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+    (0..4)
+        .map(|i| seg_seg(a, b, corners[i], corners[(i + 1) % 4]))
+        .fold(f64::INFINITY, f64::min)
 }
 
 #[cfg(test)]
@@ -3045,6 +3898,19 @@ mod tests {
     }
 
     #[test]
+    fn pathfinder_parallel_round_is_deterministic_and_routes() {
+        let (nets, mut opts) = corridor_board();
+        opts.parallel_rounds = true;
+        let a = PathfinderRouter::default().route(&nets, &opts);
+        let b = PathfinderRouter::default().route(&nets, &opts);
+        assert_eq!(a.conflicts, b.conflicts);
+        for (x, y) in a.tracks.iter().zip(b.tracks.iter()) {
+            assert_eq!((x.start, x.end, x.net_idx), (y.start, y.end, y.net_idx));
+        }
+        assert!(!a.tracks.is_empty());
+    }
+
+    #[test]
     fn pathfinder_single_pad_net_routes_nothing() {
         let net = RouteNet {
             net_idx: 1,
@@ -3208,52 +4074,6 @@ mod tests {
 
     // ---- fine-pitch escape (legion-of-bom-y17.1) ---------------------------
 
-    /// Distance from point `p` to segment `a`-`b`.
-    fn pt_seg(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let len2 = dx * dx + dy * dy;
-        let t = if len2 == 0.0 {
-            0.0
-        } else {
-            (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
-        };
-        let (qx, qy) = (a.0 + t * dx, a.1 + t * dy);
-        ((p.0 - qx).powi(2) + (p.1 - qy).powi(2)).sqrt()
-    }
-
-    fn segs_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
-        let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
-            (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
-        };
-        let (o1, o2) = (orient(a, b, c), orient(a, b, d));
-        let (o3, o4) = (orient(c, d, a), orient(c, d, b));
-        o1 * o2 < 0.0 && o3 * o4 < 0.0
-    }
-
-    fn seg_seg(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> f64 {
-        if segs_cross(a, b, c, d) {
-            return 0.0;
-        }
-        pt_seg(a, c, d)
-            .min(pt_seg(b, c, d))
-            .min(pt_seg(c, a, b))
-            .min(pt_seg(d, a, b))
-    }
-
-    /// Distance from segment `a`-`b` to a pad's rectangle (0 if they touch).
-    fn seg_pad(a: (f64, f64), b: (f64, f64), p: &PadPoint) -> f64 {
-        let (x0, y0) = (p.x_mm - p.w_mm / 2.0, p.y_mm - p.h_mm / 2.0);
-        let (x1, y1) = (p.x_mm + p.w_mm / 2.0, p.y_mm + p.h_mm / 2.0);
-        let inside = |q: (f64, f64)| q.0 >= x0 && q.0 <= x1 && q.1 >= y0 && q.1 <= y1;
-        if inside(a) || inside(b) {
-            return 0.0;
-        }
-        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-        (0..4)
-            .map(|i| seg_seg(a, b, corners[i], corners[(i + 1) % 4]))
-            .fold(f64::INFINITY, f64::min)
-    }
-
     /// The test oracle the router is judged by: every pair of copper items on
     /// different nets, measured edge to edge in exact geometry — not on the
     /// router's own grid, which is the thing under test. Returns one line per
@@ -3412,16 +4232,231 @@ mod tests {
         let (nets, opts) = lqfp_fanout_board();
         assert!(!opts.fine_pitch_escape);
         let escaped = prepare_fine_pitch_escape(&nets, &opts);
+        assert!(
+            escaped.rejected.is_empty(),
+            "the derived LQFP escape must satisfy black_book's oracle: {:?}",
+            escaped
+                .rejected
+                .iter()
+                .map(|r| r.summary())
+                .collect::<Vec<_>>()
+        );
         assert!(!escaped.tracks.is_empty());
         assert!(
             escaped.nets.len() > nets.len(),
             "escape copper must become obstacles"
         );
-        for track in &escaped.tracks {
-            let dx = (track.end.0 - track.start.0).abs();
-            let dy = (track.end.1 - track.start.1).abs();
-            assert!(dx < 1e-9 || dy < 1e-9 || (dx - dy).abs() < 1e-9);
+        // black_book validates one straight pad-to-portal neck, so escape copper
+        // is a single straight segment per escaped pad — not the old
+        // axis-aligned/45-degree two-segment fanout.
+        assert!(
+            escaped.tracks.iter().all(|track| track.start != track.end),
+            "escape copper must be non-degenerate straight necks"
+        );
+    }
+
+    /// A four-sided package ring at `pitch` mm, each pad its own net to a remote
+    /// test point. `pitch` below trace-width + clearance is not escapable by
+    /// straight paths at the default rules.
+    fn fine_pitch_package(pitch: f64) -> (Vec<RouteNet>, RouteOptions) {
+        let offsets: Vec<f64> = (0..3).map(|i| (i as f64 - 1.0) * pitch).collect();
+        let small = |num: String, x: f64, y: f64| {
+            let mut p = pad("U9", &num, x, y);
+            p.w_mm = 0.3;
+            p.h_mm = 0.3;
+            p
+        };
+        let mut pads = Vec::new();
+        for (i, offset) in offsets.iter().copied().enumerate() {
+            pads.push(small(format!("B{i}"), 20.0 + offset, 18.0));
+            pads.push(small(format!("T{i}"), 20.0 + offset, 22.0));
+            pads.push(small(format!("L{i}"), 18.0, 20.0 + offset));
+            pads.push(small(format!("R{i}"), 22.0, 20.0 + offset));
         }
+        let nets = pads
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| RouteNet {
+                net_idx: i + 1,
+                name: format!("N{}", i + 1),
+                pads: vec![p, pad("TP", &format!("{i}"), 30.0 + i as f64 * 0.5, 30.0)],
+            })
+            .collect();
+        let opts = RouteOptions {
+            bounds: Some((0.0, 0.0, 40.0, 40.0)),
+            ..RouteOptions::default()
+        };
+        (nets, opts)
+    }
+
+    /// A QFN-style package: `per_side` perimeter pads at `pitch` plus a large
+    /// centre thermal pad, like every real QFN footprint.
+    fn qfn_package(pitch: f64, per_side: usize) -> (Vec<RouteNet>, RouteOptions) {
+        let (cx, cy) = (20.0, 20.0);
+        let half = per_side as f64 * pitch / 2.0 + 0.5;
+        let offsets: Vec<f64> = (0..per_side)
+            .map(|i| (i as f64 - (per_side as f64 - 1.0) / 2.0) * pitch)
+            .collect();
+        let small = |num: String, x: f64, y: f64| {
+            let mut p = pad("U9", &num, x, y);
+            p.w_mm = 0.3;
+            p.h_mm = 0.3;
+            p
+        };
+        let mut pads = Vec::new();
+        for (i, offset) in offsets.iter().copied().enumerate() {
+            pads.push(small(format!("L{i}"), cx - half, cy + offset));
+            pads.push(small(format!("R{i}"), cx + half, cy + offset));
+            pads.push(small(format!("B{i}"), cx + offset, cy - half));
+            pads.push(small(format!("T{i}"), cx + offset, cy + half));
+        }
+        let mut thermal = pad("U9", "EP", cx, cy);
+        thermal.w_mm = half * 0.5;
+        thermal.h_mm = half * 0.5;
+        pads.push(thermal);
+        let nets = pads
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| RouteNet {
+                net_idx: i + 1,
+                name: format!("N{i}"),
+                pads: vec![p, pad("TP", &format!("{i}"), 35.0 + i as f64 * 0.4, 35.0)],
+            })
+            .collect();
+        let opts = RouteOptions {
+            bounds: Some((0.0, 0.0, 45.0, 45.0)),
+            ..RouteOptions::default()
+        };
+        (nets, opts)
+    }
+
+    /// A QFN's centre thermal pad sits inside the perimeter; escaping it through
+    /// an edge portal makes its straight path cross every perimeter path, which
+    /// black_book rightly flags. Interior pads must stay with the global router.
+    #[test]
+    fn fine_pitch_escape_leaves_interior_pads_to_the_global_router() {
+        let (nets, opts) = qfn_package(0.5, 5);
+        let escaped = prepare_fine_pitch_escape(&nets, &opts);
+        assert!(
+            escaped.rejected.is_empty(),
+            "centre thermal pad must not reject the perimeter escape: {:?}",
+            escaped
+                .rejected
+                .iter()
+                .map(|r| r.summary())
+                .collect::<Vec<_>>()
+        );
+        assert!(!escaped.tracks.is_empty());
+        let thermal = escaped
+            .nets
+            .iter()
+            .flat_map(|net| &net.pads)
+            .find(|p| p.refdes == "U9" && p.pad == "EP")
+            .expect("thermal pad kept");
+        assert!(
+            (thermal.x_mm - 20.0).abs() < 1e-9 && (thermal.y_mm - 20.0).abs() < 1e-9,
+            "interior pad must not be moved to a portal: {thermal:?}"
+        );
+    }
+
+    /// black_book validates the package against itself; it cannot see the rest
+    /// of the board. A neck that would short a neighbouring part's pad must be
+    /// rejected with a diagnosable reason, not emitted for DRC to catch.
+    #[test]
+    fn fine_pitch_escape_rejects_a_neck_that_would_short_a_neighbour() {
+        let (mut nets, opts) = fine_pitch_package(0.5);
+        nets.push(RouteNet {
+            net_idx: 999,
+            name: "NEIGHBOUR".into(),
+            pads: vec![pad("C1", "1", 17.4, 20.0), pad("C1", "2", 30.0, 5.0)],
+        });
+        let escaped = prepare_fine_pitch_escape(&nets, &opts);
+        let rejection = escaped
+            .rejected
+            .iter()
+            .find(|r| r.refdes == "U9")
+            .expect("a neck shorting a neighbour pad must be reported");
+        assert!(!rejection.conflicts.is_empty(), "{rejection:?}");
+        assert!(
+            rejection.summary().contains("C1.1"),
+            "{}",
+            rejection.summary()
+        );
+        // Only the colliding necks are dropped; the rest of the package escapes.
+        assert!(
+            escaped.tracks.iter().any(|track| track.net_idx != 999),
+            "non-colliding necks must still escape"
+        );
+        let kept = escaped
+            .nets
+            .iter()
+            .flat_map(|net| &net.pads)
+            .find(|p| p.refdes == "U9" && p.pad == "L1")
+            .expect("colliding pad kept");
+        assert!(
+            (kept.x_mm - 18.0).abs() < 1e-9,
+            "the colliding neck must be dropped, not moved: {kept:?}"
+        );
+    }
+
+    /// black_book is the independent oracle at this seam: a package whose pads
+    /// are closer than `trace width + clearance` cannot be escaped by straight
+    /// paths, so the candidate must be rejected with a diagnosable reason and
+    /// its original pads handed to the global router unchanged. Without this the
+    /// oracle would be decorative — the same "green for the wrong reasons"
+    /// failure the suite is meant to catch.
+    #[test]
+    fn fine_pitch_escape_rejects_infeasible_candidate_and_keeps_pads() {
+        let (nets, opts) = fine_pitch_package(0.3);
+        let escaped = prepare_fine_pitch_escape(&nets, &opts);
+        assert_eq!(
+            escaped.rejected.len(),
+            1,
+            "0.3mm pitch is not straight-path escapable at 0.25/0.2 rules"
+        );
+        let rejection = &escaped.rejected[0];
+        assert_eq!(rejection.refdes, "U9");
+        assert!(!rejection.violations.is_empty());
+        let summary = rejection.summary();
+        assert!(summary.starts_with("U9: "), "{summary}");
+        assert!(summary.contains("too close"), "{summary}");
+
+        assert!(
+            escaped.tracks.is_empty(),
+            "a rejected package must not emit escape copper"
+        );
+        let kept = escaped
+            .nets
+            .iter()
+            .flat_map(|net| &net.pads)
+            .find(|p| p.refdes == "U9" && p.pad == "B0")
+            .expect("rejected package keeps its original pads");
+        assert!(
+            (kept.x_mm - 19.7).abs() < 1e-9 && (kept.y_mm - 18.0).abs() < 1e-9,
+            "pad moved despite rejection: {kept:?}"
+        );
+    }
+
+    /// A KiCad exposed pad is often authored as several primitives that share
+    /// one pad number. Escape geometry is per electrical pad, so the duplicate
+    /// primitives must collapse to one portal rather than look like two portals
+    /// at the same offset (which black_book correctly rejects).
+    #[test]
+    fn fine_pitch_escape_collapses_shared_pad_numbers() {
+        let (mut nets, opts) = fine_pitch_package(0.5);
+        let duplicate = nets[0].pads[0].clone();
+        nets[0].pads.push(duplicate);
+        let escaped = prepare_fine_pitch_escape(&nets, &opts);
+        assert!(
+            escaped.rejected.is_empty(),
+            "shared pad numbers must not reject an escapable package: {:?}",
+            escaped
+                .rejected
+                .iter()
+                .map(|r| r.summary())
+                .collect::<Vec<_>>()
+        );
+        assert!(!escaped.tracks.is_empty());
     }
 
     #[test]
@@ -3528,5 +4563,215 @@ mod tests {
         let names: Vec<&str> = order.iter().map(|&i| routable[i].name.as_str()).collect();
 
         assert_eq!(names, ["+3V3", "SIG", "BUS", "AUX"]);
+    }
+
+    // ---- design rules as board input (legion-of-bom-orld slice 2) ----------
+
+    fn tight_gap_nets() -> Vec<RouteNet> {
+        // Two parallel signals either side of a fence of 0.3mm pads at
+        // x = 106. Net B's straight row threads a 0.7mm slot in the fence:
+        // ~0.225mm of air from the fence pads — legal at the 0.2 default,
+        // illegal at a 0.35 class pair. The tightened class must force net B
+        // onto the back layer (or a refusal), not let it ship the slot.
+        let mut nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "SIG_A".into(),
+                pads: vec![
+                    small_pad("A1", "1", 98.0, 100.0),
+                    small_pad("A2", "1", 114.0, 100.0),
+                ],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG_B".into(),
+                pads: vec![
+                    small_pad("B1", "1", 98.0, 102.2),
+                    small_pad("B2", "1", 114.0, 102.2),
+                ],
+            },
+        ];
+        let lower: Vec<f64> = (94..=99).map(|v| v as f64).collect();
+        let upper: Vec<f64> = (0..7).map(|k| 100.7 + k as f64).collect();
+        for (k, y) in lower.iter().chain(upper.iter()).enumerate() {
+            nets.push(RouteNet {
+                net_idx: 90 + k,
+                name: String::new(),
+                pads: vec![PadPoint {
+                    layer: PadLayer::Both,
+                    ..small_pad("W", "1", 106.0, *y)
+                }],
+            });
+        }
+        nets
+    }
+
+    fn small_pad(refdes: &str, num: &str, x: f64, y: f64) -> PadPoint {
+        PadPoint {
+            refdes: refdes.into(),
+            pad: num.into(),
+            x_mm: x,
+            y_mm: y,
+            w_mm: 0.3,
+            h_mm: 0.3,
+            layer: PadLayer::Front,
+        }
+    }
+
+    fn tight_gap_opts(design_rules: Option<crate::design_rules::DesignRules>) -> RouteOptions {
+        RouteOptions {
+            bounds: Some((96.0, 93.5, 116.0, 104.5)),
+            grid_mm: 0.05,
+            design_rules,
+            ..Default::default()
+        }
+    }
+
+    fn power_pair_rules() -> crate::design_rules::DesignRules {
+        crate::design_rules::DesignRules {
+            net_classes: vec![
+                crate::design_rules::DesignRules::jlcpcb_two_layer_default()
+                    .default_class()
+                    .cloned()
+                    .unwrap(),
+                crate::design_rules::NetClassRule {
+                    name: "Mid".into(),
+                    nets: vec!["SIG_A".into(), "SIG_B".into()],
+                    clearance_mm: 0.35,
+                    track_width_mm: 0.25,
+                    via_dia_mm: 0.8,
+                    via_drill_mm: 0.4,
+                },
+            ],
+            constraints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_tightened_net_class_moves_the_router_and_the_checker_together() {
+        use crate::pcb_drc::{check_copper, check_copper_with, CopperGeometry};
+
+        let nets = tight_gap_nets();
+        // Pass 1: default rules. Both nets route, and the copper they ship is
+        // ILLEGAL at 0.35 — the fixture must discriminate, or pass 2 proves
+        // nothing (legion-of-bom-69v: a test that cannot fail).
+        let base = tight_gap_opts(None);
+        let out = GridRouter.route(&nets, &base);
+        assert!(out.conflicts.is_empty(), "default should route: {out:?}");
+        let geo = CopperGeometry {
+            nets: &nets,
+            tracks: &out.tracks,
+            vias: &out.vias,
+            outline: None,
+            edge_clearance_mm: 0.5,
+            poured_nets: &[],
+        };
+        let at_default = check_copper(&geo, 0.2);
+        assert!(
+            at_default.violations.iter().all(|v| v.kind != "clearance"),
+            "default copper must be legal at the default clearance: {:?}",
+            at_default.violations
+        );
+        let at_035 = check_copper(&geo, 0.35);
+        assert!(
+            at_035.violations.iter().any(|v| v.kind == "clearance"),
+            "the fixture is not discriminating: default copper is already legal at 0.35"
+        );
+
+        // Pass 2: the same board against a class that demands 0.35 between
+        // these two nets. The router must not *emit* copper that violates it:
+        // either it finds a legal route or it refuses the connection. It did
+        // neither before this wiring existed (it shipped the 0.3mm air gap).
+        let strict = tight_gap_opts(Some(power_pair_rules()));
+        let out2 = GridRouter.route(&nets, &strict);
+        let name = |i: usize| {
+            nets.iter()
+                .find(|n| n.net_idx == i)
+                .map(|n| n.name.as_str())
+                .unwrap_or("")
+        };
+        let geo2 = CopperGeometry {
+            nets: &nets,
+            tracks: &out2.tracks,
+            vias: &out2.vias,
+            outline: None,
+            edge_clearance_mm: 0.5,
+            poured_nets: &[],
+        };
+        let drc2 = check_copper_with(&geo2, &|a, b| strict.clearance_for(name(a), name(b)));
+        assert!(
+            drc2.violations.iter().all(|v| v.kind != "clearance"),
+            "the router shipped class-illegal copper: {:?}",
+            drc2.violations
+        );
+        // And the class genuinely bit: the two runs are not the same answer.
+        assert_ne!(
+            (out.tracks.len(), out.conflicts.len()),
+            (out2.tracks.len(), out2.conflicts.len()),
+            "tightening the class changed nothing — the rules are not wired in"
+        );
+    }
+
+    #[test]
+    fn a_class_width_is_the_width_the_router_emits() {
+        let nets = tight_gap_nets();
+        let mut rules = crate::design_rules::DesignRules::jlcpcb_two_layer_default();
+        rules.net_classes[0].track_width_mm = 0.4;
+        let opts = tight_gap_opts(Some(rules));
+        let out = GridRouter.route(&nets, &opts);
+        assert!(!out.tracks.is_empty(), "board should route");
+        for t in &out.tracks {
+            assert_eq!(t.width_mm, 0.4, "every net is Default-class here");
+        }
+    }
+
+    #[test]
+    fn per_class_width_emits_per_net() {
+        // SIG_A is wide-classed; SIG_B keeps the default width. The wall gap
+        // is irrelevant here — straight rows, so this isolates emission from
+        // feasibility.
+        let nets = vec![
+            RouteNet {
+                net_idx: 1,
+                name: "SIG_A".into(),
+                pads: vec![pad("A1", "1", 98.0, 100.0), pad("A2", "1", 114.0, 100.0)],
+            },
+            RouteNet {
+                net_idx: 2,
+                name: "SIG_B".into(),
+                pads: vec![pad("B1", "1", 98.0, 102.0), pad("B2", "1", 114.0, 102.0)],
+            },
+        ];
+        let opts = RouteOptions {
+            bounds: Some((96.0, 98.0, 116.0, 104.0)),
+            design_rules: Some(power_pair_rules_wide()),
+            ..Default::default()
+        };
+        let out = GridRouter.route(&nets, &opts);
+        assert!(out.conflicts.is_empty(), "{:?}", out.conflicts);
+        for t in &out.tracks {
+            let want = if t.net_idx == 1 { 0.5 } else { 0.25 };
+            assert_eq!(t.width_mm, want, "track of net {}", t.net_idx);
+        }
+    }
+
+    fn power_pair_rules_wide() -> crate::design_rules::DesignRules {
+        crate::design_rules::DesignRules {
+            net_classes: vec![
+                crate::design_rules::DesignRules::jlcpcb_two_layer_default()
+                    .default_class()
+                    .cloned()
+                    .unwrap(),
+                crate::design_rules::NetClassRule {
+                    name: "Power".into(),
+                    nets: vec!["SIG_A".into()],
+                    clearance_mm: 0.2,
+                    track_width_mm: 0.5,
+                    via_dia_mm: 1.0,
+                    via_drill_mm: 0.5,
+                },
+            ],
+            constraints: Vec::new(),
+        }
     }
 }

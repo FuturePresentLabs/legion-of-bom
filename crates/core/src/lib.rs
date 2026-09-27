@@ -23,6 +23,7 @@ pub mod controlled_path;
 pub mod datasheet;
 pub mod decouple;
 pub mod derating;
+pub mod design_rules;
 pub mod distributor_lua;
 pub mod domain_profile;
 pub mod drc;
@@ -64,6 +65,7 @@ pub mod panel;
 pub mod panel_edit;
 pub mod panel_lua;
 pub mod parts;
+pub mod pcb_drc;
 pub mod pdf;
 pub mod pedal_panel;
 pub mod photo;
@@ -117,7 +119,7 @@ pub use board::{
     build_facts, decoupling_pairs, framed_template, free_outline_template, generate_board,
     generate_board_artifacts, generate_board_report, minimum_framed_outline, minimum_free_outline,
     minimum_hp, BoardArtifacts, BoardError, BoardOptions, EurorackPlacer, GridPlacer, PartFacts,
-    Placement, PlacementSidePolicy, Placer, SeededPlacer, SilkLegend, SilkValues,
+    Placement, PlacementSidePolicy, Placer, PourNet, SeededPlacer, SilkLegend, SilkValues,
 };
 pub use bom::{generate_bom, Bom, BomLine, LineKind};
 pub use bom_repair::{
@@ -133,6 +135,7 @@ pub use derating::{
     ElectricalStress, PartDeratingReport, PartStressInput, Rating, RatingProvenance,
     StressInputError, StressResult, StressVerdict,
 };
+pub use design_rules::{ConstraintKind, CustomConstraint, DesignRules, NetClassRule, RulesError};
 pub use distributor_lua::{
     distributor_script_dir, load_named_script, DistributorScript, DistributorScriptError,
 };
@@ -163,7 +166,8 @@ pub use fab::{
     board_sides, ecss_q_st_70_12c_rev1_rigid_30v_design_rules, export_board_svg, export_cpl,
     export_gerbers, jlc_assembly_bom, jlc_bom_csv, jlc_cpl_from_kicad_pos, jlcpcb_design_rules,
     jlcpcb_design_rules_with_placement, placement_design_rules, png_to_jpeg, render_board_jpeg,
-    render_board_png, strip_smd, zip_dir, BoardSides, MountCounts, Populate, Quality,
+    render_board_png, routing_design_rules, strip_smd, zip_dir, BoardSides, MountCounts, Populate,
+    Quality,
 };
 pub use fetch::{fetch_from_jlcpcb, fetch_from_kicad};
 pub use frame::{Keepout as BoardKeepout, StandoffHole, StandoffPattern};
@@ -222,6 +226,10 @@ pub use panel_lua::{
 pub use parts::{
     default_parts_dir, HousePart, PartRecord, PartResolution, PartsError, PartsLibrary, PinRecord,
     RatingRecord, ResolutionStatus,
+};
+pub use pcb_drc::{
+    check_copper, check_copper_with, CopperGeometry, FirstPartyDrcSummary, DEFERRED_CHECKS,
+    IMPLEMENTED_CHECKS,
 };
 pub use pedal_panel::{fuzz_pedal_panel_file, PedalCutouts, PedalPanel};
 pub use photo::{photo_keyword, photo_source, thonk_keyword};

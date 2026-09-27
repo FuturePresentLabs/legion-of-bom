@@ -137,6 +137,19 @@ enum Command {
         transient_hz: f64,
         #[arg(long, default_value_t = 1.0)]
         input_peak_v: f64,
+        /// Select a pulse-triggered transient instead of the default sine.
+        #[arg(long)]
+        trigger_amplitude_v: Option<f64>,
+        #[arg(long)]
+        trigger_width_s: Option<f64>,
+        #[arg(long)]
+        trigger_time_s: Option<f64>,
+        #[arg(long)]
+        retrigger_time_s: Option<f64>,
+        #[arg(long)]
+        transient_stop_s: Option<f64>,
+        #[arg(long)]
+        transient_sample_rate_hz: Option<f64>,
         #[arg(long)]
         load_ohms: Option<f64>,
     },
@@ -202,12 +215,54 @@ enum Command {
         /// Opt into derived local fine-pitch escape portals before global routing.
         #[arg(long)]
         fine_pitch_escape: bool,
-        /// Maximum A* heap expansions across one routing attempt.
-        #[arg(long, default_value_t = 50_000_000)]
-        router_max_expansions: u64,
+        /// Maximum A* heap expansions across one routing attempt. Omitted = no
+        /// expansion ceiling; the negotiation stops when it settles or stalls,
+        /// and `--router-timeout-ms` is the hard safety.
+        #[arg(long)]
+        router_max_expansions: Option<u64>,
         /// Wall-clock safety cap for one routing attempt, in milliseconds.
-        #[arg(long, default_value_t = 300_000)]
+        #[arg(long, default_value_t = 1_800_000)]
         router_timeout_ms: u64,
+        /// Routing-grid cell size in mm (finer finds more channels, slower).
+        #[arg(long)]
+        router_grid_mm: Option<f64>,
+        /// Cost in mm-equivalent charged for a layer change (lower routes more
+        /// vias, which relieves congestion on a two-layer board).
+        #[arg(long)]
+        router_via_cost_mm: Option<f64>,
+        /// Extra per-cell cost for routing on the back layer.
+        #[arg(long)]
+        router_back_penalty_mm: Option<f64>,
+        /// Route each negotiation round's nets in parallel against a congestion
+        /// snapshot (Jacobi) instead of one at a time. EXPERIMENTAL: measured to
+        /// oscillate and regress vs the sequential router.
+        #[arg(long)]
+        router_parallel: bool,
+        /// Pour a net on a layer as a copper plane, removing it from maze
+        /// routing. Repeatable, e.g. `--pour +3V3@F.Cu --pour GND@B.Cu`. When
+        /// given, this replaces the default two-sided ground pour.
+        #[arg(long = "pour", value_name = "NET@LAYER")]
+        pours: Vec<String>,
+        /// Extra board-edge margin around the placed parts (mm).
+        #[arg(long)]
+        outline_margin_mm: Option<f64>,
+        /// Routing trace width (mm); default 0.25.
+        #[arg(long)]
+        trace_width_mm: Option<f64>,
+        /// Routing clearance (mm); default 0.20. Smaller is denser/slower per
+        /// net but adds channels.
+        #[arg(long)]
+        clearance_mm: Option<f64>,
+        /// Also run KiCad's DRC as an oracle alongside the first-party checker
+        /// (requires kicad-cli). Off by default; the first-party check always runs.
+        #[arg(long)]
+        drc_oracle: bool,
+        /// Design rules file (`.kicad_dru` or `.kicad_pro`): the single source
+        /// for per-net-class clearance, track width, and via geometry. The
+        /// router, the first-party checker, and the emitted `.kicad_dru` all
+        /// read it; do not combine with `--trace-width-mm`/`--clearance-mm`.
+        #[arg(long)]
+        design_rules: Option<PathBuf>,
         /// Write machine-readable routing progress and final budget evidence.
         #[arg(long)]
         routing_report: Option<PathBuf>,
@@ -702,6 +757,12 @@ fn main() -> ExitCode {
             ac_points_per_decade,
             transient_hz,
             input_peak_v,
+            trigger_amplitude_v,
+            trigger_width_s,
+            trigger_time_s,
+            retrigger_time_s,
+            transient_stop_s,
+            transient_sample_rate_hz,
             load_ohms,
         } => analog_export_cmd(
             circuit,
@@ -714,6 +775,12 @@ fn main() -> ExitCode {
             ac_points_per_decade,
             transient_hz,
             input_peak_v,
+            trigger_amplitude_v,
+            trigger_width_s,
+            trigger_time_s,
+            retrigger_time_s,
+            transient_stop_s,
+            transient_sample_rate_hz,
             load_ohms,
         ),
         Command::Bom {
@@ -737,6 +804,16 @@ fn main() -> ExitCode {
             fine_pitch_escape,
             router_max_expansions,
             router_timeout_ms,
+            router_grid_mm,
+            router_via_cost_mm,
+            router_back_penalty_mm,
+            router_parallel,
+            pours,
+            outline_margin_mm,
+            trace_width_mm,
+            clearance_mm,
+            drc_oracle,
+            design_rules,
             routing_report,
         } => board_cmd(
             circuit,
@@ -751,6 +828,16 @@ fn main() -> ExitCode {
                 fine_pitch_escape,
                 router_max_expansions,
                 router_timeout_ms,
+                router_grid_mm,
+                router_via_cost_mm,
+                router_back_penalty_mm,
+                router_parallel,
+                pours,
+                outline_margin_mm,
+                trace_width_mm,
+                clearance_mm,
+                drc_oracle,
+                design_rules,
                 routing_report,
                 rlcd_model,
                 llm_model,
@@ -1906,6 +1993,9 @@ struct Layout {
     /// Parts with no footprint at all â off-board hardware, absent from the board.
     not_placed: Vec<String>,
     routing: Option<legion_of_bom_core::route::RoutingReport>,
+    /// First-party copper DRC of the emitted copper, carried on the routing
+    /// evidence; `None` when nothing was checked (placement-only preview).
+    first_party_drc: Option<legion_of_bom_core::FirstPartyDrcSummary>,
 }
 
 /// The two placement-model capabilities are deliberately separate: a bounded
@@ -2004,12 +2094,15 @@ fn build_layout(
             if models.is_none() {
                 if let Some(hit) = layout_cache::read(&cache, &cache_key)? {
                     println!("  layout cache: hit {cache_key}");
+                    let routing = hit.routing;
+                    let first_party_drc = routing.as_ref().and_then(|r| r.first_party_drc.clone());
                     return Ok(Layout {
                         board: hit.board,
                         conflicts: hit.conflicts,
                         collisions: hit.collisions,
                         not_placed: hit.not_placed,
-                        routing: hit.routing,
+                        routing,
+                        first_party_drc,
                     });
                 }
             }
@@ -2050,12 +2143,15 @@ fn build_layout(
                 && report.collisions.is_empty()
                 && report.metrics.violations.is_empty()
                 && report.drc.as_ref().is_none_or(|drc| drc.is_clean());
+            let routing = report.routing;
+            let first_party_drc = routing.as_ref().and_then(|r| r.first_party_drc.clone());
             let layout = Layout {
                 board: report.board,
                 conflicts: report.unresolved,
                 collisions: report.collisions,
                 not_placed: report.not_placed,
-                routing: report.routing,
+                routing,
+                first_party_drc,
             };
             if cacheable && models.is_none() {
                 layout_cache::write(
@@ -2075,12 +2171,15 @@ fn build_layout(
         }
         _ => {
             let art = generate_board_artifacts(model, &options)?;
+            let routing = art.route.report;
+            let first_party_drc = routing.as_ref().and_then(|r| r.first_party_drc.clone());
             Ok(Layout {
                 board: art.pcb,
                 conflicts: art.route.conflicts,
                 collisions: art.collisions,
                 not_placed: art.not_placed,
-                routing: art.route.report,
+                routing,
+                first_party_drc,
             })
         }
     }
@@ -2155,8 +2254,18 @@ struct BoardOutputOptions {
     model_glb: Option<PathBuf>,
     placement_only: bool,
     fine_pitch_escape: bool,
-    router_max_expansions: u64,
+    router_max_expansions: Option<u64>,
     router_timeout_ms: u64,
+    router_grid_mm: Option<f64>,
+    router_via_cost_mm: Option<f64>,
+    router_back_penalty_mm: Option<f64>,
+    router_parallel: bool,
+    pours: Vec<String>,
+    outline_margin_mm: Option<f64>,
+    trace_width_mm: Option<f64>,
+    clearance_mm: Option<f64>,
+    drc_oracle: bool,
+    design_rules: Option<PathBuf>,
     routing_report: Option<PathBuf>,
     rlcd_model: Option<String>,
     llm_model: Option<String>,
@@ -2186,6 +2295,16 @@ fn board_cmd(
         fine_pitch_escape,
         router_max_expansions,
         router_timeout_ms,
+        router_grid_mm,
+        router_via_cost_mm,
+        router_back_penalty_mm,
+        router_parallel,
+        pours,
+        outline_margin_mm,
+        trace_width_mm,
+        clearance_mm,
+        drc_oracle,
+        design_rules,
         routing_report,
         rlcd_model,
         llm_model,
@@ -2211,10 +2330,75 @@ fn board_cmd(
     let frame = read_frame(&circuit, stem)?;
     let mut options =
         board_options_with_panel_and_placement(footprint_dir.clone(), &panel, Some(&placement))?;
-    options.route_options.max_expansions = Some(router_max_expansions);
+    if let Some(max_expansions) = router_max_expansions {
+        options.route_options.max_expansions = Some(max_expansions);
+    }
     options.route_options.max_wall_time_ms = Some(router_timeout_ms);
     options.route_options.emit_progress_jsonl = routing_report.is_some();
     options.route_options.fine_pitch_escape = fine_pitch_escape;
+    if let Some(grid) = router_grid_mm {
+        options.route_options.grid_mm = grid;
+    }
+    if let Some(via_cost) = router_via_cost_mm {
+        options.route_options.via_cost_mm = via_cost;
+    }
+    if let Some(back_penalty) = router_back_penalty_mm {
+        options.route_options.back_penalty_mm = back_penalty;
+    }
+    options.route_options.parallel_rounds = router_parallel;
+    if let Some(width) = trace_width_mm {
+        options.route_options.signal_width_mm = width;
+    }
+    if let Some(clearance) = clearance_mm {
+        options.route_options.clearance_mm = clearance;
+    }
+    // `--design-rules` replaces the ad-hoc scalars as the single source for
+    // copper geometry. Refuse the ambiguous combination rather than silently
+    // letting two inputs disagree about what the board's rules are.
+    if let Some(rules_path) = design_rules {
+        if trace_width_mm.is_some() || clearance_mm.is_some() {
+            anyhow::bail!(
+                "--design-rules and --trace-width-mm/--clearance-mm cannot be combined: the \
+                 rules file is the single source for clearance and width"
+            );
+        }
+        let text = std::fs::read_to_string(&rules_path)
+            .with_context(|| format!("reading rules {}", rules_path.display()))?;
+        let rules = if rules_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("pro"))
+        {
+            legion_of_bom_core::DesignRules::from_kicad_pro(&text)
+        } else {
+            legion_of_bom_core::DesignRules::from_kicad_dru(&text)
+        }
+        .with_context(|| format!("parsing rules {}", rules_path.display()))?;
+        let net_classes = rules.net_classes.len();
+        println!(
+            "  design rules: {} ({net_classes} net class(es))",
+            rules_path.display()
+        );
+        options.route_options.design_rules = Some(rules);
+    }
+    if let Some(margin) = outline_margin_mm {
+        options.outline_margin_mm = margin;
+    }
+    if !pours.is_empty() {
+        let mut plan = Vec::with_capacity(pours.len());
+        for spec in &pours {
+            let (net, layer) = spec.split_once('@').ok_or_else(|| {
+                anyhow::anyhow!("--pour expects NET@LAYER (e.g. +3V3@F.Cu), got '{spec}'")
+            })?;
+            if net.is_empty() || layer.is_empty() {
+                anyhow::bail!("--pour expects NET@LAYER (e.g. +3V3@F.Cu), got '{spec}'");
+            }
+            plan.push(legion_of_bom_core::PourNet {
+                net: net.to_string(),
+                layer: layer.to_string(),
+            });
+        }
+        options.pour_plan = Some(plan);
+    }
     if placement_only {
         options.router = None;
     }
@@ -2230,7 +2414,9 @@ fn board_cmd(
     let cfg = LayoutLoop {
         mode: parse_mode(&mode)?,
         max_iters: iterations,
-        kicad_cli: None,
+        // KiCad DRC is now an opt-in oracle; the first-party copper check runs
+        // on every generated board regardless.
+        kicad_cli: if drc_oracle { kicad_cli_path() } else { None },
         drc_every_iter: false,
     };
     let layout_models = LayoutModels::from_slugs(rlcd_model.as_deref(), llm_model.as_deref())?;
@@ -2244,12 +2430,32 @@ fn board_cmd(
             llm_model.as_deref().unwrap_or("off")
         );
     }
+    // Capture the routing rules before `options` moves into the layout loop:
+    // the board gets a companion `.kicad_dru` so `kicad-cli pcb drc` judges the
+    // copper against the same clearance/width the router used. When no rules
+    // file was supplied, derive the same auto net-classes board generation
+    // routes with — the emitted file and the copper must be one story.
+    let routing_rules = match &options.route_options.design_rules {
+        Some(rules) => rules.routing_rules(),
+        None => {
+            let names: Vec<String> = model.nets().iter().map(|n| n.name.clone()).collect();
+            legion_of_bom_core::DesignRules::auto_from_nets(
+                &names,
+                options.route_options.clearance_mm,
+                options.route_options.signal_width_mm,
+                options.route_options.via_size_mm,
+                options.route_options.via_drill_mm,
+            )
+            .routing_rules()
+        }
+    };
     let Layout {
         board,
         conflicts,
         collisions,
         not_placed,
         routing,
+        first_party_drc,
     } = build_layout(
         &model,
         options,
@@ -2260,9 +2466,16 @@ fn board_cmd(
     )?;
 
     std::fs::write(&path, &board).with_context(|| format!("writing {}", path.display()))?;
+    let dru_path = path.with_extension("kicad_dru");
+    std::fs::write(&dru_path, &routing_rules)
+        .with_context(|| format!("writing {}", dru_path.display()))?;
     let tracks = board.matches("(segment").count();
     let vias = board.matches("(via").count();
     println!("wrote {}", path.display());
+    println!(
+        "  wrote {} (routing design rules; kicad-cli loads it automatically)",
+        dru_path.display()
+    );
     if let Some(report_path) = routing_report {
         let report = routing.as_ref().ok_or_else(|| {
             anyhow::anyhow!("--routing-report requires routing (remove --placement-only)")
@@ -2275,6 +2488,31 @@ fn board_cmd(
         println!("  placement preview: unrouted, outline + GND pour");
     } else {
         println!("  placed + routed: {tracks} tracks, {vias} vias, outline + GND pour");
+    }
+    // Surface the first-party copper verdict on its face, with exactly what it
+    // covered. Absent means the router did not run — never claim clean for a
+    // check that did not happen.
+    if let Some(drc) = &first_party_drc {
+        if drc.error_count > 0 || drc.unconnected_count > 0 {
+            let kinds = drc
+                .error_kinds
+                .iter()
+                .map(|(k, n)| format!("{k}×{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "  â first-party copper DRC: {} error(s), {} unconnected [{kinds}] (checked {})",
+                drc.error_count,
+                drc.unconnected_count,
+                drc.implemented_checks.join("/")
+            );
+        } else {
+            println!(
+                "  first-party copper DRC: clean (checked {}; deferred to KiCad: {})",
+                drc.implemented_checks.join("/"),
+                legion_of_bom_core::DEFERRED_CHECKS.len()
+            );
+        }
     }
     if let Some(model_path) = model_glb {
         let parts = guide::parse_board(&board).map_err(|e| anyhow::anyhow!(e))?;
@@ -2297,6 +2535,17 @@ fn board_cmd(
         );
         for c in &conflicts {
             eprintln!("      - {c}");
+        }
+    }
+    if let Some(report) = &routing {
+        if !report.escape_rejections.is_empty() {
+            eprintln!(
+                "  â  {} package(s) had fine-pitch escape neck(s) rejected by the geometric oracle; affected pads kept:",
+                report.escape_rejections.len()
+            );
+            for rejection in &report.escape_rejections {
+                eprintln!("      - {rejection}");
+            }
         }
     }
     if !collisions.is_empty() {
@@ -3420,6 +3669,12 @@ fn analog_export_cmd(
     ac_points_per_decade: u32,
     transient_hz: f64,
     input_peak_v: f64,
+    trigger_amplitude_v: Option<f64>,
+    trigger_width_s: Option<f64>,
+    trigger_time_s: Option<f64>,
+    retrigger_time_s: Option<f64>,
+    transient_stop_s: Option<f64>,
+    transient_sample_rate_hz: Option<f64>,
     load_ohms: Option<f64>,
 ) -> Result<()> {
     if ac_out.is_none() && transient_out.is_none() {
@@ -3431,6 +3686,42 @@ fn analog_export_cmd(
     if !(transient_hz > 0.0 && input_peak_v > 0.0) {
         anyhow::bail!("transient frequency and input peak must be positive");
     }
+    let trigger = match trigger_amplitude_v {
+        Some(amplitude) => {
+            let width = trigger_width_s.context("--trigger-width-s is required with a trigger")?;
+            let time = trigger_time_s.context("--trigger-time-s is required with a trigger")?;
+            let stop = transient_stop_s.context("--transient-stop-s is required with a trigger")?;
+            let sample_rate = transient_sample_rate_hz
+                .context("--transient-sample-rate-hz is required with a trigger")?;
+            if !amplitude.is_finite()
+                || amplitude <= 0.0
+                || !width.is_finite()
+                || width <= 0.0
+                || !time.is_finite()
+                || time <= 0.0
+                || !stop.is_finite()
+                || stop <= time + width
+                || !sample_rate.is_finite()
+                || sample_rate <= 0.0
+                || retrigger_time_s
+                    .is_some_and(|second| second <= time + width || second + width >= stop)
+            {
+                anyhow::bail!("invalid pulse-trigger transient");
+            }
+            Some((amplitude, width, time, retrigger_time_s, stop, sample_rate))
+        }
+        None => {
+            if trigger_width_s.is_some()
+                || trigger_time_s.is_some()
+                || retrigger_time_s.is_some()
+                || transient_stop_s.is_some()
+                || transient_sample_rate_hz.is_some()
+            {
+                anyhow::bail!("trigger transient options require --trigger-amplitude-v");
+            }
+            None
+        }
+    };
     if load_ohms.is_some_and(|load| !load.is_finite() || load <= 0.0) {
         anyhow::bail!("test load must be finite and positive");
     }
@@ -3486,15 +3777,40 @@ fn analog_export_cmd(
             .with_context(|| format!("writing {}", ac_out.display()))?;
     }
     if let Some(transient_out) = transient_out {
-        let cycles = 10;
-        let points_per_cycle = 128;
-        let pwl = sine_pwl(transient_hz, input_peak_v, cycles, points_per_cycle);
-        let stop_s = cycles as f64 / transient_hz;
+        let (pwl, step_s, stop_s) =
+            if let Some((amplitude, width, time, retrigger, stop, sample_rate)) = trigger {
+                let edge = (1.0 / sample_rate).min(width / 10.0);
+                let mut pwl = vec![
+                    (0.0, 0.0),
+                    (time - edge, 0.0),
+                    (time, amplitude),
+                    (time + width, amplitude),
+                    (time + width + edge, 0.0),
+                ];
+                if let Some(second) = retrigger {
+                    pwl.extend([
+                        (second - edge, 0.0),
+                        (second, amplitude),
+                        (second + width, amplitude),
+                        (second + width + edge, 0.0),
+                    ]);
+                }
+                pwl.push((stop, 0.0));
+                (pwl, 1.0 / sample_rate, stop)
+            } else {
+                let cycles = 10;
+                let points_per_cycle = 128;
+                (
+                    sine_pwl(transient_hz, input_peak_v, cycles, points_per_cycle),
+                    1.0 / (transient_hz * points_per_cycle as f64),
+                    cycles as f64 / transient_hz,
+                )
+            };
         let tran = simulate_tran_drive(
             &model,
             &config,
             &TranDrive {
-                step_s: 1.0 / (transient_hz * points_per_cycle as f64),
+                step_s,
                 stop_s,
                 pwl,
                 cv: Vec::new(),
@@ -3503,22 +3819,36 @@ fn analog_export_cmd(
             &work_dir,
         )
         .context("raw sine transient simulation")?;
-        let transient_json = serde_json::json!({
-        "schema": "lob.analog-source.v1",
-        "provenance": {
-            "source_digest": digest,
-            "simulator": "ngspice",
-            "analysis": "transient",
-            "input_net": config.input_net,
-            "output_net": config.output_net,
-            "test_load_ohms": load_ohms,
-        },
-        "fundamental_hz": transient_hz,
-        "input_peak_v": input_peak_v,
-        "points": tran.points.into_iter().map(|point| serde_json::json!({
-            "time_s": point.t_s, "output_v": point.v
-        })).collect::<Vec<_>>(),
-        });
+        let transient_json = if let Some((amplitude, width, time, retrigger, _, _)) = trigger {
+            serde_json::json!({
+            "schema": "lob.analog-source.v1",
+            "provenance": {
+                "source_digest": digest, "simulator": "ngspice", "analysis": "triggered_transient",
+                "input_net": config.input_net, "output_net": config.output_net, "test_load_ohms": load_ohms,
+            },
+            "trigger_amplitude_v": amplitude,
+            "trigger_width_s": width,
+            "trigger_times_s": std::iter::once(time).chain(retrigger).collect::<Vec<_>>(),
+            "points": tran.points.into_iter().map(|point| serde_json::json!({"time_s": point.t_s, "output_v": point.v})).collect::<Vec<_>>(),
+            })
+        } else {
+            serde_json::json!({
+            "schema": "lob.analog-source.v1",
+            "provenance": {
+                "source_digest": digest,
+                "simulator": "ngspice",
+                "analysis": "transient",
+                "input_net": config.input_net,
+                "output_net": config.output_net,
+                "test_load_ohms": load_ohms,
+            },
+            "fundamental_hz": transient_hz,
+            "input_peak_v": input_peak_v,
+            "points": tran.points.into_iter().map(|point| serde_json::json!({
+                "time_s": point.t_s, "output_v": point.v
+            })).collect::<Vec<_>>(),
+            })
+        };
         if let Some(parent) = transient_out.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -5155,11 +5485,26 @@ mod tests {
                 fine_pitch_escape,
                 ..
             } => {
-                assert_eq!(router_max_expansions, 1234);
+                assert_eq!(router_max_expansions, Some(1234));
                 assert_eq!(router_timeout_ms, 5678);
                 assert_eq!(routing_report, Some(PathBuf::from("route.json")));
                 assert!(fine_pitch_escape);
             }
+            _ => panic!("expected board command"),
+        }
+    }
+
+    #[test]
+    fn board_defaults_to_no_expansion_ceiling() {
+        use clap::Parser;
+        // A hard expansion cap that fires mid-negotiation ships a partial board;
+        // the default must leave the ceiling open and let settle/stall stop it.
+        let cli = Cli::parse_from(["lob", "board", "c.py"]);
+        match cli.command {
+            Command::Board {
+                router_max_expansions,
+                ..
+            } => assert_eq!(router_max_expansions, None),
             _ => panic!("expected board command"),
         }
     }

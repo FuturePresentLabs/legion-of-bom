@@ -13,12 +13,12 @@
 use std::path::Path;
 use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stage::StageError;
 
 /// A parsed `kicad-cli pcb drc --format json` report.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DrcReport {
     /// Design-rule violations (clearance, shorts, silk, holes, …).
     pub violations: Vec<DrcViolation>,
@@ -29,7 +29,7 @@ pub struct DrcReport {
 }
 
 /// One DRC finding.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DrcViolation {
     /// Rule key, e.g. `clearance`, `unconnected_items`, `hole_to_hole`.
     #[serde(rename = "type", default)]
@@ -58,7 +58,7 @@ impl DrcViolation {
 }
 
 /// One item referenced by a violation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DrcItem {
     #[serde(default)]
     pub description: String,
@@ -67,7 +67,7 @@ pub struct DrcItem {
 }
 
 /// A board position in millimetres.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Pos {
     pub x: f64,
     pub y: f64,

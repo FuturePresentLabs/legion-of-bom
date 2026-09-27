@@ -17,8 +17,11 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::design_rules::DesignRules;
+use crate::drc::DrcReport;
 use crate::logo::Logo;
 use crate::model::Side;
+use crate::pcb_drc::{check_copper_with, CopperGeometry, FirstPartyDrcSummary};
 use crate::route::{
     prepare_fine_pitch_escape, track_sexpr, via_sexpr, PadLayer, PadPoint, PathfinderRouter,
     RouteNet, RouteOptions, RouteOutput, Router, Track, Via,
@@ -1665,6 +1668,13 @@ fn rects_overlap(a: &Rect, b: &Rect, c: f64) -> bool {
     a.0 - c < b.2 && b.0 - c < a.2 && a.1 - c < b.3 && b.1 - c < a.3
 }
 
+/// One copper pour: `net` flooded across the whole board on `layer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PourNet {
+    pub net: String,
+    pub layer: String,
+}
+
 /// Options for [`generate_board`].
 pub struct BoardOptions {
     pub footprint_dir: PathBuf,
@@ -1677,6 +1687,13 @@ pub struct BoardOptions {
     /// Net to flood the bottom-layer ground pour to (DESIGN 6.2's default
     /// convention); `None` disables the pour.
     pub ground_net: Option<String>,
+    /// Explicit pour plan. When `Some`, these are the only pours emitted and
+    /// every listed net is removed from maze routing (the plane connects it).
+    /// `None` keeps the DESIGN 6.2 default: `ground_net` poured on both layers.
+    /// A 2-layer signal board wants power on one layer and ground on the other —
+    /// e.g. `[+3V3@F.Cu, GND@B.Cu]` — which takes a large power fanout out of
+    /// the router entirely instead of routing it as tracks.
+    pub pour_plan: Option<Vec<PourNet>>,
     /// Margin (mm) added around the placed parts for the board outline.
     pub outline_margin_mm: f64,
     /// A fixed board outline `(min_x, min_y, max_x, max_y)` — set for a Eurorack
@@ -1685,6 +1702,9 @@ pub struct BoardOptions {
     pub fixed_outline: Option<(f64, f64, f64, f64)>,
     /// Relational layout requirements selected by the CircuitPlan/profile.
     pub placement_intent: crate::rules::PlacementIntent,
+    /// Finished PCB thickness. This is source data shared by board emission and
+    /// electromechanical export; it must never be recovered from a mesh.
+    pub thickness_mm: f64,
     /// Which components get their value ("47nF", "TL072") on silk next to the
     /// refdes (DESIGN 6.10). Defaults to [`SilkValues::HandSoldered`].
     pub silk_values: SilkValues,
@@ -1775,9 +1795,11 @@ impl BoardOptions {
             router: Some(Box::new(PathfinderRouter::default())),
             route_options: RouteOptions::default(),
             ground_net: Some("GND".into()),
+            pour_plan: None,
             outline_margin_mm: 5.0,
             fixed_outline: None,
             placement_intent: crate::rules::PlacementIntent::default(),
+            thickness_mm: 1.6,
             silk_values: SilkValues::default(),
             title: None,
             legend: SilkLegend::default(),
@@ -1810,6 +1832,16 @@ pub struct BoardArtifacts {
     /// (same as `collisions`) rather than silently dropped, so a genuinely
     /// forgotten footprint still gets noticed.
     pub not_placed: Vec<String>,
+    /// Final generated board outline in KiCad board coordinates.
+    pub outline_mm: Option<(f64, f64, f64, f64)>,
+    /// Finished thickness used by this exact generation pass.
+    pub thickness_mm: f64,
+    /// First-party copper DRC (clearance, edge, connectivity). Scoped: see
+    /// [`crate::pcb_drc::DEFERRED_CHECKS`] for what it does not cover. `None`
+    /// when no router ran (an unrouted preview has no copper to judge).
+    pub first_party_drc: Option<DrcReport>,
+    /// Measured footprint facts used by this exact generation pass.
+    pub facts: HashMap<String, PartFacts>,
 }
 
 /// Load every part's footprint and measure its placement facts (keep-out extent,
@@ -2444,6 +2476,20 @@ pub fn generate_board_artifacts(
         })
     });
 
+    // The pour plan: either explicit, or the DESIGN 6.2 default (ground on both
+    // layers). A poured net is emitted as a zone and removed from maze routing,
+    // so its connections are made by the plane rather than by tracks.
+    let pours: Vec<(String, String)> = match &options.pour_plan {
+        Some(plan) => plan
+            .iter()
+            .map(|p| (p.net.clone(), p.layer.clone()))
+            .collect(),
+        None => match &options.ground_net {
+            Some(g) => vec![(g.clone(), "F.Cu".into()), (g.clone(), "B.Cu".into())],
+            None => Vec::new(),
+        },
+    };
+
     // Setup: anchor the drill/place-file origin at the board's bottom-left, so
     // CPL/Gerber coordinates exported with `--use-drill-file-origin` are small
     // and positive (see `fab::export_cpl`) rather than page-space.
@@ -2467,7 +2513,7 @@ pub fn generate_board_artifacts(
         kv("generator_version", Sexpr::string("9.0")),
         Sexpr::list(vec![
             Sexpr::sym("general"),
-            kv("thickness", Sexpr::sym("1.6")),
+            kv("thickness", Sexpr::sym(mm(options.thickness_mm))),
         ]),
         kv("paper", Sexpr::string("A4")),
         two_layer_stack(),
@@ -2485,11 +2531,24 @@ pub fn generate_board_artifacts(
         let mut keepouts = options.placement_intent.keepouts.iter().collect::<Vec<_>>();
         keepouts.sort_by(|a, b| a.name.cmp(&b.name));
         board.extend(keepouts.into_iter().map(placement_rule_area));
-        if let Some(gnd) = &options.ground_net {
-            if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
-                let idx = net_index[name.as_str()];
-                for layer in ["F.Cu", "B.Cu"] {
-                    board.push(ground_zone(idx, name, rect, layer));
+        // Pours: the explicit plan, or the DESIGN 6.2 default (ground on both layers,
+        // so through-hole GND pads bridge them and a trace-cut island reconnects
+        // through the other layer). A power plane on one layer and ground on the
+        // other takes a large power fanout out of the router entirely.
+        if options.pour_plan.is_none() {
+            if let Some(gnd) = &options.ground_net {
+                if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
+                    let idx = net_index[name.as_str()];
+                    for layer in ["F.Cu", "B.Cu"] {
+                        board.push(pour_zone(idx, name, rect, layer));
+                    }
+                }
+            }
+        } else {
+            for (pour_net, layer) in &pours {
+                if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(pour_net)) {
+                    let idx = net_index[name.as_str()];
+                    board.push(pour_zone(idx, name, rect, layer));
                 }
             }
         }
@@ -2546,6 +2605,10 @@ pub fn generate_board_artifacts(
     // Route the nets into copper tracks (DESIGN 6.5). Ground still gets the pour;
     // routing traces the rest (and any multi-pad ground net) on the copper layers.
     let mut route = RouteOutput::default();
+    // First-party copper DRC, computed from the copper this pass emitted.
+    // `None` when no router ran: an unrouted preview has no copper verdict,
+    // and an empty report must never read as "clean".
+    let mut first_party_drc: Option<DrcReport> = None;
     if let Some(router) = &options.router {
         let mut nets: Vec<RouteNet> = net_pads.into_values().collect();
         // By net index, because `into_values` hands them over in hash order and
@@ -2582,15 +2645,21 @@ pub fn generate_board_artifacts(
             h: p.h_mm,
             net_idx: 0,
         }));
-        // Both copper layers receive a solid zone for `ground_net`. Routing the
-        // same pads with tracks is redundant, damages the plane, and makes a
-        // large multi-pad GND net dominate negotiated-congestion runtime. The
-        // pads must still block signal copper, so feed them back as independent
-        // no-net obstacles instead.
-        if let Some(gnd) = &options.ground_net {
-            if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
-                poured_net_as_obstacles(&mut nets, &mut obstacle_pads, net_index[name.as_str()]);
+        // Every poured net is connected by its plane. Routing the same pads with
+        // tracks is redundant, damages the plane, and makes a large multi-pad net
+        // dominate negotiated-congestion runtime. The pads must still block signal
+        // copper, so feed them back as independent no-net obstacles instead.
+        let mut poured_idx: Vec<usize> = Vec::new();
+        for (pour_net, _) in &pours {
+            if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(pour_net)) {
+                let idx = net_index[name.as_str()];
+                if !poured_idx.contains(&idx) {
+                    poured_idx.push(idx);
+                }
             }
+        }
+        for &idx in &poured_idx {
+            poured_net_as_obstacles(&mut nets, &mut obstacle_pads, idx);
         }
         // Each no-net pad as its own single-pad net: painted as an obstacle (with
         // clearance halo) so traces route around it, but never itself routed
@@ -2609,9 +2678,28 @@ pub fn generate_board_artifacts(
         if route_opts.bounds.is_none() {
             route_opts.bounds = outline;
         }
+        // The board's copper rules derive from its nets unless the caller set
+        // explicit ones: a board with supply rails gives them a class of their
+        // own so rail traces get deliberate width instead of whatever the
+        // signal default happened to be. Only width widens for rails — class
+        // clearance stays at the board default, because the shared grid would
+        // pay for it on every net's corridor until per-pair asymmetry exists
+        // (legion-of-bom-4s7y).
+        if route_opts.design_rules.is_none() {
+            route_opts.design_rules = Some(DesignRules::auto_from_nets(
+                &net_names,
+                route_opts.clearance_mm,
+                route_opts.signal_width_mm,
+                route_opts.via_size_mm,
+                route_opts.via_drill_mm,
+            ));
+        }
         if route_opts.fine_pitch_escape {
             let escaped = prepare_fine_pitch_escape(&nets, &route_opts);
             route = router.route(&escaped.nets, &route_opts);
+            if let Some(report) = route.report.as_mut() {
+                report.escape_rejections = escaped.rejected.iter().map(|r| r.summary()).collect();
+            }
             let failed: HashSet<usize> = route
                 .conflicts
                 .iter()
@@ -2637,10 +2725,15 @@ pub fn generate_board_artifacts(
                 &options.route_options.back,
             ));
         }
-        // GND stitching vias tie the two-sided pour together next to every GND
-        // pad. This reconnects islands fenced off by dense THT grids and gives
-        // SMD IC ground pads a nearby path into the opposite plane.
-        if let (Some(rect), Some(gnd)) = (outline, &options.ground_net) {
+        // Ground stitching: a via next to every GND pad ties it to the ground pour.
+        // With ground on both faces it also joins the two pours; with a power
+        // plane on one face, the via still reaches the ground plane through it
+        // (KiCad clears the power zone around a foreign-net via, so no short).
+        let ground_anywhere = options
+            .ground_net
+            .as_ref()
+            .is_some_and(|g| pours.iter().any(|(n, _)| n.eq_ignore_ascii_case(g)));
+        if let (Some(rect), Some(gnd), true) = (outline, &options.ground_net, ground_anywhere) {
             if let Some(name) = net_names.iter().find(|n| n.eq_ignore_ascii_case(gnd)) {
                 let gnd_idx = net_index[name.as_str()];
                 for via in ground_stitching_vias(
@@ -2659,6 +2752,34 @@ pub fn generate_board_artifacts(
                 }
             }
         }
+        // First-party copper DRC over the copper this pass emitted, so the
+        // layout loop can rank candidates without a kicad-cli subprocess.
+        // Clearance resolves per net *pair* through the same `route_opts` the
+        // router painted its obstacles with — one source, two consumers.
+        let geo = CopperGeometry {
+            nets: &nets,
+            tracks: &route.tracks,
+            vias: &route.vias,
+            outline,
+            edge_clearance_mm: route_opts.edge_clearance(),
+            poured_nets: &poured_idx,
+        };
+        let drc = check_copper_with(&geo, &|a, b| {
+            let name = |i: usize| {
+                geo.nets
+                    .iter()
+                    .find(|n| n.net_idx == i)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("")
+            };
+            route_opts.clearance_for(name(a), name(b))
+        });
+        // The routing evidence reports its own DRC verdict: the same check the
+        // layout loop ranked this candidate with, not a later external opinion.
+        if let Some(report) = &mut route.report {
+            report.first_party_drc = Some(FirstPartyDrcSummary::of(&drc));
+        }
+        first_party_drc = Some(drc);
     }
 
     Ok(BoardArtifacts {
@@ -2667,6 +2788,10 @@ pub fn generate_board_artifacts(
         route,
         collisions,
         not_placed,
+        outline_mm: outline,
+        thickness_mm: options.thickness_mm,
+        first_party_drc,
+        facts,
     })
 }
 
@@ -3576,8 +3701,8 @@ fn edge_cuts_rect((x1, y1, x2, y2): Rect) -> Sexpr {
     ])
 }
 
-/// A bottom-layer (`B.Cu`) ground pour over `rect`, flooded to `net`.
-fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &str) -> Sexpr {
+/// A solid copper pour over `rect` on `layer`, flooded to `net`.
+fn pour_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &str) -> Sexpr {
     let xy =
         |x: f64, y: f64| Sexpr::list(vec![Sexpr::sym("xy"), Sexpr::sym(mm(x)), Sexpr::sym(mm(y))]);
     Sexpr::list(vec![
@@ -3587,16 +3712,16 @@ fn ground_zone(net_idx: usize, net_name: &str, (x1, y1, x2, y2): Rect, layer: &s
         kv("layer", Sexpr::string(layer)),
         kv(
             "uuid",
-            Sexpr::string(det_uuid(&format!("gnd.zone.{layer}"))),
+            Sexpr::string(det_uuid(&format!("pour.{net_name}.{layer}"))),
         ),
         Sexpr::list(vec![
             Sexpr::sym("hatch"),
             Sexpr::sym("edge"),
             Sexpr::sym("0.5"),
         ]),
-        // Solid-connect pads to the plane (a low-impedance ground; jack sleeves +
+        // Solid-connect pads to the plane (a low-impedance rail; jack sleeves +
         // header GND especially want it). Also removes the fragile thermal-spoke
-        // dependency so a tightly-placed edge-hugging GND pad can't "starve" to a
+        // dependency so a tightly-placed edge-hugging pad can't "starve" to a
         // single spoke.
         Sexpr::list(vec![
             Sexpr::sym("connect_pads"),
@@ -4571,6 +4696,53 @@ mod tests {
             art.route.conflicts
         );
         assert!(art.pcb.contains("(segment"), "AUDIO net becomes a track");
+    }
+
+    #[test]
+    fn rails_get_their_own_width_by_default() {
+        // legion-of-bom-orld: a board with supply rails derives a Power class
+        // automatically — rails get deliberate, wider copper while signals keep
+        // the default width and every corridor. This is the whole loop on a
+        // self-contained (synthesized-footprint) circuit: generation, auto
+        // rules, routing, and the checker reading that one source.
+        let c = Circuit {
+            name: "rails".into(),
+            parts: vec![Part::new("A1", "Daisy_Seed").with_footprint("LobModule:Daisy_Seed")],
+            nets: vec![
+                Net::new(
+                    "+12V",
+                    vec![PinRef::new("A1", "1"), PinRef::new("A1", "40")],
+                ),
+                Net::new("SIG", vec![PinRef::new("A1", "2"), PinRef::new("A1", "39")]),
+                Net::new("GND", vec![PinRef::new("A1", "20")]),
+            ],
+        };
+        let art = generate_board_artifacts(&c, &BoardOptions::new("/nonexistent"))
+            .expect("rail board generates");
+        assert!(art.route.conflicts.is_empty(), "{:?}", art.route.conflicts);
+        // Sorted net names: "+12V" = 1, "GND" = 2, "SIG" = 3.
+        let rail: Vec<_> = art.route.tracks.iter().filter(|t| t.net_idx == 1).collect();
+        let sig: Vec<_> = art.route.tracks.iter().filter(|t| t.net_idx == 3).collect();
+        assert!(!rail.is_empty() && !sig.is_empty(), "both nets routed");
+        assert!(
+            rail.iter().all(|t| (t.width_mm - 0.4).abs() < 1e-9),
+            "rail copper is class width: {:?}",
+            rail.iter().map(|t| t.width_mm).collect::<Vec<_>>()
+        );
+        assert!(sig.iter().all(|t| (t.width_mm - 0.25).abs() < 1e-9));
+        assert!(
+            art.pcb.contains("(width 0.4)"),
+            "wider rail reaches the board file"
+        );
+        // And the first-party checker, reading the same rules, still calls the
+        // whole board clean — the producer must not manufacture violations.
+        let drc = art.first_party_drc.expect("a router ran");
+        assert_eq!(
+            drc.violations.len(),
+            0,
+            "auto class copper must still pass: {:?}",
+            drc.violations
+        );
     }
 
     #[test]
@@ -5722,8 +5894,8 @@ mod tests {
         };
         let pin = |p: &str| PinRef {
             refdes: RefDes("J3".into()),
-            function: None,
             pin: p.into(),
+            function: None,
             electrical_type: None,
         };
         let circuit = Circuit {
